@@ -27,7 +27,8 @@ pub struct Region {
 pub enum Element {
     Image { region: Region, at: (i32, i32), clip: [i32; 4] },
     /// `rect`: x, y, width, height.
-    Fill { rect: [i32; 4], rgb: [u8; 3], clip: [i32; 4] },
+    /// `alpha` 255: opaque.
+    Fill { rect: [i32; 4], rgb: [u8; 3], alpha: u8, clip: [i32; 4] },
     /// Region `rect` (x, y, w, h) of a picture made at run time (`name`,
     /// `size`), whose pixels come with the scene (see [`patch`]).
     Dynamic { name: String, size: (u32, u32), rect: [i32; 4], at: (i32, i32), clip: [i32; 4] },
@@ -37,8 +38,8 @@ pub enum Element {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScreenArt {
     pub regions: BTreeSet<Region>,
-    /// Fill colours and sizes.
-    pub fills: BTreeSet<([u8; 3], (u32, u32))>,
+    /// Fill colours (RGBA) and sizes.
+    pub fills: BTreeSet<([u8; 4], (u32, u32))>,
     /// Run-time pictures: name and size.
     pub dynamic: BTreeSet<(String, (u32, u32))>,
 }
@@ -49,8 +50,8 @@ fn region_sprite(r: &Region) -> String {
     format!("Screen@{}#{x},{y},{w},{h}{}/0", r.source, if r.keyed { "k" } else { "" })
 }
 
-fn fill_sprite(rgb: [u8; 3], (w, h): (u32, u32)) -> String {
-    format!("ScreenFill@{},{},{}#{w}x{h}/0", rgb[0], rgb[1], rgb[2])
+fn fill_sprite(c: [u8; 4], (w, h): (u32, u32)) -> String {
+    format!("ScreenFill@{},{},{},{}#{w}x{h}/0", c[0], c[1], c[2], c[3])
 }
 
 fn dynamic_sprite(name: &str, (w, h): (u32, u32)) -> String {
@@ -68,7 +69,9 @@ impl ScreenArt {
         for e in elements {
             new |= match e {
                 Element::Image { region, .. } => self.regions.insert(region.clone()),
-                Element::Fill { rect, rgb, .. } => self.fills.insert((*rgb, (rect[2].max(0) as u32, rect[3].max(0) as u32))),
+                Element::Fill { rect, rgb, alpha, .. } => {
+                    self.fills.insert(([rgb[0], rgb[1], rgb[2], *alpha], (rect[2].max(0) as u32, rect[3].max(0) as u32)))
+                }
                 Element::Dynamic { name, size, .. } => self.dynamic.insert((name.clone(), *size)),
             };
         }
@@ -107,11 +110,11 @@ impl ScreenArt {
                 toml_str(dynamic_sprite(name, (*w, *h)).trim_end_matches("/0"))
             );
         }
-        for (n, &([r, g, b], (w, h))) in self.fills.iter().enumerate() {
+        for (n, &([r, g, b, a], (w, h))) in self.fills.iter().enumerate() {
             let _ = writeln!(
                 out,
-                "[images.screen_fill_{n}]\nsource = \"solid:{r},{g},{b},255:{w}x{h}\"\n\n[sheets.screen_fill_{n}]\nimage = \"screen_fill_{n}\"\ncell = [{w}, {h}]\ngrid = [1, 1]\ngroup = {}\nscaling = \"keep\"\n",
-                toml_str(fill_sprite([r, g, b], (w, h)).trim_end_matches("/0"))
+                "[images.screen_fill_{n}]\nsource = \"solid:{r},{g},{b},{a}:{w}x{h}\"\n\n[sheets.screen_fill_{n}]\nimage = \"screen_fill_{n}\"\ncell = [{w}, {h}]\ngrid = [1, 1]\ngroup = {}\nscaling = \"keep\"\n",
+                toml_str(fill_sprite([r, g, b, a], (w, h)).trim_end_matches("/0"))
             );
         }
         out
@@ -133,8 +136,8 @@ pub fn sprites(elements: &[Element], compiled: &Compiled) -> Vec<FreeSprite> {
                     (dynamic_sprite(name, *size), (x - rx, y - ry), clip)
                 }
                 Element::Image { region, at, clip } => (region_sprite(region), *at, *clip),
-                Element::Fill { rect, rgb, clip } => {
-                    (fill_sprite(*rgb, (rect[2].max(0) as u32, rect[3].max(0) as u32)), (rect[0], rect[1]), *clip)
+                Element::Fill { rect, rgb, alpha, clip } => {
+                    (fill_sprite([rgb[0], rgb[1], rgb[2], *alpha], (rect[2].max(0) as u32, rect[3].max(0) as u32)), (rect[0], rect[1]), *clip)
                 }
             };
             let (set, _) = compiled.set(&name)?;
@@ -177,7 +180,7 @@ mod tests {
         let elements = vec![
             Element::Image { region: region("b.pcx", true), at: (100, 50), clip: [0, 0, 640, 480] },
             Element::Image { region: region("a.pcx", false), at: (3, 4), clip: [0, 0, 10, 10] },
-            Element::Fill { rect: [5, 6, 7, 8], rgb: [1, 2, 3], clip: [0, 0, 640, 480] },
+            Element::Fill { rect: [5, 6, 7, 8], rgb: [1, 2, 3], alpha: 128, clip: [0, 0, 640, 480] },
         ];
         let mut art = ScreenArt::default();
         assert!(art.add(&elements));
