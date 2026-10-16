@@ -36,8 +36,9 @@ pub enum Element {
     /// `size`), whose pixels come with the scene (see [`patch`]).
     Dynamic { name: String, size: (u32, u32), rect: [i32; 4], at: (i32, i32), clip: [i32; 4] },
     /// A sprite of the description by name, its top-left at `at` (art the
-    /// description has anyway, e.g. animation frames).
-    Sprite { name: String, at: (i32, i32), clip: [i32; 4] },
+    /// description has anyway, e.g. animation frames). `scale_den`: 0 for
+    /// an ordinary sprite, else a scale blend ([`FreeSprite::scale_den`]).
+    Sprite { name: String, at: (i32, i32), clip: [i32; 4], scale_den: u32 },
 }
 
 
@@ -156,8 +157,9 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
                 let id = compiled.sprite_names.iter().position(|n| n == name)?;
                 compiled.atlas.sprites.get(id).map(|s| (s.anchor_x, s.anchor_y))
             };
+            let scale_den = if let Element::Sprite { scale_den, .. } = e { *scale_den } else { 0 };
             let (name, (x, y), clip) = match e {
-                Element::Sprite { name, at: (x, y), clip } => {
+                Element::Sprite { name, at: (x, y), clip, .. } => {
                     let (ax, ay) = anchor(name).unwrap_or((0, 0));
                     (name.clone(), (x - ax, y - ay), *clip)
                 }
@@ -182,7 +184,7 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
                 after_pass,
                 phase: 0,
                 ticks_per_frame: 1,
-                scale_den: 0,
+                scale_den,
                 clip: Some(clip),
             })
         })
