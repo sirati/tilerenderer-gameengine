@@ -82,7 +82,7 @@ pub fn render_offscreen(
     let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world(compiled, scene));
-    gpu.render(&renderer, &scene_camera(scene, config.overhang), scene.tick, config.clear)
+    gpu.render(&mut renderer, &scene_camera(scene, config.overhang), scene.tick, config.clear)
 }
 
 /// Opens the window and runs until it is closed. Blocks the calling thread,
@@ -147,8 +147,10 @@ impl App {
             .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
             .unwrap_or(caps.formats[0]);
         let size = window.inner_size();
+        // Scale-blend passes copy the target, so ask for COPY_SRC.
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | (caps.usages & wgpu::TextureUsages::COPY_SRC);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -183,29 +185,10 @@ impl App {
                 return;
             }
         };
-        let view = frame.texture.create_view(&Default::default());
         let mut camera = scene_camera(&scene, self.config.overhang);
         camera.viewport = (gpu.config.width, gpu.config.height);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("viewer"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(tile_render::gpu::color(self.config.clear)),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            gpu.renderer.draw(&gpu.queue, &mut pass, &camera, scene.tick);
-        }
+        gpu.renderer.render(&gpu.device, &gpu.queue, &mut encoder, &frame.texture, &camera, scene.tick, self.config.clear);
         gpu.queue.submit([encoder.finish()]);
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);

@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
-use tile_render::{AtlasBuilder, Grid, LayerSpec, Layout, RgbaImage, SpriteId, SpriteSetId, SpriteSets};
+use tile_render::{AtlasBuilder, Blend, Grid, LayerSpec, Layout, RgbaImage, SpriteId, SpriteSetId, SpriteSets};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DescError {
@@ -164,6 +164,20 @@ pub struct LayerDesc {
     /// tested against.
     #[serde(default)]
     pub cull_offset: [i32; 2],
+    /// How the layer combines with what is below; all layers of a pass
+    /// must agree.
+    #[serde(default)]
+    pub blend: BlendDesc,
+}
+
+/// `blend = "alpha"` (default) or `blend = { scale = { bits = 5,
+/// denominator = 16 } }`, see `tile_render::Blend`.
+#[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
+pub enum BlendDesc {
+    #[default]
+    Alpha,
+    Scale { bits: u32, denominator: u32 },
 }
 
 fn one() -> u32 {
@@ -271,8 +285,20 @@ impl Description {
             spec.hidden = layer.hidden;
             spec.pass = layer.pass;
             spec.cull_offset = (layer.cull_offset[0], layer.cull_offset[1]);
+            spec.blend = match layer.blend {
+                BlendDesc::Alpha => Blend::Alpha,
+                BlendDesc::Scale { bits, denominator } if (4..=8).contains(&bits) && denominator > 0 => {
+                    Blend::Scale { bits, denominator }
+                }
+                BlendDesc::Scale { .. } => {
+                    return Err(DescError::Unknown { kind: "blend (bits 4..=8, denominator > 0) of layer", name: layer.name.clone() });
+                }
+            };
             if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
                 return Err(DescError::Unknown { kind: "pass order for layer", name: layer.name.clone() });
+            }
+            if layers.last().is_some_and(|l: &LayerSpec| l.pass == spec.pass && l.blend != spec.blend) {
+                return Err(DescError::Unknown { kind: "blend (differs within its pass) of layer", name: layer.name.clone() });
             }
             layers.push(spec);
         }
