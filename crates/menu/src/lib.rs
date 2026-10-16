@@ -32,6 +32,8 @@
 
 use std::collections::BTreeMap;
 
+pub mod screen;
+
 use render_desc::Compiled;
 use scene::{Button, FreeSprite, Input};
 use serde::Deserialize;
