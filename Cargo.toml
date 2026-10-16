@@ -4,6 +4,7 @@ members = [
     "crates/tile-render-shared",
     "crates/tile-render",
     "crates/civ3-assets",
+    "crates/render-desc",
     "crates/inproc",
     "crates/civ3-sys",
     "crates/civ3-bridge",
