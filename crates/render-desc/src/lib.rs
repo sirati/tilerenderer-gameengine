@@ -201,6 +201,63 @@ fn solid(spec: &str) -> Result<RgbaImage, String> {
     Ok(RgbaImage::from_fn(w, h, |_, _| [r, g, b, a]))
 }
 
+/// `source = "line:R,G,B,A:DX,DY:W"`: a line `W` pixels thick from a start
+/// point to the point `(DX, DY)` away, mostly horizontal (`|DY| <= |DX|`),
+/// rasterized like simple software renderers do: every column from the
+/// start's x up to (not including) the end's x — counted `j = 0, 1, ...`
+/// from the start — gets `W` pixels from row `j·|DY|/|DX|` (rounded down)
+/// on, towards the end. The image's top-left is [`line_origin`] relative to
+/// the start, so a sheet with that anchor places the line at its start.
+fn line(spec: &str) -> Result<RgbaImage, String> {
+    let (color, (dx, dy), w) = line_spec(spec)?;
+    let pixels = line_pixels(dx, dy, w);
+    let (ox, oy) = line_origin(dx, dy, w);
+    let width = pixels.iter().map(|p| p.0 - ox + 1).max().unwrap_or(0) as u32;
+    let height = pixels.iter().map(|p| p.1 - oy + 1).max().unwrap_or(0) as u32;
+    let mut img = RgbaImage::from_fn(width, height, |_, _| [0; 4]);
+    for (x, y) in pixels {
+        img.put((x - ox) as u32, (y - oy) as u32, color);
+    }
+    Ok(img)
+}
+
+fn line_spec(spec: &str) -> Result<([u8; 4], (i32, i32), i32), String> {
+    let err = || format!("line image {spec:?}: expected R,G,B,A:DX,DY:W with |DY| <= |DX|");
+    let mut parts = spec.split(':');
+    let mut numbers = |n: usize| -> Result<Vec<i32>, String> {
+        let v: Vec<i32> = parts.next().ok_or_else(err)?.split(',').map(|v| v.trim().parse().map_err(|_| err())).collect::<Result<_, _>>()?;
+        if v.len() == n { Ok(v) } else { Err(err()) }
+    };
+    let c = numbers(4)?;
+    let d = numbers(2)?;
+    let w = numbers(1)?[0];
+    let color = c.iter().map(|&v| u8::try_from(v).map_err(|_| err())).collect::<Result<Vec<_>, _>>()?;
+    if d[1].abs() > d[0].abs() || w < 1 {
+        return Err(err());
+    }
+    Ok(([color[0], color[1], color[2], color[3]], (d[0], d[1]), w))
+}
+
+/// The pixels of a `line:` image relative to its start.
+fn line_pixels(dx: i32, dy: i32, w: i32) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    for j in 0..dx.abs() {
+        let x = if dx < 0 { -1 - j } else { j };
+        let row = j * dy.abs() / dx.abs();
+        for t in 0..w {
+            out.push((x, if dy < 0 { -(row + t) } else { row + t }));
+        }
+    }
+    out
+}
+
+/// Top-left of a `line:` image relative to its start (the anchor of a
+/// sheet that draws the line from its start point).
+pub fn line_origin(dx: i32, dy: i32, w: i32) -> (i32, i32) {
+    let pixels = line_pixels(dx, dy, w);
+    (pixels.iter().map(|p| p.0).min().unwrap_or(0), pixels.iter().map(|p| p.1).min().unwrap_or(0))
+}
+
 fn blend_of(desc: BlendDesc) -> Option<Blend> {
     match desc {
         BlendDesc::Alpha => Some(Blend::Alpha),
@@ -293,8 +350,13 @@ impl Description {
         for (name, img) in &self.images {
             let mut options = self.loader.clone();
             options.extend(img.options.clone());
-            let frames = match img.source.strip_prefix("solid:") {
-                Some(spec) => vec![solid(spec).map_err(|message| DescError::Image { name: name.clone(), message })?],
+            let generated = if let Some(spec) = img.source.strip_prefix("solid:") {
+                Some(solid(spec))
+            } else {
+                img.source.strip_prefix("line:").map(line)
+            };
+            let frames = match generated {
+                Some(image) => vec![image.map_err(|message| DescError::Image { name: name.clone(), message })?],
                 None => loader.load(&img.source, &options).map_err(|message| DescError::Image { name: name.clone(), message })?,
             };
             images.insert(name, frames);
@@ -554,5 +616,28 @@ mod tests {
     fn rejects_unknown_names() {
         let d = Description::parse("grid = { layout = \"orthogonal\", step = [1, 1] }\n[[layers]]\nname = \"x\"\nsets = [\"nope\"]").unwrap();
         assert!(matches!(d.compile(&Checker, 64), Err(DescError::Unknown { kind: "set", .. })));
+    }
+
+    #[test]
+    fn lines_follow_the_column_rule() {
+        // Civ III's tile-edge lines (measured): 2 pixels per column, rows
+        // j/2 and j/2 + 1 from the start, the end column excluded.
+        for (dx, dy) in [(-64, -32), (-64, 32), (64, 32), (64, -32)] {
+            let img = line(&format!("1,2,3,128:{dx},{dy}:2")).unwrap();
+            let (ox, oy) = line_origin(dx, dy, 2);
+            assert_eq!((img.width, img.height), (64, 33));
+            assert_eq!((ox, oy), (dx.min(0), dy.min(0)));
+            let mut n = 0;
+            for j in 0..64 {
+                let x = if dx < 0 { -1 - j } else { j };
+                for t in 0..2 {
+                    let y = dy.signum() * (j / 2 + t);
+                    assert_eq!(img.get((x - ox) as u32, (y - oy) as u32), [1, 2, 3, 128], "({dx}, {dy}) column {j}");
+                    n += 1;
+                }
+            }
+            assert_eq!(img.pixels.iter().filter(|p| p[3] != 0).count(), n);
+        }
+        assert!(line("1,2,3,4:10,20:2").is_err());
     }
 }
