@@ -79,6 +79,18 @@ pub struct Scene {
     pub layers: Vec<LayerCells>,
     /// In drawing order (within the pass each follows).
     pub sprites: Vec<FreeSprite>,
+    /// New pixels for atlas sprites whose content changes at run time.
+    pub patches: Vec<Patch>,
+}
+
+/// The pixels of one atlas sprite (row-major RGBA, its exact size).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Patch {
+    /// Atlas sprite id (`Compiled` names them).
+    pub sprite: u32,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
 impl Scene {

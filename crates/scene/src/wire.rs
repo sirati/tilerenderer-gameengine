@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Button, FreeSprite, Input, LayerCells, Scene, View, WorldShape};
+use crate::{Button, FreeSprite, Input, LayerCells, Patch, Scene, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -125,6 +125,14 @@ pub fn encode_scene(s: &Scene) -> Vec<u8> {
             w.i32(c);
         }
     }
+    w.u32(s.patches.len() as u32);
+    for p in &s.patches {
+        w.u32(p.sprite);
+        w.u32(p.width);
+        w.u32(p.height);
+        w.u32(p.rgba.len() as u32);
+        w.0.extend_from_slice(&p.rgba);
+    }
     w.0
 }
 
@@ -175,6 +183,13 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, WireError> {
             },
         });
     }
+    let n = r.len(16)?;
+    let mut patches = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (sprite, width, height) = (r.u32()?, r.u32()?, r.u32()?);
+        let k = r.len(1)?;
+        patches.push(Patch { sprite, width, height, rgba: r.take(k)?.to_vec() });
+    }
     Ok(Scene {
         seq,
         tick,
@@ -182,6 +197,7 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, WireError> {
         shape,
         layers,
         sprites,
+        patches,
     })
 }
 
@@ -319,6 +335,7 @@ mod tests {
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
         s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: true, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, clip: None });
         s.sprites.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, clip: Some([1, -2, 300, 40]) });
+        s.patches.push(Patch { sprite: 7, width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
         assert_eq!(decode_scene(&encode_scene(&s)).unwrap(), s);
         let events = vec![
             Input::MouseMove { x: 1, y: -2 },
@@ -332,7 +349,7 @@ mod tests {
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2 };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
-        assert_eq!(decode_scene(&[3, 0, 0, 0, 5]), Err(WireError::Truncated));
+        assert_eq!(decode_scene(&[4, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[9, 0, 0, 0]), Err(WireError::Version(9)));
     }
 }

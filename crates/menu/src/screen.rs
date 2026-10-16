@@ -28,6 +28,9 @@ pub enum Element {
     Image { region: Region, at: (i32, i32), clip: [i32; 4] },
     /// `rect`: x, y, width, height.
     Fill { rect: [i32; 4], rgb: [u8; 3], clip: [i32; 4] },
+    /// Region `rect` (x, y, w, h) of a picture made at run time (`name`,
+    /// `size`), whose pixels come with the scene (see [`patch`]).
+    Dynamic { name: String, size: (u32, u32), rect: [i32; 4], at: (i32, i32), clip: [i32; 4] },
 }
 
 /// The art a set of screens needs.
@@ -36,6 +39,8 @@ pub struct ScreenArt {
     pub regions: BTreeSet<Region>,
     /// Fill colours and sizes.
     pub fills: BTreeSet<([u8; 3], (u32, u32))>,
+    /// Run-time pictures: name and size.
+    pub dynamic: BTreeSet<(String, (u32, u32))>,
 }
 
 /// The sprite name of a region.
@@ -46,6 +51,10 @@ fn region_sprite(r: &Region) -> String {
 
 fn fill_sprite(rgb: [u8; 3], (w, h): (u32, u32)) -> String {
     format!("ScreenFill@{},{},{}#{w}x{h}/0", rgb[0], rgb[1], rgb[2])
+}
+
+fn dynamic_sprite(name: &str, (w, h): (u32, u32)) -> String {
+    format!("ScreenDynamic@{name}#{w}x{h}/0")
 }
 
 fn toml_str(s: &str) -> String {
@@ -60,6 +69,7 @@ impl ScreenArt {
             new |= match e {
                 Element::Image { region, .. } => self.regions.insert(region.clone()),
                 Element::Fill { rect, rgb, .. } => self.fills.insert((*rgb, (rect[2].max(0) as u32, rect[3].max(0) as u32))),
+                Element::Dynamic { name, size, .. } => self.dynamic.insert((name.clone(), *size)),
             };
         }
         new
@@ -67,7 +77,7 @@ impl ScreenArt {
 
     /// Whether everything `other` needs is here.
     pub fn covers(&self, other: &ScreenArt) -> bool {
-        other.regions.is_subset(&self.regions) && other.fills.is_subset(&self.fills)
+        other.regions.is_subset(&self.regions) && other.fills.is_subset(&self.fills) && other.dynamic.is_subset(&self.dynamic)
     }
 
     /// Render description entries for this art. `keyed_options` /
@@ -90,6 +100,13 @@ impl ScreenArt {
             let options = if *keyed { keyed_options } else { opaque_options };
             let _ = writeln!(out, "[images.screen_{i}{}]\nsource = {}\n{options}\n", if *keyed { "k" } else { "o" }, toml_str(source));
         }
+        for (n, (name, (w, h))) in self.dynamic.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "[images.screen_dynamic_{n}]\nsource = \"solid:0,0,0,255:{w}x{h}\"\n\n[sheets.screen_dynamic_{n}]\nimage = \"screen_dynamic_{n}\"\ncell = [{w}, {h}]\ngrid = [1, 1]\ngroup = {}\nscaling = \"keep\"\n",
+                toml_str(dynamic_sprite(name, (*w, *h)).trim_end_matches("/0"))
+            );
+        }
         for (n, &([r, g, b], (w, h))) in self.fills.iter().enumerate() {
             let _ = writeln!(
                 out,
@@ -108,6 +125,13 @@ pub fn sprites(elements: &[Element], compiled: &Compiled) -> Vec<FreeSprite> {
         .iter()
         .filter_map(|e| {
             let (name, (x, y), clip) = match e {
+                // The whole picture, moved so the region lands at `at`, clipped
+                // to the region.
+                Element::Dynamic { name, size, rect: [rx, ry, rw, rh], at: (x, y), clip } => {
+                    let region = [*x, *y, x + rw, y + rh];
+                    let clip = [clip[0].max(region[0]), clip[1].max(region[1]), clip[2].min(region[2]), clip[3].min(region[3])];
+                    (dynamic_sprite(name, *size), (x - rx, y - ry), clip)
+                }
                 Element::Image { region, at, clip } => (region_sprite(region), *at, *clip),
                 Element::Fill { rect, rgb, clip } => {
                     (fill_sprite(*rgb, (rect[2].max(0) as u32, rect[3].max(0) as u32)), (rect[0], rect[1]), *clip)
@@ -129,6 +153,13 @@ pub fn sprites(elements: &[Element], compiled: &Compiled) -> Vec<FreeSprite> {
         .collect()
 }
 
+
+/// The scene patch giving run-time picture `name` (`size`) its pixels
+/// (row-major RGBA), if the description has it.
+pub fn patch(compiled: &Compiled, name: &str, size: (u32, u32), rgba: Vec<u8>) -> Option<scene::Patch> {
+    let sprite = compiled.sprite_names.iter().position(|n| *n == dynamic_sprite(name, size))?;
+    (rgba.len() == (size.0 * size.1 * 4) as usize).then(|| scene::Patch { sprite: sprite as u32, width: size.0, height: size.1, rgba })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

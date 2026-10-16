@@ -109,6 +109,22 @@ pub fn scene_camera(scene: &Scene, overhang: (u32, u32, u32, u32)) -> Camera {
     Camera { x: v.camera_x, y: v.camera_y, zoom: (v.zoom.0.max(1), v.zoom.1.max(1)), viewport: v.viewport, overhang, cull: v.cull }
 }
 
+/// Writes the scene's run-time sprite pixels into the atlas.
+fn apply_patches(renderer: &TileRenderer, queue: &wgpu::Queue, scene: &Scene) {
+    for p in &scene.patches {
+        if p.rgba.len() != (p.width * p.height * 4) as usize {
+            continue;
+        }
+        let image = RgbaImage::from_fn(p.width, p.height, |x, y| {
+            let i = ((y * p.width + x) * 4) as usize;
+            [p.rgba[i], p.rgba[i + 1], p.rgba[i + 2], p.rgba[i + 3]]
+        });
+        if !renderer.patch_sprite(queue, tile_render::SpriteId(p.sprite), &image) {
+            log::debug!("viewer: patch for sprite {} does not fit", p.sprite);
+        }
+    }
+}
+
 /// Renders `scene` offscreen (for tests and pixel comparisons).
 pub fn render_offscreen(
     gpu: &tile_render::Headless,
@@ -119,6 +135,7 @@ pub fn render_offscreen(
     let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world(compiled, scene));
+    apply_patches(&renderer, &gpu.queue, scene);
     gpu.render(&mut renderer, &scene_camera(scene, config.overhang), scene.tick, config.clear)
 }
 
@@ -229,12 +246,16 @@ impl App {
             self.assets_version = version;
         }
         let Some(scene) = self.link.latest() else { return };
+        let changed = new_assets || scene.seq != self.last_seq;
         if new_assets {
             gpu.renderer.set_world(&gpu.device, &scene_world(&self.compiled, &scene));
             self.last_seq = scene.seq;
         } else if scene.seq != self.last_seq {
             gpu.renderer.update_world(&gpu.device, &gpu.queue, &scene_world(&self.compiled, &scene));
             self.last_seq = scene.seq;
+        }
+        if changed {
+            apply_patches(&gpu.renderer, &gpu.queue, &scene);
         }
         let frame = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
