@@ -20,6 +20,9 @@ pub struct Region {
     /// Whether the image's transparent colours are transparent (or the
     /// region is opaque).
     pub keyed: bool,
+    /// An alpha mask image and the offset from a region pixel to its mask
+    /// pixel, if blended through one.
+    pub mask: Option<(String, (i32, i32))>,
 }
 
 /// One element of a screen, in drawing order.
@@ -61,7 +64,8 @@ pub struct ScreenArt {
 /// The sprite name of a region.
 fn region_sprite(r: &Region) -> String {
     let [x, y, w, h] = r.rect;
-    format!("Screen@{}#{x},{y},{w},{h}{}/0", r.source, if r.keyed { "k" } else { "" })
+    let mask = r.mask.as_ref().map(|(m, (dx, dy))| format!("%{m}+{dx},{dy}")).unwrap_or_default();
+    format!("Screen@{}#{x},{y},{w},{h}{}{mask}/0", r.source, if r.keyed { "k" } else { "" })
 }
 
 fn fill_sprite(c: [u8; 4], (w, h): (u32, u32)) -> String {
@@ -100,13 +104,15 @@ impl ScreenArt {
 
     /// Render description entries for this art. `keyed_options` /
     /// `opaque_options`: loader options (TOML lines) of keyed and opaque
-    /// images, e.g. which palette entries are transparent.
-    pub fn description(&self, keyed_options: &str, opaque_options: &str) -> String {
+    /// images, e.g. which palette entries are transparent; `mask_options`:
+    /// those blending an image through a mask (file, offset).
+    pub fn description(&self, keyed_options: &str, opaque_options: &str, mask_options: impl Fn(&str, (i32, i32)) -> String) -> String {
         let mut out = String::from("\n# Screen art (generated).\n");
-        let images: BTreeSet<(&str, bool)> = self.regions.iter().map(|r| (r.source.as_str(), r.keyed)).collect();
-        let index: std::collections::HashMap<(&str, bool), usize> = images.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+        type Key<'a> = (&'a str, bool, Option<&'a (String, (i32, i32))>);
+        let images: BTreeSet<Key> = self.regions.iter().map(|r| (r.source.as_str(), r.keyed, r.mask.as_ref())).collect();
+        let index: std::collections::HashMap<Key, usize> = images.iter().enumerate().map(|(i, k)| (*k, i)).collect();
         for (n, r) in self.regions.iter().enumerate() {
-            let image = format!("screen_{}{}", index[&(r.source.as_str(), r.keyed)], if r.keyed { "k" } else { "o" });
+            let image = format!("screen_{}{}", index[&(r.source.as_str(), r.keyed, r.mask.as_ref())], if r.keyed { "k" } else { "o" });
             let [x, y, w, h] = r.rect;
             let _ = writeln!(
                 out,
@@ -114,9 +120,10 @@ impl ScreenArt {
                 toml_str(region_sprite(r).trim_end_matches("/0"))
             );
         }
-        for (i, (source, keyed)) in images.iter().enumerate() {
+        for (i, (source, keyed, mask)) in images.iter().enumerate() {
             let options = if *keyed { keyed_options } else { opaque_options };
-            let _ = writeln!(out, "[images.screen_{i}{}]\nsource = {}\n{options}\n", if *keyed { "k" } else { "o" }, toml_str(source));
+            let mask = mask.map(|(m, d)| mask_options(m, *d)).unwrap_or_default();
+            let _ = writeln!(out, "[images.screen_{i}{}]\nsource = {}\n{options}\n{mask}\n", if *keyed { "k" } else { "o" }, toml_str(source));
         }
         for (n, (name, (w, h))) in self.dynamic.iter().enumerate() {
             let _ = writeln!(
@@ -202,7 +209,7 @@ mod tests {
 
     #[test]
     fn screens_compile_and_place_their_art() {
-        let region = |source: &str, keyed| Region { source: source.into(), rect: [8, 4, 16, 10], keyed };
+        let region = |source: &str, keyed| Region { source: source.into(), rect: [8, 4, 16, 10], keyed, mask: None };
         let elements = vec![
             Element::Image { region: region("b.pcx", true), at: (100, 50), clip: [0, 0, 640, 480] },
             Element::Image { region: region("a.pcx", false), at: (3, 4), clip: [0, 0, 10, 10] },
@@ -211,7 +218,7 @@ mod tests {
         let mut art = ScreenArt::default();
         assert!(art.add(&elements));
         assert!(!art.add(&elements));
-        let text = format!("[grid]\nlayout = \"orthogonal\"\nstep = [1, 1]\n{}", art.description("", ""));
+        let text = format!("[grid]\nlayout = \"orthogonal\"\nstep = [1, 1]\n{}", art.description("", "", |_, _| String::new()));
         let compiled = render_desc::Description::parse(&text).unwrap().compile(&Plain, 256).unwrap();
         let sprites = sprites(&elements, &compiled, u32::MAX);
         assert_eq!(sprites.len(), 3);
