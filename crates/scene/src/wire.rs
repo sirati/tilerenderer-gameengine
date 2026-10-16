@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -316,6 +316,11 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.u32(height);
             }
             Input::Quit => w.u8(5),
+            Input::Look { x, y } => {
+                w.u8(6);
+                w.i32(x);
+                w.i32(y);
+            }
         }
     }
     w.0
@@ -346,6 +351,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
             3 => Input::Key { vk: r.u32()?, down: r.bool()?, text: char::from_u32(r.u32()?) },
             4 => Input::Resized { width: r.u32()?, height: r.u32()? },
             5 => Input::Quit,
+            6 => Input::Look { x: r.i32()?, y: r.i32()? },
             t => return Err(WireError::Tag(t)),
         });
     }
@@ -427,6 +433,7 @@ mod tests {
             Input::Key { vk: 0x10, down: true, text: None },
             Input::Resized { width: 800, height: 600 },
             Input::Quit,
+            Input::Look { x: -5, y: 7000 },
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2 };

@@ -4,6 +4,7 @@
 //! Nothing here knows which game it is showing.
 
 mod input;
+pub mod layout;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,6 +82,13 @@ impl Assets {
 /// (drawn in every view) and each view's overlay (drawn in that view, see
 /// [`scene_cameras`] for the view order).
 pub fn scene_world(compiled: &Compiled, scene: &Scene) -> TileWorld {
+    let identity: Vec<Option<u32>> = (0..scene.views.len() as u32).map(Some).collect();
+    scene_world_for(compiled, scene, &identity)
+}
+
+/// [`scene_world`] for cameras arranged otherwise: scene view `i`'s overlay
+/// is drawn by camera `view_cameras[i]` (none: not drawn).
+pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Option<u32>]) -> TileWorld {
     let s = scene.shape;
     let mut world = compiled.world(s.cols.max(1), s.rows.max(1), s.wrap_x, s.wrap_y);
     let cells = s.cols * s.rows;
@@ -110,8 +118,10 @@ pub fn scene_world(compiled: &Compiled, scene: &Scene) -> TileWorld {
         view,
     };
     world.free = scene.sprites.iter().map(|s| placed(s, None)).collect();
-    for (i, v) in scene.views.iter().enumerate() {
-        world.free.extend(v.overlay.iter().map(|s| placed(s, Some(i as u32))));
+    for (v, camera) in scene.views.iter().zip(view_cameras) {
+        if let Some(c) = camera {
+            world.free.extend(v.overlay.iter().map(|s| placed(s, Some(*c))));
+        }
     }
     world
 }
@@ -138,6 +148,27 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
             }
         })
         .collect()
+}
+
+/// The window rectangles (x, y, w, h) the scene's interface-only views
+/// cover: their sprites' first frames, clipped.
+fn interface_rects(compiled: &Compiled, scene: &Scene) -> Vec<[i32; 4]> {
+    let mut out = Vec::new();
+    for v in scene.views.iter().filter(|v| v.view.interface_only) {
+        for s in &v.overlay {
+            let Some(id) = compiled.sets.frame(tile_render::SpriteSetId::from_raw(s.set), 0) else { continue };
+            let Some(sprite) = compiled.atlas.sprites.get(id.0 as usize) else { continue };
+            let (mut x0, mut y0) = (s.x + sprite.anchor_x, s.y + sprite.anchor_y);
+            let (mut x1, mut y1) = (x0 + sprite.width as i32, y0 + sprite.height as i32);
+            if let Some([cx0, cy0, cx1, cy1]) = s.clip {
+                (x0, y0, x1, y1) = (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1));
+            }
+            if x1 > x0 && y1 > y0 {
+                out.push([x0, y0, x1 - x0, y1 - y0]);
+            }
+        }
+    }
+    out
 }
 
 /// Writes run-time sprite pixels into the atlas; patches for sprites the
@@ -201,6 +232,8 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         drawn_seq: 0,
         patches: std::collections::BTreeMap::new(),
         input: input::InputState::default(),
+        layout: layout::Layout::default(),
+        drawn_views: Vec::new(),
         error: None,
     };
     event_loop.run_app(&mut app)?;
@@ -229,6 +262,10 @@ struct App {
     /// atlas).
     patches: std::collections::BTreeMap<String, scene::Patch>,
     input: input::InputState,
+    /// The viewer's own arrangement (zoom, split, insets, magnifier).
+    layout: layout::Layout,
+    /// Which camera drew each scene view's overlay in the renderer's world.
+    drawn_views: Vec<Option<u32>>,
     error: Option<ViewerError>,
 }
 
@@ -304,11 +341,15 @@ impl App {
         if scene.seq == 0 {
             return;
         }
+        let window = (gpu.config.width, gpu.config.height);
+        let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene));
+        let views_moved = arranged.view_cameras != self.drawn_views;
         if new_assets {
-            gpu.renderer.set_world(&gpu.device, &scene_world(&self.compiled, scene));
-        } else if scene.seq != self.drawn_seq {
-            gpu.renderer.update_world(&gpu.device, &gpu.queue, &scene_world(&self.compiled, scene));
+            gpu.renderer.set_world(&gpu.device, &scene_world_for(&self.compiled, scene, &arranged.view_cameras));
+        } else if scene.seq != self.drawn_seq || views_moved {
+            gpu.renderer.update_world(&gpu.device, &gpu.queue, &scene_world_for(&self.compiled, scene, &arranged.view_cameras));
         }
+        self.drawn_views = arranged.view_cameras.clone();
         if new_assets || scene.seq != self.drawn_seq {
             apply_patches(&gpu.renderer, &gpu.queue, &self.compiled, self.patches.values());
         }
@@ -324,9 +365,10 @@ impl App {
                 return;
             }
         };
-        let cameras = scene_cameras(scene, (gpu.config.width, gpu.config.height), self.config.overhang);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        gpu.renderer.render_views(&gpu.device, &gpu.queue, &mut encoder, &frame.texture, &cameras, scene.tick, self.config.clear);
+        let target = &frame.texture;
+        let (cameras, copies) = (&arranged.cameras, &arranged.copies);
+        gpu.renderer.render_composed(&gpu.device, &gpu.queue, &mut encoder, target, cameras, copies, scene.tick, self.config.clear);
         gpu.queue.submit([encoder.finish()]);
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
@@ -362,7 +404,9 @@ impl ApplicationHandler for App {
             _ => {}
         }
         for input in self.input.translate(&event) {
-            self.display.send_input(input);
+            for input in self.layout.route(input) {
+                self.display.send_input(input);
+            }
         }
     }
 

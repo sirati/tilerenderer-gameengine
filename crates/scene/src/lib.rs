@@ -255,6 +255,9 @@ pub enum Input {
     Resized { width: u32, height: u32 },
     /// The renderer's window was closed.
     Quit,
+    /// The user wants to see world pixel (x, y) in the driver's main view
+    /// (e.g. clicked it in another view): a driver may move its camera there.
+    Look { x: i32, y: i32 },
 }
 
 /// Connects a driver (the game side) and a renderer, each on its own
