@@ -146,6 +146,10 @@ pub struct LayerDesc {
     pub per_cell_phase: bool,
     #[serde(default)]
     pub hidden: bool,
+    /// Render pass; layers must be listed in pass order. Each pass sweeps all
+    /// visible cells before the next one starts.
+    #[serde(default)]
+    pub pass: u32,
 }
 
 fn one() -> u32 {
@@ -243,6 +247,10 @@ impl Description {
             spec.ticks_per_frame = layer.ticks_per_frame.max(1);
             spec.per_cell_phase = layer.per_cell_phase;
             spec.hidden = layer.hidden;
+            spec.pass = layer.pass;
+            if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
+                return Err(DescError::Unknown { kind: "pass order for layer", name: layer.name.clone() });
+            }
             layers.push(spec);
         }
 
