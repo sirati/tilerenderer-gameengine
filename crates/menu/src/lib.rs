@@ -199,10 +199,7 @@ impl Menus {
         let art = |menu: &str, name: &str| -> Result<Art, MenuError> {
             let (set, blend) =
                 compiled.set(name).ok_or_else(|| MenuError::Unknown { menu: menu.into(), kind: "set", name: name.into() })?;
-            let scale_den = match blend {
-                tile_render::Blend::Alpha => 0,
-                tile_render::Blend::Scale { denominator } => denominator,
-            };
+            let scale_den = blend.scale_den();
             Ok(Art { set: set.raw(), scale_den })
         };
         let mut font_index = BTreeMap::new();
