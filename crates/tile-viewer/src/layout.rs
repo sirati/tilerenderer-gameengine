@@ -15,7 +15,10 @@
 //! Pointer input is routed through the arrangement: what lands on the
 //! interface goes to the driver unchanged, what lands on the world goes to
 //! the point of the driver's main view showing the same world pixel, and
-//! world pixels the driver's view does not show become [`Input::Look`].
+//! world pixels the driver's view does not show (or covers with its
+//! interface) become [`Input::WorldButton`] (with [`Input::Look`] for the
+//! left button), and keys typed with the pointer over them
+//! [`Input::WorldKey`].
 //!
 //! Controls (Ctrl+Shift with a key, so they do not collide with a game's):
 //! S cycles the split (off, side by side, stacked), I adds an inset at the
@@ -269,6 +272,10 @@ pub struct Layout {
     drag: Option<Drag>,
     /// Per button: whether its press went to the driver.
     pressed: [bool; 3],
+    /// Per button: the world pixel its press went to as `Input::WorldButton`.
+    world_pressed: [Option<(i32, i32)>; 3],
+    /// Keys whose press went to the driver as `Input::WorldKey`.
+    world_keys: Vec<u32>,
     /// From the last frame: the driver's main view (scene camera, unzoomed),
     /// where the world is shown, the interface rectangles, the world.
     main: Option<Camera>,
@@ -301,6 +308,8 @@ impl Default for Layout {
             shift: false,
             drag: None,
             pressed: [false; 3],
+            world_pressed: [None; 3],
+            world_keys: Vec::new(),
             main: None,
             shown: Vec::new(),
             interface: Vec::new(),
@@ -842,6 +851,7 @@ impl Layout {
                 vec![input]
             }
             Input::Key { vk, down, .. } if self.ctrl && self.shift && self.command(vk, down) => vec![],
+            Input::Key { vk, down, text } => vec![self.key(vk, down, text)],
             Input::MouseMove { x, y } => {
                 if self.locked {
                     return vec![];
@@ -876,6 +886,13 @@ impl Layout {
         if !down {
             self.drag = None;
             // The release goes where the press went.
+            if let Some(at) = self.world_pressed[b].take() {
+                let (x, y) = match self.route_point(p) {
+                    Err(Some(w)) => w,
+                    _ => at,
+                };
+                return vec![Input::WorldButton { button, down, x, y }];
+            }
             if !std::mem::take(&mut self.pressed[b]) {
                 return vec![];
             }
@@ -921,9 +938,48 @@ impl Layout {
                 self.pressed[b] = true;
                 vec![Input::MouseButton { button, down, x: q.0, y: q.1 }]
             }
-            Err(Some(w)) if button == Button::Left => vec![Input::Look { x: w.0, y: w.1 }],
-            Err(_) => vec![],
+            // A world pixel the driver's window does not take input for:
+            // the driver may look there (left button) and act on it.
+            Err(Some(w)) => {
+                self.world_pressed[b] = Some(w);
+                let press = Input::WorldButton { button, down, x: w.0, y: w.1 };
+                if button == Button::Left { vec![Input::Look { x: w.0, y: w.1 }, press] } else { vec![press] }
+            }
+            Err(None) => vec![],
         }
+    }
+
+    /// A key that is not the viewer's: `Input::WorldKey` while the pointer
+    /// is over a world pixel the driver's window does not take input for
+    /// (a release follows its press), else `Input::Key`.
+    fn key(&mut self, vk: u32, down: bool, text: Option<char>) -> Input {
+        let world = match self.route_point(self.pointer) {
+            Err(Some(w)) => Some(w),
+            _ => None,
+        };
+        let pressed = self.world_keys.iter().position(|&k| k == vk);
+        let (x, y) = match (down, pressed, world) {
+            (true, _, Some(w)) => {
+                if pressed.is_none() {
+                    self.world_keys.push(vk);
+                }
+                w
+            }
+            // (Held into a view that takes input: stays a world key.)
+            (true, Some(_), None) => self.cursor_or_pointer_world(),
+            (false, Some(k), w) => {
+                self.world_keys.remove(k);
+                w.unwrap_or_else(|| self.cursor_or_pointer_world())
+            }
+            _ => return Input::Key { vk, down, text },
+        };
+        Input::WorldKey { vk, down, text, x, y }
+    }
+
+    /// The world pixel under the pointer (the world cursor while the mouse
+    /// is captured), or (0, 0).
+    fn cursor_or_pointer_world(&self) -> (i32, i32) {
+        if self.locked { self.cursor } else { self.world_under(self.pointer).unwrap_or((0, 0)) }
     }
 
     /// Window pixel `p` moved into the driver's main view (for releases
@@ -1167,9 +1223,17 @@ mod tests {
         assert_eq!(f.cameras.len(), 3);
         assert_eq!(f.cameras[0].viewport, (400, 600));
         assert_eq!(f.cameras[1].origin, (404, 0));
-        // A click there: the driver is asked to look.
+        // A click there: the driver is asked to look, and told of the
+        // press and release on that world pixel.
         let out = click(&mut l, (600, 300));
-        assert!(matches!(out[..], [Input::Look { .. }]), "{out:?}");
+        assert!(
+            matches!(out[..], [
+                Input::Look { x, y },
+                Input::WorldButton { button: Button::Left, down: true, x: x2, y: y2 },
+                Input::WorldButton { button: Button::Left, down: false, x: x3, y: y3 }
+            ] if (x, y) == (x2, y2) && (x, y) == (x3, y3)),
+            "{out:?}"
+        );
         // Dragging the divider moves it, nothing reaches the driver.
         assert!(l.route(Input::MouseButton { button: Button::Left, down: true, x: 401, y: 10 }).is_empty());
         assert!(l.route(Input::MouseMove { x: 200, y: 10 }).is_empty());
@@ -1245,6 +1309,71 @@ mod tests {
         assert!(f.cameras[1].stacked);
         assert_eq!(f.view_cameras, [Some(0), Some(1)]);
         assert_eq!(click(&mut l, (100, 270))[0], Input::MouseButton { button: Button::Left, down: true, x: 200, y: 540 });
+    }
+
+    /// A split whose pane (right half) shows world (5000, 2000) around its
+    /// middle, which the driver's main view does not show.
+    fn free_pane() -> Layout {
+        let mut l = Layout::default();
+        l.configure("split=vertical,pane=free").unwrap();
+        frame(&mut l, vec![]);
+        l.split.as_mut().unwrap().view.center = (5000, 2000);
+        frame(&mut l, vec![]);
+        l
+    }
+
+    #[test]
+    fn buttons_on_a_free_pane_go_to_the_world() {
+        let mut l = free_pane();
+        // The pane is 396 wide from x 404, the camera centred on 5000.
+        let (wx, wy) = (5000 - 198 + (600 - 404), 2000 - 300 + 300);
+        let right = |down| Input::MouseButton { button: Button::Right, down, x: 600, y: 300 };
+        assert_eq!(l.route(right(true)), [Input::WorldButton { button: Button::Right, down: true, x: wx, y: wy }]);
+        // The release goes where the press went, even off the pane.
+        assert_eq!(l.route(Input::MouseButton { button: Button::Right, down: false, x: 100, y: 300 }), [
+            Input::WorldButton { button: Button::Right, down: false, x: wx, y: wy }
+        ]);
+        // On the main pane, buttons still go to the driver's window.
+        assert_eq!(click(&mut l, (100, 100))[0], Input::MouseButton { button: Button::Left, down: true, x: 100, y: 100 });
+    }
+
+    #[test]
+    fn keys_over_a_free_pane_go_to_the_world() {
+        let mut l = free_pane();
+        let key = |down| Input::Key { vk: 0x66, down, text: None };
+        // Over the main pane: a plain key.
+        l.route(Input::MouseMove { x: 100, y: 100 });
+        assert_eq!(l.route(key(true)), [key(true)]);
+        assert_eq!(l.route(key(false)), [key(false)]);
+        // Over the free pane: a world key at the pointer's world pixel.
+        l.route(Input::MouseMove { x: 600, y: 300 });
+        let (wx, wy) = (5000 - 198 + (600 - 404), 2000);
+        assert_eq!(l.route(key(true)), [Input::WorldKey { vk: 0x66, down: true, text: None, x: wx, y: wy }]);
+        // Released over the main pane: still a world key (its press was).
+        l.route(Input::MouseMove { x: 100, y: 100 });
+        assert!(matches!(l.route(key(false))[..], [Input::WorldKey { vk: 0x66, down: false, .. }]));
+        // Ctrl and Shift stay plain keys; viewer commands stay the viewer's.
+        l.route(Input::MouseMove { x: 600, y: 300 });
+        assert_eq!(l.route(Input::Key { vk: VK_CONTROL, down: true, text: None }), [Input::Key { vk: VK_CONTROL, down: true, text: None }]);
+        l.route(Input::Key { vk: VK_SHIFT, down: true, text: None });
+        assert!(l.route(Input::Key { vk: 0x41, down: true, text: None }).is_empty());
+    }
+
+    #[test]
+    fn world_the_driver_covers_with_its_interface_goes_to_the_world() {
+        // ui=pane: the driver's screen in the left half, all of it covered
+        // by its interface (e.g. a full-screen menu); the right half shows
+        // the same world the driver's main view does.
+        let mut l = Layout::default();
+        l.configure("split=vertical,ui=pane,pane=driver").unwrap();
+        let cover = vec![[0, 0, 800, 600]];
+        frame(&mut l, cover.clone());
+        let f = frame(&mut l, cover);
+        let pane = f.cameras.iter().find(|c| c.origin == (404, 0)).copied().unwrap();
+        let out = l.route(Input::MouseButton { button: Button::Right, down: true, x: 500, y: 200 });
+        assert_eq!(out, [Input::WorldButton { button: Button::Right, down: true, x: pane.x + 96, y: pane.y + 200 }]);
+        // The fitted screen still takes its clicks.
+        assert!(matches!(click(&mut l, (100, 100))[0], Input::MouseButton { .. }));
     }
 
     #[test]
