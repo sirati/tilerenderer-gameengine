@@ -2053,6 +2053,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "tile-render",
+ "tile-render-shared",
  "toml 0.9.12+spec-1.1.0",
 ]
 

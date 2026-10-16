@@ -46,6 +46,28 @@ pub enum ViewerError {
     Os(#[from] winit::error::OsError),
 }
 
+/// The compiled description a viewer draws with, replaceable while it runs
+/// (e.g. when a game loads a scenario with its own art).
+#[derive(Clone)]
+pub struct Assets(Arc<std::sync::Mutex<(u64, Arc<Compiled>)>>);
+
+impl Assets {
+    pub fn new(compiled: Arc<Compiled>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new((1, compiled))))
+    }
+
+    pub fn replace(&self, compiled: Arc<Compiled>) {
+        let mut slot = self.0.lock().unwrap();
+        *slot = (slot.0 + 1, compiled);
+    }
+
+    /// The current description and its version (bumped by `replace`).
+    pub fn current(&self) -> (u64, Arc<Compiled>) {
+        let slot = self.0.lock().unwrap();
+        (slot.0, slot.1.clone())
+    }
+}
+
 /// Turns a scene into the renderer's world and camera.
 pub fn scene_world(compiled: &Compiled, scene: &Scene) -> TileWorld {
     let s = scene.shape;
@@ -88,7 +110,7 @@ pub fn render_offscreen(
 /// Opens the window and runs until it is closed. Blocks the calling thread,
 /// which need not be the process's main thread (the viewer usually runs
 /// inside someone else's process).
-pub fn run(config: ViewerConfig, compiled: Arc<Compiled>, link: Link) -> Result<(), ViewerError> {
+pub fn run(config: ViewerConfig, assets: Assets, link: Link) -> Result<(), ViewerError> {
     let mut builder = EventLoop::builder();
     #[cfg(windows)]
     winit::platform::windows::EventLoopBuilderExtWindows::with_any_thread(&mut builder, true);
@@ -96,7 +118,18 @@ pub fn run(config: ViewerConfig, compiled: Arc<Compiled>, link: Link) -> Result<
     winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
     let event_loop = builder.build()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App { config, compiled, link, gpu: None, last_seq: 0, input: input::InputState::default(), error: None };
+    let (assets_version, compiled) = assets.current();
+    let mut app = App {
+        config,
+        assets,
+        assets_version,
+        compiled,
+        link,
+        gpu: None,
+        last_seq: 0,
+        input: input::InputState::default(),
+        error: None,
+    };
     event_loop.run_app(&mut app)?;
     app.error.map_or(Ok(()), Err)
 }
@@ -112,6 +145,8 @@ struct Gpu {
 
 struct App {
     config: ViewerConfig,
+    assets: Assets,
+    assets_version: u64,
     compiled: Arc<Compiled>,
     link: Link,
     gpu: Option<Gpu>,
@@ -169,8 +204,19 @@ impl App {
 
     fn draw(&mut self) {
         let Some(gpu) = &mut self.gpu else { return };
+        let (version, compiled) = self.assets.current();
+        let new_assets = version != self.assets_version;
+        if new_assets {
+            log::info!("viewer: new assets ({} sprites)", compiled.sprite_names.len());
+            gpu.renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
+            self.compiled = compiled;
+            self.assets_version = version;
+        }
         let Some(scene) = self.link.latest() else { return };
-        if scene.seq != self.last_seq {
+        if new_assets {
+            gpu.renderer.set_world(&gpu.device, &scene_world(&self.compiled, &scene));
+            self.last_seq = scene.seq;
+        } else if scene.seq != self.last_seq {
             gpu.renderer.update_world(&gpu.device, &gpu.queue, &scene_world(&self.compiled, &scene));
             self.last_seq = scene.seq;
         }

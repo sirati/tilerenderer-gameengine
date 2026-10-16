@@ -6,6 +6,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+tile-render-shared.workspace = true
 tile-render.workspace = true
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"

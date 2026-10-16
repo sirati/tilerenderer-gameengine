@@ -81,7 +81,7 @@ pub struct Description {
 pub struct GridDesc {
     pub layout: LayoutDesc,
     pub step: [u32; 2],
-    /// Compose in channels of this many bits (4..=8), e.g. 5 for a game
+    /// Compose in channels of this many bits (4..=7), e.g. 5 for a game
     /// with an RGB555 frame buffer; see `tile_render::ColorModel`.
     #[serde(default)]
     pub color_bits: Option<u32>,
@@ -360,9 +360,9 @@ impl Description {
             spec.cull_offset = (layer.cull_offset[0], layer.cull_offset[1]);
             spec.blend = match layer.blend {
                 BlendDesc::Alpha => Blend::Alpha,
-                BlendDesc::Scale(denominator) if denominator > 0 => Blend::Scale { denominator },
+                BlendDesc::Scale(d) if (1..=tile_render_shared::MAX_SCALE_DENOMINATOR).contains(&d) => Blend::Scale { denominator: d },
                 BlendDesc::Scale(_) => {
-                    return Err(DescError::Unknown { kind: "blend (scale denominator 0) of layer", name: layer.name.clone() });
+                    return Err(DescError::Unknown { kind: "blend (scale denominator 1..=32) of layer", name: layer.name.clone() });
                 }
             };
             if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
@@ -379,8 +379,8 @@ impl Description {
             step: (self.grid.step[0], self.grid.step[1]),
             color: match self.grid.color_bits {
                 None => ColorModel::Direct,
-                Some(bits @ 4..=8) => ColorModel::Quantized { bits },
-                Some(bits) => return Err(DescError::Unknown { kind: "grid colour depth (4..=8 bits)", name: bits.to_string() }),
+                Some(bits @ 4..=7) => ColorModel::Quantized { bits },
+                Some(bits) => return Err(DescError::Unknown { kind: "grid colour depth (4..=7 bits)", name: bits.to_string() }),
             },
             sprite_names: {
                 let mut names = vec![String::new(); sprites.len()];
