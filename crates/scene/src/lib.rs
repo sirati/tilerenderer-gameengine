@@ -203,7 +203,14 @@ impl Scene {
             Update::View { id, view: Some(view) } => self.view_mut(id).view = view,
             Update::View { id, view: None } => self.views.retain(|v| v.id != id),
             Update::Overlay { view, sprites } => self.view_mut(view).overlay = sprites,
-            Update::Patches(patches) => self.patches.extend(patches),
+            // Newer pixels replace older ones not taken yet (a renderer that
+            // does not draw for a while keeps the latest only).
+            Update::Patches(patches) => {
+                for p in patches {
+                    self.patches.retain(|q| q.sprite != p.sprite);
+                    self.patches.push(p);
+                }
+            }
             Update::Tick(tick) => self.tick = tick,
             Update::Focus(focus) => self.focus = focus,
             Update::Assets(n) => self.assets = n,
@@ -310,7 +317,11 @@ pub enum Input {
 pub fn connect() -> (Driver, Display) {
     let (updates_tx, updates_rx) = mpsc::channel();
     let (input_tx, input_rx) = mpsc::channel();
-    (Driver { updates: updates_tx, input: input_rx }, Display { updates: updates_rx, input: input_tx, scene: Scene::default() })
+    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    (
+        Driver { updates: updates_tx, input: input_rx, in_flight: in_flight.clone() },
+        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight },
+    )
 }
 
 /// A sender of update batches (any number of them may feed one renderer).
@@ -323,13 +334,26 @@ pub type InputSender = mpsc::Sender<Input>;
 pub struct Driver {
     updates: Updater,
     input: mpsc::Receiver<Input>,
+    /// Batches sent but not yet taken by the renderer.
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Driver {
     /// Sends a batch of updates, applied by the renderer at once; false
     /// once the renderer is gone.
     pub fn send(&self, batch: Vec<Update>) -> bool {
-        batch.is_empty() || self.updates.send(batch).is_ok()
+        if batch.is_empty() {
+            return true;
+        }
+        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.updates.send(batch).is_ok()
+    }
+
+    /// Whether the renderer has not taken everything sent yet: a driver may
+    /// hold back its next batch (folding it into a later one) rather than
+    /// queue up work for a slow renderer.
+    pub fn busy(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 
     /// Another sender to the same renderer.
@@ -348,6 +372,7 @@ pub struct Display {
     updates: mpsc::Receiver<Vec<Update>>,
     input: InputSender,
     scene: Scene,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Display {
@@ -371,6 +396,7 @@ impl Display {
             self.scene.apply(u);
         }
         self.scene.seq += 1;
+        let _ = self.in_flight.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
     }
 
     pub fn scene(&self) -> &Scene {
