@@ -179,7 +179,7 @@ impl App {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
         let window = Arc::new(event_loop.create_window(attrs)?);
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let instance = wgpu::Instance::new(tile_render::gpu::instance_descriptor());
         let surface = instance.create_surface(window.clone())?;
         let (adapter, device, queue) = pollster::block_on(async {
             let adapter = tile_render::gpu::select_adapter(&instance, Some(&surface), None).await?;

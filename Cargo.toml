@@ -15,7 +15,7 @@ members = [
 ]
 # The shader crate is compiled by rust-gpu (pinned nightly) from
 # tile-render's build script, never by the workspace toolchain.
-exclude = ["crates/tile-render-shaders"]
+exclude = ["crates/tile-render-shaders", "vendor"]
 
 [workspace.package]
 edition = "2024"
@@ -38,3 +38,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# wgpu-hal with a fix for DX12 in 32-bit processes (pipeline stream
+# subobject alignment), see vendor/wgpu-hal/src/dx12/pipeline_desc.rs.
+[patch.crates-io]
+wgpu-hal = { path = "vendor/wgpu-hal" }
