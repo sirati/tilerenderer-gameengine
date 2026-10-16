@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
-use tile_render::{AtlasBuilder, Blend, Grid, LayerSpec, Layout, RgbaImage, SpriteId, SpriteSetId, SpriteSets};
+use tile_render::{AtlasBuilder, Blend, ColorModel, Grid, LayerSpec, Layout, RgbaImage, SpriteId, SpriteSetId, SpriteSets};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DescError {
@@ -81,6 +81,10 @@ pub struct Description {
 pub struct GridDesc {
     pub layout: LayoutDesc,
     pub step: [u32; 2],
+    /// Compose in channels of this many bits (4..=8), e.g. 5 for a game
+    /// with an RGB555 frame buffer; see `tile_render::ColorModel`.
+    #[serde(default)]
+    pub color_bits: Option<u32>,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -170,14 +174,14 @@ pub struct LayerDesc {
     pub blend: BlendDesc,
 }
 
-/// `blend = "alpha"` (default) or `blend = { scale = { bits = 5,
-/// denominator = 16 } }`, see `tile_render::Blend`.
+/// `blend = "alpha"` (default) or `blend = { scale = 16 }` (the
+/// denominator), see `tile_render::Blend`.
 #[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum BlendDesc {
     #[default]
     Alpha,
-    Scale { bits: u32, denominator: u32 },
+    Scale(u32),
 }
 
 fn one() -> u32 {
@@ -287,18 +291,13 @@ impl Description {
             spec.cull_offset = (layer.cull_offset[0], layer.cull_offset[1]);
             spec.blend = match layer.blend {
                 BlendDesc::Alpha => Blend::Alpha,
-                BlendDesc::Scale { bits, denominator } if (4..=8).contains(&bits) && denominator > 0 => {
-                    Blend::Scale { bits, denominator }
-                }
-                BlendDesc::Scale { .. } => {
-                    return Err(DescError::Unknown { kind: "blend (bits 4..=8, denominator > 0) of layer", name: layer.name.clone() });
+                BlendDesc::Scale(denominator) if denominator > 0 => Blend::Scale { denominator },
+                BlendDesc::Scale(_) => {
+                    return Err(DescError::Unknown { kind: "blend (scale denominator 0) of layer", name: layer.name.clone() });
                 }
             };
             if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
                 return Err(DescError::Unknown { kind: "pass order for layer", name: layer.name.clone() });
-            }
-            if layers.last().is_some_and(|l: &LayerSpec| l.pass == spec.pass && l.blend != spec.blend) {
-                return Err(DescError::Unknown { kind: "blend (differs within its pass) of layer", name: layer.name.clone() });
             }
             layers.push(spec);
         }
@@ -309,6 +308,11 @@ impl Description {
                 LayoutDesc::Staggered => Layout::Staggered,
             },
             step: (self.grid.step[0], self.grid.step[1]),
+            color: match self.grid.color_bits {
+                None => ColorModel::Direct,
+                Some(bits @ 4..=8) => ColorModel::Quantized { bits },
+                Some(bits) => return Err(DescError::Unknown { kind: "grid colour depth (4..=8 bits)", name: bits.to_string() }),
+            },
             sprite_names: {
                 let mut names = vec![String::new(); sprites.len()];
                 for (n, id) in &sprites {
@@ -328,6 +332,7 @@ impl Description {
 pub struct Compiled {
     pub layout: Layout,
     pub step: (u32, u32),
+    pub color: ColorModel,
     pub atlas: tile_render::Atlas,
     pub sets: SpriteSets,
     pub layers: Vec<LayerSpec>,
@@ -350,6 +355,7 @@ impl Compiled {
     pub fn world(&self, cols: u32, rows: u32, wrap_x: bool, wrap_y: bool) -> tile_render::TileWorld {
         let grid = Grid { cols, rows, layout: self.layout, wrap_x, wrap_y, step: self.step };
         let mut world = tile_render::TileWorld::new(grid, self.sets.clone());
+        world.color = self.color;
         for l in &self.layers {
             world.add_layer(l.clone());
         }
