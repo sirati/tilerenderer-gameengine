@@ -21,9 +21,7 @@ pub struct View {
     /// World pixel at the top-left of the viewport.
     pub camera_x: i32,
     pub camera_y: i32,
-    /// The zoom the view's zoomed overlay sprites (`zoom_art` 2) are made
-    /// for (see [`Input::ViewZoom`]); the view itself is drawn 1:1 unless a
-    /// renderer arranges it otherwise.
+    /// Screen pixels per world pixel (a renderer may arrange it otherwise).
     pub zoom: (u32, u32),
     /// Viewport size in screen pixels.
     pub viewport: (u32, u32),
@@ -72,11 +70,13 @@ pub struct FreeSprite {
     /// The colour of ClearType-like text (`scale_den` = the renderer's
     /// `SCALE_SUBPIXEL`), 0xRRGGBB.
     pub tint: u32,
-    /// Screen sprites: 0 any zoom; 1 the 1:1 twin of a sprite made for
-    /// the view's zoom, left out where that is shown; 2 made for the zoom
-    /// given by [`View::zoom`] (positions scaled by it), shown where the
-    /// view is at that zoom.
+    /// 0 any zoom; 1 the 1:1 twin of sprites made for zooms, left out in
+    /// views at a zoom the scene has art for ([`Scene::zooms`]); 2 made for
+    /// `zoom`: drawn in views at that zoom, at the sprite's 1:1 position
+    /// scaled plus `zoom_offset` (pixels at that zoom).
     pub zoom_art: u8,
+    pub zoom: (u16, u16),
+    pub zoom_offset: (i32, i32),
     /// Drawn only inside this viewport rectangle (left, top, right,
     /// bottom; exclusive).
     pub clip: Option<[i32; 4]>,
@@ -110,6 +110,8 @@ pub struct Scene {
     pub sprites: Vec<FreeSprite>,
     /// By id.
     pub views: Vec<ViewState>,
+    /// The zooms the scene has zoomed art for (see `FreeSprite::zoom_art`).
+    pub zooms: Vec<(u32, u32)>,
     /// The generation of the art (render assets) the scene's sprite ids
     /// refer to; 0: whatever the renderer has.
     pub assets: u64,
@@ -151,6 +153,8 @@ pub enum Update {
     Focus(Option<(i32, i32)>),
     /// The scene now refers to art generation `n` (see [`Scene::assets`]).
     Assets(u64),
+    /// See [`Scene::zooms`].
+    Zooms(Vec<(u32, u32)>),
 }
 
 impl Scene {
@@ -203,6 +207,7 @@ impl Scene {
             Update::Tick(tick) => self.tick = tick,
             Update::Focus(focus) => self.focus = focus,
             Update::Assets(n) => self.assets = n,
+            Update::Zooms(z) => self.zooms = z,
         }
     }
 
@@ -258,6 +263,9 @@ impl Scene {
         if self.assets != old.assets {
             out.push(Update::Assets(self.assets));
         }
+        if self.zooms != old.zooms {
+            out.push(Update::Zooms(self.zooms.clone()));
+        }
         out
     }
 }
@@ -283,9 +291,10 @@ pub enum Input {
     Resized { width: u32, height: u32 },
     /// The renderer's window was closed.
     Quit,
-    /// The renderer shows the driver's main view at zoom `num / den`: a
-    /// driver may make art for it (e.g. text at that size, `zoom_art` 2).
-    ViewZoom { num: u32, den: u32 },
+    /// The renderer shows the world at these zooms (`(num, den)` reduced;
+    /// `(0, 0)`: unused): a driver may make art for them (e.g. text at that
+    /// size, `FreeSprite::zoom_art` 2) and list them in `Scene::zooms`.
+    Zooms([(u8, u8); 8]),
     /// The user wants to see world pixel (x, y) in the driver's main view
     /// (e.g. clicked it in another view): a driver may move its camera there.
     Look { x: i32, y: i32 },

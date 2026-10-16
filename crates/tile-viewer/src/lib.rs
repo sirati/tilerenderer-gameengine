@@ -124,7 +124,7 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
         view,
         zoom_art: match s.zoom_art {
             1 => tile_render::ZoomArt::Low,
-            2 => tile_render::ZoomArt::Zoomed,
+            2 => tile_render::ZoomArt::Zoomed { zoom: (u32::from(s.zoom.0), u32::from(s.zoom.1)), offset: s.zoom_offset },
             _ => tile_render::ZoomArt::Any,
         },
     };
@@ -519,8 +519,8 @@ impl ApplicationHandler for App {
         if let Some(lock) = self.layout.take_grab() {
             self.grab(lock);
         }
-        if let Some((num, den)) = self.layout.take_zoom_change() {
-            self.display.send_input(Input::ViewZoom { num, den });
+        if let Some(zooms) = self.layout.take_zooms_change() {
+            self.display.send_input(Input::Zooms(zooms));
         }
     }
 

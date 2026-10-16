@@ -22,7 +22,9 @@
 //! pointer, X removes the inset under it, F cycles what the view under the
 //! pointer follows, Space releases (or takes) the mouse, M cycles the
 //! magnifier (off, everything on screen, the world only), A toggles the
-//! arrow at the point of interest, +/− and Ctrl+wheel zoom what is under
+//! arrow at the point of interest, T toggles sharp text in zoomed views (text
+//! rasterised at their zoom by the driver, or its pixels scaled), +/− and
+//! Ctrl+wheel zoom what is under
 //! the pointer, 0 resets its zoom, arrows pan it; a middle-button drag pans
 //! a view, Ctrl+Shift+left drag moves an inset (resizes it at its
 //! bottom-right corner), a left drag on the divider moves it.
@@ -234,6 +236,9 @@ pub struct Layout {
     pub magnifier: Option<Magnifier>,
     /// Whether to draw the arrow at the driver's point of interest.
     pub focus_arrow: bool,
+    /// Whether zoomed views show text at their resolution (the driver's
+    /// zoomed art) rather than its pixels scaled.
+    pub sharp_text: bool,
     window: (u32, u32),
     pointer: (i32, i32),
     /// The world cursor, and the motion not yet a whole world pixel.
@@ -243,8 +248,10 @@ pub struct Layout {
     /// change of that for the window to make.
     locked: bool,
     grab: Option<bool>,
-    /// The main pane's zoom as last told to the driver.
-    reported_zoom: (u32, u32),
+    /// The zooms in use as last told to the driver.
+    reported_zooms: [(u8, u8); 8],
+    /// Zooms the scene has zoomed art (text) for, from the last frame.
+    art_zooms: Vec<(u32, u32)>,
     ctrl: bool,
     shift: bool,
     drag: Option<Drag>,
@@ -272,7 +279,9 @@ impl Default for Layout {
             motion_rest: (0.0, 0.0),
             locked: false,
             grab: None,
-            reported_zoom: (1, 1),
+            reported_zooms: [(0, 0); 8],
+            art_zooms: Vec::new(),
+            sharp_text: true,
             ctrl: false,
             shift: false,
             drag: None,
@@ -319,7 +328,8 @@ impl Layout {
     /// `split` (vertical, horizontal, off), `fraction` (the main pane's
     /// share), `main` and `pane` (what they follow: driver, focus, pointer,
     /// free), `main_zoom` and `pane_zoom` (e.g. 2 or 1/2), `magnifier`
-    /// (screen, world, off), `magnifier_zoom`, `arrow` (on, off).
+    /// (screen, world, off), `magnifier_zoom`, `arrow` (on, off), `text`
+    /// (sharp: zoomed views show text at their resolution; pixel).
     pub fn configure(&mut self, spec: &str) -> Result<(), String> {
         for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let (key, value) = item.split_once('=').ok_or_else(|| format!("{item:?}: expected key=value"))?;
@@ -353,6 +363,13 @@ impl Layout {
                     self.magnifier = Some(Magnifier { zoom, ..self.magnifier.unwrap_or(Self::MAGNIFIER) });
                 }
                 "arrow" => self.focus_arrow = matches!(value, "on" | "1" | "true"),
+                "text" => {
+                    self.sharp_text = match value {
+                        "sharp" => true,
+                        "pixel" => false,
+                        _ => return Err(bad()),
+                    }
+                }
                 _ => return Err(format!("unknown key {key:?}")),
             }
         }
@@ -361,14 +378,29 @@ impl Layout {
 
     const MAGNIFIER: Magnifier = Magnifier { mode: MagnifierMode::Screen, zoom: ONE + 3, size: (240, 160) };
 
-    /// The main pane's zoom, when it changed since last asked (for the
-    /// driver, `Input::ViewZoom`).
-    pub fn take_zoom_change(&mut self) -> Option<(u32, u32)> {
-        let z = ZOOMS[self.main_view.zoom];
-        (z != self.reported_zoom).then(|| {
-            self.reported_zoom = z;
-            z
+    /// The zooms of the views showing the world scaled, when they changed
+    /// since last asked (for the driver, `Input::Zooms`; none without sharp
+    /// text).
+    pub fn take_zooms_change(&mut self) -> Option<[(u8, u8); 8]> {
+        let mut zooms = [(0, 0); 8];
+        if self.sharp_text {
+            let views = std::iter::once(self.main_view).chain(self.split.map(|s| s.view)).chain(self.insets.iter().map(|i| i.view));
+            let mut used: Vec<usize> = views.map(|v| v.zoom).chain(self.magnifier.filter(|m| m.mode == MagnifierMode::World).map(|m| m.zoom)).filter(|&z| z != ONE).collect();
+            used.sort();
+            used.dedup();
+            for (slot, z) in zooms.iter_mut().zip(used) {
+                *slot = (ZOOMS[z].0 as u8, ZOOMS[z].1 as u8);
+            }
+        }
+        (zooms != self.reported_zooms).then(|| {
+            self.reported_zooms = zooms;
+            zooms
         })
+    }
+
+    /// Whether a view at `zoom` shows the driver's zoomed art.
+    fn zoomed_art(&self, zoom: (u32, u32)) -> bool {
+        self.sharp_text && zoom.0 != zoom.1 && self.art_zooms.contains(&zoom)
     }
 
     /// A change of mouse capture for the window to make (true: capture and
@@ -466,6 +498,7 @@ impl Layout {
             }
         }
         self.interface = interface;
+        self.art_zooms = scene.zooms.clone();
         self.shown.clear();
         let mut frame = Frame { view_cameras: vec![None; scene.views.len()], ..Default::default() };
         let (main_rect, pane_rect) = self.panes();
@@ -478,7 +511,7 @@ impl Layout {
             if v.view.interface_only {
                 continue;
             }
-            let camera = if Some(i) == main { self.arranged_main(camera, main_rect, overhang, v.view.zoom) } else { *camera };
+            let camera = if Some(i) == main { self.arranged_main(camera, main_rect, overhang) } else { *camera };
             frame.view_cameras[i] = Some(push(&mut frame, camera));
             if Some(i) == main {
                 self.shown.push((Hit::Main, camera));
@@ -491,13 +524,15 @@ impl Layout {
             Camera { zoom: (2, 1), origin: (r[0], r[1]), cells: false, ..Camera::new((r[2].max(1) as u32, r[3].max(1) as u32)) }
         };
         if let (Some(split), Some(rect)) = (self.split, pane_rect) {
-            let camera = split.view.camera(rect, overhang, bounds);
+            let mut camera = split.view.camera(rect, overhang, bounds);
+            camera.zoomed_art = self.zoomed_art(camera.zoom);
             push(&mut frame, camera);
             self.shown.push((Hit::Pane, camera));
         }
         for (k, inset) in self.insets.iter().enumerate() {
             push(&mut frame, frame_of(inset.rect));
-            let camera = inset.view.camera(inset.rect, overhang, bounds);
+            let mut camera = inset.view.camera(inset.rect, overhang, bounds);
+            camera.zoomed_art = self.zoomed_art(camera.zoom);
             push(&mut frame, camera);
             self.shown.push((Hit::Inset(k), camera));
         }
@@ -520,7 +555,8 @@ impl Layout {
                 MagnifierMode::World => {
                     let center = if self.locked { Some(self.cursor) } else { self.world_under(self.pointer) };
                     push(&mut frame, frame_of(rect));
-                    let camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None);
+                    let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None);
+                    camera.zoomed_art = self.zoomed_art(camera.zoom);
                     push(&mut frame, camera);
                 }
             }
@@ -538,9 +574,7 @@ impl Layout {
     /// driver it is zoomed about the driver's centre (at zoom 1, unmoved);
     /// otherwise it is placed like any arranged view. The driver's screen
     /// sprites (labels) stay on their world pixels.
-    /// `art_zoom`: the zoom the driver's zoomed sprites are made for (they are
-    /// shown when the main pane has that zoom).
-    fn arranged_main(&self, camera: &Camera, rect: [i32; 4], overhang: (u32, u32, u32, u32), art_zoom: (u32, u32)) -> Camera {
+    fn arranged_main(&self, camera: &Camera, rect: [i32; 4], overhang: (u32, u32, u32, u32)) -> Camera {
         let v = self.main_view;
         let unmoved = v.follow == Follow::Driver && v.zoom == ONE && (rect[0], rect[1]) == camera.origin;
         let (x, y, cull) = if unmoved {
@@ -561,7 +595,7 @@ impl Layout {
             origin: (rect[0], rect[1]),
             screen_shift: shift,
             cull,
-            zoomed_art: { let z = ZOOMS[v.zoom]; z.0 != z.1 && z.0 * art_zoom.1.max(1) == art_zoom.0 * z.1 },
+            zoomed_art: self.zoomed_art(ZOOMS[v.zoom]),
             ..*camera
         }
     }
@@ -874,7 +908,7 @@ impl Layout {
 
     /// A Ctrl+Shift command key; whether it was one.
     fn command(&mut self, vk: u32, down: bool) -> bool {
-        const KEYS: [u32; 17] = [0x53, 0x49, 0x58, 0x4D, 0x30, 0xBB, 0xBD, 0x6B, 0x6D, 0x25, 0x26, 0x27, 0x28, 0x46, 0x20, 0x41, 0x60];
+        const KEYS: [u32; 18] = [0x53, 0x49, 0x58, 0x4D, 0x30, 0xBB, 0xBD, 0x6B, 0x6D, 0x25, 0x26, 0x27, 0x28, 0x46, 0x20, 0x41, 0x60, 0x54];
         if !KEYS.contains(&vk) {
             return false;
         }
@@ -924,6 +958,8 @@ impl Layout {
             }
             // A: the arrow at the point of interest.
             0x41 => self.focus_arrow = !self.focus_arrow,
+            // T: text at the zoomed views' resolution, or scaled.
+            0x54 => self.sharp_text = !self.sharp_text,
             // M: magnifier off → everything → world → off.
             0x4D => {
                 self.magnifier = match self.magnifier {

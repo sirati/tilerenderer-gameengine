@@ -187,6 +187,8 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
                 scale_den,
                 tint: 0,
                 zoom_art: 0,
+                zoom: (0, 0),
+                zoom_offset: (0, 0),
                 clip: Some(clip),
             })
         })

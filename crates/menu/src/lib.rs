@@ -281,6 +281,8 @@ impl Menus {
                 scale_den: art.scale_den,
                 tint: 0,
                 zoom_art: 0,
+                zoom: (0, 0),
+                zoom_offset: (0, 0),
                 clip: None,
             });
         };
