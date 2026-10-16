@@ -429,6 +429,10 @@ impl App {
         let window = (gpu.config.width, gpu.config.height);
         let bounds = world_bounds(&self.compiled, scene);
         let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
+        // Views following something move without input: tell the driver.
+        if let Some(views) = self.layout.take_views_change() {
+            self.display.send_input(Input::Views(views));
+        }
         let views_moved = arranged.view_cameras != self.drawn_views;
         // A scene for other art than the renderer has waits (its last world is
         // drawn meanwhile).
@@ -521,6 +525,9 @@ impl ApplicationHandler for App {
         }
         if let Some(zooms) = self.layout.take_zooms_change() {
             self.display.send_input(Input::Zooms(zooms));
+        }
+        if let Some(views) = self.layout.take_views_change() {
+            self.display.send_input(Input::Views(views));
         }
     }
 

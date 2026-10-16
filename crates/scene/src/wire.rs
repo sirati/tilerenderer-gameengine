@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 13;
+pub const VERSION: u32 = 14;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -363,6 +363,14 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
+            Input::Views(views) => {
+                w.u8(8);
+                for (x, y, ww, h) in views {
+                    for v in [x, y, ww, h] {
+                        w.i32(v);
+                    }
+                }
+            }
             Input::Zooms(zooms) => {
                 w.u8(7);
                 for (n, d) in zooms {
@@ -401,6 +409,13 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
             4 => Input::Resized { width: r.u32()?, height: r.u32()? },
             5 => Input::Quit,
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
+            8 => {
+                let mut views = [(0, 0, 0, 0); 4];
+                for v in &mut views {
+                    *v = (r.i32()?, r.i32()?, r.i32()?, r.i32()?);
+                }
+                Input::Views(views)
+            }
             7 => {
                 let mut zooms = [(0, 0); 8];
                 for z in &mut zooms {
@@ -500,6 +515,7 @@ mod tests {
             Input::Quit,
             Input::Look { x: -5, y: 7000 },
             Input::Zooms([(3, 2), (2, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]),
+            Input::Views([(10, -20, 300, 200), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]),
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2, generation: 7 };

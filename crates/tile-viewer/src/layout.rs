@@ -250,6 +250,9 @@ pub struct Layout {
     grab: Option<bool>,
     /// The zooms in use as last told to the driver.
     reported_zooms: [(u8, u8); 8],
+    /// The world rectangles of the viewer's own views as last told to the
+    /// driver.
+    reported_views: [(i32, i32, i32, i32); 4],
     /// Zooms the scene has zoomed art (text) for, from the last frame.
     art_zooms: Vec<(u32, u32)>,
     ctrl: bool,
@@ -281,6 +284,7 @@ impl Default for Layout {
             grab: None,
             reported_zooms: [(0, 0); 8],
             art_zooms: Vec::new(),
+            reported_views: [(0, 0, 0, 0); 4],
             sharp_text: true,
             ctrl: false,
             shift: false,
@@ -395,6 +399,22 @@ impl Layout {
         (zooms != self.reported_zooms).then(|| {
             self.reported_zooms = zooms;
             zooms
+        })
+    }
+
+    /// The world rectangles the split pane and the insets show (as of the
+    /// last frame), when they changed since last asked (for the driver,
+    /// `Input::Views`).
+    pub fn take_views_change(&mut self) -> Option<[(i32, i32, i32, i32); 4]> {
+        let mut views = [(0, 0, 0, 0); 4];
+        let own = self.shown.iter().filter(|(h, _)| matches!(h, Hit::Pane | Hit::Inset(_)));
+        for (slot, (_, c)) in views.iter_mut().zip(own) {
+            let (w, h) = c.source_size();
+            *slot = (c.x, c.y, w as i32, h as i32);
+        }
+        (views != self.reported_views).then(|| {
+            self.reported_views = views;
+            views
         })
     }
 
