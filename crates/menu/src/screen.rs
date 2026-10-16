@@ -197,6 +197,7 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
                 zoom: (0, 0),
                 zoom_offset: (0, 0),
                 clip: Some(clip),
+                not_in_view: None,
             })
         })
         .collect()
