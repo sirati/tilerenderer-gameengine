@@ -144,6 +144,9 @@ pub struct SheetDesc {
 #[serde(deny_unknown_fields)]
 pub struct SetDesc {
     pub frames: Vec<String>,
+    /// Blend when drawn as a free sprite (layers have their own).
+    #[serde(default)]
+    pub blend: BlendDesc,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -184,6 +187,14 @@ pub enum BlendDesc {
     #[default]
     Alpha,
     Scale(u32),
+}
+
+fn blend_of(desc: BlendDesc) -> Option<Blend> {
+    match desc {
+        BlendDesc::Alpha => Some(Blend::Alpha),
+        BlendDesc::Scale(d) if (1..=tile_render_shared::MAX_SCALE_DENOMINATOR).contains(&d) => Some(Blend::Scale { denominator: d }),
+        BlendDesc::Scale(_) => None,
+    }
 }
 
 /// `{v}` and `{v:02}` in `s` replaced by `v`.
@@ -314,16 +325,20 @@ impl Description {
         // Sets: explicit ones, plus an implicit single-frame set per sprite.
         let mut sets = SpriteSets::default();
         let mut set_ids: BTreeMap<String, SpriteSetId> = BTreeMap::new();
+        let mut set_blend: HashMap<SpriteSetId, Blend> = HashMap::new();
         for (name, &sprite) in &sprites {
             set_ids.insert(name.clone(), sets.single(sprite));
         }
         for (name, set) in &self.sets {
+            let blend = blend_of(set.blend).ok_or_else(|| DescError::Unknown { kind: "blend of set", name: name.clone() })?;
             let frames = set
                 .frames
                 .iter()
                 .map(|f| sprites.get(f).copied().ok_or(DescError::Unknown { kind: "sprite", name: f.clone() }))
                 .collect::<Result<Vec<_>, _>>()?;
-            set_ids.insert(name.clone(), sets.add(&frames));
+            let id = sets.add(&frames);
+            set_ids.insert(name.clone(), id);
+            set_blend.insert(id, blend);
         }
 
         // Layers and their value tables.
@@ -358,13 +373,8 @@ impl Description {
             spec.hidden = layer.hidden;
             spec.pass = layer.pass;
             spec.cull_offset = (layer.cull_offset[0], layer.cull_offset[1]);
-            spec.blend = match layer.blend {
-                BlendDesc::Alpha => Blend::Alpha,
-                BlendDesc::Scale(d) if (1..=tile_render_shared::MAX_SCALE_DENOMINATOR).contains(&d) => Blend::Scale { denominator: d },
-                BlendDesc::Scale(_) => {
-                    return Err(DescError::Unknown { kind: "blend (scale denominator 1..=32) of layer", name: layer.name.clone() });
-                }
-            };
+            spec.blend = blend_of(layer.blend)
+                .ok_or_else(|| DescError::Unknown { kind: "blend (scale denominator 1..=32) of layer", name: layer.name.clone() })?;
             if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
                 return Err(DescError::Unknown { kind: "pass order for layer", name: layer.name.clone() });
             }
@@ -393,6 +403,8 @@ impl Description {
             sets,
             layers,
             values,
+            set_ids,
+            set_blend,
         })
     }
 }
@@ -408,12 +420,21 @@ pub struct Compiled {
     /// Name of every sprite, by `SpriteId`.
     pub sprite_names: Vec<String>,
     values: HashMap<(String, String), u32>,
+    set_ids: BTreeMap<String, SpriteSetId>,
+    set_blend: HashMap<SpriteSetId, Blend>,
 }
 
 impl Compiled {
     /// The cell value that draws set `set` on layer `layer` (0 = nothing).
     pub fn value(&self, layer: &str, set: &str) -> Option<u32> {
         self.values.get(&(layer.to_owned(), set.to_owned())).copied()
+    }
+
+    /// The set (sprite, or named animation) for a free sprite, and how it
+    /// blends.
+    pub fn set(&self, name: &str) -> Option<(SpriteSetId, Blend)> {
+        let id = *self.set_ids.get(name)?;
+        Some((id, self.set_blend.get(&id).copied().unwrap_or_default()))
     }
 
     pub fn layer_index(&self, layer: &str) -> Option<usize> {

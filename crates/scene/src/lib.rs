@@ -43,6 +43,24 @@ pub struct LayerCells {
     pub phases: Option<Vec<u8>>,
 }
 
+/// A sprite not tied to a cell (units, effects, UI).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FreeSprite {
+    /// Sprite set (animation) id, resolved from a set name by the
+    /// description.
+    pub set: u32,
+    /// Anchor position: world pixels, or viewport pixels if `screen`.
+    pub x: i32,
+    pub y: i32,
+    pub screen: bool,
+    /// Drawn after this render pass (beyond the last: on top).
+    pub after_pass: u32,
+    pub phase: u32,
+    pub ticks_per_frame: u32,
+    /// 0: alpha blending; otherwise darkens like a scale layer.
+    pub scale_den: u32,
+}
+
 /// One frame's worth of world state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scene {
@@ -54,6 +72,8 @@ pub struct Scene {
     pub shape: WorldShape,
     /// In the description's layer order.
     pub layers: Vec<LayerCells>,
+    /// In drawing order (within the pass each follows).
+    pub sprites: Vec<FreeSprite>,
 }
 
 impl Scene {

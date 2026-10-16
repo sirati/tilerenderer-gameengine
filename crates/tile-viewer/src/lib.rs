@@ -86,6 +86,20 @@ pub fn scene_world(compiled: &Compiled, scene: &Scene) -> TileWorld {
             }
         }
     }
+    world.free = scene
+        .sprites
+        .iter()
+        .map(|s| tile_render::PlacedSprite {
+            set: tile_render::SpriteSetId::from_raw(s.set),
+            x: s.x,
+            y: s.y,
+            screen: s.screen,
+            after_pass: s.after_pass as usize,
+            phase: s.phase,
+            ticks_per_frame: s.ticks_per_frame.max(1),
+            blend: if s.scale_den == 0 { tile_render::Blend::Alpha } else { tile_render::Blend::Scale { denominator: s.scale_den } },
+        })
+        .collect();
     world
 }
 
