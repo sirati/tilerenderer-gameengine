@@ -134,6 +134,8 @@ pub struct SheetDesc {
     /// two sheets into one collection).
     #[serde(default = "one")]
     pub index_stride: u32,
+    /// See [`Description::parse`].
+    pub variants: Option<Vec<i64>>,
 }
 
 /// One frame of a set: a sprite name, or `{ sheet, index }`-style shorthand
@@ -184,13 +186,80 @@ pub enum BlendDesc {
     Scale(u32),
 }
 
+/// `{v}` and `{v:02}` in `s` replaced by `v`.
+fn substitute(s: &str, v: i64) -> String {
+    s.replace("{v:02}", &format!("{v:02}")).replace("{v}", &v.to_string())
+}
+
+fn substitute_value(value: &toml::Value, v: i64) -> toml::Value {
+    match value {
+        toml::Value::String(s) => toml::Value::String(substitute(s, v)),
+        toml::Value::Array(a) => toml::Value::Array(a.iter().map(|x| substitute_value(x, v)).collect()),
+        toml::Value::Table(t) => toml::Value::Table(t.iter().map(|(k, x)| (k.clone(), substitute_value(x, v))).collect()),
+        other => other.clone(),
+    }
+}
+
 fn one() -> u32 {
     1
 }
 
 impl Description {
+    /// Parses a description and expands *variants*: an image or sheet with
+    /// `variants = [0, 1, ...]` stands for one copy per value, named
+    /// `"name@value"`, in which `{v}` (or zero-padded `{v:02}`) in every
+    /// string is replaced by the value — e.g. a sprite sheet recoloured with
+    /// each player's palette:
+    ///
+    /// ```toml
+    /// [images.border]
+    /// source = "Art/border.pcx"
+    /// palette = "Art/Palettes/player{v:02}.pcx"
+    /// variants = [0, 1, 2]
+    ///
+    /// [sheets.border]
+    /// image = "border@{v}"
+    /// group = "Border@{v}"   # sprites "Border@0/0", "Border@1/0", ...
+    /// variants = [0, 1, 2]
+    /// ```
     pub fn parse(text: &str) -> Result<Self, DescError> {
-        Ok(toml::from_str(text)?)
+        let mut desc: Description = toml::from_str(text)?;
+        let mut images = BTreeMap::new();
+        for (name, mut img) in std::mem::take(&mut desc.images) {
+            match img.options.remove("variants") {
+                None => {
+                    images.insert(name, img);
+                }
+                Some(values) => {
+                    let values: Vec<i64> = values.try_into().map_err(|e: toml::de::Error| DescError::Toml(e))?;
+                    for v in values {
+                        let source = substitute(&img.source, v);
+                        let options = img.options.iter().map(|(k, o)| (k.clone(), substitute_value(o, v))).collect();
+                        images.insert(format!("{name}@{v}"), ImageDesc { source, options });
+                    }
+                }
+            }
+        }
+        desc.images = images;
+        let mut sheets = BTreeMap::new();
+        for (name, sheet) in std::mem::take(&mut desc.sheets) {
+            match &sheet.variants {
+                None => {
+                    sheets.insert(name, sheet);
+                }
+                Some(values) => {
+                    for &v in values {
+                        let mut copy = sheet.clone();
+                        copy.variants = None;
+                        copy.image = substitute(&sheet.image, v);
+                        copy.group = sheet.group.as_ref().map(|g| substitute(g, v));
+                        sheets.insert(format!("{name}@{v}"), copy);
+                    }
+                }
+            }
+        }
+        desc.sheets = sheets;
+        Ok(desc)
     }
 
     /// Loads every image, slices the sheets and builds the tile renderer's
@@ -413,6 +482,38 @@ mod tests {
         assert_eq!((s5.anchor_x, s5.anchor_y), (0, -4));
         let mut w = c.world(3, 3, true, false);
         w.set(tile_render::LayerId(0), 1, 1, c.value("base", "s/3").unwrap());
+    }
+
+    #[test]
+    fn expands_variants() {
+        let d = Description::parse(
+            r#"
+            grid = { layout = "orthogonal", step = [10, 10] }
+            [images.b]
+            source = "b{v:02}.pcx"
+            palette = "p{v}.pcx"
+            variants = [3, 12]
+            [sheets.b]
+            image = "b@{v}"
+            cell = [10, 10]
+            grid = [2, 1]
+            group = "B@{v}"
+            variants = [3, 12]
+            [[layers]]
+            name = "l"
+            sets = ["B@*"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(d.images["b@3"].source, "b03.pcx");
+        assert_eq!(d.images["b@12"].options["palette"].as_str(), Some("p12.pcx"));
+        assert!(!d.images["b@3"].options.contains_key("variants"));
+        let c = d.compile(&Checker, 256).unwrap();
+        assert_eq!(c.atlas.sprites.len(), 4);
+        assert!(c.value("l", "B@12/1").is_some());
+        // Sources differ in length only by the padded value: "b03.pcx" vs "b12.pcx".
+        let s = c.atlas.sprites[c.sprite_names.iter().position(|n| n == "B@3/0").unwrap()];
+        assert_eq!(c.atlas.pages[s.page as usize].get(s.atlas_x, s.atlas_y)[2], 7);
     }
 
     #[test]
