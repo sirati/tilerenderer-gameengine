@@ -18,7 +18,11 @@ export WINEDEBUG=${WINEDEBUG:--all}
 export WINEDLLOVERRIDES="mscoree,mshtml=;${WINEDLLOVERRIDES:-}"
 unset DISPLAY
 # AMD iGPU only (see flake.nix).
-export VK_DRIVER_FILES=${VK_DRIVER_FILES:-/run/opengl-driver/share/vulkan/icd.d/radeon_icd.x86_64.json}
+# 32-bit processes (the game) need an i686 RADV: the host has none, so use
+# Nix's, kept alive by a GC root.
+MESA32=$HOME/.cache/winvm/mesa-i686
+[ -e "$MESA32" ] || nix build --out-link "$MESA32" nixpkgs#pkgsi686Linux.mesa >/dev/null
+export VK_DRIVER_FILES=${VK_DRIVER_FILES:-/run/opengl-driver/share/vulkan/icd.d/radeon_icd.x86_64.json:$MESA32/share/vulkan/icd.d/radeon_icd.i686.json}
 export TILE_RENDER_ADAPTER=${TILE_RENDER_ADAPTER:-radv}
 export __EGL_VENDOR_LIBRARY_FILENAMES=/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json
 export DRI_PRIME=pci-0000_72_00_0

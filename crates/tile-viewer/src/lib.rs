@@ -88,7 +88,7 @@ pub fn render_offscreen(
 /// Opens the window and runs until it is closed. Blocks the calling thread,
 /// which need not be the process's main thread (the viewer usually runs
 /// inside someone else's process).
-pub fn run(config: ViewerConfig, compiled: Compiled, link: Link) -> Result<(), ViewerError> {
+pub fn run(config: ViewerConfig, compiled: Arc<Compiled>, link: Link) -> Result<(), ViewerError> {
     let mut builder = EventLoop::builder();
     #[cfg(windows)]
     winit::platform::windows::EventLoopBuilderExtWindows::with_any_thread(&mut builder, true);
@@ -112,7 +112,7 @@ struct Gpu {
 
 struct App {
     config: ViewerConfig,
-    compiled: Compiled,
+    compiled: Arc<Compiled>,
     link: Link,
     gpu: Option<Gpu>,
     last_seq: u64,
