@@ -209,6 +209,71 @@ fn solid(spec: &str) -> Result<RgbaImage, String> {
     Ok(RgbaImage::from_fn(w, h, |_, _| [r, g, b, a]))
 }
 
+/// `source = "arrow:R,G,B,A:WxH"`: an arrow pointing down, `W × H` pixels
+/// with its outline (one black pixel around it): a shaft over a head,
+/// the tip at the bottom middle.
+fn arrow(spec: &str) -> Result<RgbaImage, String> {
+    let (color, (w, h)) = shape_spec(spec, "arrow")?;
+    let (iw, ih) = (w as i32 - 2, h as i32 - 2);
+    let head = ih / 2;
+    let inside = |x: i32, y: i32| {
+        let (x, y) = (x - 1, y - 1);
+        if x < 0 || y < 0 || x >= iw || y >= ih {
+            return false;
+        }
+        let c2 = 2 * x + 1 - iw; // twice the distance from the middle
+        if y < ih - head {
+            c2.abs() <= iw / 3
+        } else {
+            // The head narrows from the full width to the tip.
+            c2.abs() * head <= iw * (ih - y)
+        }
+    };
+    Ok(outlined(w, h, color, inside))
+}
+
+/// `source = "crosshair:R,G,B,A:WxH"`: a cross through the middle with a
+/// gap there, outlined like `arrow:`.
+fn crosshair(spec: &str) -> Result<RgbaImage, String> {
+    let (color, (w, h)) = shape_spec(spec, "crosshair")?;
+    let (cx, cy) = (w as i32 / 2, h as i32 / 2);
+    let gap = (w.min(h) as i32 / 8).max(1);
+    let inside = |x: i32, y: i32| {
+        let on_margin = x == 0 || y == 0 || x == w as i32 - 1 || y == h as i32 - 1;
+        let horizontal = (y - cy).abs() <= 0 && (x - cx).abs() > gap;
+        let vertical = (x - cx).abs() <= 0 && (y - cy).abs() > gap;
+        !on_margin && (horizontal || vertical)
+    };
+    Ok(outlined(w, h, color, inside))
+}
+
+fn shape_spec(spec: &str, kind: &str) -> Result<([u8; 4], (u32, u32)), String> {
+    let err = || format!("{kind} image {spec:?}: expected R,G,B,A:WxH (at least 4x4)");
+    let (rgba, size) = spec.split_once(':').ok_or_else(err)?;
+    let c: Vec<u8> = rgba.split(',').map(|v| v.trim().parse().map_err(|_| err())).collect::<Result<_, _>>()?;
+    let (w, h) = size.split_once('x').ok_or_else(err)?;
+    let (w, h): (u32, u32) = (w.parse().map_err(|_| err())?, h.parse().map_err(|_| err())?);
+    let color = <[u8; 4]>::try_from(c).map_err(|_| err())?;
+    if w < 4 || h < 4 {
+        return Err(err());
+    }
+    Ok((color, (w, h)))
+}
+
+/// `color` where `inside`, black on the pixels next to those, clear elsewhere.
+fn outlined(w: u32, h: u32, color: [u8; 4], inside: impl Fn(i32, i32) -> bool) -> RgbaImage {
+    RgbaImage::from_fn(w, h, |x, y| {
+        let (x, y) = (x as i32, y as i32);
+        if inside(x, y) {
+            color
+        } else if [(-1, 0), (1, 0), (0, -1), (0, 1)].iter().any(|(dx, dy)| inside(x + dx, y + dy)) {
+            [0, 0, 0, 255]
+        } else {
+            [0; 4]
+        }
+    })
+}
+
 /// `source = "line:R,G,B,A:DX,DY:W"`: a line `W` pixels thick from a start
 /// point to the point `(DX, DY)` away, mostly horizontal (`|DY| <= |DX|`),
 /// rasterized like simple software renderers do: every column from the
@@ -358,11 +423,8 @@ impl Description {
         for (name, img) in &self.images {
             let mut options = self.loader.clone();
             options.extend(img.options.clone());
-            let generated = if let Some(spec) = img.source.strip_prefix("solid:") {
-                Some(solid(spec))
-            } else {
-                img.source.strip_prefix("line:").map(line)
-            };
+            let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 4] = [("solid:", solid), ("line:", line), ("arrow:", arrow), ("crosshair:", crosshair)];
+            let generated = generators.iter().find_map(|(prefix, make)| img.source.strip_prefix(prefix).map(make));
             let frames = match generated {
                 Some(image) => vec![image.map_err(|message| DescError::Image { name: name.clone(), message })?],
                 None => loader.load(&img.source, &options).map_err(|message| DescError::Image { name: name.clone(), message })?,
@@ -605,6 +667,24 @@ impl Description {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrows_point_down_and_are_outlined() {
+        let a = arrow("255,255,0,255:21x30").unwrap();
+        let row = |y: u32| (0..21).map(|x| a.get(x, y)).collect::<Vec<_>>();
+        // Shaft at the top, middle third; the tip at the bottom middle.
+        assert_eq!(row(1)[10], [255, 255, 0, 255]);
+        assert_eq!(row(1)[2], [0; 4]);
+        assert_eq!(row(28)[10], [255, 255, 0, 255]);
+        assert_eq!(row(28)[9], [0, 0, 0, 255]);
+        assert_eq!(row(29)[10], [0, 0, 0, 255]);
+        assert_eq!(row(29)[9], [0; 4]);
+        // The head is wider than the shaft.
+        let wide = |y: u32| row(y).iter().filter(|p| **p == [255, 255, 0, 255]).count();
+        assert!(wide(15) > 2 * wide(5));
+        assert!(crosshair("1,2,3,255:15x15").unwrap().get(7, 7) == [0; 4]);
+        assert!(arrow("1,2,3,4:2x9").is_err());
+    }
 
     struct Checker;
     impl ImageLoader for Checker {

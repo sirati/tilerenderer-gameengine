@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -211,6 +211,13 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u8(6);
                 w.u32(*t);
             }
+            Update::Focus(f) => {
+                w.u8(7);
+                w.bool(f.is_some());
+                let (x, y) = f.unwrap_or_default();
+                w.i32(x);
+                w.i32(y);
+            }
         }
     }
     w.0
@@ -268,6 +275,11 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 Update::Patches(patches)
             }
             6 => Update::Tick(r.u32()?),
+            7 => {
+                let some = r.bool()?;
+                let p = (r.i32()?, r.i32()?);
+                Update::Focus(some.then_some(p))
+            }
             t => return Err(WireError::Tag(t)),
         });
     }
@@ -415,6 +427,7 @@ mod tests {
         s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, clip: None });
         s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, clip: Some([1, -2, 300, 40]) });
         s.patches.push(Patch { sprite: "Screen@x/0".into(), width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
+        s.focus = Some((-64, 96));
         let mut updates = s.updates_since(&Scene::default());
         updates.push(Update::Cells(vec![(1, 0, 9)]));
         updates.push(Update::View { id: 2, view: None });
@@ -439,6 +452,6 @@ mod tests {
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2 };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
         assert_eq!(decode_updates(&[VERSION as u8, 0, 0, 0, 5]), Err(WireError::Truncated));
-        assert_eq!(decode_input(&[9, 0, 0, 0]), Err(WireError::Version(9)));
+        assert_eq!(decode_input(&[0xFE, 0, 0, 0]), Err(WireError::Version(0xFE)));
     }
 }

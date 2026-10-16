@@ -100,6 +100,9 @@ pub struct Scene {
     pub sprites: Vec<FreeSprite>,
     /// By id.
     pub views: Vec<ViewState>,
+    /// The world pixel the driver considers its point of interest (e.g. the
+    /// unit a player is moving), if any.
+    pub focus: Option<(i32, i32)>,
     /// New pixels for atlas sprites whose content changes at run time.
     pub patches: Vec<Patch>,
 }
@@ -131,6 +134,8 @@ pub enum Update {
     /// Sprite pixels to write into the atlas.
     Patches(Vec<Patch>),
     Tick(u32),
+    /// The point of interest moved (see [`Scene::focus`]).
+    Focus(Option<(i32, i32)>),
 }
 
 impl Scene {
@@ -181,6 +186,7 @@ impl Scene {
             Update::Overlay { view, sprites } => self.view_mut(view).overlay = sprites,
             Update::Patches(patches) => self.patches.extend(patches),
             Update::Tick(tick) => self.tick = tick,
+            Update::Focus(focus) => self.focus = focus,
         }
     }
 
@@ -229,6 +235,9 @@ impl Scene {
         }
         if self.tick != old.tick {
             out.push(Update::Tick(self.tick));
+        }
+        if self.focus != old.focus {
+            out.push(Update::Focus(self.focus));
         }
         out
     }

@@ -150,6 +150,40 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
         .collect()
 }
 
+/// The world's extent in pixels and how it wraps.
+fn world_bounds(compiled: &Compiled, scene: &Scene) -> layout::WorldBounds {
+    let s = scene.shape;
+    let col = match compiled.layout {
+        tile_render::Layout::Staggered => 2 * compiled.step.0,
+        tile_render::Layout::Orthogonal => compiled.step.0,
+    };
+    layout::WorldBounds { size: ((s.cols * col) as i32, (s.rows * compiled.step.1) as i32), wrap: (s.wrap_x, s.wrap_y) }
+}
+
+/// Sprite sets the viewer draws its markers with, if the description has
+/// them (anchored at the point they mark).
+pub const CURSOR_SPRITE: &str = "Viewer@cursor/0";
+pub const ARROW_SPRITE: &str = "Viewer@arrow/0";
+
+/// The markers as world sprites on top of everything. The arrow blinks
+/// twice every three seconds (`time`: since the viewer started).
+fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], time: Duration) -> Vec<tile_render::PlacedSprite> {
+    let blink = time.as_millis() % 3000;
+    let arrow_off = blink < 150 || (300..450).contains(&blink);
+    markers
+        .iter()
+        .filter_map(|m| {
+            let (name, (x, y)) = match *m {
+                layout::Marker::Cursor(p) => (CURSOR_SPRITE, p),
+                layout::Marker::Focus(_) if arrow_off => return None,
+                layout::Marker::Focus(p) => (ARROW_SPRITE, p),
+            };
+            let (set, _) = compiled.set(name)?;
+            Some(tile_render::PlacedSprite::new(set, x, y))
+        })
+        .collect()
+}
+
 /// The window rectangles (x, y, w, h) the scene's interface-only views
 /// cover: their sprites' first frames, clipped.
 fn interface_rects(compiled: &Compiled, scene: &Scene) -> Vec<[i32; 4]> {
@@ -234,8 +268,17 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         input: input::InputState::default(),
         layout: layout::Layout::default(),
         drawn_views: Vec::new(),
+        world: None,
+        drawn_markers: Vec::new(),
+        started: std::time::Instant::now(),
         error: None,
     };
+    // The arrangement to start with (see `layout::Layout::configure`).
+    if let Ok(spec) = std::env::var("TILE_VIEWER_LAYOUT") {
+        if let Err(e) = app.layout.configure(&spec) {
+            log::warn!("TILE_VIEWER_LAYOUT: {e}");
+        }
+    }
     event_loop.run_app(&mut app)?;
     app.error.map_or(Ok(()), Err)
 }
@@ -266,6 +309,10 @@ struct App {
     layout: layout::Layout,
     /// Which camera drew each scene view's overlay in the renderer's world.
     drawn_views: Vec<Option<u32>>,
+    /// The renderer's world without the markers, and the markers drawn.
+    world: Option<TileWorld>,
+    drawn_markers: Vec<tile_render::PlacedSprite>,
+    started: std::time::Instant,
     error: Option<ViewerError>,
 }
 
@@ -320,6 +367,21 @@ impl App {
         Ok(())
     }
 
+    /// Captures (hides, holds) or releases the mouse.
+    fn grab(&self, lock: bool) {
+        let Some(gpu) = &self.gpu else { return };
+        use winit::window::CursorGrabMode;
+        if lock {
+            // Locked where the system can, else kept inside the window.
+            if gpu.window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                let _ = gpu.window.set_cursor_grab(CursorGrabMode::Confined);
+            }
+        } else {
+            let _ = gpu.window.set_cursor_grab(CursorGrabMode::None);
+        }
+        gpu.window.set_cursor_visible(!lock);
+    }
+
     fn draw(&mut self) {
         let Some(gpu) = &mut self.gpu else { return };
         let (version, compiled) = self.assets.current();
@@ -342,13 +404,27 @@ impl App {
             return;
         }
         let window = (gpu.config.width, gpu.config.height);
-        let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene));
+        let bounds = world_bounds(&self.compiled, scene);
+        let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
         let views_moved = arranged.view_cameras != self.drawn_views;
-        if new_assets {
-            gpu.renderer.set_world(&gpu.device, &scene_world_for(&self.compiled, scene, &arranged.view_cameras));
-        } else if scene.seq != self.drawn_seq || views_moved {
-            gpu.renderer.update_world(&gpu.device, &gpu.queue, &scene_world_for(&self.compiled, scene, &arranged.view_cameras));
+        let rebuilt = new_assets || scene.seq != self.drawn_seq || views_moved || self.world.is_none();
+        if rebuilt {
+            self.world = Some(scene_world_for(&self.compiled, scene, &arranged.view_cameras));
         }
+        // The viewer's markers on top of the world, for this frame only.
+        let markers = marker_sprites(&self.compiled, &arranged.markers, self.started.elapsed());
+        let world = self.world.as_mut().expect("built above");
+        let own = world.free.len();
+        world.free.extend_from_slice(&markers);
+        if new_assets {
+            gpu.renderer.set_world(&gpu.device, world);
+        } else if rebuilt {
+            gpu.renderer.update_world(&gpu.device, &gpu.queue, world);
+        } else if markers != self.drawn_markers {
+            gpu.renderer.update_free(&gpu.device, &gpu.queue, world);
+        }
+        world.free.truncate(own);
+        self.drawn_markers = markers;
         self.drawn_views = arranged.view_cameras.clone();
         if new_assets || scene.seq != self.drawn_seq {
             apply_patches(&gpu.renderer, &gpu.queue, &self.compiled, self.patches.values());
@@ -403,8 +479,24 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.draw(),
             _ => {}
         }
+        if let WindowEvent::Focused(false) = event {
+            self.layout.released();
+            self.grab(false);
+        }
         for input in self.input.translate(&event) {
             for input in self.layout.route(input) {
+                self.display.send_input(input);
+            }
+        }
+        if let Some(lock) = self.layout.take_grab() {
+            self.grab(lock);
+        }
+    }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+        // While the mouse is captured its motion moves the world cursor.
+        if let winit::event::DeviceEvent::MouseMotion { delta } = event {
+            for input in self.layout.motion(delta) {
                 self.display.send_input(input);
             }
         }
