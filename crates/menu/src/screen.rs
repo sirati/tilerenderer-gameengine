@@ -186,6 +186,7 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
                 ticks_per_frame: 1,
                 scale_den,
                 tint: 0,
+                zoom_art: 0,
                 clip: Some(clip),
             })
         })

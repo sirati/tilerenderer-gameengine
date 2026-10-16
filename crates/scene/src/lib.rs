@@ -21,7 +21,9 @@ pub struct View {
     /// World pixel at the top-left of the viewport.
     pub camera_x: i32,
     pub camera_y: i32,
-    /// Screen pixels per world pixel.
+    /// The zoom the view's zoomed overlay sprites (`zoom_art` 2) are made
+    /// for (see [`Input::ViewZoom`]); the view itself is drawn 1:1 unless a
+    /// renderer arranges it otherwise.
     pub zoom: (u32, u32),
     /// Viewport size in screen pixels.
     pub viewport: (u32, u32),
@@ -70,6 +72,11 @@ pub struct FreeSprite {
     /// The colour of ClearType-like text (`scale_den` = the renderer's
     /// `SCALE_SUBPIXEL`), 0xRRGGBB.
     pub tint: u32,
+    /// Screen sprites: 0 any zoom; 1 the 1:1 twin of a sprite made for
+    /// the view's zoom, left out where that is shown; 2 made for the zoom
+    /// given by [`View::zoom`] (positions scaled by it), shown where the
+    /// view is at that zoom.
+    pub zoom_art: u8,
     /// Drawn only inside this viewport rectangle (left, top, right,
     /// bottom; exclusive).
     pub clip: Option<[i32; 4]>,
@@ -276,6 +283,9 @@ pub enum Input {
     Resized { width: u32, height: u32 },
     /// The renderer's window was closed.
     Quit,
+    /// The renderer shows the driver's main view at zoom `num / den`: a
+    /// driver may make art for it (e.g. text at that size, `zoom_art` 2).
+    ViewZoom { num: u32, den: u32 },
     /// The user wants to see world pixel (x, y) in the driver's main view
     /// (e.g. clicked it in another view): a driver may move its camera there.
     Look { x: i32, y: i32 },

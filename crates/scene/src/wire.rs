@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -100,6 +100,7 @@ impl Writer {
             self.u32(f.ticks_per_frame);
             self.u32(f.scale_den);
             self.u32(f.tint);
+            self.u8(f.zoom_art);
             self.bool(f.clip.is_some());
             for c in f.clip.unwrap_or_default() {
                 self.i32(c);
@@ -121,7 +122,7 @@ impl Reader<'_> {
     }
 
     fn sprites(&mut self) -> Result<Vec<FreeSprite>, WireError> {
-        let n = self.len(50)?;
+        let n = self.len(51)?;
         (0..n)
             .map(|_| {
                 Ok(FreeSprite {
@@ -134,6 +135,7 @@ impl Reader<'_> {
                     ticks_per_frame: self.u32()?,
                     scale_den: self.u32()?,
                     tint: self.u32()?,
+                    zoom_art: self.u8()?,
                     clip: {
                         let has = self.bool()?;
                         let c = [self.i32()?, self.i32()?, self.i32()?, self.i32()?];
@@ -341,6 +343,11 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
+            Input::ViewZoom { num, den } => {
+                w.u8(7);
+                w.u32(num);
+                w.u32(den);
+            }
         }
     }
     w.0
@@ -372,6 +379,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
             4 => Input::Resized { width: r.u32()?, height: r.u32()? },
             5 => Input::Quit,
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
+            7 => Input::ViewZoom { num: r.u32()?, den: r.u32()? },
             t => return Err(WireError::Tag(t)),
         });
     }
@@ -438,8 +446,8 @@ mod tests {
         s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false };
         s.set(1, 2, 1, 0xABCDEF);
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
-        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, tint: 0x123456, clip: None });
-        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, tint: 0, clip: Some([1, -2, 300, 40]) });
+        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, tint: 0x123456, zoom_art: 2, clip: None });
+        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, tint: 0, zoom_art: 0, clip: Some([1, -2, 300, 40]) });
         s.patches.push(Patch { sprite: "Screen@x/0".into(), width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
         s.focus = Some((-64, 96));
         s.assets = 3;
@@ -462,6 +470,7 @@ mod tests {
             Input::Resized { width: 800, height: 600 },
             Input::Quit,
             Input::Look { x: -5, y: 7000 },
+            Input::ViewZoom { num: 3, den: 2 },
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2, generation: 7 };

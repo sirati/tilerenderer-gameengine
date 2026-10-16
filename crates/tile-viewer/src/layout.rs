@@ -243,6 +243,8 @@ pub struct Layout {
     /// change of that for the window to make.
     locked: bool,
     grab: Option<bool>,
+    /// The main pane's zoom as last told to the driver.
+    reported_zoom: (u32, u32),
     ctrl: bool,
     shift: bool,
     drag: Option<Drag>,
@@ -270,6 +272,7 @@ impl Default for Layout {
             motion_rest: (0.0, 0.0),
             locked: false,
             grab: None,
+            reported_zoom: (1, 1),
             ctrl: false,
             shift: false,
             drag: None,
@@ -357,6 +360,16 @@ impl Layout {
     }
 
     const MAGNIFIER: Magnifier = Magnifier { mode: MagnifierMode::Screen, zoom: ONE + 3, size: (240, 160) };
+
+    /// The main pane's zoom, when it changed since last asked (for the
+    /// driver, `Input::ViewZoom`).
+    pub fn take_zoom_change(&mut self) -> Option<(u32, u32)> {
+        let z = ZOOMS[self.main_view.zoom];
+        (z != self.reported_zoom).then(|| {
+            self.reported_zoom = z;
+            z
+        })
+    }
 
     /// A change of mouse capture for the window to make (true: capture and
     /// hide the pointer, report motion to [`Layout::motion`]).
@@ -465,7 +478,7 @@ impl Layout {
             if v.view.interface_only {
                 continue;
             }
-            let camera = if Some(i) == main { self.arranged_main(camera, main_rect, overhang) } else { *camera };
+            let camera = if Some(i) == main { self.arranged_main(camera, main_rect, overhang, v.view.zoom) } else { *camera };
             frame.view_cameras[i] = Some(push(&mut frame, camera));
             if Some(i) == main {
                 self.shown.push((Hit::Main, camera));
@@ -525,7 +538,9 @@ impl Layout {
     /// driver it is zoomed about the driver's centre (at zoom 1, unmoved);
     /// otherwise it is placed like any arranged view. The driver's screen
     /// sprites (labels) stay on their world pixels.
-    fn arranged_main(&self, camera: &Camera, rect: [i32; 4], overhang: (u32, u32, u32, u32)) -> Camera {
+    /// `art_zoom`: the zoom the driver's zoomed sprites are made for (they are
+    /// shown when the main pane has that zoom).
+    fn arranged_main(&self, camera: &Camera, rect: [i32; 4], overhang: (u32, u32, u32, u32), art_zoom: (u32, u32)) -> Camera {
         let v = self.main_view;
         let unmoved = v.follow == Follow::Driver && v.zoom == ONE && (rect[0], rect[1]) == camera.origin;
         let (x, y, cull) = if unmoved {
@@ -546,6 +561,7 @@ impl Layout {
             origin: (rect[0], rect[1]),
             screen_shift: shift,
             cull,
+            zoomed_art: { let z = ZOOMS[v.zoom]; z.0 != z.1 && z.0 * art_zoom.1.max(1) == art_zoom.0 * z.1 },
             ..*camera
         }
     }

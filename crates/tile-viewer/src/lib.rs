@@ -122,6 +122,11 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
         blend: tile_render::Blend::from_scale_den(s.scale_den, s.tint),
         clip: s.clip,
         view,
+        zoom_art: match s.zoom_art {
+            1 => tile_render::ZoomArt::Low,
+            2 => tile_render::ZoomArt::Zoomed,
+            _ => tile_render::ZoomArt::Any,
+        },
     };
     world.free = scene.sprites.iter().map(|s| placed(s, None)).collect();
     for (v, camera) in scene.views.iter().zip(view_cameras) {
@@ -132,8 +137,9 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
     world
 }
 
-/// The cameras of the scene's views, in its view order. A view with an
-/// empty viewport fills `window`.
+/// The cameras of the scene's views, in its view order, 1:1 (a view's
+/// `zoom` is that of its zoomed art). A view with an empty viewport fills
+/// `window`.
 pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32, u32)) -> Vec<Camera> {
     scene
         .views
@@ -144,13 +150,14 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
             Camera {
                 x: v.camera_x,
                 y: v.camera_y,
-                zoom: (v.zoom.0.max(1), v.zoom.1.max(1)),
+                zoom: (1, 1),
                 viewport,
                 overhang,
                 cull: v.cull,
                 origin: v.origin,
                 cells: !v.interface_only,
                 screen_shift: (0, 0),
+                zoomed_art: false,
             }
         })
         .collect()
@@ -511,6 +518,9 @@ impl ApplicationHandler for App {
         }
         if let Some(lock) = self.layout.take_grab() {
             self.grab(lock);
+        }
+        if let Some((num, den)) = self.layout.take_zoom_change() {
+            self.display.send_input(Input::ViewZoom { num, den });
         }
     }
 
