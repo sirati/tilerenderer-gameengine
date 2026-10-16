@@ -111,8 +111,6 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
             }
         }
     }
-    // The camera showing scene view `id`, if one does.
-    let camera_of = |id: u32| scene.views.iter().zip(view_cameras).find(|(v, _)| v.id == id).and_then(|(_, c)| *c);
     let placed = |s: &scene::FreeSprite, view: Option<u32>| tile_render::PlacedSprite {
         set: tile_render::SpriteSetId::from_raw(s.set),
         x: s.x,
@@ -123,8 +121,7 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
         ticks_per_frame: s.ticks_per_frame.max(1),
         blend: tile_render::Blend::from_scale_den(s.scale_den, s.tint),
         clip: s.clip,
-        view: view.or_else(|| s.not_in_view.and_then(camera_of)),
-        except_view: view.is_none() && s.not_in_view.and_then(camera_of).is_some(),
+        view,
         zoom_art: match s.zoom_art {
             1 => tile_render::ZoomArt::Low,
             2 => tile_render::ZoomArt::Zoomed { zoom: (u32::from(s.zoom.0), u32::from(s.zoom.1)), offset: s.zoom_offset },
