@@ -62,6 +62,12 @@ impl Assets {
         *slot = (slot.0 + 1, compiled);
     }
 
+    /// Replaces the description by `compiled` of generation `generation`
+    /// (what scenes refer to, `Scene::assets`).
+    pub fn set(&self, compiled: Arc<Compiled>, generation: u64) {
+        *self.0.lock().unwrap() = (generation, compiled);
+    }
+
     /// Replaces version `version` by `light` (the same without its atlas
     /// pixels) once they are uploaded, unless a newer one came meanwhile.
     fn uploaded(&self, version: u64, light: Arc<Compiled>) {
@@ -271,6 +277,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         world: None,
         drawn_markers: Vec::new(),
         started: std::time::Instant::now(),
+        art_waiting: None,
         error: None,
     };
     // The arrangement to start with (see `layout::Layout::configure`).
@@ -313,6 +320,8 @@ struct App {
     world: Option<TileWorld>,
     drawn_markers: Vec<tile_render::PlacedSprite>,
     started: std::time::Instant,
+    /// Since when newer art is waiting for a scene that refers to it.
+    art_waiting: Option<std::time::Instant>,
     error: Option<ViewerError>,
 }
 
@@ -385,7 +394,14 @@ impl App {
     fn draw(&mut self) {
         let Some(gpu) = &mut self.gpu else { return };
         let (version, compiled) = self.assets.current();
-        let new_assets = version != self.assets_version;
+        // New art is taken together with a scene that refers to it (sprite
+        // ids change with every compile), or when none came for a while.
+        let refers_to = self.display.scene().assets;
+        if version == self.assets_version && (refers_to == 0 || refers_to == version) {
+            self.art_waiting = None;
+        }
+        let gave_up = self.art_waiting.get_or_insert_with(std::time::Instant::now).elapsed() > Duration::from_secs(3);
+        let new_assets = version != self.assets_version && (refers_to == 0 || refers_to == version || gave_up);
         if new_assets {
             log::info!("viewer: new assets ({} sprites)", compiled.sprite_names.len());
             gpu.renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
@@ -407,7 +423,10 @@ impl App {
         let bounds = world_bounds(&self.compiled, scene);
         let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
         let views_moved = arranged.view_cameras != self.drawn_views;
-        let rebuilt = new_assets || scene.seq != self.drawn_seq || views_moved || self.world.is_none();
+        // A scene for other art than the renderer has waits (its last world is
+        // drawn meanwhile).
+        let matches = scene.assets == 0 || scene.assets == self.assets_version || gave_up;
+        let rebuilt = new_assets || ((scene.seq != self.drawn_seq || views_moved) && matches) || self.world.is_none();
         if rebuilt {
             self.world = Some(scene_world_for(&self.compiled, scene, &arranged.view_cameras));
         }
@@ -426,10 +445,12 @@ impl App {
         world.free.truncate(own);
         self.drawn_markers = markers;
         self.drawn_views = arranged.view_cameras.clone();
-        if new_assets || scene.seq != self.drawn_seq {
+        if new_assets || (scene.seq != self.drawn_seq && matches) {
             apply_patches(&gpu.renderer, &gpu.queue, &self.compiled, self.patches.values());
         }
-        self.drawn_seq = scene.seq;
+        if matches {
+            self.drawn_seq = scene.seq;
+        }
         let frame = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {

@@ -100,6 +100,9 @@ pub struct Scene {
     pub sprites: Vec<FreeSprite>,
     /// By id.
     pub views: Vec<ViewState>,
+    /// The generation of the art (render assets) the scene's sprite ids
+    /// refer to; 0: whatever the renderer has.
+    pub assets: u64,
     /// The world pixel the driver considers its point of interest (e.g. the
     /// unit a player is moving), if any.
     pub focus: Option<(i32, i32)>,
@@ -136,6 +139,8 @@ pub enum Update {
     Tick(u32),
     /// The point of interest moved (see [`Scene::focus`]).
     Focus(Option<(i32, i32)>),
+    /// The scene now refers to art generation `n` (see [`Scene::assets`]).
+    Assets(u64),
 }
 
 impl Scene {
@@ -187,6 +192,7 @@ impl Scene {
             Update::Patches(patches) => self.patches.extend(patches),
             Update::Tick(tick) => self.tick = tick,
             Update::Focus(focus) => self.focus = focus,
+            Update::Assets(n) => self.assets = n,
         }
     }
 
@@ -238,6 +244,9 @@ impl Scene {
         }
         if self.focus != old.focus {
             out.push(Update::Focus(self.focus));
+        }
+        if self.assets != old.assets {
+            out.push(Update::Assets(self.assets));
         }
         out
     }

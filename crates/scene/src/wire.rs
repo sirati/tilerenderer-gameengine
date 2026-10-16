@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -218,6 +218,11 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
+            Update::Assets(n) => {
+                w.u8(8);
+                w.u32(*n as u32);
+                w.u32((*n >> 32) as u32);
+            }
         }
     }
     w.0
@@ -280,6 +285,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let p = (r.i32()?, r.i32()?);
                 Update::Focus(some.then_some(p))
             }
+            8 => Update::Assets(r.u32()? as u64 | (r.u32()? as u64) << 32),
             t => return Err(WireError::Tag(t)),
         });
     }
@@ -380,6 +386,8 @@ pub struct Assets {
     /// Compile the description this many times smaller (1: as it is; 2: a
     /// zoomed-out view).
     pub scale_down: u32,
+    /// Its generation, as scenes refer to it (`Scene::assets`).
+    pub generation: u64,
 }
 
 pub fn encode_assets(a: &Assets) -> Vec<u8> {
@@ -393,6 +401,8 @@ pub fn encode_assets(a: &Assets) -> Vec<u8> {
     w.u32(a.description.len() as u32);
     w.0.extend_from_slice(a.description.as_bytes());
     w.u32(a.scale_down);
+    w.u32(a.generation as u32);
+    w.u32((a.generation >> 32) as u32);
     w.0
 }
 
@@ -409,7 +419,9 @@ pub fn decode_assets(bytes: &[u8]) -> Result<Assets, WireError> {
     let n = r.len(4)?;
     let roots = (0..n).map(|_| string(&mut r)).collect::<Result<_, _>>()?;
     let description = string(&mut r)?;
-    Ok(Assets { description, roots, scale_down: r.u32()? })
+    let scale_down = r.u32()?;
+    let generation = r.u32()? as u64 | (r.u32()? as u64) << 32;
+    Ok(Assets { description, roots, scale_down, generation })
 }
 
 #[cfg(test)]
@@ -428,6 +440,7 @@ mod tests {
         s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, clip: Some([1, -2, 300, 40]) });
         s.patches.push(Patch { sprite: "Screen@x/0".into(), width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
         s.focus = Some((-64, 96));
+        s.assets = 3;
         let mut updates = s.updates_since(&Scene::default());
         updates.push(Update::Cells(vec![(1, 0, 9)]));
         updates.push(Update::View { id: 2, view: None });
@@ -449,7 +462,7 @@ mod tests {
             Input::Look { x: -5, y: 7000 },
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
-        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2 };
+        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2, generation: 7 };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
         assert_eq!(decode_updates(&[VERSION as u8, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[0xFE, 0, 0, 0]), Err(WireError::Version(0xFE)));
