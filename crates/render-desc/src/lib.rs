@@ -120,6 +120,12 @@ pub struct SheetDesc {
     pub anchor: [i32; 2],
     /// Only these sprite indices (default: all).
     pub only: Option<Vec<u32>>,
+    /// Name sprites `"{group}/{first_index + i}"` instead of
+    /// `"{sheet}/{i}"`, so that several files form one numbered collection
+    /// (e.g. a game's sprite array spanning nine sheets).
+    pub group: Option<String>,
+    #[serde(default)]
+    pub first_index: u32,
 }
 
 /// One frame of a set: a sprite name, or `{ sheet, index }`-style shorthand
@@ -197,9 +203,17 @@ impl Description {
                 let (c, r) = (i % cols, i / cols);
                 let sprite = img.crop(ox + c * (cw + sx), oy + r * (ch + sy), cw, ch);
                 let id = atlas.add(&sprite, (sheet.anchor[0], sheet.anchor[1]))?;
-                sprites.insert(format!("{sheet_name}/{i}"), id);
+                let name = match &sheet.group {
+                    Some(g) => format!("{g}/{}", sheet.first_index + i),
+                    None => format!("{sheet_name}/{i}"),
+                };
+                if sprites.insert(name.clone(), id).is_some() {
+                    return Err(err(format!("sprite {name} defined twice")));
+                }
             }
-            sheet_len.insert(sheet_name, cols * rows);
+            let group = sheet.group.as_deref().unwrap_or(sheet_name);
+            let len = sheet_len.entry(group).or_insert(0);
+            *len = (*len).max(sheet.first_index + cols * rows);
         }
 
         // Sets: explicit ones, plus an implicit single-frame set per sprite.
@@ -260,6 +274,13 @@ impl Description {
                 LayoutDesc::Staggered => Layout::Staggered,
             },
             step: (self.grid.step[0], self.grid.step[1]),
+            sprite_names: {
+                let mut names = vec![String::new(); sprites.len()];
+                for (n, id) in &sprites {
+                    names[id.0 as usize] = n.clone();
+                }
+                names
+            },
             atlas: atlas.finish(),
             sets,
             layers,
@@ -275,6 +296,8 @@ pub struct Compiled {
     pub atlas: tile_render::Atlas,
     pub sets: SpriteSets,
     pub layers: Vec<LayerSpec>,
+    /// Name of every sprite, by `SpriteId`.
+    pub sprite_names: Vec<String>,
     values: HashMap<(String, String), u32>,
 }
 

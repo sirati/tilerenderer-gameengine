@@ -335,9 +335,16 @@ dependencies = [
 name = "civ3-bridge"
 version = "0.1.0"
 dependencies = [
+ "civ3-assets",
  "civ3-sys",
+ "image",
  "inproc",
  "log",
+ "render-desc",
+ "scene",
+ "thiserror 2.0.21",
+ "tile-render",
+ "tile-viewer",
 ]
 
 [[package]]
