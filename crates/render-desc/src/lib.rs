@@ -189,6 +189,18 @@ pub enum BlendDesc {
     Scale(u32),
 }
 
+/// `source = "solid:R,G,B,A:WxH"`: a single-colour image, made without the
+/// loader (bars, lines).
+fn solid(spec: &str) -> Result<RgbaImage, String> {
+    let err = || format!("solid image {spec:?}: expected R,G,B,A:WxH");
+    let (rgba, size) = spec.split_once(':').ok_or_else(err)?;
+    let c: Vec<u8> = rgba.split(',').map(|v| v.trim().parse().map_err(|_| err())).collect::<Result<_, _>>()?;
+    let (w, h) = size.split_once('x').ok_or_else(err)?;
+    let (w, h): (u32, u32) = (w.parse().map_err(|_| err())?, h.parse().map_err(|_| err())?);
+    let [r, g, b, a] = <[u8; 4]>::try_from(c).map_err(|_| err())?;
+    Ok(RgbaImage::from_fn(w, h, |_, _| [r, g, b, a]))
+}
+
 fn blend_of(desc: BlendDesc) -> Option<Blend> {
     match desc {
         BlendDesc::Alpha => Some(Blend::Alpha),
@@ -281,9 +293,10 @@ impl Description {
         for (name, img) in &self.images {
             let mut options = self.loader.clone();
             options.extend(img.options.clone());
-            let frames = loader
-                .load(&img.source, &options)
-                .map_err(|message| DescError::Image { name: name.clone(), message })?;
+            let frames = match img.source.strip_prefix("solid:") {
+                Some(spec) => vec![solid(spec).map_err(|message| DescError::Image { name: name.clone(), message })?],
+                None => loader.load(&img.source, &options).map_err(|message| DescError::Image { name: name.clone(), message })?,
+            };
             images.insert(name, frames);
         }
 
