@@ -1,0 +1,8 @@
+[package]
+name = "scene"
+description = "Game-agnostic world snapshots and input events exchanged between a game driver and a renderer"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
