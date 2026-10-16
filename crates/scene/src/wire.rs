@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 14;
+pub const VERSION: u32 = 15;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -378,6 +378,21 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                     w.u8(d);
                 }
             }
+            Input::WorldButton { button: b, down, x, y } => {
+                w.u8(9);
+                w.u8(button(b));
+                w.bool(down);
+                w.i32(x);
+                w.i32(y);
+            }
+            Input::WorldKey { vk, down, text, x, y } => {
+                w.u8(10);
+                w.u32(vk);
+                w.bool(down);
+                w.u32(text.map_or(u32::MAX, |c| c as u32));
+                w.i32(x);
+                w.i32(y);
+            }
         }
     }
     w.0
@@ -392,18 +407,24 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
     }
     let n = r.len(1)?;
     let mut out = Vec::with_capacity(n);
+    let button = |r: &mut Reader| match r.u8()? {
+        0 => Ok(Button::Left),
+        1 => Ok(Button::Right),
+        2 => Ok(Button::Middle),
+        t => Err(WireError::Tag(t)),
+    };
     for _ in 0..n {
         out.push(match r.u8()? {
             0 => Input::MouseMove { x: r.i32()?, y: r.i32()? },
             1 => {
-                let button = match r.u8()? {
-                    0 => Button::Left,
-                    1 => Button::Right,
-                    2 => Button::Middle,
-                    t => return Err(WireError::Tag(t)),
-                };
+                let button = button(&mut r)?;
                 Input::MouseButton { button, down: r.bool()?, x: r.i32()?, y: r.i32()? }
             }
+            9 => {
+                let button = button(&mut r)?;
+                Input::WorldButton { button, down: r.bool()?, x: r.i32()?, y: r.i32()? }
+            }
+            10 => Input::WorldKey { vk: r.u32()?, down: r.bool()?, text: char::from_u32(r.u32()?), x: r.i32()?, y: r.i32()? },
             2 => Input::Wheel { delta: r.i32()?, x: r.i32()?, y: r.i32()? },
             3 => Input::Key { vk: r.u32()?, down: r.bool()?, text: char::from_u32(r.u32()?) },
             4 => Input::Resized { width: r.u32()?, height: r.u32()? },
@@ -516,6 +537,10 @@ mod tests {
             Input::Look { x: -5, y: 7000 },
             Input::Zooms([(3, 2), (2, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]),
             Input::Views([(10, -20, 300, 200), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]),
+            Input::WorldButton { button: Button::Right, down: true, x: -64, y: 4096 },
+            Input::WorldButton { button: Button::Middle, down: false, x: 0, y: 0 },
+            Input::WorldKey { vk: 0x66, down: true, text: Some('6'), x: 130, y: -2 },
+            Input::WorldKey { vk: 0x25, down: false, text: None, x: 1, y: 1 },
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2, generation: 7 };

@@ -309,6 +309,16 @@ pub enum Input {
     /// The user wants to see world pixel (x, y) in the driver's main view
     /// (e.g. clicked it in another view): a driver may move its camera there.
     Look { x: i32, y: i32 },
+    /// A button went down or up on world pixel (x, y) in a view of the
+    /// renderer's own whose pointer input does not reach the driver's
+    /// window (it shows what the driver's main view does not, or what the
+    /// driver's interface covers there): a driver may act on the world at
+    /// that pixel.
+    WorldButton { button: Button, down: bool, x: i32, y: i32 },
+    /// A key went down or up while the pointer was over world pixel (x, y)
+    /// in such a view, sent instead of `Key`: a driver may act on the world
+    /// there, or take it as the `Key` it would have been.
+    WorldKey { vk: u32, down: bool, text: Option<char>, x: i32, y: i32 },
 }
 
 /// Connects a driver (the game side) and a renderer, each on its own
