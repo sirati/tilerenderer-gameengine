@@ -259,6 +259,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
+                self.link.send_input(Input::Resized { width: size.width, height: size.height });
                 if let Some(gpu) = &mut self.gpu {
                     gpu.config.width = size.width.max(1);
                     gpu.config.height = size.height.max(1);

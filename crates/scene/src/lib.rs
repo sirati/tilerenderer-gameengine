@@ -84,6 +84,9 @@ pub enum Input {
     /// A key, as a Windows virtual-key code (the de-facto lingua franca of
     /// keyboard input), with the character it produced, if any.
     Key { vk: u32, down: bool, text: Option<char> },
+    /// The renderer's drawing area now has this size (sent at start and on
+    /// every resize).
+    Resized { width: u32, height: u32 },
     /// The renderer's window was closed.
     Quit,
 }
