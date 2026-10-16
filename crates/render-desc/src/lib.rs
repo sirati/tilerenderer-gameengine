@@ -62,6 +62,10 @@ pub trait ImageLoader {
 #[serde(deny_unknown_fields)]
 pub struct Description {
     pub grid: GridDesc,
+    /// Options passed to the loader for every image (an image's own keys
+    /// override them).
+    #[serde(default)]
+    pub loader: toml::Table,
     #[serde(default)]
     pub images: BTreeMap<String, ImageDesc>,
     #[serde(default)]
@@ -159,8 +163,10 @@ impl Description {
         let mut atlas = AtlasBuilder::new(page_size);
         let mut images: HashMap<&str, Vec<RgbaImage>> = HashMap::new();
         for (name, img) in &self.images {
+            let mut options = self.loader.clone();
+            options.extend(img.options.clone());
             let frames = loader
-                .load(&img.source, &img.options)
+                .load(&img.source, &options)
                 .map_err(|message| DescError::Image { name: name.clone(), message })?;
             images.insert(name, frames);
         }
