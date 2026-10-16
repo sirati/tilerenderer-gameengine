@@ -2170,6 +2170,9 @@ dependencies = [
 [[package]]
 name = "scene"
 version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "scoped-tls"

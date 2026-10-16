@@ -8,6 +8,8 @@
 //!
 //! [`Link`] connects the two sides inside one process.
 
+pub mod wire;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
