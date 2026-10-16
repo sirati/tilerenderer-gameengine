@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 15;
+pub const VERSION: u32 = 16;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -108,6 +108,8 @@ impl Writer {
             for c in f.clip.unwrap_or_default() {
                 self.i32(c);
             }
+            self.bool(f.not_in_view.is_some());
+            self.u32(f.not_in_view.unwrap_or(0));
         }
     }
 }
@@ -125,7 +127,7 @@ impl Reader<'_> {
     }
 
     fn sprites(&mut self) -> Result<Vec<FreeSprite>, WireError> {
-        let n = self.len(63)?;
+        let n = self.len(68)?;
         (0..n)
             .map(|_| {
                 Ok(FreeSprite {
@@ -148,6 +150,11 @@ impl Reader<'_> {
                         let has = self.bool()?;
                         let c = [self.i32()?, self.i32()?, self.i32()?, self.i32()?];
                         has.then_some(c)
+                    },
+                    not_in_view: {
+                        let has = self.bool()?;
+                        let v = self.u32()?;
+                        has.then_some(v)
                     },
                 })
             })
@@ -510,8 +517,8 @@ mod tests {
         s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false };
         s.set(1, 2, 1, 0xABCDEF);
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
-        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, tint: 0x123456, zoom_art: 2, zoom: (3, 2), zoom_offset: (-4, 7), clip: None });
-        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, tint: 0, zoom_art: 0, zoom: (0, 0), zoom_offset: (0, 0), clip: Some([1, -2, 300, 40]) });
+        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, tint: 0x123456, zoom_art: 2, zoom: (3, 2), zoom_offset: (-4, 7), clip: None, not_in_view: Some(3) });
+        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, tint: 0, zoom_art: 0, zoom: (0, 0), zoom_offset: (0, 0), clip: Some([1, -2, 300, 40]), not_in_view: None });
         s.patches.push(Patch { sprite: "Screen@x/0".into(), width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
         s.focus = Some((-64, 96));
         s.assets = 3;

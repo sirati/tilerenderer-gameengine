@@ -80,6 +80,9 @@ pub struct FreeSprite {
     /// Drawn only inside this viewport rectangle (left, top, right,
     /// bottom; exclusive).
     pub clip: Option<[i32; 4]>,
+    /// A world sprite drawn in every view but this one (a view id): what
+    /// the driver's own view does not show there, other views do.
+    pub not_in_view: Option<u32>,
 }
 
 /// One view of the world: where it sits in the window, what it looks at,
