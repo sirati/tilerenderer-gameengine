@@ -82,7 +82,7 @@ impl ScreenArt {
             let [x, y, w, h] = r.rect;
             let _ = writeln!(
                 out,
-                "[sheets.screen_region_{n}]\nimage = \"{image}\"\norigin = [{x}, {y}]\ncell = [{w}, {h}]\ngrid = [1, 1]\ngroup = {}\n",
+                "[sheets.screen_region_{n}]\nimage = \"{image}\"\norigin = [{x}, {y}]\ncell = [{w}, {h}]\ngrid = [1, 1]\ngroup = {}\nscaling = \"keep\"\n",
                 toml_str(region_sprite(r).trim_end_matches("/0"))
             );
         }
@@ -93,7 +93,7 @@ impl ScreenArt {
         for (n, &([r, g, b], (w, h))) in self.fills.iter().enumerate() {
             let _ = writeln!(
                 out,
-                "[images.screen_fill_{n}]\nsource = \"solid:{r},{g},{b},255:{w}x{h}\"\n\n[sheets.screen_fill_{n}]\nimage = \"screen_fill_{n}\"\ncell = [{w}, {h}]\ngrid = [1, 1]\ngroup = {}\n",
+                "[images.screen_fill_{n}]\nsource = \"solid:{r},{g},{b},255:{w}x{h}\"\n\n[sheets.screen_fill_{n}]\nimage = \"screen_fill_{n}\"\ncell = [{w}, {h}]\ngrid = [1, 1]\ngroup = {}\nscaling = \"keep\"\n",
                 toml_str(fill_sprite([r, g, b], (w, h)).trim_end_matches("/0"))
             );
         }

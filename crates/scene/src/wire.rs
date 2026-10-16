@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Scene, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -270,6 +270,9 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
 pub struct Assets {
     pub description: String,
     pub roots: Vec<String>,
+    /// Compile the description this many times smaller (1: as it is; 2: a
+    /// zoomed-out view).
+    pub scale_down: u32,
 }
 
 pub fn encode_assets(a: &Assets) -> Vec<u8> {
@@ -282,6 +285,7 @@ pub fn encode_assets(a: &Assets) -> Vec<u8> {
     }
     w.u32(a.description.len() as u32);
     w.0.extend_from_slice(a.description.as_bytes());
+    w.u32(a.scale_down);
     w.0
 }
 
@@ -297,7 +301,8 @@ pub fn decode_assets(bytes: &[u8]) -> Result<Assets, WireError> {
     };
     let n = r.len(4)?;
     let roots = (0..n).map(|_| string(&mut r)).collect::<Result<_, _>>()?;
-    Ok(Assets { description: string(&mut r)?, roots })
+    let description = string(&mut r)?;
+    Ok(Assets { description, roots, scale_down: r.u32()? })
 }
 
 #[cfg(test)]
@@ -325,9 +330,9 @@ mod tests {
             Input::Quit,
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
-        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()] };
+        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2 };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
-        assert_eq!(decode_scene(&[2, 0, 0, 0, 5]), Err(WireError::Truncated));
+        assert_eq!(decode_scene(&[3, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[9, 0, 0, 0]), Err(WireError::Version(9)));
     }
 }

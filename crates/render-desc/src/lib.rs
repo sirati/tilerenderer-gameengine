@@ -134,6 +134,14 @@ pub struct SheetDesc {
     /// two sheets into one collection).
     #[serde(default = "one")]
     pub index_stride: u32,
+    /// Sprites shrunk by this factor: every n-th pixel of every n-th row from
+    /// the cell's top-left (nearest neighbour), size rounded down — how
+    /// games draw a zoomed-out view.
+    #[serde(default = "one")]
+    pub downscale: u32,
+    /// How a zoomed-out view (see [`Description::scaled_down`]) treats it.
+    #[serde(default)]
+    pub scaling: SheetScaling,
     /// See [`Description::parse`].
     pub variants: Option<Vec<i64>>,
 }
@@ -383,6 +391,7 @@ impl Description {
                 }
                 let (c, r) = (i % cols, i / cols);
                 let sprite = img.crop(ox + c * (cw + sx), oy + r * (ch + sy), cw, ch);
+                let sprite = if sheet.downscale > 1 { downscale(&sprite, sheet.downscale) } else { sprite };
                 let id = atlas.add(&sprite, (sheet.anchor[0], sheet.anchor[1]))?;
                 let name = match &sheet.group {
                     Some(g) => format!("{g}/{}", sheet.first_index + i * sheet.index_stride),
@@ -528,6 +537,50 @@ impl Compiled {
     }
 }
 
+
+/// Every `n`-th pixel of every `n`-th row, from the top-left.
+fn downscale(img: &RgbaImage, n: u32) -> RgbaImage {
+    RgbaImage::from_fn(img.width / n, img.height / n, |x, y| img.get(x * n, y * n))
+}
+
+/// How [`Description::scaled_down`] treats a sheet (`scaling = "..."`).
+#[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SheetScaling {
+    /// Shrunk, anchor divided.
+    #[default]
+    Scale,
+    /// Shrunk, anchor kept.
+    ScaleKeepAnchor,
+    /// As it is (e.g. screen-space art).
+    Keep,
+}
+
+impl Description {
+    /// The same world `n` times smaller (a zoomed-out view): grid steps and
+    /// offsets divided by `n`, sprites shrunk by [`SheetDesc::downscale`]
+    /// with their anchors divided by `n` (rounded toward zero), as each
+    /// sheet's `scaling` says.
+    pub fn scaled_down(&self, n: u32) -> Description {
+        let n = n.max(1);
+        let ni = n as i32;
+        let mut d = self.clone();
+        d.grid.step = d.grid.step.map(|s| s / n);
+        for sheet in d.sheets.values_mut() {
+            match sheet.scaling {
+                SheetScaling::Keep => continue,
+                SheetScaling::Scale => sheet.anchor = sheet.anchor.map(|a| a / ni),
+                SheetScaling::ScaleKeepAnchor => {}
+            }
+            sheet.downscale *= n;
+        }
+        for layer in &mut d.layers {
+            layer.offset = layer.offset.map(|o| o / ni);
+            layer.cull_offset = layer.cull_offset.map(|o| o / ni);
+        }
+        d
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +692,32 @@ mod tests {
             assert_eq!(img.pixels.iter().filter(|p| p[3] != 0).count(), n);
         }
         assert!(line("1,2,3,4:10,20:2").is_err());
+    }
+
+    #[test]
+    fn scaled_down_keeps_even_pixels_and_halves_offsets() {
+        let d = Description::parse(
+            "[grid]\nlayout = \"staggered\"\nstep = [64, 32]\n\
+             [images.a]\nsource = \"a\"\n\
+             [sheets.s]\nimage = \"a\"\ncell = [5, 3]\ngrid = [1, 1]\nanchor = [-19, -15]\n\
+             [sheets.f]\nimage = \"a\"\ncell = [4, 4]\ngrid = [1, 1]\nanchor = [0, -12]\nscaling = \"scale_keep_anchor\"\n\
+             [sheets.u]\nimage = \"a\"\ncell = [4, 4]\ngrid = [1, 1]\nanchor = [3, 3]\nscaling = \"keep\"\n\
+             [[layers]]\nname = \"l\"\nsets = [\"s/*\", \"f/*\", \"u/*\"]\ncull_offset = [0, -32]\n",
+        )
+        .unwrap()
+        .scaled_down(2);
+        assert_eq!(d.grid.step, [32, 16]);
+        assert_eq!(d.layers[0].cull_offset, [0, -16]);
+        let c = d.compile(&Checker, 64).unwrap();
+        let sprite = |name: &str| c.atlas.sprites[c.sprite_names.iter().position(|n| n == name).unwrap()];
+        let s = sprite("s/0");
+        assert_eq!((s.width, s.height, s.anchor_x, s.anchor_y), (2, 1, -9, -7));
+        let f = sprite("f/0");
+        assert_eq!((f.width, f.height, f.anchor_x, f.anchor_y), (2, 2, 0, -12));
+        let u = sprite("u/0");
+        assert_eq!((u.width, u.height, u.anchor_x, u.anchor_y), (4, 4, 3, 3));
+        // Pixel (1, 0) of the shrunk sprite is (2, 0) of the cell.
+        let page = &c.atlas.pages[s.page as usize];
+        assert_eq!(page.get(s.atlas_x + 1, s.atlas_y)[0], 2);
     }
 }
