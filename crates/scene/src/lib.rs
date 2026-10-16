@@ -67,6 +67,9 @@ pub struct FreeSprite {
     pub ticks_per_frame: u32,
     /// 0: alpha blending; otherwise darkens like a scale layer.
     pub scale_den: u32,
+    /// The colour of ClearType-like text (`scale_den` = the renderer's
+    /// `SCALE_SUBPIXEL`), 0xRRGGBB.
+    pub tint: u32,
     /// Drawn only inside this viewport rectangle (left, top, right,
     /// bottom; exclusive).
     pub clip: Option<[i32; 4]>,

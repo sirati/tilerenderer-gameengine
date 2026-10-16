@@ -119,7 +119,7 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
         after_pass: s.after_pass as usize,
         phase: s.phase,
         ticks_per_frame: s.ticks_per_frame.max(1),
-        blend: tile_render::Blend::from_scale_den(s.scale_den),
+        blend: tile_render::Blend::from_scale_den(s.scale_den, s.tint),
         clip: s.clip,
         view,
     };
