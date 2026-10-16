@@ -380,8 +380,11 @@ impl Description {
             let [cw, ch] = sheet.cell;
             let [ox, oy] = sheet.origin;
             let [sx, sy] = sheet.spacing;
+            if cw == 0 || ch == 0 {
+                return Err(err(format!("empty cell {cw}×{ch}")));
+            }
             let fit = |total: u32, o: u32, c: u32, s: u32| if total < o + c { 0 } else { (total - o + s) / (c + s) };
-            let [cols, rows] = sheet.grid.unwrap_or([fit(img.width, ox, cw, sx), fit(img.height, oy, ch, sy)]);
+            let [cols, rows] = sheet.grid.unwrap_or_else(|| [fit(img.width, ox, cw, sx), fit(img.height, oy, ch, sy)]);
             if ox + cols * (cw + sx) - sx > img.width || oy + rows * (ch + sy) - sy > img.height {
                 return Err(err(format!("{cols}×{rows} cells of {cw}×{ch} exceed the {}×{} image", img.width, img.height)));
             }

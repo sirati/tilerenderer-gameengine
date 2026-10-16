@@ -34,6 +34,16 @@ pub enum Element {
     Dynamic { name: String, size: (u32, u32), rect: [i32; 4], at: (i32, i32), clip: [i32; 4] },
 }
 
+
+impl Element {
+    /// Whether it covers no pixels (nothing to draw or describe).
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Element::Image { region, .. } => region.rect[2] <= 0 || region.rect[3] <= 0,
+            Element::Fill { rect, .. } | Element::Dynamic { rect, .. } => rect[2] <= 0 || rect[3] <= 0,
+        }
+    }
+}
 /// The art a set of screens needs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScreenArt {
@@ -66,7 +76,7 @@ impl ScreenArt {
     /// Adds what `elements` need; whether anything was new.
     pub fn add(&mut self, elements: &[Element]) -> bool {
         let mut new = false;
-        for e in elements {
+        for e in elements.iter().filter(|e| !e.is_empty()) {
             new |= match e {
                 Element::Image { region, .. } => self.regions.insert(region.clone()),
                 Element::Fill { rect, rgb, alpha, .. } => {
@@ -121,11 +131,13 @@ impl ScreenArt {
     }
 }
 
-/// The free sprites drawing `elements` (screen space, on top of
-/// everything); elements whose art is not compiled are left out.
-pub fn sprites(elements: &[Element], compiled: &Compiled) -> Vec<FreeSprite> {
+/// The free sprites drawing `elements` (screen space) after render pass
+/// `after_pass` (`u32::MAX`: on top of everything); elements whose art is
+/// not compiled are left out.
+pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Vec<FreeSprite> {
     elements
         .iter()
+        .filter(|e| !e.is_empty())
         .filter_map(|e| {
             let (name, (x, y), clip) = match e {
                 // The whole picture, moved so the region lands at `at`, clipped
@@ -146,7 +158,7 @@ pub fn sprites(elements: &[Element], compiled: &Compiled) -> Vec<FreeSprite> {
                 x,
                 y,
                 screen: true,
-                after_pass: u32::MAX,
+                after_pass,
                 phase: 0,
                 ticks_per_frame: 1,
                 scale_den: 0,
@@ -187,7 +199,7 @@ mod tests {
         assert!(!art.add(&elements));
         let text = format!("[grid]\nlayout = \"orthogonal\"\nstep = [1, 1]\n{}", art.description("", ""));
         let compiled = render_desc::Description::parse(&text).unwrap().compile(&Plain, 256).unwrap();
-        let sprites = sprites(&elements, &compiled);
+        let sprites = sprites(&elements, &compiled, u32::MAX);
         assert_eq!(sprites.len(), 3);
         assert_eq!((sprites[1].x, sprites[1].y, sprites[1].clip), (3, 4, Some([0, 0, 10, 10])));
         assert!(sprites.iter().all(|s| s.screen));
