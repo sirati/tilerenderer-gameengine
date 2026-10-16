@@ -32,6 +32,9 @@ pub enum Element {
     /// Region `rect` (x, y, w, h) of a picture made at run time (`name`,
     /// `size`), whose pixels come with the scene (see [`patch`]).
     Dynamic { name: String, size: (u32, u32), rect: [i32; 4], at: (i32, i32), clip: [i32; 4] },
+    /// A sprite of the description by name, its top-left at `at` (art the
+    /// description has anyway, e.g. animation frames).
+    Sprite { name: String, at: (i32, i32), clip: [i32; 4] },
 }
 
 
@@ -41,6 +44,7 @@ impl Element {
         match self {
             Element::Image { region, .. } => region.rect[2] <= 0 || region.rect[3] <= 0,
             Element::Fill { rect, .. } | Element::Dynamic { rect, .. } => rect[2] <= 0 || rect[3] <= 0,
+            Element::Sprite { .. } => false,
         }
     }
 }
@@ -83,6 +87,7 @@ impl ScreenArt {
                     self.fills.insert(([rgb[0], rgb[1], rgb[2], *alpha], (rect[2].max(0) as u32, rect[3].max(0) as u32)))
                 }
                 Element::Dynamic { name, size, .. } => self.dynamic.insert((name.clone(), *size)),
+                Element::Sprite { .. } => false,
             };
         }
         new
@@ -139,7 +144,16 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
         .iter()
         .filter(|e| !e.is_empty())
         .filter_map(|e| {
+            // Sprites are placed by their anchor; elements give their top-left.
+            let anchor = |name: &str| {
+                let id = compiled.sprite_names.iter().position(|n| n == name)?;
+                compiled.atlas.sprites.get(id).map(|s| (s.anchor_x, s.anchor_y))
+            };
             let (name, (x, y), clip) = match e {
+                Element::Sprite { name, at: (x, y), clip } => {
+                    let (ax, ay) = anchor(name).unwrap_or((0, 0));
+                    (name.clone(), (x - ax, y - ay), *clip)
+                }
                 // The whole picture, moved so the region lands at `at`, clipped
                 // to the region.
                 Element::Dynamic { name, size, rect: [rx, ry, rw, rh], at: (x, y), clip } => {
