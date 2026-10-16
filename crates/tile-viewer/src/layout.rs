@@ -376,11 +376,11 @@ impl Layout {
             None => ([0, 0, w, h], None),
             Some(s) => match s.axis {
                 Axis::Vertical => {
-                    let a = ((w as f32 * s.fraction) as i32).clamp(GAP, w - GAP);
+                    let a = ((w as f32 * s.fraction) as i32).clamp(GAP, (w - GAP).max(GAP));
                     ([0, 0, a, h], Some([a + GAP, 0, w - a - GAP, h]))
                 }
                 Axis::Horizontal => {
-                    let a = ((h as f32 * s.fraction) as i32).clamp(GAP, h - GAP);
+                    let a = ((h as f32 * s.fraction) as i32).clamp(GAP, (h - GAP).max(GAP));
                     ([0, 0, w, a], Some([0, a + GAP, w, h - a - GAP]))
                 }
             },
@@ -1078,6 +1078,16 @@ mod tests {
         // Released with Ctrl+Shift+Space.
         assert!(ctrl_shift(&mut l, 0x20).is_empty());
         assert_eq!(l.take_grab(), Some(false));
+    }
+
+    #[test]
+    fn input_before_the_first_frame_is_fine() {
+        // Configured split, the window size not known yet.
+        let mut l = Layout::default();
+        l.configure("split=horizontal,main=focus,pane=pointer").unwrap();
+        click(&mut l, (5, 5));
+        l.route(Input::MouseMove { x: 3, y: 3 });
+        frame(&mut l, vec![]);
     }
 
     #[test]
