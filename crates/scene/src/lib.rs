@@ -396,7 +396,7 @@ impl Display {
             self.scene.apply(u);
         }
         self.scene.seq += 1;
-        let _ = self.in_flight.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
+        let _ = self.in_flight.try_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
     }
 
     pub fn scene(&self) -> &Scene {
