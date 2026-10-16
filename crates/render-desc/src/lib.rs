@@ -142,8 +142,19 @@ pub struct SheetDesc {
     /// How a zoomed-out view (see [`Description::scaled_down`]) treats it.
     #[serde(default)]
     pub scaling: SheetScaling,
+    /// Each sprite replaced by a band `width` pixels wide just outside its
+    /// art, in `color` (a ring around a ring); the sprite grows by `width` on
+    /// every side, its anchor moves accordingly.
+    pub outline: Option<OutlineDesc>,
     /// See [`Description::parse`].
     pub variants: Option<Vec<i64>>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutlineDesc {
+    pub width: u32,
+    pub color: [u8; 4],
 }
 
 /// One frame of a set: a sprite name, or `{ sheet, index }`-style shorthand
@@ -271,6 +282,33 @@ fn outlined(w: u32, h: u32, color: [u8; 4], inside: impl Fn(i32, i32) -> bool) -
         } else {
             [0; 4]
         }
+    })
+}
+
+/// The band `width` pixels wide outside `sprite`'s art (its opaque pixels
+/// and what they enclose), in `color`, on an image grown by `width` on
+/// every side.
+fn outline(sprite: &RgbaImage, width: u32, color: [u8; 4]) -> RgbaImage {
+    let t = width as i32;
+    let (w, h) = (sprite.width as i32 + 2 * t, sprite.height as i32 + 2 * t);
+    let opaque = |x: i32, y: i32| {
+        let (sx, sy) = (x - t, y - t);
+        sx >= 0 && sy >= 0 && sx < sprite.width as i32 && sy < sprite.height as i32 && sprite.get(sx as u32, sy as u32)[3] != 0
+    };
+    // Outside: reachable from the border without crossing the art.
+    let mut outside = vec![false; (w * h) as usize];
+    let mut stack: Vec<(i32, i32)> = (0..w).flat_map(|x| [(x, 0), (x, h - 1)]).chain((0..h).flat_map(|y| [(0, y), (w - 1, y)])).collect();
+    while let Some((x, y)) = stack.pop() {
+        if x < 0 || y < 0 || x >= w || y >= h || outside[(y * w + x) as usize] || opaque(x, y) {
+            continue;
+        }
+        outside[(y * w + x) as usize] = true;
+        stack.extend([(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]);
+    }
+    let near_art = |x: i32, y: i32| (-t..=t).any(|dy| (-t..=t).any(|dx| dx * dx + dy * dy <= t * t + t && opaque(x + dx, y + dy)));
+    RgbaImage::from_fn(w as u32, h as u32, |x, y| {
+        let (x, y) = (x as i32, y as i32);
+        if outside[(y * w + x) as usize] && near_art(x, y) { color } else { [0; 4] }
     })
 }
 
@@ -456,8 +494,12 @@ impl Description {
                 }
                 let (c, r) = (i % cols, i / cols);
                 let sprite = img.crop(ox + c * (cw + sx), oy + r * (ch + sy), cw, ch);
+                let (sprite, grow) = match &sheet.outline {
+                    Some(o) => (outline(&sprite, o.width, o.color), o.width as i32),
+                    None => (sprite, 0),
+                };
                 let sprite = if sheet.downscale > 1 { downscale(&sprite, sheet.downscale) } else { sprite };
-                let id = atlas.add(&sprite, (sheet.anchor[0], sheet.anchor[1]))?;
+                let id = atlas.add(&sprite, (sheet.anchor[0] - grow, sheet.anchor[1] - grow))?;
                 let name = match &sheet.group {
                     Some(g) => format!("{g}/{}", sheet.first_index + i * sheet.index_stride),
                     None => format!("{sheet_name}/{i}"),
@@ -667,6 +709,20 @@ impl Description {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outlines_go_around_the_outside() {
+        // A 2-pixel ring (a hollow square) gets a 1-pixel band outside it,
+        // none inside.
+        let ring = RgbaImage::from_fn(8, 8, |x, y| if x < 2 || y < 2 || x > 5 || y > 5 { [9, 9, 9, 255] } else { [0; 4] });
+        let o = outline(&ring, 1, [1, 2, 3, 255]);
+        assert_eq!((o.width, o.height), (10, 10));
+        assert_eq!(o.get(0, 5), [1, 2, 3, 255]);
+        assert_eq!(o.get(1, 5), [0; 4]);
+        assert_eq!(o.get(5, 5), [0; 4]);
+        // (Width 1 still rounds the corners: the diagonal neighbour is in.)
+        assert_eq!(o.get(0, 0), [1, 2, 3, 255]);
+    }
 
     #[test]
     fn arrows_point_down_and_are_outlined() {
