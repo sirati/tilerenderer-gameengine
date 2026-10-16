@@ -127,6 +127,10 @@ pub struct SheetDesc {
     /// Pixel position of sprite (0, 0) in the image.
     #[serde(default)]
     pub origin: [u32; 2],
+    /// Where sprite (0, 0) is instead once the description is scaled down
+    /// ([`Description::scaled_down`]): for art the game keeps in a second
+    /// place for its zoomed-out view.
+    pub scaled_origin: Option<[u32; 2]>,
     /// Gap between sprites.
     #[serde(default)]
     pub spacing: [u32; 2],
@@ -794,6 +798,9 @@ impl Description {
         let mut d = self.clone();
         d.grid.step = d.grid.step.map(|s| s / n);
         for sheet in d.sheets.values_mut() {
+            if let Some(origin) = sheet.scaled_origin.take() {
+                sheet.origin = origin;
+            }
             match sheet.scaling {
                 SheetScaling::Keep => continue,
                 SheetScaling::Scale => sheet.anchor = sheet.anchor.map(|a| a / ni),
@@ -1069,6 +1076,23 @@ mod tests {
         // An image's own `blank` overrides it: 254 blank again -> odd origin.
         let text = format!("[blank_loader]\ntransparent = [255]\n{}", BOXED.replace("source = \"a\"\n", "source = \"a\"\nblank = { transparent = [254, 255] }\n"));
         assert_eq!(shrunk(&format!("{text}sample_from = \"box\"\n"), 2)[0], [Some(1), Some(3), Some(5), None]);
+    }
+
+    #[test]
+    fn scaled_down_art_can_come_from_another_cell() {
+        // A game that keeps a second sprite for its zoomed-out view.
+        let text = "[grid]\nlayout = \"orthogonal\"\nstep = [8, 4]\n[images.a]\nsource = \"a\"\n\
+                    [sheets.s]\nimage = \"a\"\ncell = [4, 4]\ngrid = [1, 1]\norigin = [0, 0]\nscaled_origin = [8, 4]\n";
+        let corner = |c: &Compiled| {
+            let s = c.atlas.sprites[0];
+            let page = &c.atlas.pages[s.page as usize];
+            [page.get(s.atlas_x, s.atlas_y), page.get(s.atlas_x + 1, s.atlas_y)]
+        };
+        let full = Description::parse(text).unwrap().compile(&Checker, 64).unwrap();
+        assert_eq!(corner(&full)[0][..2], [0, 0]);
+        let small = Description::parse(text).unwrap().scaled_down(2).compile(&Checker, 64).unwrap();
+        // The cell at (8, 4), every second pixel.
+        assert_eq!(corner(&small).map(|p| [p[0], p[1]]), [[8, 4], [10, 4]]);
     }
 
     #[test]
