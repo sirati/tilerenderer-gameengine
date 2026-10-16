@@ -306,6 +306,10 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     renderer: TileRenderer,
+    /// A software renderer (e.g. WARP, llvmpipe): frames wait for the one
+    /// before (it would pile up frames and their uploads); hardware ones
+    /// keep the surface's own frame latency.
+    software: bool,
 }
 
 struct App {
@@ -328,8 +332,8 @@ struct App {
     /// The renderer's world without the markers, and the markers drawn.
     world: Option<TileWorld>,
     drawn_markers: Vec<tile_render::PlacedSprite>,
-    /// The last frame submitted: the next waits for it, so a slow renderer
-    /// (e.g. a software one) does not pile up frames and their uploads.
+    /// The last frame submitted (on a software renderer the next waits for
+    /// it, see `Gpu::software`).
     in_flight: Option<wgpu::SubmissionIndex>,
     started: std::time::Instant,
     /// Since when newer art is waiting for a scene that refers to it.
@@ -384,7 +388,11 @@ impl App {
         self.assets.uploaded(self.assets_version, light.clone());
         self.compiled = light;
         self.display.send_input(Input::Resized { width: config.width, height: config.height });
-        self.gpu = Some(Gpu { window, surface, device, queue, config, renderer });
+        let software = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
+        if software {
+            log::info!("viewer: software renderer, one frame in flight");
+        }
+        self.gpu = Some(Gpu { window, surface, device, queue, config, renderer, software });
         Ok(())
     }
 
@@ -405,7 +413,7 @@ impl App {
 
     fn draw(&mut self) {
         let Some(gpu) = &mut self.gpu else { return };
-        if let Some(index) = self.in_flight.take() {
+        if let Some(index) = self.in_flight.take().filter(|_| gpu.software) {
             let wait = wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(Duration::from_secs(2)) };
             if let Err(e) = gpu.device.poll(wait) {
                 log::debug!("viewer: waiting for the last frame: {e}");
