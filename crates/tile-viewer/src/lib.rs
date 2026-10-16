@@ -287,7 +287,9 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         drawn_views: Vec::new(),
         world: None,
         drawn_markers: Vec::new(),
-        in_flight: None,
+        frame_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        drawn_tick: 0,
+        drawn_window: (0, 0),
         started: std::time::Instant::now(),
         art_waiting: None,
         error: None,
@@ -309,9 +311,9 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     renderer: TileRenderer,
-    /// A software renderer (e.g. WARP, llvmpipe): frames wait for the one
-    /// before (it would pile up frames and their uploads); hardware ones
-    /// keep the surface's own frame latency.
+    /// A software renderer (e.g. WARP, llvmpipe): a new frame only once the
+    /// last is done (it would pile up frames and their uploads) and only if
+    /// it differs; hardware ones keep the surface's own frame latency.
     software: bool,
 }
 
@@ -335,9 +337,11 @@ struct App {
     /// The renderer's world without the markers, and the markers drawn.
     world: Option<TileWorld>,
     drawn_markers: Vec<tile_render::PlacedSprite>,
-    /// The last frame submitted (on a software renderer the next waits for
-    /// it, see `Gpu::software`).
-    in_flight: Option<wgpu::SubmissionIndex>,
+    /// Whether the last frame submitted is done (see `Gpu::software`).
+    frame_done: Arc<std::sync::atomic::AtomicBool>,
+    /// The animation tick and window size drawn last.
+    drawn_tick: u32,
+    drawn_window: (u32, u32),
     started: std::time::Instant,
     /// Since when newer art is waiting for a scene that refers to it.
     art_waiting: Option<std::time::Instant>,
@@ -393,7 +397,7 @@ impl App {
         self.display.send_input(Input::Resized { width: config.width, height: config.height });
         let software = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
         if software {
-            log::info!("viewer: software renderer, one frame in flight");
+            log::info!("viewer: software renderer, one frame in flight, unchanged frames skipped");
         }
         self.gpu = Some(Gpu { window, surface, device, queue, config, renderer, software });
         Ok(())
@@ -416,10 +420,13 @@ impl App {
 
     fn draw(&mut self) {
         let Some(gpu) = &mut self.gpu else { return };
-        if let Some(index) = self.in_flight.take().filter(|_| gpu.software) {
-            let wait = wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(Duration::from_secs(2)) };
-            if let Err(e) = gpu.device.poll(wait) {
-                log::debug!("viewer: waiting for the last frame: {e}");
+        // A software renderer still at the last frame: no new one yet (the
+        // event loop goes on meanwhile).
+        let done = || self.frame_done.load(std::sync::atomic::Ordering::Acquire);
+        if gpu.software && !done() {
+            let _ = gpu.device.poll(wgpu::PollType::Poll);
+            if !done() {
+                return;
             }
         }
         let (version, compiled) = self.assets.current();
@@ -472,7 +479,9 @@ impl App {
             gpu.renderer.set_world(&gpu.device, world);
         } else if rebuilt {
             gpu.renderer.update_world(&gpu.device, &gpu.queue, world);
-        } else if markers != self.drawn_markers {
+        }
+        let markers_moved = markers != self.drawn_markers;
+        if !new_assets && !rebuilt && markers_moved {
             gpu.renderer.update_free(&gpu.device, &gpu.queue, world);
         }
         world.free.truncate(own);
@@ -484,6 +493,13 @@ impl App {
         if matches {
             self.drawn_seq = scene.seq;
         }
+        // A software renderer draws a frame only when it differs from the last.
+        let unchanged = !new_assets && !rebuilt && !markers_moved && scene.tick == self.drawn_tick && window == self.drawn_window;
+        if gpu.software && unchanged {
+            return;
+        }
+        self.drawn_tick = scene.tick;
+        self.drawn_window = window;
         let frame = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -499,7 +515,13 @@ impl App {
         let target = &frame.texture;
         let (cameras, copies) = (&arranged.cameras, &arranged.copies);
         gpu.renderer.render_composed(&gpu.device, &gpu.queue, &mut encoder, target, cameras, copies, scene.tick, self.config.clear);
-        self.in_flight = Some(gpu.queue.submit([encoder.finish()]));
+        gpu.queue.submit([encoder.finish()]);
+        if gpu.software {
+            // (Called back from a later poll once this submission is done.)
+            self.frame_done.store(false, std::sync::atomic::Ordering::Release);
+            let done = self.frame_done.clone();
+            gpu.queue.on_submitted_work_done(move || done.store(true, std::sync::atomic::Ordering::Release));
+        }
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
     }
