@@ -11,6 +11,22 @@ use render_desc::Compiled;
 use scene::FreeSprite;
 
 /// A region of an image file.
+/// Palette entries taken from another image: `count` from `first` on (an
+/// image drawn through another colour table).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PaletteFrom {
+    /// The image, as the loader names it.
+    pub image: String,
+    pub first: u32,
+    pub count: u32,
+}
+
+impl std::fmt::Display for PaletteFrom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{},{}", self.image, self.first, self.count)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Region {
     /// Image source as the loader names it.
@@ -23,9 +39,9 @@ pub struct Region {
     /// An alpha mask image and the offset from a region pixel to its mask
     /// pixel, if blended through one.
     pub mask: Option<(String, (i32, i32))>,
-    /// An image whose palette replaces the source's (it is drawn through
-    /// another colour table), as the loader names it.
-    pub palette: Option<String>,
+    /// Palette entries taken from another image, if drawn through another
+    /// colour table.
+    pub palette: Option<PaletteFrom>,
 }
 
 /// One element of a screen, in drawing order.
@@ -113,7 +129,7 @@ impl ScreenArt {
     /// those blending an image through a mask (file, offset).
     pub fn description(&self, keyed_options: &str, opaque_options: &str, mask_options: impl Fn(&str, (i32, i32)) -> String) -> String {
         let mut out = String::from("\n# Screen art (generated).\n");
-        type Key<'a> = (&'a str, bool, Option<&'a (String, (i32, i32))>, Option<&'a String>);
+        type Key<'a> = (&'a str, bool, Option<&'a (String, (i32, i32))>, Option<&'a PaletteFrom>);
         let images: BTreeSet<Key> = self.regions.iter().map(|r| (r.source.as_str(), r.keyed, r.mask.as_ref(), r.palette.as_ref())).collect();
         let index: std::collections::HashMap<Key, usize> = images.iter().enumerate().map(|(i, k)| (*k, i)).collect();
         for (n, r) in self.regions.iter().enumerate() {
@@ -129,7 +145,7 @@ impl ScreenArt {
             let options = if *keyed { keyed_options } else { opaque_options };
             let mut mask = mask.map(|(m, d)| mask_options(m, *d)).unwrap_or_default();
             if let Some(p) = palette {
-                let _ = writeln!(mask, "palette = {}", toml_str(p));
+                let _ = writeln!(mask, "palette = {}\npalette_range = [{}, {}]", toml_str(&p.image), p.first, p.count);
             }
             let _ = writeln!(out, "[images.screen_{i}{}]\nsource = {}\n{options}\n{mask}\n", if *keyed { "k" } else { "o" }, toml_str(source));
         }
