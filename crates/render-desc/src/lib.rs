@@ -126,6 +126,10 @@ pub struct SheetDesc {
     pub group: Option<String>,
     #[serde(default)]
     pub first_index: u32,
+    /// Index step between consecutive sprites of the sheet (2 interleaves
+    /// two sheets into one collection).
+    #[serde(default = "one")]
+    pub index_stride: u32,
 }
 
 /// One frame of a set: a sprite name, or `{ sheet, index }`-style shorthand
@@ -204,7 +208,7 @@ impl Description {
                 let sprite = img.crop(ox + c * (cw + sx), oy + r * (ch + sy), cw, ch);
                 let id = atlas.add(&sprite, (sheet.anchor[0], sheet.anchor[1]))?;
                 let name = match &sheet.group {
-                    Some(g) => format!("{g}/{}", sheet.first_index + i),
+                    Some(g) => format!("{g}/{}", sheet.first_index + i * sheet.index_stride),
                     None => format!("{sheet_name}/{i}"),
                 };
                 if sprites.insert(name.clone(), id).is_some() {
@@ -213,7 +217,7 @@ impl Description {
             }
             let group = sheet.group.as_deref().unwrap_or(sheet_name);
             let len = sheet_len.entry(group).or_insert(0);
-            *len = (*len).max(sheet.first_index + cols * rows);
+            *len = (*len).max(sheet.first_index + cols * rows * sheet.index_stride);
         }
 
         // Sets: explicit ones, plus an implicit single-frame set per sprite.

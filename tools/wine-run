@@ -17,6 +17,11 @@ export WINEPREFIX=${CIV3R_WINEPREFIX:-/mnt/datasets/winvm/wine-dev}
 export WINEDEBUG=${WINEDEBUG:--all}
 export WINEDLLOVERRIDES="mscoree,mshtml=;${WINEDLLOVERRIDES:-}"
 unset DISPLAY
+# AMD iGPU only (see flake.nix).
+export VK_DRIVER_FILES=${VK_DRIVER_FILES:-/run/opengl-driver/share/vulkan/icd.d/radeon_icd.x86_64.json}
+export TILE_RENDER_ADAPTER=${TILE_RENDER_ADAPTER:-radv}
+export __EGL_VENDOR_LIBRARY_FILENAMES=/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json
+export DRI_PRIME=pci-0000_72_00_0
 if [ ! -f "$WINEPREFIX/system.reg" ]; then
   mkdir -p "$WINEPREFIX"
   wineboot -i >/dev/null 2>&1

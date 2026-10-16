@@ -43,6 +43,12 @@
           export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++
           export CC_i686_pc_windows_gnu=i686-w64-mingw32-gcc CXX_i686_pc_windows_gnu=i686-w64-mingw32-g++
           export PATH=$HOME/.cargo/bin:$PATH
+          # Tests and tools run on the AMD iGPU only: the Vulkan loader sees
+          # no other driver, so nothing can land on the NVIDIA cards.
+          export VK_DRIVER_FILES=/run/opengl-driver/share/vulkan/icd.d/radeon_icd.x86_64.json
+          export TILE_RENDER_ADAPTER=''${TILE_RENDER_ADAPTER:-radv}
+          export __EGL_VENDOR_LIBRARY_FILENAMES=/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json
+          export DRI_PRIME=pci-0000_72_00_0
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=$PWD/tools/wine-run
           export CARGO_TARGET_I686_PC_WINDOWS_GNU_RUNNER=$PWD/tools/wine-run
         '';
