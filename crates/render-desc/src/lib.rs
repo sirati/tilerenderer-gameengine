@@ -512,6 +512,24 @@ pub struct Compiled {
 }
 
 impl Compiled {
+    /// A copy without the atlas pixels (sprite placements, names, sets and
+    /// layers kept): what everything but the atlas upload needs, at a
+    /// fraction of the memory.
+    pub fn without_pixels(&self) -> Compiled {
+        Compiled {
+            layout: self.layout,
+            step: self.step,
+            color: self.color,
+            atlas: tile_render::Atlas { page_size: self.atlas.page_size, pages: Vec::new(), sprites: self.atlas.sprites.clone() },
+            sets: self.sets.clone(),
+            layers: self.layers.clone(),
+            sprite_names: self.sprite_names.clone(),
+            values: self.values.clone(),
+            set_ids: self.set_ids.clone(),
+            set_blend: self.set_blend.clone(),
+        }
+    }
+
     /// The cell value that draws set `set` on layer `layer` (0 = nothing).
     pub fn value(&self, layer: &str, set: &str) -> Option<u32> {
         self.values.get(&(layer.to_owned(), set.to_owned())).copied()

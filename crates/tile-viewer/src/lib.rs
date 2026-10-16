@@ -61,6 +61,15 @@ impl Assets {
         *slot = (slot.0 + 1, compiled);
     }
 
+    /// Replaces version `version` by `light` (the same without its atlas
+    /// pixels) once they are uploaded, unless a newer one came meanwhile.
+    fn uploaded(&self, version: u64, light: Arc<Compiled>) {
+        let mut slot = self.0.lock().unwrap();
+        if slot.0 == version {
+            slot.1 = light;
+        }
+    }
+
     /// The current description and its version (bumped by `replace`).
     pub fn current(&self) -> (u64, Arc<Compiled>) {
         let slot = self.0.lock().unwrap();
@@ -258,6 +267,9 @@ impl App {
         surface.configure(&device, &config);
         let mut renderer = TileRenderer::new(&device, config.format);
         renderer.set_atlas(&device, &queue, &self.compiled.atlas);
+        let light = Arc::new(self.compiled.without_pixels());
+        self.assets.uploaded(self.assets_version, light.clone());
+        self.compiled = light;
         self.display.send_input(Input::Resized { width: config.width, height: config.height });
         self.gpu = Some(Gpu { window, surface, device, queue, config, renderer });
         Ok(())
@@ -270,7 +282,11 @@ impl App {
         if new_assets {
             log::info!("viewer: new assets ({} sprites)", compiled.sprite_names.len());
             gpu.renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
-            self.compiled = compiled;
+            // The pixels are on the GPU now: keep only the rest.
+            let light = Arc::new(compiled.without_pixels());
+            drop(compiled);
+            self.assets.uploaded(version, light.clone());
+            self.compiled = light;
             self.assets_version = version;
         }
         for p in self.display.take_patches() {
