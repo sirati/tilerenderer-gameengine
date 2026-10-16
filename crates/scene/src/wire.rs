@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -199,7 +199,8 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u8(5);
                 w.u32(patches.len() as u32);
                 for p in patches {
-                    w.u32(p.sprite);
+                    w.u32(p.sprite.len() as u32);
+                    w.0.extend_from_slice(p.sprite.as_bytes());
                     w.u32(p.width);
                     w.u32(p.height);
                     w.u32(p.rgba.len() as u32);
@@ -258,7 +259,9 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let n = r.len(16)?;
                 let mut patches = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let (sprite, width, height) = (r.u32()?, r.u32()?, r.u32()?);
+                    let n = r.len(1)?;
+                    let sprite = String::from_utf8_lossy(r.take(n)?).into_owned();
+                    let (width, height) = (r.u32()?, r.u32()?);
                     let k = r.len(1)?;
                     patches.push(Patch { sprite, width, height, rgba: r.take(k)?.to_vec() });
                 }
@@ -405,7 +408,7 @@ mod tests {
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
         s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, clip: None });
         s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, clip: Some([1, -2, 300, 40]) });
-        s.patches.push(Patch { sprite: 7, width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
+        s.patches.push(Patch { sprite: "Screen@x/0".into(), width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
         let mut updates = s.updates_since(&Scene::default());
         updates.push(Update::Cells(vec![(1, 0, 9)]));
         updates.push(Update::View { id: 2, view: None });
@@ -428,7 +431,7 @@ mod tests {
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2 };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
-        assert_eq!(decode_updates(&[6, 0, 0, 0, 5]), Err(WireError::Truncated));
+        assert_eq!(decode_updates(&[VERSION as u8, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[9, 0, 0, 0]), Err(WireError::Version(9)));
     }
 }

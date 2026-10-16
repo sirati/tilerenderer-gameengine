@@ -195,8 +195,9 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
 /// The scene patch giving run-time picture `name` (`size`) its pixels
 /// (row-major RGBA), if the description has it.
 pub fn patch(compiled: &Compiled, name: &str, size: (u32, u32), rgba: Vec<u8>) -> Option<scene::Patch> {
-    let sprite = compiled.sprite_names.iter().position(|n| *n == dynamic_sprite(name, size))?;
-    (rgba.len() == (size.0 * size.1 * 4) as usize).then(|| scene::Patch { sprite: sprite as u32, width: size.0, height: size.1, rgba })
+    let sprite = dynamic_sprite(name, size);
+    compiled.sprite_names.contains(&sprite).then_some(())?;
+    (rgba.len() == (size.0 * size.1 * 4) as usize).then(|| scene::Patch { sprite, width: size.0, height: size.1, rgba })
 }
 #[cfg(test)]
 mod tests {

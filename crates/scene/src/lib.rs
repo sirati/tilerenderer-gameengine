@@ -107,8 +107,9 @@ pub struct Scene {
 /// The pixels of one atlas sprite (row-major RGBA, its exact size).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Patch {
-    /// Atlas sprite id (`Compiled` names them).
-    pub sprite: u32,
+    /// Sprite name (`Compiled::sprite_names`): ids change with every
+    /// compile, and patches outlive compiles.
+    pub sprite: String,
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,

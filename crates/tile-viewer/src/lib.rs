@@ -139,9 +139,16 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
         .collect()
 }
 
-/// Writes run-time sprite pixels into the atlas.
-fn apply_patches<'p>(renderer: &TileRenderer, queue: &wgpu::Queue, patches: impl IntoIterator<Item = &'p scene::Patch>) {
+/// Writes run-time sprite pixels into the atlas; patches for sprites the
+/// description does not have (yet) wait for one that has.
+fn apply_patches<'p>(
+    renderer: &TileRenderer,
+    queue: &wgpu::Queue,
+    compiled: &Compiled,
+    patches: impl IntoIterator<Item = &'p scene::Patch>,
+) {
     for p in patches {
+        let Some(id) = compiled.sprite_names.iter().position(|n| *n == p.sprite) else { continue };
         if p.rgba.len() != (p.width * p.height * 4) as usize {
             continue;
         }
@@ -149,7 +156,7 @@ fn apply_patches<'p>(renderer: &TileRenderer, queue: &wgpu::Queue, patches: impl
             let i = ((y * p.width + x) * 4) as usize;
             [p.rgba[i], p.rgba[i + 1], p.rgba[i + 2], p.rgba[i + 3]]
         });
-        if !renderer.patch_sprite(queue, tile_render::SpriteId(p.sprite), &image) {
+        if !renderer.patch_sprite(queue, tile_render::SpriteId(id as u32), &image) {
             log::debug!("viewer: patch for sprite {} does not fit", p.sprite);
         }
     }
@@ -167,7 +174,7 @@ pub fn render_offscreen(
     let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world(compiled, scene));
-    apply_patches(&renderer, &gpu.queue, &scene.patches);
+    apply_patches(&renderer, &gpu.queue, compiled, &scene.patches);
     gpu.render_views(&mut renderer, &scene_cameras(scene, size, config.overhang), size, scene.tick, config.clear)
 }
 
@@ -219,7 +226,7 @@ struct App {
     drawn_seq: u64,
     /// The latest pixels of every patched sprite (written again into a new
     /// atlas).
-    patches: std::collections::BTreeMap<u32, scene::Patch>,
+    patches: std::collections::BTreeMap<String, scene::Patch>,
     input: input::InputState,
     error: Option<ViewerError>,
 }
@@ -290,7 +297,7 @@ impl App {
             self.assets_version = version;
         }
         for p in self.display.take_patches() {
-            self.patches.insert(p.sprite, p);
+            self.patches.insert(p.sprite.clone(), p);
         }
         let scene = self.display.scene();
         if scene.seq == 0 {
@@ -302,7 +309,7 @@ impl App {
             gpu.renderer.update_world(&gpu.device, &gpu.queue, &scene_world(&self.compiled, scene));
         }
         if new_assets || scene.seq != self.drawn_seq {
-            apply_patches(&gpu.renderer, &gpu.queue, self.patches.values());
+            apply_patches(&gpu.renderer, &gpu.queue, &self.compiled, self.patches.values());
         }
         self.drawn_seq = scene.seq;
         let frame = match gpu.surface.get_current_texture() {
