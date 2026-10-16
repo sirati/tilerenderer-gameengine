@@ -280,6 +280,7 @@ impl Menus {
                 phase: 0,
                 ticks_per_frame: 1,
                 scale_den: art.scale_den,
+                clip: None,
             });
         };
         let text = |font: &Font, s: &str, (x, y): (i32, i32), put: &mut dyn FnMut(Art, (i32, i32))| {

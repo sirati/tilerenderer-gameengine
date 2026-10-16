@@ -98,6 +98,7 @@ pub fn scene_world(compiled: &Compiled, scene: &Scene) -> TileWorld {
             phase: s.phase,
             ticks_per_frame: s.ticks_per_frame.max(1),
             blend: if s.scale_den == 0 { tile_render::Blend::Alpha } else { tile_render::Blend::Scale { denominator: s.scale_den } },
+            clip: s.clip,
         })
         .collect();
     world

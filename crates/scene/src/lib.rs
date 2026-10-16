@@ -61,6 +61,9 @@ pub struct FreeSprite {
     pub ticks_per_frame: u32,
     /// 0: alpha blending; otherwise darkens like a scale layer.
     pub scale_den: u32,
+    /// Drawn only inside this viewport rectangle (left, top, right,
+    /// bottom; exclusive).
+    pub clip: Option<[i32; 4]>,
 }
 
 /// One frame's worth of world state.

@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Scene, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -120,6 +120,10 @@ pub fn encode_scene(s: &Scene) -> Vec<u8> {
         w.u32(f.phase);
         w.u32(f.ticks_per_frame);
         w.u32(f.scale_den);
+        w.bool(f.clip.is_some());
+        for c in f.clip.unwrap_or_default() {
+            w.i32(c);
+        }
     }
     w.0
 }
@@ -152,7 +156,7 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, WireError> {
         };
         layers.push(LayerCells { values, phases });
     }
-    let n = r.len(29)?;
+    let n = r.len(46)?;
     let mut sprites = Vec::with_capacity(n);
     for _ in 0..n {
         sprites.push(FreeSprite {
@@ -164,6 +168,11 @@ pub fn decode_scene(bytes: &[u8]) -> Result<Scene, WireError> {
             phase: r.u32()?,
             ticks_per_frame: r.u32()?,
             scale_den: r.u32()?,
+            clip: {
+                let has = r.bool()?;
+                let c = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                has.then_some(c)
+            },
         });
     }
     Ok(Scene {
@@ -303,7 +312,8 @@ mod tests {
         s.view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)) };
         s.set(1, 2, 1, 0xABCDEF);
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
-        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: true, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16 });
+        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: true, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, clip: None });
+        s.sprites.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, clip: Some([1, -2, 300, 40]) });
         assert_eq!(decode_scene(&encode_scene(&s)).unwrap(), s);
         let events = vec![
             Input::MouseMove { x: 1, y: -2 },
@@ -317,7 +327,7 @@ mod tests {
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()] };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
-        assert_eq!(decode_scene(&[1, 0, 0, 0, 5]), Err(WireError::Truncated));
-        assert_eq!(decode_input(&[2, 0, 0, 0]), Err(WireError::Version(2)));
+        assert_eq!(decode_scene(&[2, 0, 0, 0, 5]), Err(WireError::Truncated));
+        assert_eq!(decode_input(&[9, 0, 0, 0]), Err(WireError::Version(9)));
     }
 }
