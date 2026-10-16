@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -85,6 +85,7 @@ impl Writer {
         }
         self.i32(v.origin.0);
         self.i32(v.origin.1);
+        self.bool(v.interface_only);
     }
 
     fn sprites(&mut self, sprites: &[FreeSprite]) {
@@ -114,7 +115,8 @@ impl Reader<'_> {
         let has_cull = self.bool()?;
         let cull = (self.i32()?, self.i32()?, self.i32()?, self.i32()?);
         let origin = (self.i32()?, self.i32()?);
-        Ok(View { camera_x, camera_y, zoom, viewport, cull: has_cull.then_some(cull), origin })
+        let interface_only = self.bool()?;
+        Ok(View { camera_x, camera_y, zoom, viewport, cull: has_cull.then_some(cull), origin, interface_only })
     }
 
     fn sprites(&mut self) -> Result<Vec<FreeSprite>, WireError> {
@@ -398,7 +400,7 @@ mod tests {
     fn updates_and_input_round_trip() {
         let mut s = Scene::empty(WorldShape { cols: 3, rows: 2, wrap_x: true, wrap_y: false }, 2);
         s.tick = 7;
-        s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4) };
+        s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false };
         s.set(1, 2, 1, 0xABCDEF);
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
         s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, clip: None });
@@ -426,7 +428,7 @@ mod tests {
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2 };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
-        assert_eq!(decode_updates(&[5, 0, 0, 0, 5]), Err(WireError::Truncated));
+        assert_eq!(decode_updates(&[6, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[9, 0, 0, 0]), Err(WireError::Version(9)));
     }
 }

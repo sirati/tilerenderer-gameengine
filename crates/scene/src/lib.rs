@@ -30,6 +30,8 @@ pub struct View {
     pub cull: Option<(i32, i32, i32, i32)>,
     /// Where the view sits in the window (its top-left, window pixels).
     pub origin: (i32, i32),
+    /// Shows only its overlay, not the world (an interface on top).
+    pub interface_only: bool,
 }
 
 /// Shape of the cell grid (layout and spacing come from the description).
