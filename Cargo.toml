@@ -8,6 +8,8 @@ members = [
     "crates/scene",
     "crates/menu",
     "crates/gdi-text",
+    "crates/wine-unixlib",
+    "crates/civ3r-native",
     "crates/tile-viewer",
     "crates/inproc",
     "crates/civ3-sys",

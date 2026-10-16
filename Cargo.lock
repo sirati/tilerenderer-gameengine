@@ -398,6 +398,7 @@ version = "0.1.0"
 dependencies = [
  "civ3-assets",
  "civ3-sys",
+ "civ3r-native",
  "env_logger",
  "image",
  "inproc",
@@ -408,6 +409,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tile-render",
  "tile-viewer",
+ "wine-unixlib",
 ]
 
 [[package]]
@@ -418,6 +420,20 @@ dependencies = [
  "inproc",
  "log",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "civ3r-native"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "civ3-assets",
+ "env_logger",
+ "log",
+ "render-desc",
+ "scene",
+ "tile-viewer",
+ "wine-unixlib",
 ]
 
 [[package]]
@@ -3348,6 +3364,15 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "wine-unixlib"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "libc",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "winit"

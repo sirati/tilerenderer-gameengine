@@ -254,6 +254,43 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
     Ok(out)
 }
 
+/// What a renderer needs to build its sprites: a render description and
+/// the folders its images are searched in (highest priority first, as the
+/// driver names them).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Assets {
+    pub description: String,
+    pub roots: Vec<String>,
+}
+
+pub fn encode_assets(a: &Assets) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.u32(VERSION);
+    w.u32(a.roots.len() as u32);
+    for r in &a.roots {
+        w.u32(r.len() as u32);
+        w.0.extend_from_slice(r.as_bytes());
+    }
+    w.u32(a.description.len() as u32);
+    w.0.extend_from_slice(a.description.as_bytes());
+    w.0
+}
+
+pub fn decode_assets(bytes: &[u8]) -> Result<Assets, WireError> {
+    let mut r = Reader { bytes };
+    let version = r.u32()?;
+    if version != VERSION {
+        return Err(WireError::Version(version));
+    }
+    let string = |r: &mut Reader| -> Result<String, WireError> {
+        let n = r.len(1)?;
+        Ok(String::from_utf8_lossy(r.take(n)?).into_owned())
+    };
+    let n = r.len(4)?;
+    let roots = (0..n).map(|_| string(&mut r)).collect::<Result<_, _>>()?;
+    Ok(Assets { description: string(&mut r)?, roots })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +315,8 @@ mod tests {
             Input::Quit,
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
+        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()] };
+        assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
         assert_eq!(decode_scene(&[1, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[2, 0, 0, 0]), Err(WireError::Version(2)));
     }
