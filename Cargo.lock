@@ -402,6 +402,7 @@ dependencies = [
  "image",
  "inproc",
  "log",
+ "menu",
  "render-desc",
  "scene",
  "thiserror 2.0.21",

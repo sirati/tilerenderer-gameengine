@@ -212,6 +212,7 @@ impl App {
         surface.configure(&device, &config);
         let mut renderer = TileRenderer::new(&device, config.format);
         renderer.set_atlas(&device, &queue, &self.compiled.atlas);
+        self.link.send_input(Input::Resized { width: config.width, height: config.height });
         self.gpu = Some(Gpu { window, surface, device, queue, config, renderer });
         Ok(())
     }
