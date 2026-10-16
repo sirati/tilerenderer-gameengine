@@ -160,6 +160,10 @@ pub struct LayerDesc {
     /// visible cells before the next one starts.
     #[serde(default)]
     pub pass: u32,
+    /// Point (relative to the cell origin) a camera cull rectangle is
+    /// tested against.
+    #[serde(default)]
+    pub cull_offset: [i32; 2],
 }
 
 fn one() -> u32 {
@@ -266,6 +270,7 @@ impl Description {
             spec.per_cell_phase = layer.per_cell_phase;
             spec.hidden = layer.hidden;
             spec.pass = layer.pass;
+            spec.cull_offset = (layer.cull_offset[0], layer.cull_offset[1]);
             if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
                 return Err(DescError::Unknown { kind: "pass order for layer", name: layer.name.clone() });
             }

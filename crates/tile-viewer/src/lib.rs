@@ -69,7 +69,7 @@ pub fn scene_world(compiled: &Compiled, scene: &Scene) -> TileWorld {
 
 pub fn scene_camera(scene: &Scene, overhang: (u32, u32, u32, u32)) -> Camera {
     let v = scene.view;
-    Camera { x: v.camera_x, y: v.camera_y, zoom: (v.zoom.0.max(1), v.zoom.1.max(1)), viewport: v.viewport, overhang }
+    Camera { x: v.camera_x, y: v.camera_y, zoom: (v.zoom.0.max(1), v.zoom.1.max(1)), viewport: v.viewport, overhang, cull: v.cull }
 }
 
 /// Renders `scene` offscreen (for tests and pixel comparisons).

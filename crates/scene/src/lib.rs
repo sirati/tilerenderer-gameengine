@@ -21,6 +21,9 @@ pub struct View {
     pub zoom: (u32, u32),
     /// Viewport size in screen pixels.
     pub viewport: (u32, u32),
+    /// Draw only cells whose logical anchor lies in this world-pixel
+    /// rectangle (x0, y0, x1, y1), if set (games that clip by tile range).
+    pub cull: Option<(i32, i32, i32, i32)>,
 }
 
 /// Shape of the cell grid (layout and spacing come from the description).
