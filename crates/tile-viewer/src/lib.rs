@@ -284,6 +284,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         drawn_views: Vec::new(),
         world: None,
         drawn_markers: Vec::new(),
+        in_flight: None,
         started: std::time::Instant::now(),
         art_waiting: None,
         error: None,
@@ -327,6 +328,9 @@ struct App {
     /// The renderer's world without the markers, and the markers drawn.
     world: Option<TileWorld>,
     drawn_markers: Vec<tile_render::PlacedSprite>,
+    /// The last frame submitted: the next waits for it, so a slow renderer
+    /// (e.g. a software one) does not pile up frames and their uploads.
+    in_flight: Option<wgpu::SubmissionIndex>,
     started: std::time::Instant,
     /// Since when newer art is waiting for a scene that refers to it.
     art_waiting: Option<std::time::Instant>,
@@ -401,6 +405,12 @@ impl App {
 
     fn draw(&mut self) {
         let Some(gpu) = &mut self.gpu else { return };
+        if let Some(index) = self.in_flight.take() {
+            let wait = wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(Duration::from_secs(2)) };
+            if let Err(e) = gpu.device.poll(wait) {
+                log::debug!("viewer: waiting for the last frame: {e}");
+            }
+        }
         let (version, compiled) = self.assets.current();
         // New art is taken together with a scene that refers to it (sprite
         // ids change with every compile), or when none came for a while.
@@ -478,7 +488,7 @@ impl App {
         let target = &frame.texture;
         let (cameras, copies) = (&arranged.cameras, &arranged.copies);
         gpu.renderer.render_composed(&gpu.device, &gpu.queue, &mut encoder, target, cameras, copies, scene.tick, self.config.clear);
-        gpu.queue.submit([encoder.finish()]);
+        self.in_flight = Some(gpu.queue.submit([encoder.finish()]));
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
     }
