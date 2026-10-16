@@ -1,4 +1,4 @@
-//! A window that shows a [`scene::Link`]'s latest scene, drawn with a
+//! A window that draws a [`scene::Display`]'s scene (every view of it) with a
 //! compiled render description, and sends the user's input back.
 //!
 //! Nothing here knows which game it is showing.
@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use render_desc::Compiled;
-use scene::{Input, Link, Scene};
+use scene::{Display, Input, Scene};
 use tile_render::{Camera, RgbaImage, TileRenderer, TileWorld};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -68,7 +68,9 @@ impl Assets {
     }
 }
 
-/// Turns a scene into the renderer's world and camera.
+/// Turns a scene into the renderer's world: cells, the world's sprites
+/// (drawn in every view) and each view's overlay (drawn in that view, see
+/// [`scene_cameras`] for the view order).
 pub fn scene_world(compiled: &Compiled, scene: &Scene) -> TileWorld {
     let s = scene.shape;
     let mut world = compiled.world(s.cols.max(1), s.rows.max(1), s.wrap_x, s.wrap_y);
@@ -86,32 +88,50 @@ pub fn scene_world(compiled: &Compiled, scene: &Scene) -> TileWorld {
             }
         }
     }
-    world.free = scene
-        .sprites
-        .iter()
-        .map(|s| tile_render::PlacedSprite {
-            set: tile_render::SpriteSetId::from_raw(s.set),
-            x: s.x,
-            y: s.y,
-            screen: s.screen,
-            after_pass: s.after_pass as usize,
-            phase: s.phase,
-            ticks_per_frame: s.ticks_per_frame.max(1),
-            blend: if s.scale_den == 0 { tile_render::Blend::Alpha } else { tile_render::Blend::Scale { denominator: s.scale_den } },
-            clip: s.clip,
-        })
-        .collect();
+    let placed = |s: &scene::FreeSprite, view: Option<u32>| tile_render::PlacedSprite {
+        set: tile_render::SpriteSetId::from_raw(s.set),
+        x: s.x,
+        y: s.y,
+        screen: s.screen,
+        after_pass: s.after_pass as usize,
+        phase: s.phase,
+        ticks_per_frame: s.ticks_per_frame.max(1),
+        blend: if s.scale_den == 0 { tile_render::Blend::Alpha } else { tile_render::Blend::Scale { denominator: s.scale_den } },
+        clip: s.clip,
+        view,
+    };
+    world.free = scene.sprites.iter().map(|s| placed(s, None)).collect();
+    for (i, v) in scene.views.iter().enumerate() {
+        world.free.extend(v.overlay.iter().map(|s| placed(s, Some(i as u32))));
+    }
     world
 }
 
-pub fn scene_camera(scene: &Scene, overhang: (u32, u32, u32, u32)) -> Camera {
-    let v = scene.view;
-    Camera { x: v.camera_x, y: v.camera_y, zoom: (v.zoom.0.max(1), v.zoom.1.max(1)), viewport: v.viewport, overhang, cull: v.cull }
+/// The cameras of the scene's views, in its view order. A view with an
+/// empty viewport fills `window`.
+pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32, u32)) -> Vec<Camera> {
+    scene
+        .views
+        .iter()
+        .map(|v| {
+            let v = v.view;
+            let viewport = if v.viewport.0 == 0 || v.viewport.1 == 0 { window } else { v.viewport };
+            Camera {
+                x: v.camera_x,
+                y: v.camera_y,
+                zoom: (v.zoom.0.max(1), v.zoom.1.max(1)),
+                viewport,
+                overhang,
+                cull: v.cull,
+                origin: v.origin,
+            }
+        })
+        .collect()
 }
 
-/// Writes the scene's run-time sprite pixels into the atlas.
-fn apply_patches(renderer: &TileRenderer, queue: &wgpu::Queue, scene: &Scene) {
-    for p in &scene.patches {
+/// Writes run-time sprite pixels into the atlas.
+fn apply_patches<'p>(renderer: &TileRenderer, queue: &wgpu::Queue, patches: impl IntoIterator<Item = &'p scene::Patch>) {
+    for p in patches {
         if p.rgba.len() != (p.width * p.height * 4) as usize {
             continue;
         }
@@ -125,24 +145,26 @@ fn apply_patches(renderer: &TileRenderer, queue: &wgpu::Queue, scene: &Scene) {
     }
 }
 
-/// Renders `scene` offscreen (for tests and pixel comparisons).
+/// Renders every view of `scene` into an offscreen target of `size` (for
+/// tests and pixel comparisons).
 pub fn render_offscreen(
     gpu: &tile_render::Headless,
     compiled: &Compiled,
     scene: &Scene,
+    size: (u32, u32),
     config: &ViewerConfig,
 ) -> RgbaImage {
     let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world(compiled, scene));
-    apply_patches(&renderer, &gpu.queue, scene);
-    gpu.render(&mut renderer, &scene_camera(scene, config.overhang), scene.tick, config.clear)
+    apply_patches(&renderer, &gpu.queue, &scene.patches);
+    gpu.render_views(&mut renderer, &scene_cameras(scene, size, config.overhang), size, scene.tick, config.clear)
 }
 
-/// Opens the window and runs until it is closed. Blocks the calling thread,
-/// which need not be the process's main thread (the viewer usually runs
-/// inside someone else's process).
-pub fn run(config: ViewerConfig, assets: Assets, link: Link) -> Result<(), ViewerError> {
+/// Opens the window and runs until it is closed, drawing what `display`
+/// receives. Blocks the calling thread, which need not be the process's
+/// main thread (the viewer usually runs inside someone else's process).
+pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(), ViewerError> {
     let mut builder = EventLoop::builder();
     #[cfg(windows)]
     winit::platform::windows::EventLoopBuilderExtWindows::with_any_thread(&mut builder, true);
@@ -156,9 +178,10 @@ pub fn run(config: ViewerConfig, assets: Assets, link: Link) -> Result<(), Viewe
         assets,
         assets_version,
         compiled,
-        link,
+        display,
         gpu: None,
-        last_seq: 0,
+        drawn_seq: 0,
+        patches: std::collections::BTreeMap::new(),
         input: input::InputState::default(),
         error: None,
     };
@@ -180,9 +203,13 @@ struct App {
     assets: Assets,
     assets_version: u64,
     compiled: Arc<Compiled>,
-    link: Link,
+    display: Display,
     gpu: Option<Gpu>,
-    last_seq: u64,
+    /// The scene version the renderer's world was built from.
+    drawn_seq: u64,
+    /// The latest pixels of every patched sprite (written again into a new
+    /// atlas).
+    patches: std::collections::BTreeMap<u32, scene::Patch>,
     input: input::InputState,
     error: Option<ViewerError>,
 }
@@ -230,7 +257,7 @@ impl App {
         surface.configure(&device, &config);
         let mut renderer = TileRenderer::new(&device, config.format);
         renderer.set_atlas(&device, &queue, &self.compiled.atlas);
-        self.link.send_input(Input::Resized { width: config.width, height: config.height });
+        self.display.send_input(Input::Resized { width: config.width, height: config.height });
         self.gpu = Some(Gpu { window, surface, device, queue, config, renderer });
         Ok(())
     }
@@ -245,18 +272,22 @@ impl App {
             self.compiled = compiled;
             self.assets_version = version;
         }
-        let Some(scene) = self.link.latest() else { return };
-        let changed = new_assets || scene.seq != self.last_seq;
+        for p in self.display.take_patches() {
+            self.patches.insert(p.sprite, p);
+        }
+        let scene = self.display.scene();
+        if scene.seq == 0 {
+            return;
+        }
         if new_assets {
-            gpu.renderer.set_world(&gpu.device, &scene_world(&self.compiled, &scene));
-            self.last_seq = scene.seq;
-        } else if scene.seq != self.last_seq {
-            gpu.renderer.update_world(&gpu.device, &gpu.queue, &scene_world(&self.compiled, &scene));
-            self.last_seq = scene.seq;
+            gpu.renderer.set_world(&gpu.device, &scene_world(&self.compiled, scene));
+        } else if scene.seq != self.drawn_seq {
+            gpu.renderer.update_world(&gpu.device, &gpu.queue, &scene_world(&self.compiled, scene));
         }
-        if changed {
-            apply_patches(&gpu.renderer, &gpu.queue, &scene);
+        if new_assets || scene.seq != self.drawn_seq {
+            apply_patches(&gpu.renderer, &gpu.queue, self.patches.values());
         }
+        self.drawn_seq = scene.seq;
         let frame = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -268,10 +299,9 @@ impl App {
                 return;
             }
         };
-        let mut camera = scene_camera(&scene, self.config.overhang);
-        camera.viewport = (gpu.config.width, gpu.config.height);
+        let cameras = scene_cameras(scene, (gpu.config.width, gpu.config.height), self.config.overhang);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        gpu.renderer.render(&gpu.device, &gpu.queue, &mut encoder, &frame.texture, &camera, scene.tick, self.config.clear);
+        gpu.renderer.render_views(&gpu.device, &gpu.queue, &mut encoder, &frame.texture, &cameras, scene.tick, self.config.clear);
         gpu.queue.submit([encoder.finish()]);
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
@@ -292,11 +322,11 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match &event {
             WindowEvent::CloseRequested => {
-                self.link.send_input(Input::Quit);
+                self.display.send_input(Input::Quit);
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                self.link.send_input(Input::Resized { width: size.width, height: size.height });
+                self.display.send_input(Input::Resized { width: size.width, height: size.height });
                 if let Some(gpu) = &mut self.gpu {
                     gpu.config.width = size.width.max(1);
                     gpu.config.height = size.height.max(1);
@@ -307,15 +337,16 @@ impl ApplicationHandler for App {
             _ => {}
         }
         for input in self.input.translate(&event) {
-            self.link.send_input(input);
+            self.display.send_input(input);
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Redraw when the driver published something new (or the animation
-        // clock may have advanced); otherwise idle briefly.
+        // Take what the driver sent (waiting a frame's time for it), then
+        // redraw: the animation clock moves on even without updates.
+        self.display.receive(Duration::from_millis(16));
         if let Some(gpu) = &self.gpu {
-            if self.link.wait_newer(self.last_seq, Duration::from_millis(16)).is_some() || self.last_seq != 0 {
+            if self.display.scene().seq != 0 {
                 gpu.window.request_redraw();
             }
         }

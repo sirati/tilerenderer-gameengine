@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Button, FreeSprite, Input, LayerCells, Patch, Scene, View, WorldShape};
+use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -28,9 +28,6 @@ impl Writer {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn i32(&mut self, v: i32) {
-        self.0.extend_from_slice(&v.to_le_bytes());
-    }
-    fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn bool(&mut self, v: bool) {
@@ -60,9 +57,6 @@ impl<'a> Reader<'a> {
     fn i32(&mut self) -> Result<i32, WireError> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn u64(&mut self) -> Result<u64, WireError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
     fn bool(&mut self) -> Result<bool, WireError> {
         Ok(self.u8()? != 0)
     }
@@ -76,129 +70,203 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Encodes a scene.
-pub fn encode_scene(s: &Scene) -> Vec<u8> {
+impl Writer {
+    fn view(&mut self, v: &View) {
+        self.i32(v.camera_x);
+        self.i32(v.camera_y);
+        self.u32(v.zoom.0);
+        self.u32(v.zoom.1);
+        self.u32(v.viewport.0);
+        self.u32(v.viewport.1);
+        self.bool(v.cull.is_some());
+        let (x0, y0, x1, y1) = v.cull.unwrap_or_default();
+        for c in [x0, y0, x1, y1] {
+            self.i32(c);
+        }
+        self.i32(v.origin.0);
+        self.i32(v.origin.1);
+    }
+
+    fn sprites(&mut self, sprites: &[FreeSprite]) {
+        self.u32(sprites.len() as u32);
+        for f in sprites {
+            self.u32(f.set);
+            self.i32(f.x);
+            self.i32(f.y);
+            self.bool(f.screen);
+            self.u32(f.after_pass);
+            self.u32(f.phase);
+            self.u32(f.ticks_per_frame);
+            self.u32(f.scale_den);
+            self.bool(f.clip.is_some());
+            for c in f.clip.unwrap_or_default() {
+                self.i32(c);
+            }
+        }
+    }
+}
+
+impl Reader<'_> {
+    fn view(&mut self) -> Result<View, WireError> {
+        let (camera_x, camera_y) = (self.i32()?, self.i32()?);
+        let zoom = (self.u32()?, self.u32()?);
+        let viewport = (self.u32()?, self.u32()?);
+        let has_cull = self.bool()?;
+        let cull = (self.i32()?, self.i32()?, self.i32()?, self.i32()?);
+        let origin = (self.i32()?, self.i32()?);
+        Ok(View { camera_x, camera_y, zoom, viewport, cull: has_cull.then_some(cull), origin })
+    }
+
+    fn sprites(&mut self) -> Result<Vec<FreeSprite>, WireError> {
+        let n = self.len(46)?;
+        (0..n)
+            .map(|_| {
+                Ok(FreeSprite {
+                    set: self.u32()?,
+                    x: self.i32()?,
+                    y: self.i32()?,
+                    screen: self.bool()?,
+                    after_pass: self.u32()?,
+                    phase: self.u32()?,
+                    ticks_per_frame: self.u32()?,
+                    scale_den: self.u32()?,
+                    clip: {
+                        let has = self.bool()?;
+                        let c = [self.i32()?, self.i32()?, self.i32()?, self.i32()?];
+                        has.then_some(c)
+                    },
+                })
+            })
+            .collect()
+    }
+}
+
+/// Encodes a batch of updates.
+pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
     let mut w = Writer::default();
     w.u32(VERSION);
-    w.u64(s.seq);
-    w.u32(s.tick);
-    let v = &s.view;
-    w.i32(v.camera_x);
-    w.i32(v.camera_y);
-    w.u32(v.zoom.0);
-    w.u32(v.zoom.1);
-    w.u32(v.viewport.0);
-    w.u32(v.viewport.1);
-    w.bool(v.cull.is_some());
-    let (x0, y0, x1, y1) = v.cull.unwrap_or_default();
-    for c in [x0, y0, x1, y1] {
-        w.i32(c);
-    }
-    w.u32(s.shape.cols);
-    w.u32(s.shape.rows);
-    w.bool(s.shape.wrap_x);
-    w.bool(s.shape.wrap_y);
-    w.u32(s.layers.len() as u32);
-    for l in &s.layers {
-        w.u32(l.values.len() as u32);
-        for &v in &l.values {
-            w.u32(v);
+    w.u32(updates.len() as u32);
+    for u in updates {
+        match u {
+            Update::World { shape, layers } => {
+                w.u8(0);
+                w.u32(shape.cols);
+                w.u32(shape.rows);
+                w.bool(shape.wrap_x);
+                w.bool(shape.wrap_y);
+                w.u32(layers.len() as u32);
+                for l in layers {
+                    w.u32(l.values.len() as u32);
+                    for &v in &l.values {
+                        w.u32(v);
+                    }
+                    w.bool(l.phases.is_some());
+                    if let Some(p) = &l.phases {
+                        w.u32(p.len() as u32);
+                        w.0.extend_from_slice(p);
+                    }
+                }
+            }
+            Update::Cells(cells) => {
+                w.u8(1);
+                w.u32(cells.len() as u32);
+                for &(l, i, v) in cells {
+                    w.u32(l);
+                    w.u32(i);
+                    w.u32(v);
+                }
+            }
+            Update::Sprites(sprites) => {
+                w.u8(2);
+                w.sprites(sprites);
+            }
+            Update::View { id, view } => {
+                w.u8(3);
+                w.u32(*id);
+                w.bool(view.is_some());
+                if let Some(v) = view {
+                    w.view(v);
+                }
+            }
+            Update::Overlay { view, sprites } => {
+                w.u8(4);
+                w.u32(*view);
+                w.sprites(sprites);
+            }
+            Update::Patches(patches) => {
+                w.u8(5);
+                w.u32(patches.len() as u32);
+                for p in patches {
+                    w.u32(p.sprite);
+                    w.u32(p.width);
+                    w.u32(p.height);
+                    w.u32(p.rgba.len() as u32);
+                    w.0.extend_from_slice(&p.rgba);
+                }
+            }
+            Update::Tick(t) => {
+                w.u8(6);
+                w.u32(*t);
+            }
         }
-        w.bool(l.phases.is_some());
-        if let Some(p) = &l.phases {
-            w.u32(p.len() as u32);
-            w.0.extend_from_slice(p);
-        }
-    }
-    w.u32(s.sprites.len() as u32);
-    for f in &s.sprites {
-        w.u32(f.set);
-        w.i32(f.x);
-        w.i32(f.y);
-        w.bool(f.screen);
-        w.u32(f.after_pass);
-        w.u32(f.phase);
-        w.u32(f.ticks_per_frame);
-        w.u32(f.scale_den);
-        w.bool(f.clip.is_some());
-        for c in f.clip.unwrap_or_default() {
-            w.i32(c);
-        }
-    }
-    w.u32(s.patches.len() as u32);
-    for p in &s.patches {
-        w.u32(p.sprite);
-        w.u32(p.width);
-        w.u32(p.height);
-        w.u32(p.rgba.len() as u32);
-        w.0.extend_from_slice(&p.rgba);
     }
     w.0
 }
 
-/// Decodes a scene.
-pub fn decode_scene(bytes: &[u8]) -> Result<Scene, WireError> {
+/// Decodes a batch of updates.
+pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
     let mut r = Reader { bytes };
     let version = r.u32()?;
     if version != VERSION {
         return Err(WireError::Version(version));
     }
-    let seq = r.u64()?;
-    let tick = r.u32()?;
-    let (camera_x, camera_y) = (r.i32()?, r.i32()?);
-    let zoom = (r.u32()?, r.u32()?);
-    let viewport = (r.u32()?, r.u32()?);
-    let has_cull = r.bool()?;
-    let cull = (r.i32()?, r.i32()?, r.i32()?, r.i32()?);
-    let shape = WorldShape { cols: r.u32()?, rows: r.u32()?, wrap_x: r.bool()?, wrap_y: r.bool()? };
-    let n = r.len(5)?;
-    let mut layers = Vec::with_capacity(n);
+    let n = r.len(1)?;
+    let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        let m = r.len(4)?;
-        let values = (0..m).map(|_| r.u32()).collect::<Result<_, _>>()?;
-        let phases = if r.bool()? {
-            let k = r.len(1)?;
-            Some(r.take(k)?.to_vec())
-        } else {
-            None
-        };
-        layers.push(LayerCells { values, phases });
-    }
-    let n = r.len(46)?;
-    let mut sprites = Vec::with_capacity(n);
-    for _ in 0..n {
-        sprites.push(FreeSprite {
-            set: r.u32()?,
-            x: r.i32()?,
-            y: r.i32()?,
-            screen: r.bool()?,
-            after_pass: r.u32()?,
-            phase: r.u32()?,
-            ticks_per_frame: r.u32()?,
-            scale_den: r.u32()?,
-            clip: {
-                let has = r.bool()?;
-                let c = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-                has.then_some(c)
-            },
+        out.push(match r.u8()? {
+            0 => {
+                let shape = WorldShape { cols: r.u32()?, rows: r.u32()?, wrap_x: r.bool()?, wrap_y: r.bool()? };
+                let n = r.len(5)?;
+                let mut layers = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let m = r.len(4)?;
+                    let values = (0..m).map(|_| r.u32()).collect::<Result<_, _>>()?;
+                    let phases = if r.bool()? {
+                        let k = r.len(1)?;
+                        Some(r.take(k)?.to_vec())
+                    } else {
+                        None
+                    };
+                    layers.push(LayerCells { values, phases });
+                }
+                Update::World { shape, layers }
+            }
+            1 => {
+                let n = r.len(12)?;
+                Update::Cells((0..n).map(|_| Ok((r.u32()?, r.u32()?, r.u32()?))).collect::<Result<_, WireError>>()?)
+            }
+            2 => Update::Sprites(r.sprites()?),
+            3 => {
+                let id = r.u32()?;
+                let view = if r.bool()? { Some(r.view()?) } else { None };
+                Update::View { id, view }
+            }
+            4 => Update::Overlay { view: r.u32()?, sprites: r.sprites()? },
+            5 => {
+                let n = r.len(16)?;
+                let mut patches = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let (sprite, width, height) = (r.u32()?, r.u32()?, r.u32()?);
+                    let k = r.len(1)?;
+                    patches.push(Patch { sprite, width, height, rgba: r.take(k)?.to_vec() });
+                }
+                Update::Patches(patches)
+            }
+            6 => Update::Tick(r.u32()?),
+            t => return Err(WireError::Tag(t)),
         });
     }
-    let n = r.len(16)?;
-    let mut patches = Vec::with_capacity(n);
-    for _ in 0..n {
-        let (sprite, width, height) = (r.u32()?, r.u32()?, r.u32()?);
-        let k = r.len(1)?;
-        patches.push(Patch { sprite, width, height, rgba: r.take(k)?.to_vec() });
-    }
-    Ok(Scene {
-        seq,
-        tick,
-        view: View { camera_x, camera_y, zoom, viewport, cull: has_cull.then_some(cull) },
-        shape,
-        layers,
-        sprites,
-        patches,
-    })
+    Ok(out)
 }
 
 /// Encodes input events.
@@ -324,19 +392,28 @@ pub fn decode_assets(bytes: &[u8]) -> Result<Assets, WireError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Scene;
 
     #[test]
-    fn scenes_and_input_round_trip() {
+    fn updates_and_input_round_trip() {
         let mut s = Scene::empty(WorldShape { cols: 3, rows: 2, wrap_x: true, wrap_y: false }, 2);
-        s.seq = 99;
         s.tick = 7;
-        s.view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)) };
+        s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4) };
         s.set(1, 2, 1, 0xABCDEF);
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
-        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: true, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, clip: None });
-        s.sprites.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, clip: Some([1, -2, 300, 40]) });
+        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, clip: None });
+        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, clip: Some([1, -2, 300, 40]) });
         s.patches.push(Patch { sprite: 7, width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
-        assert_eq!(decode_scene(&encode_scene(&s)).unwrap(), s);
+        let mut updates = s.updates_since(&Scene::default());
+        updates.push(Update::Cells(vec![(1, 0, 9)]));
+        updates.push(Update::View { id: 2, view: None });
+        assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
+        let mut got = Scene::default();
+        for u in decode_updates(&encode_updates(&updates)).unwrap() {
+            got.apply(u);
+        }
+        assert_eq!(got.layers[1].values[0], 9);
+        assert_eq!(got.views.len(), 1);
         let events = vec![
             Input::MouseMove { x: 1, y: -2 },
             Input::MouseButton { button: Button::Right, down: true, x: 3, y: 4 },
@@ -349,7 +426,7 @@ mod tests {
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], scale_down: 2 };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
-        assert_eq!(decode_scene(&[4, 0, 0, 0, 5]), Err(WireError::Truncated));
+        assert_eq!(decode_updates(&[5, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[9, 0, 0, 0]), Err(WireError::Version(9)));
     }
 }
