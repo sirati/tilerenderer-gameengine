@@ -273,10 +273,18 @@ pub struct LayerDesc {
     pub sets: Vec<String>,
     #[serde(default)]
     pub offset: [i32; 2],
+    /// Clock ticks per animation frame; 0: a cell shows the frame its phase
+    /// says, whatever the clock.
     #[serde(default = "one")]
     pub ticks_per_frame: u32,
     #[serde(default)]
     pub per_cell_phase: bool,
+    /// Cells carry a pixel offset each (`TileWorld::set_offset`).
+    #[serde(default)]
+    pub per_cell_offset: bool,
+    /// The pass sweeps rows right to left (all layers of a pass must agree).
+    #[serde(default)]
+    pub descending: bool,
     #[serde(default)]
     pub hidden: bool,
     /// Render pass; layers must be listed in pass order. Each pass sweeps all
@@ -561,6 +569,44 @@ fn outline(sprite: &RgbaImage, width: u32, color: [u8; 4]) -> RgbaImage {
     })
 }
 
+/// `source = "rects:WxH;R,G,B,A:X,Y,W,H;..."`: a clear `W × H` image with
+/// rectangles filled in order (later ones over earlier ones), each given as
+/// its colour and its top-left and size; `R,G,B,A:X,Y,W,H*N,DX,DY` fills it
+/// `N` times, each copy moved by `(DX, DY)` from the one before (a column
+/// of bars, say). Parts outside the image are left out. For pictures made
+/// of a few rectangles (bars, frames, lines) that a driver describes.
+fn rects(spec: &str) -> Result<RgbaImage, String> {
+    let err = |what: &str| format!("rects image: {what} (expected WxH;R,G,B,A:X,Y,W,H[*N,DX,DY];...)");
+    let mut items = spec.split(';').map(str::trim).filter(|s| !s.is_empty());
+    let size = items.next().ok_or_else(|| err("no size"))?;
+    let (w, h) = size.split_once('x').ok_or_else(|| err(size))?;
+    let (w, h): (u32, u32) = (w.parse().map_err(|_| err(size))?, h.parse().map_err(|_| err(size))?);
+    let mut img = RgbaImage::from_fn(w, h, |_, _| [0; 4]);
+    let numbers = |s: &str, n: usize| -> Result<Vec<i32>, String> {
+        let v: Vec<i32> = s.split(',').map(|v| v.trim().parse().map_err(|_| err(s))).collect::<Result<_, _>>()?;
+        if v.len() == n { Ok(v) } else { Err(err(s)) }
+    };
+    for item in items {
+        let (color, rest) = item.split_once(':').ok_or_else(|| err(item))?;
+        let c = numbers(color, 4)?;
+        let color = [0, 1, 2, 3].map(|i| c[i].clamp(0, 255) as u8);
+        let (rect, repeat) = match rest.split_once('*') {
+            Some((rect, repeat)) => (rect, numbers(repeat, 3)?),
+            None => (rest, vec![1, 0, 0]),
+        };
+        let r = numbers(rect, 4)?;
+        for k in 0..repeat[0].max(0) {
+            let (x0, y0) = (r[0] + k * repeat[1], r[1] + k * repeat[2]);
+            for y in y0.max(0)..(y0 + r[3]).min(h as i32) {
+                for x in x0.max(0)..(x0 + r[2]).min(w as i32) {
+                    img.put(x as u32, y as u32, color);
+                }
+            }
+        }
+    }
+    Ok(img)
+}
+
 /// `source = "line:R,G,B,A:DX,DY:W"`: a line `W` pixels thick from a start
 /// point to the point `(DX, DY)` away, mostly horizontal (`|DY| <= |DX|`),
 /// rasterized like simple software renderers do: every column from the
@@ -716,8 +762,8 @@ impl Description {
             options.extend(self.blank_loader.clone());
             options.extend(image_blank);
         }
-        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 6] =
-            [("solid:", solid), ("line:", line), ("arrow:", arrow), ("crosshair:", crosshair), ("panes:", panes), ("pointer:", pointer)];
+        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 7] =
+            [("solid:", solid), ("line:", line), ("arrow:", arrow), ("crosshair:", crosshair), ("panes:", panes), ("pointer:", pointer), ("rects:", rects)];
         let generated = generators.iter().find_map(|(prefix, make)| img.source.strip_prefix(prefix).map(make));
         let image_error = |message: String| DescError::Image { name: name.to_owned(), message };
         Ok(match generated {
@@ -729,7 +775,7 @@ impl Description {
     /// The sizes of image `name`'s frames, without its pixels where the
     /// loader can tell them so (see [`ImageLoader::sizes`]).
     fn frame_sizes(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc) -> Result<Vec<(u32, u32)>, DescError> {
-        let generated = ["solid:", "line:", "arrow:", "crosshair:", "panes:", "pointer:"].iter().any(|p| img.source.starts_with(p));
+        let generated = ["solid:", "line:", "arrow:", "crosshair:", "panes:", "pointer:", "rects:"].iter().any(|p| img.source.starts_with(p));
         if generated {
             return Ok(self.load_frames(loader, name, img, false)?.iter().map(|f| (f.width, f.height)).collect());
         }
@@ -997,8 +1043,10 @@ impl Description {
             }
             let mut spec = LayerSpec::new(layer.name.clone(), lut);
             spec.offset = (layer.offset[0], layer.offset[1]);
-            spec.ticks_per_frame = layer.ticks_per_frame.max(1);
+            spec.ticks_per_frame = layer.ticks_per_frame;
             spec.per_cell_phase = layer.per_cell_phase;
+            spec.per_cell_offset = layer.per_cell_offset;
+            spec.descending = layer.descending;
             spec.hidden = layer.hidden;
             spec.pass = layer.pass;
             spec.cull_offset = (layer.cull_offset[0], layer.cull_offset[1]);
@@ -1006,6 +1054,9 @@ impl Description {
                 .ok_or_else(|| DescError::Unknown { kind: "blend (scale denominator 1..=32) of layer", name: layer.name.clone() })?;
             if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
                 return Err(DescError::Unknown { kind: "pass order for layer", name: layer.name.clone() });
+            }
+            if layers.last().is_some_and(|l: &LayerSpec| l.pass == spec.pass && l.descending != spec.descending) {
+                return Err(DescError::Unknown { kind: "column order (all layers of a pass must agree) for layer", name: layer.name.clone() });
             }
             layers.push(spec);
         }
@@ -1272,6 +1323,61 @@ mod tests {
         let last = (0..14).filter(|&x| p.get(x, 20) == white).collect::<Vec<_>>();
         assert!(!last.is_empty() && last[0] > 4, "{last:?}");
         assert!(pointer("1,2,3,4:3x9").is_err());
+    }
+
+    #[test]
+    fn rects_fill_in_order_and_repeat() {
+        let img = rects("4x6; 0,0,0,255:1,0,2,6; 0,255,0,255:1,4,2,1*3,0,-2; 9,9,9,255:3,5,5,5").unwrap();
+        assert_eq!((img.width, img.height), (4, 6));
+        let col: Vec<[u8; 4]> = (0..6).map(|y| img.get(1, y)).collect();
+        let (k, g) = ([0, 0, 0, 255], [0, 255, 0, 255]);
+        assert_eq!(col, vec![g, k, g, k, g, k]);
+        assert_eq!((img.get(0, 3), img.get(3, 5), img.get(3, 4)), ([0; 4], [9, 9, 9, 255], [0; 4]));
+        assert!(rects("4x6; 1,2,3:0,0,1,1").is_err());
+        assert!(rects("").is_err());
+    }
+
+    #[test]
+    fn layers_may_carry_offsets_follow_phases_and_sweep_right_to_left() {
+        let d = Description::parse(
+            r#"
+            grid = { layout = "staggered", step = [64, 32] }
+            [images.a]
+            source = "a.pcx"
+            [sheets.s]
+            image = "a"
+            cell = [10, 10]
+            [[layers]]
+            name = "units"
+            sets = ["s/*"]
+            pass = 2
+            per_cell_offset = true
+            per_cell_phase = true
+            ticks_per_frame = 0
+            descending = true
+            "#,
+        )
+        .unwrap();
+        let c = d.compile(&Checker, 256).unwrap();
+        let l = &c.layers[0];
+        assert_eq!((l.per_cell_offset, l.per_cell_phase, l.ticks_per_frame, l.descending), (true, true, 0, true));
+        let mut w = c.world(3, 3, true, false);
+        w.set_offset(tile_render::LayerId(0), 1, 2, (-3, 4));
+        assert!(w.passes()[0].descending);
+        let mixed = Description::parse(
+            r#"
+            grid = { layout = "staggered", step = [64, 32] }
+            [[layers]]
+            name = "a"
+            sets = []
+            [[layers]]
+            name = "b"
+            sets = []
+            descending = true
+            "#,
+        )
+        .unwrap();
+        assert!(mixed.compile(&Checker, 256).is_err(), "the layers of a pass sweep it one way");
     }
 
     struct Checker;
