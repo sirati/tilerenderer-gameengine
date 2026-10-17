@@ -293,7 +293,7 @@ pub struct Interface {
 /// the part of the screen that matters (`screen`, x, y, w, h in the
 /// driver's window pixels, e.g. a dialog) goes to one edge of the window,
 /// its interface moved with it (pointer input mapped back), and the
-/// world, all of it, fitted into the rest (shown as small as it takes,
+/// world (all of it, or the part `world` names) fitted into the rest (shown as small as it takes,
 /// see `View::downscale`). The world is not the driver's view then: pointer
 /// input on it does not reach the driver.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -301,6 +301,11 @@ pub struct Beside {
     pub screen: [i32; 4],
     /// The window edge the screen goes to.
     pub edge: Edge,
+    /// The part of the world to fit into the rest (x, y, w, h in world
+    /// pixels as the driver's views show it at full size, e.g. what a
+    /// preview has revealed; it may reach past the edge of a world that
+    /// wraps): all of the world if none.
+    pub world: Option<[i32; 4]>,
 }
 
 /// An edge of the window.

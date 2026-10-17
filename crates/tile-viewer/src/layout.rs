@@ -747,19 +747,19 @@ fn beside_geometry(beside: scene::Beside, window: (u32, u32)) -> ((i32, i32), [i
     ((to.0 - sx, to.1 - sy), [world[0], world[1], world[2].max(0), world[3].max(0)])
 }
 
-/// A camera showing all of a world of `bounds` (the pixels of `camera`'s
-/// world, at downscale 1) in `rect`, centred: the world shown `n` times
-/// smaller (`Camera::downscale`) and then zoomed by the fraction that makes
-/// it fit. `n` divides the grid's steps (`step`; the cells of a world shown
-/// smaller lie on whole pixels), the one nearest to fitting either way
-/// (zoomed least). A world the driver shows smaller itself (its view's
-/// downscale, e.g. with sprites laid out for it) is only zoomed. Staggered
-/// rows reach a step further right than the columns.
-fn fit_world(camera: &Camera, bounds: WorldBounds, rect: [i32; 4], step: (u32, u32)) -> Camera {
-    // (`bounds` are in the pixels of the world as the driver shows it.)
+/// A camera showing the part `area` (x, y, w, h) of a world (the pixels of
+/// `camera`'s world, at downscale 1; [`whole_world`]: all of it) in `rect`,
+/// centred: the world shown `n` times smaller (`Camera::downscale`) and
+/// then zoomed by the fraction that makes it fit. `n` divides the grid's
+/// steps (`step`; the cells of a world shown smaller lie on whole pixels),
+/// the one nearest to fitting either way (zoomed least). A world the driver
+/// shows smaller itself (its view's downscale, e.g. with sprites laid out
+/// for it) is only zoomed.
+fn fit_world(camera: &Camera, area: [i32; 4], rect: [i32; 4], step: (u32, u32)) -> Camera {
+    // (`area` is in the pixels of the world as the driver shows it.)
     let shown = camera.downscale.max(1);
     let step = (step.0 / shown, step.1 / shown);
-    let (ww, wh) = ((bounds.size.0 as i64 + step.0 as i64).max(1), (bounds.size.1 as i64).max(1));
+    let (ww, wh) = ((area[2] as i64).max(1), (area[3] as i64).max(1));
     let (rw, rh) = (rect[2].max(1) as i64, rect[3].max(1) as i64);
     // The zoom showing the world n times smaller in the rectangle: the
     // smaller of the two ratios, as a fraction.
@@ -779,7 +779,7 @@ fn fit_world(camera: &Camera, bounds: WorldBounds, rect: [i32; 4], step: (u32, u
     let zoom = ((a / g) as u32, (b / g) as u32);
     // The rectangle in the view's own pixels, the world in the middle.
     let (source_w, source_h) = (rw * zoom.1 as i64 / zoom.0 as i64, rh * zoom.1 as i64 / zoom.0 as i64);
-    let (x, y) = ((ww / n - source_w) / 2, (wh / n - source_h) / 2);
+    let (x, y) = (area[0] as i64 / n + (ww / n - source_w) / 2, area[1] as i64 / n + (wh / n - source_h) / 2);
     Camera {
         x: x as i32,
         y: y as i32,
@@ -791,6 +791,13 @@ fn fit_world(camera: &Camera, bounds: WorldBounds, rect: [i32; 4], step: (u32, u
         downscale: shown * n as u32,
         ..*camera
     }
+}
+
+/// All of a world of `bounds` for [`fit_world`] (in the pixels of a view
+/// showing it `shown` times smaller): staggered rows reach a step (`step`,
+/// at full size) further right than the columns.
+fn whole_world(bounds: WorldBounds, step: (u32, u32), shown: u32) -> [i32; 4] {
+    [0, 0, bounds.size.0 + (step.0 / shown.max(1)) as i32, bounds.size.1]
 }
 
 fn gcd(a: u32, b: u32) -> u32 {
@@ -1897,7 +1904,10 @@ impl Layout {
         // The world: the driver's first world view, all of it, fitted.
         let main = scene.views.iter().position(|v| !v.view.interface_only);
         if let (Some(m), Some(b)) = (main, bounds.filter(|_| world[2] > 0 && world[3] > 0)) {
-            let mut camera = fit_world(&base[m], b, world, self.grid_step);
+            // (What the driver names of it, at the scale its view shows it.)
+            let shown = base[m].downscale.max(1) as i32;
+            let area = beside.world.map_or_else(|| whole_world(b, self.grid_step, shown as u32), |[x, y, w, h]| [x / shown, y / shown, w / shown, h / shown]);
+            let mut camera = fit_world(&base[m], area, world, self.grid_step);
             // (Text comes as drawn at 1:1 and is shown at the view's zoom: drawn
             // from outlines at the zoom, world text does not show in a view of
             // a world shown smaller.)
@@ -3106,7 +3116,7 @@ mod tests {
         let mut l = Layout::default();
         l.configure("split=vertical").unwrap();
         let mut s = scene();
-        s.interface.beside = Some(scene::Beside { screen: [448, 156, 1024, 768], edge: scene::Edge::Left });
+        s.interface.beside = Some(scene::Beside { screen: [448, 156, 1024, 768], edge: scene::Edge::Left, world: None });
         let f = l.frame(&s, (1920, 1080), (0, 0, 0, 0), vec![[448, 156, 1024, 768]], BOUNDS);
         assert_eq!(f.cameras.len(), 2, "the world and the interface only");
         let (world, ui) = (f.cameras[0], f.cameras[1]);
@@ -3140,7 +3150,7 @@ mod tests {
     #[test]
     fn a_world_of_any_size_fits() {
         for (size, rect) in [((100, 50), [0, 0, 892, 1080]), ((20_000, 30_000), [10, 20, 300, 200]), ((8960, 4544), [1028, 0, 892, 1080])] {
-            let c = fit_world(&Camera::new((1, 1)), WorldBounds { size, wrap: (false, false) }, rect, (64, 32));
+            let c = fit_world(&Camera::new((1, 1)), whole_world(WorldBounds { size, wrap: (false, false) }, (64, 32), 1), rect, (64, 32));
             assert!(64 % c.downscale == 0 && 32 % c.downscale == 0, "{size:?}: {c:?}");
             let (sw, sh) = c.source_size();
             let n = c.downscale as i32;

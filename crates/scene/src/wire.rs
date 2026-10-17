@@ -5,7 +5,7 @@
 use crate::{Beside, Button, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, Patch, SystemCursor, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 28;
+pub const VERSION: u32 = 29;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -354,7 +354,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     }
                 }
                 w.bool(i.beside.is_some());
-                let beside = i.beside.unwrap_or(Beside { screen: [0; 4], edge: Edge::Left });
+                let beside = i.beside.unwrap_or(Beside { screen: [0; 4], edge: Edge::Left, world: None });
                 for v in beside.screen {
                     w.i32(v);
                 }
@@ -364,6 +364,10 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     Edge::Top => 2,
                     Edge::Bottom => 3,
                 });
+                w.bool(beside.world.is_some());
+                for v in beside.world.unwrap_or_default() {
+                    w.i32(v);
+                }
             }
             Update::Interactables(items) => {
                 w.u8(12);
@@ -507,6 +511,11 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     3 => Edge::Bottom,
                     t => return Err(WireError::Tag(t)),
                 };
+                let world = {
+                    let some = r.bool()?;
+                    let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                    some.then_some(rect)
+                };
                 Update::Interface(Interface {
                     screen: named.then_some(screen),
                     roaming,
@@ -515,7 +524,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     screen_view,
                     reachable,
                     focus_control,
-                    beside: beside.then_some(Beside { screen: screen_rect, edge }),
+                    beside: beside.then_some(Beside { screen: screen_rect, edge, world }),
                 })
             }
             12 => {
@@ -804,7 +813,7 @@ mod tests {
             screen_view: Some(258),
             reachable: Some([-1, 2, 300, 40]),
             focus_control: Some([5, 6, 7, 8]),
-            beside: Some(Beside { screen: [448, 156, 1024, 768], edge: Edge::Bottom }),
+            beside: Some(Beside { screen: [448, 156, 1024, 768], edge: Edge::Bottom, world: Some([-64, 32, 1280, 640]) }),
         };
         s.interactables = vec![
             Interactable { rect: [10, 20, 100, 24], kind: InteractableKind::Button, id: 0x1_0000_0002 },
