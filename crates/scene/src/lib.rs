@@ -161,6 +161,35 @@ pub struct Scene {
     /// keeps them, e.g. edited on a preferences screen; `None`: none sent,
     /// the renderer goes by its own copy).
     pub settings: Option<viewer_settings::Settings>,
+    /// What the driver's interface shows that a renderer may arrange.
+    pub interface: Interface,
+}
+
+/// Parts of the driver's interface a renderer may arrange (all in window
+/// pixels; views by id). A renderer that does not arrange anything draws
+/// every view where the driver put it, as always.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Interface {
+    /// The screen the interface shows, named by the driver (e.g. "F1",
+    /// "City", "Menu"); none: its usual screen over the world. A renderer
+    /// may place a named screen in one of its own views.
+    pub screen: Option<String>,
+    /// An interface-only view holding a copy of controls that belong with
+    /// whichever of the renderer's views the pointer is in (e.g. a game's
+    /// menu buttons in the top-left corner; the view's `origin` and
+    /// `viewport` are their rectangle). Its overlay duplicates what the
+    /// interface shows there: a renderer draws it only where it moved it
+    /// (and maps pointer input there back to where the driver put it).
+    pub roaming: Option<u32>,
+    /// An interface-only view holding the open popup (its `origin` and
+    /// `viewport` are the popup's rectangle; the other interface views do
+    /// not have it). A renderer may draw it elsewhere (and map pointer input
+    /// there back to where the driver put it).
+    pub popup: Option<u32>,
+    /// A rectangle (x, y, w, h) of controls the pointer has to reach from
+    /// every view of the renderer's (e.g. the active unit's orders), while
+    /// they are shown.
+    pub reachable: Option<[i32; 4]>,
 }
 
 /// The pixels of one atlas sprite (row-major RGBA, its exact size).
@@ -199,6 +228,8 @@ pub enum Update {
     /// The renderer's settings changed (see [`Scene::settings`]): it takes them
     /// in place of its own.
     Settings(viewer_settings::Settings),
+    /// See [`Scene::interface`].
+    Interface(Interface),
 }
 
 impl Scene {
@@ -260,6 +291,7 @@ impl Scene {
             Update::Assets(n) => self.assets = n,
             Update::Zooms(z) => self.zooms = z,
             Update::Settings(s) => self.settings = Some(s),
+            Update::Interface(i) => self.interface = i,
         }
     }
 
@@ -321,6 +353,9 @@ impl Scene {
         if let Some(s) = self.settings.as_ref().filter(|s| old.settings.as_ref() != Some(s)) {
             out.push(Update::Settings(s.clone()));
         }
+        if self.interface != old.interface {
+            out.push(Update::Interface(self.interface.clone()));
+        }
         out
     }
 }
@@ -375,7 +410,9 @@ pub enum Input {
     /// [`EDGE_ZONE`] pixels of that axis's edges, else how far from the edge
     /// it is plus one, negative for the left (top) edge, positive for the
     /// right (bottom) one; `(0, 0)` once it is at no edge (or left the window
-    /// or such a view). Sent when it changes.
+    /// or such a view). Sent when it changes. A renderer that divides its
+    /// window may also send it while the pointer pushes against a divider
+    /// from such a view (its edge there, at the outermost pixel).
     Edge { x: i32, y: i32 },
 }
 

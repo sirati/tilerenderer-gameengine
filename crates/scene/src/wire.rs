@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Button, FreeSprite, Glyph, Input, LayerCells, Patch, Update, View, WorldShape};
+use crate::{Button, FreeSprite, Glyph, Input, Interface, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 21;
+pub const VERSION: u32 = 22;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -300,6 +300,21 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u32(text.len() as u32);
                 w.0.extend_from_slice(text.as_bytes());
             }
+            Update::Interface(i) => {
+                w.u8(11);
+                let screen = i.screen.as_deref().unwrap_or_default();
+                w.bool(i.screen.is_some());
+                w.u32(screen.len() as u32);
+                w.0.extend_from_slice(screen.as_bytes());
+                for view in [i.roaming, i.popup] {
+                    w.bool(view.is_some());
+                    w.u32(view.unwrap_or_default());
+                }
+                w.bool(i.reachable.is_some());
+                for v in i.reachable.unwrap_or_default() {
+                    w.i32(v);
+                }
+            }
         }
     }
     w.0
@@ -371,6 +386,20 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let n = r.len(1)?;
                 let text = String::from_utf8_lossy(r.take(n)?).into_owned();
                 Update::Settings(toml::from_str(&text).map_err(|e| WireError::Settings(e.to_string()))?)
+            }
+            11 => {
+                let named = r.bool()?;
+                let n = r.len(1)?;
+                let screen = String::from_utf8_lossy(r.take(n)?).into_owned();
+                let mut view = || -> Result<Option<u32>, WireError> {
+                    let some = r.bool()?;
+                    let id = r.u32()?;
+                    Ok(some.then_some(id))
+                };
+                let (roaming, popup) = (view()?, view()?);
+                let some = r.bool()?;
+                let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                Update::Interface(Interface { screen: named.then_some(screen), roaming, popup, reachable: some.then_some(rect) })
             }
             t => return Err(WireError::Tag(t)),
         });
@@ -587,10 +616,12 @@ mod tests {
         settings.layout.screens.insert("Spy".into(), viewer_settings::ScreenPlace { vertical: viewer_settings::Place::RightOrTop, horizontal: viewer_settings::Place::LeftOrBottom });
         settings.input.snap_updates_per_second = 4.5;
         s.settings = Some(settings);
+        s.interface = Interface { screen: Some("F4".into()), roaming: Some(256), popup: None, reachable: Some([-1, 2, 300, 40]) };
         let mut updates = s.updates_since(&Scene::default());
         assert!(updates.iter().any(|u| matches!(u, Update::Settings(_))));
         updates.push(Update::Cells(vec![(1, 0, 9)]));
         updates.push(Update::View { id: 2, view: None });
+        updates.push(Update::Interface(Interface { screen: None, roaming: None, popup: Some(7), reachable: None }));
         assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
         let mut got = Scene::default();
         for u in decode_updates(&encode_updates(&updates)).unwrap() {
