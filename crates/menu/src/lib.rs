@@ -6,6 +6,19 @@
 //! description (`render_desc`), so the same crate draws any game's menus
 //! from that game's art.
 //!
+//! Three kinds of screens:
+//! - menus (this module): images and buttons from the render description's
+//!   sets, text from glyph sets, placed in the viewport (below);
+//! - panels ([`panel`]): controls bound to named values (choices and tabs,
+//!   checkboxes, sliders), images and text in a named face, shown and
+//!   enabled by conditions on the values, drawn as run-time screen elements
+//!   (regions of image files, fills, sprites) and text the driver draws with
+//!   its own fonts, with input routing (what is the panel's, what lies
+//!   below);
+//! - run-time screens ([`screen`]): elements a driver makes frame by frame
+//!   (a mirror of another program's interface), and the render description
+//!   entries their art needs.
+//!
 //! ```toml
 //! [fonts.small]
 //! glyphs = "font_small"        # set "font_small/<codepoint>" per character
@@ -32,6 +45,7 @@
 
 use std::collections::BTreeMap;
 
+pub mod panel;
 pub mod screen;
 
 use render_desc::Compiled;
