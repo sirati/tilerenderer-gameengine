@@ -401,6 +401,7 @@ dependencies = [
  "civ3-sys",
  "civ3r-native",
  "env_logger",
+ "gdi-text",
  "image",
  "inproc",
  "log",
