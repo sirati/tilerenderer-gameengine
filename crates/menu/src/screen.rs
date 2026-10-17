@@ -48,6 +48,8 @@ pub struct Region {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Element {
     Image { region: Region, at: (i32, i32), clip: [i32; 4] },
+    /// The same atlas region with a uniform opacity, applied at draw time.
+    OpacityImage { region: Region, at: (i32, i32), clip: [i32; 4], opacity: u8 },
     /// `rect`: x, y, width, height.
     /// `alpha` 255: opaque.
     Fill { rect: [i32; 4], rgb: [u8; 3], alpha: u8, clip: [i32; 4] },
@@ -68,6 +70,7 @@ impl Element {
     pub fn is_empty(&self) -> bool {
         match self {
             Element::Image { region, .. } => region.rect[2] <= 0 || region.rect[3] <= 0,
+            Element::OpacityImage { region, opacity, .. } => *opacity == 0 || region.rect[2] <= 0 || region.rect[3] <= 0,
             Element::Fill { rect, .. } | Element::Dynamic { rect, .. } => rect[2] <= 0 || rect[3] <= 0,
             Element::Sprite { .. } => false,
         }
@@ -109,7 +112,7 @@ impl ScreenArt {
         let mut new = false;
         for e in elements.iter().filter(|e| !e.is_empty()) {
             new |= match e {
-                Element::Image { region, .. } => self.regions.insert(region.clone()),
+                Element::Image { region, .. } | Element::OpacityImage { region, .. } => self.regions.insert(region.clone()),
                 Element::Fill { rect, rgb, alpha, .. } => {
                     self.fills.insert(([rgb[0], rgb[1], rgb[2], *alpha], (rect[2].max(0) as u32, rect[3].max(0) as u32)))
                 }
@@ -269,7 +272,7 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
                     let clip = [clip[0].max(region[0]), clip[1].max(region[1]), clip[2].min(region[2]), clip[3].min(region[3])];
                     (dynamic_sprite(name, *size), (x - rx, y - ry), clip)
                 }
-                Element::Image { region, at, clip } => (region_sprite(region), *at, *clip),
+                Element::Image { region, at, clip } | Element::OpacityImage { region, at, clip, .. } => (region_sprite(region), *at, *clip),
                 Element::Fill { rect, rgb, alpha, clip } => {
                     (fill_sprite([rgb[0], rgb[1], rgb[2], *alpha], (rect[2].max(0) as u32, rect[3].max(0) as u32)), (rect[0], rect[1]), *clip)
                 }
@@ -284,7 +287,7 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
                 phase: 0,
                 ticks_per_frame: 1,
                 scale_den,
-                tint: 0,
+                tint: match e { Element::OpacityImage { opacity, .. } => (255 - u32::from(*opacity)) << 24, _ => 0 },
                 zoom_art: 0,
                 zoom: (0, 0),
                 zoom_offset: (0, 0),
@@ -330,6 +333,23 @@ mod tests {
     impl render_desc::ImageLoader for Plain {
         fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> {
             Ok(vec![tile_render::RgbaImage::from_fn(64, 64, |x, y| [x as u8, y as u8, 0, 255])])
+        }
+    }
+
+    #[test]
+    fn fading_images_share_one_atlas_region() {
+        let region = Region { source: "bubble.pcx".into(), rect: [0, 0, 16, 16], keyed: true, mask: None, palette: None };
+        let elements: Vec<_> = (1..=255).map(|opacity| Element::OpacityImage { region: region.clone(), at: (0, 0), clip: [0, 0, 16, 16], opacity }).collect();
+        let mut art = ScreenArt::default();
+        assert!(art.add(&elements));
+        assert_eq!(art.regions.len(), 1);
+        let text = format!("[grid]\nlayout = \"orthogonal\"\nstep = [1, 1]\n{}", art.description("", "", |_, _| String::new()));
+        let compiled = render_desc::Description::parse(&text).unwrap().compile(&Plain, 256).unwrap();
+        let draws = sprites(&elements, &compiled, u32::MAX);
+        assert_eq!(draws.len(), 255);
+        assert!(draws.iter().all(|draw| draw.set == draws[0].set));
+        for (draw, opacity) in draws.iter().zip(1..=255_u32) {
+            assert_eq!(255 - (draw.tint >> 24), opacity);
         }
     }
 
