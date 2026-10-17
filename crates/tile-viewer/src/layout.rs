@@ -49,6 +49,10 @@ pub const MAX_INSETS: usize = 3;
 const GAP: i32 = 4;
 /// A view's centre before it was placed (it starts where the driver looks).
 const UNPLACED: (i32, i32) = (i32::MIN, i32::MIN);
+/// For how many frames after a world first shows a free view not yet
+/// moved by hand follows the driver's view (a game loading a save moves
+/// its view about for a moment, about 3 s at 60 frames a second).
+pub const SETTLE_FRAMES: u32 = 180;
 
 /// What a view keeps in sight.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -92,11 +96,14 @@ pub struct FreeView {
     pub center: (i32, i32),
     pub zoom: usize,
     pub follow: Follow,
+    /// Placed by the viewer, not by hand, while the driver's view may still
+    /// be settling (see [`SETTLE_FRAMES`]): it goes on following it.
+    settling: bool,
 }
 
 impl FreeView {
     pub fn new(center: (i32, i32), zoom: usize, follow: Follow) -> Self {
-        Self { center, zoom, follow }
+        Self { center, zoom, follow, settling: false }
     }
 
     /// World pixels it shows in a rectangle `rect` wide and high.
@@ -109,9 +116,11 @@ impl FreeView {
     /// that does not wrap.
     fn camera(&self, rect: [i32; 4], overhang: (u32, u32, u32, u32), bounds: Option<WorldBounds>) -> Camera {
         let (sw, sh) = self.source(rect);
+        // (Not placed yet: where the world starts.)
+        let center = if self.center == UNPLACED { (0, 0) } else { self.center };
         let (cx, cy) = match bounds {
-            Some(b) => (b.clamp_center(0, self.center.0, sw), b.clamp_center(1, self.center.1, sh)),
-            None => self.center,
+            Some(b) => (b.clamp_center(0, center.0, sw), b.clamp_center(1, center.1, sh)),
+            None => center,
         };
         Camera {
             x: cx - sw / 2,
@@ -287,6 +296,8 @@ pub struct Layout {
     driver_rects: Vec<[i32; 4]>,
     insets_shown: usize,
     left_out: usize,
+    /// Frames in a row the driver has shown a world.
+    world_frames: u32,
     bounds: Option<WorldBounds>,
 }
 
@@ -322,6 +333,7 @@ impl Default for Layout {
             driver_rects: Vec::new(),
             insets_shown: 0,
             left_out: 0,
+            world_frames: 0,
             bounds: None,
         }
     }
@@ -592,12 +604,26 @@ impl Layout {
         }
         let driver = self.main.map(|m| (m.x + m.viewport.0 as i32 / 2, m.y + m.viewport.1 as i32 / 2));
         let (cursor, focus) = (self.cursor, scene.focus);
+        let has_world = scene.shape.cols > 0 && scene.shape.rows > 0;
+        self.world_frames = if has_world { self.world_frames.saturating_add(1) } else { 0 };
+        let settled = self.world_frames > SETTLE_FRAMES;
         for v in self.views_mut() {
             match v.follow {
                 Follow::Driver => v.center = driver.unwrap_or(v.center),
                 Follow::Focus => v.center = focus.or(driver).unwrap_or(v.center),
                 Follow::Pointer => v.center = cursor,
-                Follow::Free if v.center == UNPLACED => v.center = driver.unwrap_or((0, 0)),
+                // Placed where the driver first shows a world (not before: a
+                // title screen has none, its empty view looks at (0, 0)).
+                Follow::Free if v.center == UNPLACED || v.settling => match driver.filter(|_| has_world) {
+                    Some(d) if settled => {
+                        v.center = d;
+                        if std::mem::take(&mut v.settling) {
+                            log::info!("viewer: a free view placed at world pixel {d:?} (the middle of the driver's view)");
+                        }
+                    }
+                    Some(d) => (v.center, v.settling) = (d, true),
+                    None => {}
+                },
                 Follow::Free => {}
             }
         }
@@ -816,6 +842,13 @@ impl Layout {
         let m = self.main?;
         let (x, y) = (wx - m.x + m.origin.0, wy - m.y + m.origin.1);
         inside([m.origin.0, m.origin.1, m.viewport.0 as i32, m.viewport.1 as i32], (x, y)).then_some((x, y))
+    }
+
+    /// Where a view made at window pixel `p` looks: the world pixel there,
+    /// or (no world yet) where the driver first shows one.
+    fn placed_at(&self, p: (i32, i32)) -> (i32, i32) {
+        let world = self.bounds.is_some_and(|b| b.size.0 > 0 && b.size.1 > 0);
+        self.world_under(p).filter(|_| world).unwrap_or(UNPLACED)
     }
 
     /// Where the driver gets a pointer event on world pixel `w`: `Ok(q)`,
@@ -1079,6 +1112,7 @@ impl Layout {
                 if let Some(view) = self.free_view(hit) {
                     // Moved by hand: it follows nothing now.
                     view.follow = Follow::Free;
+                    view.settling = false;
                     view.center = (center.0 - (p.0 - from.0) * d / n, center.1 - (p.1 - from.1) * d / n);
                 }
             }
@@ -1134,7 +1168,7 @@ impl Layout {
             // S: split off → side by side → stacked → off.
             0x53 => {
                 self.split = match self.split {
-                    None => Some(Split { axis: Axis::Vertical, fraction: 0.5, view: FreeView::new(self.world_under(p).unwrap_or(UNPLACED), ONE, Follow::Free) }),
+                    None => Some(Split { axis: Axis::Vertical, fraction: 0.5, view: FreeView::new(self.placed_at(p), ONE, Follow::Free) }),
                     Some(s) if s.axis == Axis::Vertical => Some(Split { axis: Axis::Horizontal, ..s }),
                     Some(_) => None,
                 }
@@ -1142,7 +1176,7 @@ impl Layout {
             // I: an inset at the pointer.
             0x49 if self.insets.len() < MAX_INSETS => {
                 let (w, h) = (self.window.0 as i32 / 4, self.window.1 as i32 / 4);
-                let view = FreeView::new(self.world_under(p).unwrap_or(UNPLACED), ONE + 2, Follow::Free);
+                let view = FreeView::new(self.placed_at(p), ONE + 2, Follow::Free);
                 self.insets.push(Inset { rect: [p.0 - w / 2, p.1 - h / 2, w.max(48), h.max(32)], view });
             }
             // X: remove the inset under the pointer (else the last one).
@@ -1208,6 +1242,7 @@ impl Layout {
                         _ => (0, h as i32 / 8),
                     };
                     v.follow = Follow::Free;
+                    v.settling = false;
                     v.center = (center.0 + dx, center.1 + dy);
                 }
             }
@@ -1228,6 +1263,7 @@ mod tests {
         Scene {
             views: vec![ViewState { id: 0, view: main, overlay: vec![] }, ViewState { id: 255, view: ui, overlay: vec![] }],
             focus: Some((3000, 2000)),
+            shape: scene::WorldShape { cols: 62, rows: 125, wrap_x: true, wrap_y: false },
             ..Default::default()
         }
     }
@@ -1286,7 +1322,7 @@ mod tests {
         let mut l = Layout::default();
         frame(&mut l, vec![]);
         assert!(ctrl_shift(&mut l, 0x53).is_empty());
-        l.split.as_mut().unwrap().view.center = (5000, 2000);
+        l.split.as_mut().unwrap().view = FreeView { center: (5000, 2000), ..FreeView::new((0, 0), ONE, Follow::Free) };
         let f = frame(&mut l, vec![]);
         assert_eq!(f.cameras.len(), 3);
         assert_eq!(f.cameras[0].viewport, (400, 600));
@@ -1409,7 +1445,7 @@ mod tests {
         let mut l = Layout::default();
         l.configure("split=vertical,pane=free").unwrap();
         frame(&mut l, vec![]);
-        l.split.as_mut().unwrap().view.center = (5000, 2000);
+        l.split.as_mut().unwrap().view = FreeView { center: (5000, 2000), ..FreeView::new((0, 0), ONE, Follow::Free) };
         frame(&mut l, vec![]);
         l
     }
@@ -1567,4 +1603,50 @@ mod tests {
         assert_eq!(f.view_cameras, [Some(0), Some(1), Some(2)]);
         assert_eq!(click(&mut l, (300, 120))[0], Input::MouseButton { button: Button::Left, down: true, x: 600, y: 240 });
     }
+
+    #[test]
+    fn a_free_pane_starts_where_the_driver_shows_the_world() {
+        // Configured before the game shows a map (a title screen: no world,
+        // an empty game view at (0, 0) and the interface), the pane is
+        // placed once it does, at the middle of the driver's view (not at
+        // the world's corner), and follows it while it settles (a game
+        // loading a save moves it about).
+        let mut l = Layout::default();
+        l.configure("split=vertical,ui=pane,pane=free").unwrap();
+        let empty = |id, interface_only| ViewState { id, view: View { interface_only, ..Default::default() }, overlay: vec![] };
+        let title = Scene { views: vec![empty(0, false), empty(255, true)], ..Default::default() };
+        for _ in 0..3 {
+            l.frame(&title, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        }
+        assert_eq!(l.split.unwrap().view.center, UNPLACED);
+        let at = |x: i32, y: i32| {
+            let mut s = scene();
+            (s.views[0].view.camera_x, s.views[0].view.camera_y) = (x - 400, y - 300);
+            s
+        };
+        l.frame(&at(5000, 3000), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(l.split.unwrap().view.center, (5000, 3000));
+        let f = frame(&mut l, vec![]);
+        assert_eq!(l.split.unwrap().view.center, (1400, 800));
+        let pane = f.cameras.iter().find(|c| c.origin == (404, 0)).unwrap();
+        assert_eq!((pane.x + 198, pane.y + 300), (1400, 800));
+        // Then it stays put.
+        for _ in 0..SETTLE_FRAMES {
+            frame(&mut l, vec![]);
+        }
+        l.frame(&at(2000, 1000), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(l.split.unwrap().view.center, (1400, 800));
+        // Moved by hand while settling, it stays where it was moved.
+        let mut l = Layout::default();
+        l.configure("split=vertical,pane=free").unwrap();
+        frame(&mut l, vec![]);
+        l.route(Input::MouseButton { button: Button::Middle, down: true, x: 600, y: 300 });
+        l.route(Input::MouseMove { x: 500, y: 300 });
+        l.route(Input::MouseButton { button: Button::Middle, down: false, x: 500, y: 300 });
+        let moved = l.split.unwrap().view.center;
+        assert_eq!(moved, (1500, 800));
+        l.frame(&at(2000, 1000), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(l.split.unwrap().view.center, moved);
+    }
+
 }
