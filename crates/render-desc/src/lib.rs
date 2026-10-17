@@ -32,10 +32,10 @@
 //! sets = ["xtgc/*"]              # sets drawable on this layer; `*` expands
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::Deserialize;
-use tile_render::{AtlasBuilder, Blend, ColorModel, Grid, IndexImage, LayerSpec, Layout, RgbaImage, SpriteId, SpriteSetId, SpriteSets};
+use tile_render::{AtlasBuilder, AtlasGrowth, Blend, Blit, BlitPixels, ColorModel, Grid, IndexImage, LayerSpec, Layout, RgbaImage, Shelves, SpriteId, SpriteSetId, SpriteSets};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DescError {
@@ -207,64 +207,168 @@ impl SheetCache {
     }
 }
 
-/// Places a compile's sprites: with their pixels into an atlas (indexed
-/// sprites of the same pixels sharing them, own palette rows of the same
-/// colours shared), or (without pixels) their sizes only.
+/// Places a compile's sprites: with their pixels into an atlas (a whole
+/// compile) or as blits of a growth (indexed sprites of the same pixels
+/// sharing them, own palette rows of the same colours shared), or (without
+/// pixels) their sizes only.
 struct Placer {
     pixels: bool,
     page_size: u32,
-    atlas: AtlasBuilder,
-    /// Without pixels: the sprites' sizes and anchors.
-    placed: Vec<tile_render_shared::SpriteDesc>,
-    /// The first sprite of each indexed sprite's pixels.
+    target: Target,
+    /// The id of the first sprite placed (a growth: after those before).
+    first: u32,
+    /// The first sprite of each indexed sprite's pixels (also of earlier
+    /// compiles, for a growth).
     texels: HashMap<TexelKey, SpriteId>,
-    /// Own palette rows (row 0, then one per distinct colouring), and each
-    /// colouring's row.
+    /// Palette rows: those of the table before (a growth), the rows this
+    /// compile adds (a whole compile: row 0, then one per distinct
+    /// colouring), and each colouring's row.
+    row_base: u32,
     own: Vec<u32>,
     rows: HashMap<std::sync::Arc<Vec<u32>>, u32>,
 }
 
+/// Where a [`Placer`] puts sprites.
+enum Target {
+    /// A whole atlas with its pixels.
+    Atlas(AtlasBuilder),
+    /// A growth with pixels: the next places, the new pixels and sprites.
+    Grow { rgba: Shelves, index: Shelves, blits: Vec<Blit>, sprites: Vec<tile_render_shared::SpriteDesc> },
+    /// Without pixels: the sprites' sizes and anchors.
+    Sizes(Vec<tile_render_shared::SpriteDesc>),
+}
+
 impl Placer {
     fn new(page_size: u32, pixels: bool) -> Self {
-        Self { pixels, page_size, atlas: AtlasBuilder::new(page_size), placed: Vec::new(), texels: HashMap::new(), own: tile_render::atlas::no_palettes(), rows: HashMap::new() }
+        Self {
+            pixels,
+            page_size,
+            target: if pixels { Target::Atlas(AtlasBuilder::new(page_size)) } else { Target::Sizes(Vec::new()) },
+            first: 0,
+            texels: HashMap::new(),
+            row_base: 0,
+            own: tile_render::atlas::no_palettes(),
+            rows: HashMap::new(),
+        }
+    }
+
+    /// A placer for a growth of `growing`'s art, which has `first` sprites
+    /// and a palette table of `rows` rows.
+    fn growing(growing: &Growing, first: u32, rows: u32) -> Self {
+        Self {
+            pixels: growing.pixels,
+            page_size: growing.page_size,
+            target: if growing.pixels {
+                Target::Grow { rgba: growing.shelves.0.clone(), index: growing.shelves.1.clone(), blits: Vec::new(), sprites: Vec::new() }
+            } else {
+                Target::Sizes(Vec::new())
+            },
+            first,
+            texels: growing.texels.clone(),
+            row_base: rows,
+            own: Vec::new(),
+            rows: growing.rows.clone(),
+        }
+    }
+
+    /// The sprites placed (of a growth or a compile without pixels).
+    fn placed(&self) -> &[tile_render_shared::SpriteDesc] {
+        match &self.target {
+            Target::Atlas(_) => &[],
+            Target::Grow { sprites, .. } | Target::Sizes(sprites) => sprites,
+        }
+    }
+
+    /// Sprite `id`, placed by this placer or (`known`) before.
+    fn sprite(&self, id: SpriteId, known: Option<&Compiled>) -> Option<tile_render_shared::SpriteDesc> {
+        if id.0 < self.first {
+            return known.and_then(|k| k.atlas.sprites.get(id.0 as usize)).copied();
+        }
+        match &self.target {
+            Target::Atlas(a) => Some(*a.sprite(id)),
+            Target::Grow { sprites, .. } | Target::Sizes(sprites) => sprites.get((id.0 - self.first) as usize).copied(),
+        }
     }
 
     fn sprite_mut(&mut self, id: SpriteId) -> &mut tile_render_shared::SpriteDesc {
-        if self.pixels { self.atlas.sprite_mut(id) } else { &mut self.placed[id.0 as usize] }
+        match &mut self.target {
+            Target::Atlas(a) => a.sprite_mut(id),
+            Target::Grow { sprites, .. } | Target::Sizes(sprites) => &mut sprites[(id.0 - self.first) as usize],
+        }
+    }
+
+    fn push(&mut self, desc: tile_render_shared::SpriteDesc) -> SpriteId {
+        match &mut self.target {
+            Target::Atlas(_) => unreachable!("a whole atlas places sprites itself"),
+            Target::Grow { sprites, .. } | Target::Sizes(sprites) => {
+                sprites.push(desc);
+                SpriteId(self.first + sprites.len() as u32 - 1)
+            }
+        }
+    }
+
+    /// A sprite of pixels placed before (part of another sprite's, `desc`
+    /// says where); a whole atlas: `of`'s pixels.
+    fn alias(&mut self, desc: tile_render_shared::SpriteDesc) -> SpriteId {
+        match &mut self.target {
+            Target::Atlas(a) => a.add_desc(desc),
+            _ => self.push(desc),
+        }
     }
 
     /// Adds a sprite (`cut`: its pixels, `None` without pixels), drawn
     /// with `scaling` from `sample_box` by views showing the world smaller;
-    /// an indexed one with its indices in `remap` remapped.
-    fn add(&mut self, cut: Option<&Cut>, (w, h): (u32, u32), anchor: (i32, i32), scaling: u32, sample_box: [u32; 4], remap: u32) -> Result<SpriteId, DescError> {
+    /// an indexed one with its indices in `remap` remapped. `known`: the
+    /// art a growth is appended to.
+    #[allow(clippy::too_many_arguments)]
+    fn add(&mut self, cut: Option<&Cut>, (w, h): (u32, u32), anchor: (i32, i32), scaling: u32, sample_box: [u32; 4], remap: u32, known: Option<&Compiled>) -> Result<SpriteId, DescError> {
         let id = match cut {
             None => {
                 if w > self.page_size || h > self.page_size {
                     return Err(tile_render::atlas::AtlasError::TooLarge(w, h, self.page_size).into());
                 }
-                self.placed.push(tile_render_shared::SpriteDesc { width: w, height: h, anchor_x: anchor.0, anchor_y: anchor.1, ..Default::default() });
-                SpriteId(self.placed.len() as u32 - 1)
+                self.push(tile_render_shared::SpriteDesc { width: w, height: h, anchor_x: anchor.0, anchor_y: anchor.1, ..Default::default() })
             }
-            Some(Cut::Rgba(image)) => self.atlas.add(image, anchor)?,
+            Some(Cut::Rgba(image)) => match &mut self.target {
+                Target::Atlas(a) => a.add(image, anchor)?,
+                Target::Grow { rgba, blits, .. } => {
+                    let at = rgba.place(image.width, image.height)?;
+                    blits.push(Blit { page: at.0, x: at.1, y: at.2, pixels: BlitPixels::Rgba(image.clone()) });
+                    self.push(tile_render::atlas::sprite_at(at, (image.width, image.height), anchor))
+                }
+                Target::Sizes(_) => unreachable!("pixels without pixels"),
+            },
             Some(Cut::Indexed { image, row, key }) => {
                 let own = match self.rows.get(row) {
                     Some(&r) => r,
                     None => {
-                        let r = (self.own.len() / tile_render_shared::PALETTE_SIZE as usize) as u32;
+                        let r = self.row_base + (self.own.len() / tile_render_shared::PALETTE_SIZE as usize) as u32;
                         self.own.extend_from_slice(row);
                         self.rows.insert(row.clone(), r);
                         r
                     }
                 };
-                let id = match self.texels.get(key) {
-                    Some(&first) => self.atlas.alias(first, anchor),
-                    None => {
-                        let id = self.atlas.add_indexed(image, anchor, own, remap)?;
+                let shared = self.texels.get(key).and_then(|&first| self.sprite(first, known));
+                let id = match (shared, &mut self.target) {
+                    (Some(s), _) => {
+                        let desc = tile_render::atlas::sprite_at((s.page, s.atlas_x, s.atlas_y), (s.width, s.height), anchor);
+                        self.alias(desc)
+                    }
+                    (None, Target::Atlas(a)) => {
+                        let id = a.add_indexed(image, anchor, own, remap)?;
                         self.texels.insert(key.clone(), id);
                         id
                     }
+                    (None, Target::Grow { index, blits, .. }) => {
+                        let at = index.place(image.width, image.height)?;
+                        blits.push(Blit { page: at.0, x: at.1, y: at.2, pixels: BlitPixels::Index((**image).clone()) });
+                        let id = self.push(tile_render::atlas::sprite_at(at, (image.width, image.height), anchor));
+                        self.texels.insert(key.clone(), id);
+                        id
+                    }
+                    (None, Target::Sizes(_)) => unreachable!("pixels without pixels"),
                 };
-                let s = self.atlas.sprite_mut(id);
+                let s = self.sprite_mut(id);
                 (s.palette, s.remap) = (own, remap);
                 id
             }
@@ -378,7 +482,14 @@ pub struct ImageDesc {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SheetDesc {
+    /// The image the sprites are cut from…
+    #[serde(default)]
     pub image: String,
+    /// …or a sprite compiled before (of a sheet of an image, or of an
+    /// earlier description this one is appended to, see [`Growing`]): the
+    /// sprites are then parts of its pixels in the atlas, which they share
+    /// (no pixels of their own), e.g. regions of a whole picture.
+    pub sprite: Option<String>,
     /// Which of the image's frames (multi-frame sources, e.g. animations).
     #[serde(default)]
     pub frame: usize,
@@ -977,6 +1088,14 @@ impl Description {
     /// ```
     pub fn parse(text: &str) -> Result<Self, DescError> {
         let mut desc: Description = toml::from_str(text)?;
+        desc.expand_variants()?;
+        Ok(desc)
+    }
+
+    /// Expands the variants of images, sheets and palettes (see
+    /// [`Description::parse`]).
+    fn expand_variants(&mut self) -> Result<(), DescError> {
+        let desc = self;
         let mut images = BTreeMap::new();
         for (name, mut img) in std::mem::take(&mut desc.images) {
             match img.options.remove("variants") {
@@ -1030,7 +1149,7 @@ impl Description {
             }
         }
         desc.palettes = palettes;
-        Ok(desc)
+        Ok(())
     }
 
     /// The frames of image `name`; with `blank`, as the load that finds
@@ -1304,8 +1423,177 @@ impl Description {
         options
     }
 
-    fn compile_with(&self, loader: &dyn ImageLoader, page_size: u32, pixels: bool, mut cache: Option<&mut SheetCache>) -> Result<Compiled, DescError> {
+    fn compile_with(&self, loader: &dyn ImageLoader, page_size: u32, pixels: bool, cache: Option<&mut SheetCache>) -> Result<Compiled, DescError> {
+        self.compile_full(loader, page_size, pixels, cache, None)
+    }
+
+    /// A whole compile ([`Description::compile_with`]); with `growing`, the
+    /// state to grow it from is kept there (where the next sprites go, the
+    /// sheets compiled, shared pixels and palette rows).
+    fn compile_full(
+        &self,
+        loader: &dyn ImageLoader,
+        page_size: u32,
+        pixels: bool,
+        cache: Option<&mut SheetCache>,
+        growing: Option<&mut Growing>,
+    ) -> Result<Compiled, DescError> {
+        let mut placer = Placer::new(page_size, pixels);
+        let mut sprites: BTreeMap<String, SpriteId> = BTreeMap::new();
+        let mut sheet_len: HashMap<String, u32> = HashMap::new();
+        let mut seen = growing.as_ref().map(|_| HashSet::new());
+        self.add_sheets(loader, &mut placer, None, &mut sprites, &mut sheet_len, cache, seen.as_mut())?;
+        // The palette table: row 0, the sprites' own rows, the named ones.
+        let (named, palette_rows) = self.palette_rows(loader)?;
+        let Placer { target, own, texels, rows, .. } = placer;
+        let shelves = match &target {
+            Target::Atlas(a) => (a.shelves().0.clone(), a.shelves().1.clone()),
+            _ => (Shelves::new(page_size), Shelves::new(page_size)),
+        };
+        let mut atlas = match target {
+            Target::Atlas(a) => a.finish(),
+            Target::Grow { .. } => unreachable!("a whole compile does not grow"),
+            Target::Sizes(placed) => tile_render::Atlas { page_size, pages: Vec::new(), index_pages: Vec::new(), sprites: placed, palettes: Vec::new(), named_palettes: 1 },
+        };
+        atlas.named_palettes = (own.len() / tile_render_shared::PALETTE_SIZE as usize) as u32;
+        atlas.palettes = own;
+        atlas.palettes.extend_from_slice(&named[tile_render_shared::PALETTE_SIZE as usize..]);
+        if let Some(g) = growing {
+            g.shelves = shelves;
+            g.texels = texels;
+            g.rows = rows;
+            g.seen = seen.unwrap_or_default();
+            g.sheet_len = sheet_len.clone();
+        }
+
+        // Sets: explicit ones, plus an implicit single-frame set per sprite.
+        let mut sets = SpriteSets::default();
+        let mut set_ids: BTreeMap<String, SpriteSetId> = BTreeMap::new();
+        let mut set_blend: HashMap<SpriteSetId, Blend> = HashMap::new();
+        for (name, &sprite) in &sprites {
+            set_ids.insert(name.clone(), sets.single(sprite));
+        }
+        for (name, set) in &self.sets {
+            let blend = blend_of(set.blend).ok_or_else(|| DescError::Unknown { kind: "blend of set", name: name.clone() })?;
+            let frames = set
+                .frames
+                .iter()
+                .map(|f| sprites.get(f).copied().ok_or(DescError::Unknown { kind: "sprite", name: f.clone() }))
+                .collect::<Result<Vec<_>, _>>()?;
+            let id = sets.add(&frames);
+            set_ids.insert(name.clone(), id);
+            set_blend.insert(id, blend);
+        }
+
+        let fonts = self.load_fonts(loader, |_| false);
+
+        // Layers and their value tables.
+        let mut layers = Vec::new();
+        let mut values = HashMap::new();
+        for layer in &self.layers {
+            let mut names = Vec::new();
+            for pattern in &layer.sets {
+                if pattern.ends_with('*') {
+                    names.extend(matching(pattern, set_ids.keys(), &sheet_len));
+                } else if set_ids.contains_key(pattern) {
+                    names.push(pattern.clone());
+                } else {
+                    return Err(DescError::Unknown { kind: "set", name: pattern.clone() });
+                }
+            }
+            // Value 0 is always "nothing", so an all-zero layer is empty.
+            let mut lut = vec![SpriteSetId::EMPTY];
+            for (i, n) in names.iter().enumerate() {
+                values.insert((layer.name.clone(), n.clone()), i as u32 + 1);
+                lut.push(set_ids[n]);
+            }
+            let mut spec = LayerSpec::new(layer.name.clone(), lut);
+            spec.offset = (layer.offset[0], layer.offset[1]);
+            spec.ticks_per_frame = layer.ticks_per_frame;
+            spec.per_cell_phase = layer.per_cell_phase;
+            spec.per_cell_offset = layer.per_cell_offset;
+            spec.descending = layer.descending;
+            spec.hidden = layer.hidden;
+            spec.pass = layer.pass;
+            spec.cull_offset = (layer.cull_offset[0], layer.cull_offset[1]);
+            spec.blend = blend_of(layer.blend)
+                .ok_or_else(|| DescError::Unknown { kind: "blend (scale denominator 1..=32) of layer", name: layer.name.clone() })?;
+            // (Enough bits for every row, and row 0.)
+            spec.palette_bits = if layer.palettes { (u32::BITS - (palette_rows.len() as u32).leading_zeros()).max(1) } else { 0 };
+            if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
+                return Err(DescError::Unknown { kind: "pass order for layer", name: layer.name.clone() });
+            }
+            if layers.last().is_some_and(|l: &LayerSpec| l.pass == spec.pass && l.descending != spec.descending) {
+                return Err(DescError::Unknown { kind: "column order (all layers of a pass must agree) for layer", name: layer.name.clone() });
+            }
+            layers.push(spec);
+        }
+
+        let compiled = Compiled {
+            layout: match self.grid.layout {
+                LayoutDesc::Orthogonal => Layout::Orthogonal,
+                LayoutDesc::Staggered => Layout::Staggered,
+            },
+            step: (self.grid.step[0], self.grid.step[1]),
+            color: match self.grid.color_bits {
+                None => ColorModel::Direct,
+                Some(bits @ 4..=7) => ColorModel::Quantized { bits },
+                Some(bits) => return Err(DescError::Unknown { kind: "grid colour depth (4..=7 bits)", name: bits.to_string() }),
+            },
+            sprite_names: {
+                let mut names = vec![String::new(); sprites.len()];
+                for (n, id) in &sprites {
+                    names[id.0 as usize] = n.clone();
+                }
+                names
+            },
+            atlas,
+            sets,
+            layers,
+            values,
+            set_ids,
+            set_blend,
+            fonts,
+            palette_rows,
+            sprite_ids: sprites.into_iter().collect(),
+        };
+        Ok(compiled)
+    }
+
+    /// The font faces that load (logged if not), but those `known` says
+    /// are there already.
+    fn load_fonts(&self, loader: &dyn ImageLoader, known: impl Fn(&str) -> bool) -> Vec<(String, std::sync::Arc<tile_render::gpu_text::Face>)> {
+        let mut fonts = Vec::new();
+        for (name, font) in self.fonts.iter().filter(|(n, _)| !known(n)) {
+            let face = loader.font(&font.source).and_then(|data| tile_render::gpu_text::Face::parse(&data, font.index).map_err(|e| e.to_string()));
+            match face {
+                Ok(face) => fonts.push((name.clone(), std::sync::Arc::new(face))),
+                Err(e) => log::warn!("font {name:?} ({}): {e}", font.source),
+            }
+        }
+        fonts
+    }
+
+    /// Slices the sheets and places their sprites with `placer`, naming
+    /// them in `sprites` (the cells drawn instead in views showing the
+    /// world smaller after all of them, unnamed). `known`: the art this
+    /// compile is appended to (its sprites are kept: a sheet whose sprites
+    /// it has adds nothing, a sheet may cut parts of its sprites); `seen`:
+    /// the keys of the sheets compiled before (skipped), this compile's
+    /// added; `cache`: see [`SheetCache`].
+    #[allow(clippy::too_many_arguments)]
+    fn add_sheets(
+        &self,
+        loader: &dyn ImageLoader,
+        placer: &mut Placer,
+        known: Option<&Compiled>,
+        sprites: &mut BTreeMap<String, SpriteId>,
+        sheet_len: &mut HashMap<String, u32>,
+        mut cache: Option<&mut SheetCache>,
+        mut seen: Option<&mut HashSet<u64>>,
+    ) -> Result<(), DescError> {
         use std::rc::Rc;
+        let pixels = placer.pixels;
         // Images are loaded when a sheet needs them, once per compile.
         let mut loaded: HashMap<(String, bool), Frames> = HashMap::new();
         let mut frames = |name: &str, blank: bool| -> Result<Frames, DescError> {
@@ -1345,7 +1633,6 @@ impl Description {
         };
         let globals = format!("{:?}|{:?}", self.loader, self.blank_loader);
         let mut kept: HashMap<String, std::sync::Arc<Sliced>> = HashMap::new();
-        let mut placer = Placer::new(page_size, pixels);
         // The indices of the sheets kept from earlier compiles, for new sheets
         // of the same pixels to share.
         let mut shared: SharedTexels = HashMap::new();
@@ -1361,14 +1648,78 @@ impl Description {
         // Sprites with a twin for views showing the world smaller
         // (`scaled_origin`): which, and where their twin's cell is.
         let mut twins: Vec<(SpriteId, std::sync::Arc<Sliced>, usize, u32, u32)> = Vec::new();
-
-        // Sprites, named "sheet/index".
-        let mut sprites: BTreeMap<String, SpriteId> = BTreeMap::new();
-        let mut sheet_len: HashMap<String, u32> = HashMap::new();
-        for (sheet_name, sheet) in &self.sheets {
+        let existing = |name: &str| known.and_then(|k| k.sprite(name));
+        // Sheets of images first, then those of parts of sprites (which may
+        // be those of the first).
+        let ordered = self.sheets.iter().filter(|(_, s)| s.sprite.is_none()).chain(self.sheets.iter().filter(|(_, s)| s.sprite.is_some()));
+        for (sheet_name, sheet) in ordered {
+            let sprite_name = |index: u32| match &sheet.group {
+                Some(g) => format!("{g}/{}", sheet.first_index + index * sheet.index_stride),
+                None => format!("{sheet_name}/{index}"),
+            };
+            let group = sheet.group.clone().unwrap_or_else(|| sheet_name.clone());
+            let key = self.sheet_key(sheet, &globals, &identity(&sheet.image, true));
+            // (What makes the sheet and what its sprites are called.)
+            let seen_key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (&key, &sheet.sprite, &sheet.group, sheet.first_index, sheet.index_stride).hash(&mut h);
+                if sheet.group.is_none() {
+                    sheet_name.hash(&mut h);
+                }
+                h.finish()
+            };
+            if seen.as_deref().is_some_and(|s| s.contains(&seen_key)) {
+                continue;
+            }
+            if let Some(s) = seen.as_deref_mut() {
+                s.insert(seen_key);
+            }
+            let scaling = match sheet.scaling {
+                SheetScaling::Scale => tile_render_shared::SHRINK,
+                SheetScaling::ScaleKeepAnchor => tile_render_shared::SHRINK_KEEP_ANCHOR,
+                SheetScaling::Keep => tile_render_shared::KEEP_SIZE,
+            };
+            // Parts of a sprite compiled before.
+            if let Some(of) = &sheet.sprite {
+                let err = |message: String| DescError::Sheet { sheet: sheet_name.clone(), message };
+                let base = sprites
+                    .get(of)
+                    .copied()
+                    .or_else(|| existing(of))
+                    .and_then(|id| placer.sprite(id, known))
+                    .ok_or_else(|| DescError::Unknown { kind: "sprite", name: of.clone() })?;
+                if sheet.scaled_origin.is_some() || sheet.outline.is_some() || sheet.sample_from == SampleFrom::Box || !sheet.image.is_empty() || sheet.all_frames {
+                    return Err(err("a sheet of a sprite's parts has no image, frames, scaled origin, outline or box sampling".into()));
+                }
+                let [cw, ch] = sheet.cell;
+                let [ox, oy] = sheet.origin;
+                let [sx, sy] = sheet.spacing;
+                let fit = |total: u32, o: u32, c: u32, s: u32| if total < o + c { 0 } else { (total - o + s) / (c + s) };
+                let [cols, rows] = sheet.grid.unwrap_or_else(|| [fit(base.width, ox, cw, sx), fit(base.height, oy, ch, sy)]);
+                if cw == 0 || ch == 0 || cols == 0 || rows == 0 || ox + cols * (cw + sx) - sx > base.width || oy + rows * (ch + sy) - sy > base.height {
+                    return Err(err(format!("{cols}×{rows} cells of {cw}×{ch} from ({ox}, {oy}) do not fit sprite {of} ({}×{})", base.width, base.height)));
+                }
+                for i in (0..cols * rows).filter(|i| sheet.only.as_ref().is_none_or(|o| o.contains(i))) {
+                    let name = sprite_name(i);
+                    if existing(&name).is_some() {
+                        continue;
+                    }
+                    let (c, r) = (i % cols, i / cols);
+                    let (x, y) = (ox + c * (cw + sx), oy + r * (ch + sy));
+                    let mut desc = tile_render::atlas::sprite_at((base.page, base.atlas_x + x, base.atlas_y + y), (cw, ch), (sheet.anchor[0], sheet.anchor[1]));
+                    (desc.scaling, desc.palette, desc.remap) = (scaling, base.palette, base.remap);
+                    let id = placer.alias(desc);
+                    if sprites.insert(name.clone(), id).is_some() {
+                        return Err(err(format!("sprite {name} defined twice")));
+                    }
+                }
+                let len = sheet_len.entry(group).or_insert(0);
+                *len = (*len).max(sheet.first_index + cols * rows * sheet.index_stride);
+                continue;
+            }
             let sliced = match cache.as_deref_mut() {
                 Some(cache) => {
-                    let key = self.sheet_key(sheet, &globals, &identity(&sheet.image, true));
                     let sliced = match cache.sheets.as_ref().and_then(|c| c.get(&key)) {
                         Some(s) => s.clone(),
                         None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared, &identity(&sheet.image, false))?),
@@ -1378,26 +1729,21 @@ impl Description {
                 }
                 None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared, &identity(&sheet.image, false))?),
             };
-            let scaling = match sheet.scaling {
-                SheetScaling::Scale => tile_render_shared::SHRINK,
-                SheetScaling::ScaleKeepAnchor => tile_render_shared::SHRINK_KEEP_ANCHOR,
-                SheetScaling::Keep => tile_render_shared::KEEP_SIZE,
-            };
             let remap = self.remap(&sheet.image);
             for (k, s) in sliced.sprites.iter().enumerate() {
-                let id = placer.add(s.image.as_ref(), s.size, s.anchor, scaling, s.sample_box, remap)?;
+                let name = sprite_name(s.index);
+                // (Appended art: what is there already stays as it is.)
+                if existing(&name).is_some() {
+                    continue;
+                }
+                let id = placer.add(s.image.as_ref(), s.size, s.anchor, scaling, s.sample_box, remap, known)?;
                 if s.scaled.is_some() {
                     twins.push((id, sliced.clone(), k, scaling, remap));
                 }
-                let name = match &sheet.group {
-                    Some(g) => format!("{g}/{}", sheet.first_index + s.index * sheet.index_stride),
-                    None => format!("{sheet_name}/{}", s.index),
-                };
                 if sprites.insert(name.clone(), id).is_some() {
                     return Err(DescError::Sheet { sheet: sheet_name.clone(), message: format!("sprite {name} defined twice") });
                 }
             }
-            let group = sheet.group.clone().unwrap_or_else(|| sheet_name.clone());
             let len = sheet_len.entry(group).or_insert(0);
             *len = (*len).max(sheet.first_index + sliced.cells * sheet.index_stride);
         }
@@ -1407,128 +1753,13 @@ impl Description {
         for (id, sliced, k, scaling, remap) in twins {
             let s = &sliced.sprites[k];
             let Some((image, sample_box)) = &s.scaled else { continue };
-            let twin = placer.add(image.as_ref(), s.size, s.anchor, scaling, *sample_box, remap)?;
+            let twin = placer.add(image.as_ref(), s.size, s.anchor, scaling, *sample_box, remap, known)?;
             placer.sprite_mut(id).downscaled = twin.0 + 1;
         }
         if let Some(cache) = cache {
             cache.sheets = Some(kept);
         }
-        // The palette table: row 0, the sprites' own rows, the named ones.
-        let (named, palette_rows) = self.palette_rows(loader)?;
-        let Placer { atlas, placed, own, .. } = placer;
-        let mut atlas = if pixels {
-            atlas.finish()
-        } else {
-            tile_render::Atlas { page_size, pages: Vec::new(), index_pages: Vec::new(), sprites: placed, palettes: Vec::new(), named_palettes: 1 }
-        };
-        atlas.named_palettes = (own.len() / tile_render_shared::PALETTE_SIZE as usize) as u32;
-        atlas.palettes = own;
-        atlas.palettes.extend_from_slice(&named[tile_render_shared::PALETTE_SIZE as usize..]);
-
-        // Sets: explicit ones, plus an implicit single-frame set per sprite.
-        let mut sets = SpriteSets::default();
-        let mut set_ids: BTreeMap<String, SpriteSetId> = BTreeMap::new();
-        let mut set_blend: HashMap<SpriteSetId, Blend> = HashMap::new();
-        for (name, &sprite) in &sprites {
-            set_ids.insert(name.clone(), sets.single(sprite));
-        }
-        for (name, set) in &self.sets {
-            let blend = blend_of(set.blend).ok_or_else(|| DescError::Unknown { kind: "blend of set", name: name.clone() })?;
-            let frames = set
-                .frames
-                .iter()
-                .map(|f| sprites.get(f).copied().ok_or(DescError::Unknown { kind: "sprite", name: f.clone() }))
-                .collect::<Result<Vec<_>, _>>()?;
-            let id = sets.add(&frames);
-            set_ids.insert(name.clone(), id);
-            set_blend.insert(id, blend);
-        }
-
-        // Font faces (those that load).
-        let mut fonts = Vec::new();
-        for (name, font) in &self.fonts {
-            let face = loader.font(&font.source).and_then(|data| tile_render::gpu_text::Face::parse(&data, font.index).map_err(|e| e.to_string()));
-            match face {
-                Ok(face) => fonts.push((name.clone(), std::sync::Arc::new(face))),
-                Err(e) => log::warn!("font {name:?} ({}): {e}", font.source),
-            }
-        }
-
-        // Layers and their value tables.
-        let mut layers = Vec::new();
-        let mut values = HashMap::new();
-        for layer in &self.layers {
-            let mut names = Vec::new();
-            for pattern in &layer.sets {
-                if let Some(prefix) = pattern.strip_suffix('*') {
-                    let mut matched: Vec<&String> = set_ids.keys().filter(|n| n.starts_with(prefix)).collect();
-                    // "sheet/*" in sprite-index order, not lexicographic.
-                    if let Some(sheet) = prefix.strip_suffix('/').filter(|s| sheet_len.contains_key(*s)) {
-                        matched.sort_by_key(|n| n[sheet.len() + 1..].parse::<u32>().unwrap_or(u32::MAX));
-                    }
-                    names.extend(matched.into_iter().cloned());
-                } else if set_ids.contains_key(pattern) {
-                    names.push(pattern.clone());
-                } else {
-                    return Err(DescError::Unknown { kind: "set", name: pattern.clone() });
-                }
-            }
-            // Value 0 is always "nothing", so an all-zero layer is empty.
-            let mut lut = vec![SpriteSetId::EMPTY];
-            for (i, n) in names.iter().enumerate() {
-                values.insert((layer.name.clone(), n.clone()), i as u32 + 1);
-                lut.push(set_ids[n]);
-            }
-            let mut spec = LayerSpec::new(layer.name.clone(), lut);
-            spec.offset = (layer.offset[0], layer.offset[1]);
-            spec.ticks_per_frame = layer.ticks_per_frame;
-            spec.per_cell_phase = layer.per_cell_phase;
-            spec.per_cell_offset = layer.per_cell_offset;
-            spec.descending = layer.descending;
-            spec.hidden = layer.hidden;
-            spec.pass = layer.pass;
-            spec.cull_offset = (layer.cull_offset[0], layer.cull_offset[1]);
-            spec.blend = blend_of(layer.blend)
-                .ok_or_else(|| DescError::Unknown { kind: "blend (scale denominator 1..=32) of layer", name: layer.name.clone() })?;
-            // (Enough bits for every row, and row 0.)
-            spec.palette_bits = if layer.palettes { (u32::BITS - (palette_rows.len() as u32).leading_zeros()).max(1) } else { 0 };
-            if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
-                return Err(DescError::Unknown { kind: "pass order for layer", name: layer.name.clone() });
-            }
-            if layers.last().is_some_and(|l: &LayerSpec| l.pass == spec.pass && l.descending != spec.descending) {
-                return Err(DescError::Unknown { kind: "column order (all layers of a pass must agree) for layer", name: layer.name.clone() });
-            }
-            layers.push(spec);
-        }
-
-        Ok(Compiled {
-            layout: match self.grid.layout {
-                LayoutDesc::Orthogonal => Layout::Orthogonal,
-                LayoutDesc::Staggered => Layout::Staggered,
-            },
-            step: (self.grid.step[0], self.grid.step[1]),
-            color: match self.grid.color_bits {
-                None => ColorModel::Direct,
-                Some(bits @ 4..=7) => ColorModel::Quantized { bits },
-                Some(bits) => return Err(DescError::Unknown { kind: "grid colour depth (4..=7 bits)", name: bits.to_string() }),
-            },
-            sprite_names: {
-                let mut names = vec![String::new(); sprites.len()];
-                for (n, id) in &sprites {
-                    names[id.0 as usize] = n.clone();
-                }
-                names
-            },
-            atlas,
-            sets,
-            layers,
-            values,
-            set_ids,
-            set_blend,
-            fonts,
-            palette_rows,
-            sprite_ids: sprites.into_iter().collect(),
-        })
+        Ok(())
     }
 
     /// The palette table (row 0 clear, then the palettes in name order, see
@@ -1536,44 +1767,324 @@ impl Description {
     fn palette_rows(&self, loader: &dyn ImageLoader) -> Result<(Vec<u32>, HashMap<String, u32>), DescError> {
         let size = tile_render_shared::PALETTE_SIZE as usize;
         let mut made: HashMap<String, Vec<[u8; 4]>> = HashMap::new();
-        fn make(desc: &Description, loader: &dyn ImageLoader, name: &str, made: &mut HashMap<String, Vec<[u8; 4]>>, depth: u32) -> Result<Vec<[u8; 4]>, DescError> {
-            if let Some(p) = made.get(name) {
-                return Ok(p.clone());
-            }
-            let err = |message: String| DescError::Image { name: format!("palette {name}"), message };
-            let p = desc.palettes.get(name).ok_or(DescError::Unknown { kind: "palette", name: name.to_owned() })?;
-            if depth > 8 {
-                return Err(err("palettes based on each other".into()));
-            }
-            let mut colors = match (&p.source, &p.base) {
-                (Some(source), None) => {
-                    let mut options = desc.loader.clone();
-                    options.extend(p.options.clone());
-                    loader.palette(source, &options).map_err(err)?
-                }
-                (None, Some(base)) => make(desc, loader, base, made, depth + 1)?,
-                _ => return Err(err("needs a source or a base (one of them)".into())),
-            };
-            colors.resize(tile_render_shared::PALETTE_SIZE as usize, [0; 4]);
-            for (other, from, to, count) in &p.copy {
-                let other = make(desc, loader, other, made, depth + 1)?;
-                for k in 0..*count as usize {
-                    if let (Some(&c), Some(slot)) = (other.get(*from as usize + k), colors.get_mut(*to as usize + k)) {
-                        *slot = c;
-                    }
-                }
-            }
-            made.insert(name.to_owned(), colors.clone());
-            Ok(colors)
-        }
         let mut table = tile_render::atlas::no_palettes();
         let mut rows = HashMap::new();
         for (i, name) in self.palettes.keys().enumerate() {
-            let colors = make(self, loader, name, &mut made, 0)?;
+            let colors = self.palette_colors(loader, name, &mut made, 0, None)?;
             table.extend(colors.iter().take(size).map(|&c| tile_render::atlas::palette_entry(c)));
             rows.insert(name.clone(), i as u32 + 1);
         }
         Ok((table, rows))
+    }
+
+    /// The colours of palette `name` (one of this description's, or of
+    /// `known`'s, the art an addition is appended to).
+    fn palette_colors(&self, loader: &dyn ImageLoader, name: &str, made: &mut HashMap<String, Vec<[u8; 4]>>, depth: u32, known: Option<&Compiled>) -> Result<Vec<[u8; 4]>, DescError> {
+        if let Some(p) = made.get(name) {
+            return Ok(p.clone());
+        }
+        let err = |message: String| DescError::Image { name: format!("palette {name}"), message };
+        let Some(p) = self.palettes.get(name) else {
+            // A palette of the art appended to: its row's colours.
+            let size = tile_render_shared::PALETTE_SIZE as usize;
+            return match known.and_then(|k| k.palette(name).map(|r| (k, r))) {
+                Some((k, r)) => {
+                    let at = (k.atlas.named_palettes + r - 1) as usize * size;
+                    Ok(k.atlas.palettes.get(at..at + size).ok_or_else(|| err("not in the table".into()))?.iter().map(|c| c.to_le_bytes()).collect())
+                }
+                None => Err(DescError::Unknown { kind: "palette", name: name.to_owned() }),
+            };
+        };
+        if depth > 8 {
+            return Err(err("palettes based on each other".into()));
+        }
+        let mut colors = match (&p.source, &p.base) {
+            (Some(source), None) => {
+                let mut options = self.loader.clone();
+                options.extend(p.options.clone());
+                loader.palette(source, &options).map_err(err)?
+            }
+            (None, Some(base)) => self.palette_colors(loader, base, made, depth + 1, known)?,
+            _ => return Err(err("needs a source or a base (one of them)".into())),
+        };
+        colors.resize(tile_render_shared::PALETTE_SIZE as usize, [0; 4]);
+        for (other, from, to, count) in &p.copy {
+            let other = self.palette_colors(loader, other, made, depth + 1, known)?;
+            for k in 0..*count as usize {
+                if let (Some(&c), Some(slot)) = (other.get(*from as usize + k), colors.get_mut(*to as usize + k)) {
+                    *slot = c;
+                }
+            }
+        }
+        made.insert(name.to_owned(), colors.clone());
+        Ok(colors)
+    }
+}
+
+/// The names among `names` that `pattern` (ending in `*`) matches, in a
+/// layer's order: by sprite index for `"sheet/*"` (`sheet_len`: the sheets
+/// and groups), else by name.
+fn matching<'n>(pattern: &str, names: impl Iterator<Item = &'n String>, sheet_len: &HashMap<String, u32>) -> Vec<String> {
+    let prefix = pattern.strip_suffix('*').unwrap_or(pattern);
+    let mut matched: Vec<&String> = names.filter(|n| n.starts_with(prefix)).collect();
+    matched.sort();
+    // "sheet/*" in sprite-index order, not lexicographic.
+    if let Some(sheet) = prefix.strip_suffix('/').filter(|s| sheet_len.contains_key(*s)) {
+        matched.sort_by_key(|n| n[sheet.len() + 1..].parse::<u32>().unwrap_or(u32::MAX));
+    }
+    matched.into_iter().cloned().collect()
+}
+
+/// A compiled description that more art is appended to as it is needed:
+/// what was compiled keeps its sprite ids, set ids, layer values, palette
+/// rows and atlas places, the new art takes the next ones (see [`Growth`]).
+/// Made by [`Description::compile_growing`]; [`Growing::grow`] compiles an
+/// *addition*, a description of more images, sheets, sets, fonts and named
+/// palettes (no grid, loader options or layers: those of the description
+/// it is appended to; its palettes may be based on that one's). An addition's images and sheets are its
+/// own (their names may be those of an earlier one's); sprites, sets and
+/// fonts are shared: a sprite, set or font whose name is there already is
+/// the one there (names are expected to say what art they are), a sheet
+/// made the same way as an earlier one adds nothing, indexed sprites of the
+/// same pixels as earlier ones share them, and new sets join the layers
+/// whose patterns match them, at the end of their tables.
+pub struct Growing {
+    pixels: bool,
+    page_size: u32,
+    /// Where the next colour and indexed sprites go (with pixels).
+    shelves: (Shelves, Shelves),
+    /// The first sprite of each indexed sprite's pixels, and each
+    /// colouring's own palette row.
+    texels: HashMap<TexelKey, SpriteId>,
+    rows: HashMap<std::sync::Arc<Vec<u32>>, u32>,
+    grid: GridDesc,
+    loader: toml::Table,
+    blank_loader: toml::Table,
+    /// Each layer's set patterns (those ending in `*`).
+    patterns: Vec<Vec<String>>,
+    /// The keys of the sheets compiled so far.
+    seen: HashSet<u64>,
+    /// The sheets and groups (`"sheet/*"` patterns).
+    sheet_len: HashMap<String, u32>,
+}
+
+/// What appending an addition adds to a compiled description (see
+/// [`Growing`]): sprites (and their pixels, compiled with them), palette
+/// rows, sets, layer values, fonts. [`Compiled::apply`] adds it to the
+/// description it was made for, or to a copy of it (e.g. one without the
+/// pixels).
+#[derive(Clone, Default)]
+pub struct Growth {
+    pub atlas: AtlasGrowth,
+    /// The new sprites' names, in id order (`""`: a cell drawn instead in
+    /// views showing the world smaller).
+    pub sprite_names: Vec<String>,
+    /// Explicit sets: name, frames, blend.
+    sets: Vec<(String, Vec<SpriteId>, Blend)>,
+    /// Per layer (index), the sets appended to its value table.
+    layer_values: Vec<(usize, Vec<String>)>,
+    fonts: Vec<(String, std::sync::Arc<tile_render::gpu_text::Face>)>,
+    /// New named palettes and their rows.
+    named: Vec<(String, u32)>,
+}
+
+impl Growth {
+    pub fn is_empty(&self) -> bool {
+        self.atlas.sprites.is_empty() && self.sets.is_empty() && self.fonts.is_empty() && self.named.is_empty()
+    }
+}
+
+impl Description {
+    /// [`Description::compile`] (`pixels`: with the atlas pixels, else
+    /// [`Description::compile_layout`]), to be appended to (see [`Growing`]).
+    pub fn compile_growing(&self, loader: &dyn ImageLoader, page_size: u32, pixels: bool) -> Result<(Compiled, Growing), DescError> {
+        let mut growing = Growing {
+            pixels,
+            page_size,
+            shelves: (Shelves::new(page_size), Shelves::new(page_size)),
+            texels: HashMap::new(),
+            rows: HashMap::new(),
+            grid: self.grid.clone(),
+            loader: self.loader.clone(),
+            blank_loader: self.blank_loader.clone(),
+            patterns: self.layers.iter().map(|l| l.sets.iter().filter(|p| p.ends_with('*')).cloned().collect()).collect(),
+            seen: HashSet::new(),
+            sheet_len: HashMap::new(),
+        };
+        let mut compiled = self.compile_full(loader, page_size, pixels, None, Some(&mut growing))?;
+        // Values that pick a palette keep their meaning as the tables grow,
+        // with room for palettes added later.
+        for (layer, patterns) in compiled.layers.iter_mut().zip(&growing.patterns) {
+            if layer.palette_bits > 0 && !patterns.is_empty() {
+                layer.index_bits = GROWING_INDEX_BITS;
+                layer.palette_bits = layer.palette_bits.max(GROWING_PALETTE_BITS);
+            }
+        }
+        Ok((compiled, growing))
+    }
+}
+
+/// Bits a growing layer's values that pick a palette index its table with
+/// (see `tile_render::LayerSpec::index_bits`): room for this many sets.
+const GROWING_INDEX_BITS: u32 = 16;
+/// Bits a growing layer's values pick a palette row with: room for palettes
+/// (and own rows, which the named ones count past) added later.
+const GROWING_PALETTE_BITS: u32 = 10;
+
+/// The parts of a description an addition has (see [`Growing`]).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Addition {
+    #[serde(default)]
+    images: BTreeMap<String, ImageDesc>,
+    #[serde(default)]
+    sheets: BTreeMap<String, SheetDesc>,
+    #[serde(default)]
+    sets: BTreeMap<String, SetDesc>,
+    #[serde(default)]
+    fonts: BTreeMap<String, FontDesc>,
+    #[serde(default)]
+    palettes: BTreeMap<String, PaletteDesc>,
+}
+
+impl Growing {
+    /// Whether the art comes with its pixels.
+    pub fn pixels(&self) -> bool {
+        self.pixels
+    }
+
+    /// Pages the atlas uses (with pixels): colour pages, index pages.
+    pub fn pages(&self) -> (u32, u32) {
+        (self.shelves.0.pages, self.shelves.1.pages)
+    }
+
+    /// Compiles `addition` (TOML) as appended to `compiled` (this one's
+    /// description, as grown so far: apply each growth to it before the
+    /// next). Nothing is added on error.
+    pub fn grow(&mut self, compiled: &Compiled, addition: &str, loader: &dyn ImageLoader) -> Result<Growth, DescError> {
+        let a: Addition = toml::from_str(addition)?;
+        // As a description of its own, with the grid and loader options of
+        // the one it is appended to (variants expanded the same way).
+        let mut desc = Description {
+            grid: self.grid.clone(),
+            loader: self.loader.clone(),
+            blank_loader: self.blank_loader.clone(),
+            images: a.images,
+            sheets: a.sheets,
+            sets: a.sets,
+            layers: Vec::new(),
+            fonts: a.fonts,
+            palettes: a.palettes,
+        };
+        desc.expand_variants()?;
+        let first = compiled.atlas.sprites.len() as u32;
+        let rows = (compiled.atlas.palettes.len() / tile_render_shared::PALETTE_SIZE as usize).max(1) as u32;
+        let mut placer = Placer::growing(self, first, rows);
+        let mut sprites: BTreeMap<String, SpriteId> = BTreeMap::new();
+        let mut sheet_len = self.sheet_len.clone();
+        let mut seen = self.seen.clone();
+        desc.add_sheets(loader, &mut placer, Some(compiled), &mut sprites, &mut sheet_len, None, Some(&mut seen))?;
+        let mut sprite_names = vec![String::new(); placer.placed().len()];
+        for (name, id) in &sprites {
+            sprite_names[(id.0 - first) as usize] = name.clone();
+        }
+        let sprite = |name: &str| sprites.get(name).copied().or_else(|| compiled.sprite(name));
+        let mut sets = Vec::new();
+        for (name, set) in desc.sets.iter().filter(|(n, _)| !compiled.set_ids.contains_key(*n)) {
+            let blend = blend_of(set.blend).ok_or_else(|| DescError::Unknown { kind: "blend of set", name: name.clone() })?;
+            let frames = set.frames.iter().map(|f| sprite(f).ok_or(DescError::Unknown { kind: "sprite", name: f.clone() })).collect::<Result<Vec<_>, _>>()?;
+            sets.push((name.clone(), frames, blend));
+        }
+        // The new sets on the layers whose patterns match them.
+        let new_sets: Vec<String> =
+            sprites.keys().filter(|n| !compiled.set_ids.contains_key(*n)).chain(sets.iter().map(|(n, _, _)| n)).cloned().collect::<BTreeSet<_>>().into_iter().collect();
+        let mut layer_values = Vec::new();
+        for (i, patterns) in self.patterns.iter().enumerate() {
+            let Some(layer) = compiled.layers.get(i) else { continue };
+            let mut names: Vec<String> = Vec::new();
+            for p in patterns {
+                for n in matching(p, new_sets.iter(), &sheet_len) {
+                    if !names.contains(&n) && !compiled.values.contains_key(&(layer.name.clone(), n.clone())) {
+                        names.push(n);
+                    }
+                }
+            }
+            if !names.is_empty() {
+                layer_values.push((i, names));
+            }
+        }
+        let fonts = desc.load_fonts(loader, |n| compiled.font(n).is_some());
+        let Placer { target, mut own, texels, rows: colourings, .. } = placer;
+        // New named palettes after the new own rows (a named palette's row
+        // counts from the first, wherever it is in the table).
+        let size = tile_render_shared::PALETTE_SIZE as usize;
+        let mut named = Vec::new();
+        let mut made = HashMap::new();
+        for name in desc.palettes.keys().filter(|n| compiled.palette(n).is_none()) {
+            let colors = desc.palette_colors(loader, name, &mut made, 0, Some(compiled))?;
+            let row = rows + (own.len() / size) as u32;
+            own.extend(colors.iter().take(size).map(|&c| tile_render::atlas::palette_entry(c)));
+            named.push((name.clone(), row + 1 - compiled.atlas.named_palettes.max(1)));
+        }
+        let (shelves, sprites, blits) = match target {
+            Target::Grow { rgba, index, blits, sprites } => ((rgba, index), sprites, blits),
+            Target::Sizes(sprites) => (self.shelves.clone(), sprites, Vec::new()),
+            Target::Atlas(_) => unreachable!("a growth places its sprites itself"),
+        };
+        let growth = Growth {
+            atlas: AtlasGrowth { first, pages: shelves.0.pages, index_pages: shelves.1.pages, sprites, blits, palettes: own },
+            sprite_names,
+            sets,
+            layer_values,
+            fonts,
+            named,
+        };
+        // (Only now: nothing is added on error.)
+        self.shelves = shelves;
+        self.texels = texels;
+        self.rows = colourings;
+        self.seen = seen;
+        self.sheet_len = sheet_len;
+        Ok(growth)
+    }
+}
+
+impl Compiled {
+    /// Adds `growth` (made for this description as it is now, or for
+    /// another copy of it, see [`Growing`]): the same sprite ids, set ids,
+    /// palette rows and layer values on every copy. A copy with the atlas
+    /// pixels gets the new pixels too.
+    pub fn apply(&mut self, growth: &Growth) {
+        let first = self.atlas.sprites.len();
+        self.atlas.grow(&growth.atlas);
+        self.sprite_names.resize(first, String::new());
+        for (i, name) in growth.sprite_names.iter().enumerate() {
+            let id = SpriteId((first + i) as u32);
+            self.sprite_names.push(name.clone());
+            if !name.is_empty() {
+                self.sprite_ids.insert(name.clone(), id);
+                let set = self.sets.single(id);
+                self.set_ids.insert(name.clone(), set);
+            }
+        }
+        for (name, frames, blend) in &growth.sets {
+            let id = self.sets.add(frames);
+            self.set_ids.insert(name.clone(), id);
+            self.set_blend.insert(id, *blend);
+        }
+        for (i, names) in &growth.layer_values {
+            let Some(layer) = self.layers.get_mut(*i) else { continue };
+            if layer.palette_bits > 0 && layer.index_bits > 0 && layer.lut.len() + names.len() > 1 << layer.index_bits {
+                log::error!("layer {}: more than {} sets, values that pick a palette change", layer.name, 1u32 << layer.index_bits);
+            }
+            for n in names {
+                let Some(&set) = self.set_ids.get(n) else { continue };
+                self.values.insert((layer.name.clone(), n.clone()), layer.lut.len() as u32);
+                layer.lut.push(set);
+            }
+        }
+        self.fonts.extend(growth.fonts.iter().cloned());
+        self.palette_rows.extend(growth.named.iter().cloned());
     }
 }
 
@@ -2186,6 +2697,212 @@ mod tests {
         let c = Description::parse(&renamed).unwrap().compile_cached(&counting, 256, &mut cache).unwrap();
         assert_eq!(counting.0.get(), loads);
         assert!(c.sprite_names.contains(&"s0/5".to_owned()));
+    }
+
+    const BASE: &str = r#"
+        grid = { layout = "orthogonal", step = [10, 10] }
+        [images.a]
+        source = "a"
+        [sheets.s]
+        image = "a"
+        cell = [10, 10]
+        grid = [4, 1]
+        [sets.anim]
+        frames = ["s/0", "s/1"]
+        [[layers]]
+        name = "l"
+        sets = ["s/*", "anim", "U@*"]
+        [[layers]]
+        name = "m"
+        sets = ["Anim@*"]
+        "#;
+
+    /// Two additions: units of art (sheets of a new image, an animation of
+    /// them), then more, some of it again, and parts of a sprite of the
+    /// first.
+    const ADD1: &str = r#"
+        [images.u]
+        source = "uuu"
+        [sheets.u]
+        image = "u"
+        cell = [8, 5]
+        grid = [5, 2]
+        group = "U@one"
+        [sets."Anim@one"]
+        frames = ["U@one/0", "U@one/3", "s/2"]
+        "#;
+    const ADD2: &str = r#"
+        [images.u]
+        source = "vvvvv"
+        [sheets.u]
+        image = "u"
+        cell = [20, 20]
+        grid = [2, 1]
+        group = "U@two"
+        [images.again]
+        source = "uuu"
+        [sheets.again]
+        image = "again"
+        cell = [8, 5]
+        grid = [5, 2]
+        group = "U@one"
+        [sheets.parts]
+        sprite = "U@two/1"
+        origin = [5, 4]
+        cell = [3, 2]
+        grid = [2, 1]
+        group = "Part"
+        [sets."Anim@one"]
+        frames = ["s/0"]
+        [sets."Anim@two"]
+        frames = ["U@two/0", "U@one/9"]
+        "#;
+    /// The same art as one description.
+    const WHOLE: &str = r#"
+        [images.u1]
+        source = "uuu"
+        [sheets.u1]
+        image = "u1"
+        cell = [8, 5]
+        grid = [5, 2]
+        group = "U@one"
+        [sets."Anim@one"]
+        frames = ["U@one/0", "U@one/3", "s/2"]
+        [images.u2]
+        source = "vvvvv"
+        [sheets.u2]
+        image = "u2"
+        cell = [20, 20]
+        grid = [2, 1]
+        group = "U@two"
+        [sets."Anim@two"]
+        frames = ["U@two/0", "U@one/9"]
+        "#;
+
+    /// Each sprite's pixels by name.
+    fn sprite_pixels(c: &Compiled, name: &str) -> Vec<[u8; 4]> {
+        let s = c.atlas.sprites[c.sprite(name).unwrap().0 as usize];
+        let page = &c.atlas.pages[s.page as usize];
+        (0..s.height).flat_map(|y| (0..s.width).map(move |x| page.get(s.atlas_x + x, s.atlas_y + y))).collect()
+    }
+
+    fn frame_names(c: &Compiled, set: &str) -> Vec<String> {
+        let (id, _) = c.set(set).unwrap();
+        (0..).map_while(|i| c.sets.frame(id, i)).map(|s| c.sprite_names[s.0 as usize].clone()).collect()
+    }
+
+    #[test]
+    fn grown_art_keeps_what_was_there_and_draws_what_a_whole_compile_does() {
+        let base = Description::parse(BASE).unwrap();
+        let (mut grown, mut growing) = base.compile_growing(&Checker, 64, true).unwrap();
+        let (mut tables, mut tables_growing) = base.compile_growing(&Counting(std::cell::Cell::new(0)), 64, false).unwrap();
+        let before = (grown.sprite_names.clone(), grown.value("l", "s/3"), grown.value("l", "anim"), grown.set("anim").unwrap().0);
+        for add in [ADD1, ADD2] {
+            let g = growing.grow(&grown, add, &Checker).unwrap();
+            grown.apply(&g);
+            let t = tables_growing.grow(&tables, add, &Counting(std::cell::Cell::new(0))).unwrap();
+            assert!(t.atlas.blits.is_empty());
+            tables.apply(&t);
+        }
+        // What was there is as it was.
+        assert_eq!(&grown.sprite_names[..before.0.len()], &before.0[..]);
+        assert_eq!((grown.value("l", "s/3"), grown.value("l", "anim"), grown.set("anim").unwrap().0), (before.1, before.2, before.3));
+        // The new sets at the end of the layers' tables.
+        assert_eq!(grown.value("l", "U@one/0"), Some(6));
+        assert_eq!(grown.value("m", "Anim@one"), Some(1));
+        assert_eq!(grown.value("m", "Anim@two"), Some(2));
+        // Art there already is kept (the set too), a sheet made again adds nothing.
+        assert_eq!(frame_names(&grown, "Anim@one"), ["U@one/0", "U@one/3", "s/2"]);
+        assert_eq!(grown.sprite_names.iter().filter(|n| n.starts_with("U@one/")).count(), 10);
+        // The same pixels as one compile of everything.
+        let whole = Description::parse(&format!("{BASE}{WHOLE}")).unwrap().compile(&Checker, 64).unwrap();
+        for name in whole.sprite_names.iter() {
+            assert_eq!(sprite_pixels(&grown, name), sprite_pixels(&whole, name), "{name}");
+        }
+        for set in ["anim", "Anim@one", "Anim@two"] {
+            assert_eq!(frame_names(&grown, set), frame_names(&whole, set));
+        }
+        // Parts of a sprite: its pixels, none of their own.
+        let part = sprite_pixels(&grown, "Part/1");
+        let two = sprite_pixels(&grown, "U@two/1");
+        assert_eq!(part, [two[4 * 20 + 8], two[4 * 20 + 9], two[4 * 20 + 10], two[5 * 20 + 8], two[5 * 20 + 9], two[5 * 20 + 10]]);
+        // The tables alone agree.
+        assert_eq!(tables.sprite_names, grown.sprite_names);
+        let sizes = |c: &Compiled| c.atlas.sprites.iter().map(|s| (s.width, s.height, s.anchor_x, s.anchor_y)).collect::<Vec<_>>();
+        assert_eq!(sizes(&tables), sizes(&grown));
+        assert_eq!(tables.value("m", "Anim@two"), grown.value("m", "Anim@two"));
+        // A failed addition adds nothing; the next one numbers on.
+        let n = grown.atlas.sprites.len();
+        let bad = "[images.x]\nsource = \"x\"\n[sheets.x]\nimage = \"x\"\ncell = [2, 2]\ngroup = \"X\"\n[sets.\"Anim@bad\"]\nframes = [\"nothing\"]\n";
+        assert!(growing.grow(&grown, bad, &Checker).is_err());
+        let g = growing.grow(&grown, &bad.replace("nothing", "X/0"), &Checker).unwrap();
+        assert_eq!(g.atlas.first as usize, n);
+        grown.apply(&g);
+        assert_eq!(grown.value("m", "Anim@bad"), Some(3));
+    }
+
+
+    #[test]
+    fn grown_indexed_art_shares_pixels_and_keeps_the_palette_rows() {
+        let base = r#"
+            grid = { layout = "orthogonal", step = [8, 4] }
+            [palettes.civ]
+            source = "pal{v}"
+            variants = [1, 22]
+            [images.body]
+            source = "a.flc"
+            remap = [2, 6]
+            [sheets.body]
+            image = "body"
+            all_frames = true
+            cell = [8, 4]
+            [[layers]]
+            name = "units"
+            sets = ["body/*", "Shadow@*"]
+            palettes = true
+        "#;
+        let add = r#"
+            [images.shadow]
+            source = "a.flc"
+            shadow = true
+            [sheets.shadow]
+            image = "shadow"
+            all_frames = true
+            cell = [8, 4]
+            group = "Shadow@a"
+        "#;
+        let (mut grown, mut growing) = Description::parse(base).unwrap().compile_growing(&Indexed, 64, true).unwrap();
+        let before = (grown.palette("civ@22"), grown.atlas.named_palettes, grown.value_in("units", "body/1", 2));
+        let g = growing.grow(&grown, add, &Indexed).unwrap();
+        // The shadow's indices are the body's: no pixels, a palette row of its own.
+        assert!(g.atlas.blits.is_empty());
+        assert_eq!(g.atlas.palettes.len(), tile_render_shared::PALETTE_SIZE as usize);
+        grown.apply(&g);
+        assert_eq!((grown.palette("civ@22"), grown.atlas.named_palettes, grown.value_in("units", "body/1", 2)), before);
+        let whole = Description::parse(&format!("{base}{add}")).unwrap().compile(&Indexed, 64).unwrap();
+        for (name, index) in [("body/2", 3), ("body/2", 22), ("Shadow@a/2", 22), ("Shadow@a/0", 9)] {
+            let color = |c: &Compiled| {
+                let s = c.atlas.sprites[c.sprite(name).unwrap().0 as usize];
+                let page = &c.atlas.index_pages[s.page as usize];
+                let i = page.get(s.atlas_x + index % 8, s.atlas_y) as u32;
+                tile_render_shared::indexed_color(i, s.palette, s.remap, c.palette("civ@22").unwrap(), c.atlas.named_palettes, &c.atlas.palettes)
+            };
+            assert_eq!(color(&grown), color(&whole), "{name} at {index}");
+        }
+        assert!(grown.value("units", "Shadow@a/1").is_some());
+        // A named palette added later, based on one there: its row counts
+        // on past the own rows, values pick it.
+        let army = "[palettes.army]\nbase = \"civ@1\"\ncopy = [[\"civ@22\", 2, 5, 2]]\n";
+        let g = growing.grow(&grown, army, &Indexed).unwrap();
+        grown.apply(&g);
+        let whole = Description::parse(&format!("{base}{add}{army}")).unwrap().compile(&Indexed, 64).unwrap();
+        let body = |c: &Compiled| c.atlas.sprites[c.sprite("body/0").unwrap().0 as usize];
+        for index in [3, 5, 6, 7] {
+            let color = |c: &Compiled| tile_render_shared::indexed_color(index, body(c).palette, body(c).remap, c.palette("army").unwrap(), c.atlas.named_palettes, &c.atlas.palettes);
+            assert_eq!(color(&grown), color(&whole), "index {index}");
+        }
+        let row = grown.palette("army").unwrap();
+        assert_eq!(grown.value_in("units", "body/1", row).map(|v| v >> 16), Some(row));
     }
 
     #[test]
