@@ -52,39 +52,78 @@ pub enum ViewerError {
 }
 
 /// The compiled description a viewer draws with, replaceable while it runs
-/// (e.g. when a game loads a scenario with its own art).
+/// (e.g. when a game loads a scenario with its own art), and growing
+/// (`render_desc::Growth`): each whole description and each growth has a
+/// generation (what scenes refer to, `Scene::assets`); a growth keeps what
+/// was there, so a scene of an earlier generation of the same whole
+/// description is drawn with a later one.
 #[derive(Clone)]
-pub struct Assets(Arc<std::sync::Mutex<(u64, Arc<Compiled>)>>);
+pub struct Assets(Arc<std::sync::Mutex<Slot>>);
+
+struct Slot {
+    /// The latest whole description's generation, and the description
+    /// until the viewer has uploaded it.
+    generation: u64,
+    whole: Option<Arc<Compiled>>,
+    /// Its growths not yet applied by the viewer, in order.
+    growths: Vec<(u64, Arc<render_desc::Growth>)>,
+    /// The latest generation given (whole or grown).
+    latest: u64,
+}
 
 impl Assets {
     pub fn new(compiled: Arc<Compiled>) -> Self {
-        Self(Arc::new(std::sync::Mutex::new((1, compiled))))
+        Self(Arc::new(std::sync::Mutex::new(Slot { generation: 1, whole: Some(compiled), growths: Vec::new(), latest: 1 })))
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn replace(&self, compiled: Arc<Compiled>) {
-        let mut slot = self.0.lock().unwrap();
-        *slot = (slot.0 + 1, compiled);
+        let generation = self.slot().latest + 1;
+        self.set(compiled, generation);
     }
 
     /// Replaces the description by `compiled` of generation `generation`
     /// (what scenes refer to, `Scene::assets`).
     pub fn set(&self, compiled: Arc<Compiled>, generation: u64) {
-        *self.0.lock().unwrap() = (generation, compiled);
+        *self.slot() = Slot { generation, whole: Some(compiled), growths: Vec::new(), latest: generation };
     }
 
-    /// Replaces version `version` by `light` (the same without its atlas
-    /// pixels) once they are uploaded, unless a newer one came meanwhile.
-    fn uploaded(&self, version: u64, light: Arc<Compiled>) {
-        let mut slot = self.0.lock().unwrap();
-        if slot.0 == version {
-            slot.1 = light;
+    /// Grows the latest description by `growth` (made for it as grown so
+    /// far), as generation `generation`.
+    pub fn grow(&self, growth: Arc<render_desc::Growth>, generation: u64) {
+        let mut slot = self.slot();
+        slot.growths.push((generation, growth));
+        slot.latest = slot.latest.max(generation);
+    }
+
+    /// The latest generation given (whole or grown).
+    pub fn latest(&self) -> u64 {
+        self.slot().latest
+    }
+
+    /// The latest whole description's generation, and the description if
+    /// the viewer has not uploaded it yet.
+    fn whole(&self) -> (u64, Option<Arc<Compiled>>) {
+        let slot = self.slot();
+        (slot.generation, slot.whole.clone())
+    }
+
+    /// The viewer has uploaded `generation` (its pixels are on the GPU: the
+    /// slot lets go of them, unless a newer one came meanwhile).
+    fn uploaded(&self, generation: u64) {
+        let mut slot = self.slot();
+        if slot.generation == generation {
+            slot.whole = None;
         }
     }
 
-    /// The current description and its version (bumped by `replace`).
-    pub fn current(&self) -> (u64, Arc<Compiled>) {
-        let slot = self.0.lock().unwrap();
-        (slot.0, slot.1.clone())
+    /// The growths of whole generation `generation` not applied yet.
+    fn take_growths(&self, generation: u64) -> Vec<(u64, Arc<render_desc::Growth>)> {
+        let mut slot = self.slot();
+        if slot.generation == generation { std::mem::take(&mut slot.growths) } else { Vec::new() }
     }
 }
 
@@ -369,12 +408,15 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
     display.set_wake(move || {
         let _ = proxy.send_event(());
     });
-    let (assets_version, compiled) = assets.current();
+    let (assets_version, whole) = assets.whole();
+    let whole = whole.expect("a new description");
     let mut app = App {
         config,
         assets,
         assets_version,
-        compiled,
+        whole_version: assets_version,
+        compiled: whole.without_pixels(),
+        upload: Some(whole),
         display,
         gpu: None,
         drawn_seq: 0,
@@ -448,8 +490,14 @@ struct Gpu {
 struct App {
     config: ViewerConfig,
     assets: Assets,
+    /// The generation drawn (the whole description's, or a growth's of
+    /// it), and that whole description's.
     assets_version: u64,
-    compiled: Arc<Compiled>,
+    whole_version: u64,
+    /// The description as drawn (without the pixels: those are on the GPU).
+    compiled: Compiled,
+    /// The first description's pixels, until the GPU is there to take them.
+    upload: Option<Arc<Compiled>>,
     display: Display,
     gpu: Option<Gpu>,
     /// The scene version the renderer's world was built from.
@@ -789,11 +837,11 @@ impl App {
         };
         surface.configure(&device, &config);
         let mut renderer = TileRenderer::new(&device, config.format);
-        renderer.set_atlas(&device, &queue, &self.compiled.atlas);
-        self.cursor_art = cursor::Art::of(&self.compiled);
-        let light = Arc::new(self.compiled.without_pixels());
-        self.assets.uploaded(self.assets_version, light.clone());
-        self.compiled = light;
+        if let Some(whole) = self.upload.take() {
+            renderer.set_atlas(&device, &queue, &whole.atlas);
+            self.cursor_art = cursor::Art::of(&whole);
+        }
+        self.assets.uploaded(self.whole_version);
         self.display.send_input(Input::Resized { width: config.width, height: config.height });
         let software = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
         if software {
@@ -835,30 +883,60 @@ impl App {
                 return;
             }
         }
-        let (version, compiled) = self.assets.current();
-        // New art is taken together with a scene that refers to it (sprite
-        // ids change with every compile), or when none came for a while.
+        let (version, whole) = self.assets.whole();
+        // A new whole description is taken together with a scene that
+        // refers to it (sprite ids change with every compile), or when none
+        // came for a while; growths of the one drawn at once (they keep
+        // what was there).
         let refers_to = self.display.scene().assets;
-        if version == self.assets_version && (refers_to == 0 || refers_to == version) {
-            self.art_waiting = None;
-        }
-        let gave_up = self.art_waiting.get_or_insert_with(std::time::Instant::now).elapsed() > Duration::from_secs(3);
-        let new_assets = version != self.assets_version && (refers_to == 0 || refers_to == version || gave_up);
+        let drawable = |from: u64, to: u64| refers_to == 0 || (from..=to).contains(&refers_to);
+        let waits = self.art_waiting.get_or_insert_with(std::time::Instant::now).elapsed();
+        let gave_up = waits > Duration::from_secs(3);
+        let new_assets = version != self.whole_version && (refers_to == 0 || refers_to >= version || gave_up);
         if new_assets {
             let started = std::time::Instant::now();
-            gpu.renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
-            // (Set ids change with every compile.)
-            self.cursor_art = cursor::Art::of(&compiled);
-            self.custom_cursors.clear();
-            self.shown_pointer = None;
-            log::info!("viewer: new assets ({} sprites, uploaded in {} ms)", compiled.sprite_names.len(), started.elapsed().as_millis());
-            // The pixels are on the GPU now: keep only the rest.
-            let light = Arc::new(compiled.without_pixels());
-            drop(compiled);
-            self.assets.uploaded(version, light.clone());
-            self.compiled = light;
+            if let Some(compiled) = whole {
+                gpu.renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
+                // (Set ids change with every compile.)
+                self.cursor_art = cursor::Art::of(&compiled);
+                self.custom_cursors.clear();
+                self.shown_pointer = None;
+                log::info!("viewer: new assets ({} sprites, uploaded in {} ms)", compiled.sprite_names.len(), started.elapsed().as_millis());
+                // The pixels are on the GPU now: keep only the rest.
+                self.compiled = compiled.without_pixels();
+            }
+            self.assets.uploaded(version);
+            self.whole_version = version;
             self.assets_version = version;
         }
+        let mut grown = false;
+        if version == self.whole_version {
+            let growths = self.assets.take_growths(version);
+            if !growths.is_empty() {
+                let started = std::time::Instant::now();
+                let (mut sprites, mut bytes) = (0, 0);
+                for (generation, growth) in growths {
+                    self.compiled.apply(&growth);
+                    gpu.renderer.grow_atlas(&gpu.device, &gpu.queue, &growth.atlas);
+                    sprites += growth.atlas.sprites.len();
+                    bytes += growth.atlas.bytes();
+                    self.assets_version = generation;
+                }
+                let (pages, room) = gpu.renderer.atlas_room();
+                log::info!(
+                    "viewer: grown by {sprites} sprites ({} KiB of pixels) in {} ms; {} sprites, atlas room for {pages} pages ({} MiB)",
+                    bytes >> 10,
+                    started.elapsed().as_millis(),
+                    self.compiled.atlas.sprites.len(),
+                    room >> 20
+                );
+                grown = true;
+            }
+        }
+        if version == self.whole_version && drawable(self.whole_version, self.assets_version) {
+            self.art_waiting = None;
+        }
+        let new_assets = new_assets || grown;
         for p in self.display.take_patches() {
             self.patches.insert(p.sprite.clone(), p);
         }
@@ -871,7 +949,7 @@ impl App {
         // is drawn meanwhile as it was, its world in its arrangement (the
         // waiting scene's views may differ, e.g. a screen opened with a view
         // of its own).
-        let matches = scene.assets == 0 || scene.assets == self.assets_version || gave_up;
+        let matches = scene.assets == 0 || (self.whole_version..=self.assets_version).contains(&scene.assets) || gave_up;
         let arranged = match &self.drawn_frame {
             Some(frame) if !matches && self.world.is_some() && window == self.drawn_window => frame.clone(),
             _ => {
