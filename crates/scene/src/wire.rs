@@ -5,7 +5,7 @@
 use crate::{Button, Cursor, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, Patch, SystemCursor, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 25;
+pub const VERSION: u32 = 26;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
