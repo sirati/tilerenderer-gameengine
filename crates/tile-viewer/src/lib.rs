@@ -254,7 +254,7 @@ fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u3
 /// may draw elsewhere, `scene::Interface`, which it knows itself).
 fn interface_rects(compiled: &Compiled, scene: &Scene) -> Vec<[i32; 4]> {
     let mut out = Vec::new();
-    let parts = [scene.interface.roaming, scene.interface.popup, scene.interface.screen_view];
+    let parts = [scene.interface.roaming, scene.interface.popup, scene.interface.screen_view, scene.interface.capture_hint];
     for v in scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id))) {
         for s in &v.overlay {
             let Some(id) = compiled.sets.frame(tile_render::SpriteSetId::from_raw(s.set), 0) else { continue };
@@ -808,6 +808,7 @@ impl App {
                     self.layout.advance(now - at);
                 }
                 let bounds = world_bounds(&self.compiled, scene);
+                self.layout.set_snapping(self.snap.snapper.snapping());
                 let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
                 self.drawn_frame = Some(arranged.clone());
                 arranged

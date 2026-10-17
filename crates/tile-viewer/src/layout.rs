@@ -504,6 +504,8 @@ pub struct Layout {
     recapture_screen: Option<(i32, i32)>,
     /// The pointer goes to the screen just opened (this frame).
     pointer_to_screen: bool,
+    /// Whether button snapping is on (see [`Layout::set_snapping`]).
+    snapping: bool,
     moved: Vec<([i32; 4], (i32, i32))>,
     /// Whether the last frame showed the magnifier (it may be left out, or
     /// be under a screen fitted into a pane).
@@ -612,6 +614,7 @@ impl Default for Layout {
             recapture: None,
             recapture_screen: None,
             pointer_to_screen: false,
+            snapping: false,
             moved: Vec::new(),
             magnifier_shown: true,
             world_shown: true,
@@ -935,6 +938,12 @@ impl Layout {
     }
 
     /// The mouse was let go (e.g. the window lost focus).
+    /// Whether button snapping is on (`crate::snap`): it points at the
+    /// interface, so the corner's buttons show to be snapped to.
+    pub fn set_snapping(&mut self, on: bool) {
+        self.snapping = on;
+    }
+
     pub fn released(&mut self) {
         if self.locked {
             self.release("the window lost the mouse");
@@ -1359,7 +1368,12 @@ impl Layout {
         // The parts of the driver's interface the viewer arranges.
         let parts = &scene.interface;
         let part = |id: Option<u32>| id.and_then(|id| scene.views.iter().position(|v| v.id == id && v.view.interface_only));
-        let (roaming, popup, screen_part) = (part(parts.roaming), part(parts.popup), part(parts.screen_view));
+        let (roaming, popup, screen_part, hint) = (part(parts.roaming), part(parts.popup), part(parts.screen_view), part(parts.capture_hint));
+        // While the mouse is captured the corner's buttons cannot be used:
+        // the hint how to let it go shows in their place, in the view
+        // following the world cursor (the active view). While snapping (it
+        // points at the interface) the buttons show, to be snapped to.
+        let hinting = hint.is_some() && self.locked && !self.snapping;
         self.reachable = parts.reachable;
         if parts.screen != self.screen {
             match &parts.screen {
@@ -1516,7 +1530,7 @@ impl Layout {
                 self.shown.push((fit.hit, head));
             }
             // (The roaming controls too, where the driver put them.)
-            for (i, camera) in base.iter().enumerate().filter(|&(i, _)| i != m) {
+            for (i, camera) in base.iter().enumerate().filter(|&(i, _)| i != m && Some(i) != hint) {
                 let stacked = Camera { stacked: true, hairline: true, zoomed_art: self.zoomed_art(zoom), ..*camera };
                 frame.view_cameras[i] = Some(push(&mut frame, stacked));
             }
@@ -1535,7 +1549,9 @@ impl Layout {
             let screen_shift = screen_part.map(|i| Some(self.screen_shift(rect_of(&base[i]))));
             for (i, (v, camera)) in scene.views.iter().zip(&base).enumerate() {
                 let shift = if Some(i) == roaming {
-                    Some(roaming_shift)
+                    Some(roaming_shift.filter(|_| !hinting))
+                } else if Some(i) == hint {
+                    Some(roaming_shift.filter(|_| hinting))
                 } else if Some(i) == popup {
                     Some(popup_shift)
                 } else if Some(i) == screen_part {
@@ -3606,6 +3622,34 @@ mod tests {
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (0, 0));
         assert!(f.view_cameras[2].unwrap() as usize > f.cameras.iter().position(|c| c.zoom == (2, 1)).unwrap());
+    }
+
+    #[test]
+    fn while_the_mouse_is_captured_a_hint_shows_in_the_corners_place() {
+        let mut s = with_parts(None);
+        let part = |id, origin, viewport| ViewState { id, view: View { interface_only: true, origin, viewport, ..Default::default() }, overlay: vec![] };
+        s.views.push(part(259, (8, 8), (133, 38)));
+        s.interface.capture_hint = Some(259);
+        let mut l = arranged(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse)));
+        // Free: the buttons in A, no hint.
+        mv(&mut l, (100, 100));
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(f.view_cameras[2].is_some() && f.view_cameras[3].is_none());
+        // Captured in B: the hint at B's top-left, no buttons.
+        click(&mut l, (600, 300));
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(f.view_cameras[2], None);
+        assert_eq!(f.cameras[f.view_cameras[3].unwrap() as usize].origin, (412, 8));
+        // Snapping: the buttons, to be snapped to.
+        l.set_snapping(true);
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(f.view_cameras[2].is_some() && f.view_cameras[3].is_none());
+        l.set_snapping(false);
+        // Let go: the buttons again, in the view the pointer is in.
+        key(&mut l, VK_CONTROL, true);
+        key(&mut l, VK_CONTROL, false);
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(f.view_cameras[2].is_some() && f.view_cameras[3].is_none());
     }
 
     #[test]

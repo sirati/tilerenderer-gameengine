@@ -252,6 +252,11 @@ pub struct Interface {
     /// it, where the driver put it if nowhere else (and maps pointer input
     /// there back to where the driver put it).
     pub roaming: Option<u32>,
+    /// An interface-only view holding what shows in the roaming controls'
+    /// place while they cannot be used (the mouse captured: a hint how to
+    /// let it go); its `origin` and `viewport` are its rectangle. A renderer
+    /// draws it where it would draw `roaming`, instead of it, when so.
+    pub capture_hint: Option<u32>,
     /// An interface-only view holding the open popup (its `origin` and
     /// `viewport` are the popup's rectangle; the other interface views do
     /// not have it). A renderer may draw it elsewhere (and map pointer input
