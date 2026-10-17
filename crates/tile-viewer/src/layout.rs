@@ -492,6 +492,9 @@ pub struct Layout {
     /// Whether the last frame showed the magnifier (it may be left out, or
     /// be under a screen fitted into a pane).
     magnifier_shown: bool,
+    /// Whether the scene of the last frame had a world (the zoom box and
+    /// strip show only then).
+    world_shown: bool,
     /// Where a world magnifier looked last (it keeps looking there while
     /// nothing is under the pointer).
     magnifier_center: Option<(i32, i32)>,
@@ -581,6 +584,7 @@ impl Default for Layout {
             popup_shown: false,
             moved: Vec::new(),
             magnifier_shown: true,
+            world_shown: true,
             magnifier_center: None,
             focus: None,
             ctrl: false,
@@ -984,7 +988,7 @@ impl Layout {
     /// The zoom strip's rectangle, if the magnifier is one, and the region
     /// it is carved from (`None`: the whole window; else a split's pane).
     fn strip(&self) -> Option<([i32; 4], Option<Side>)> {
-        let m = self.magnifier?;
+        let m = self.magnifier.filter(|_| self.world_shown)?;
         let ZoomPlace::Strip(thousandths) = m.place else { return None };
         let (w, h) = (self.window.0 as i32, self.window.1 as i32);
         let side = match (self.split.map(|s| s.axis), m.region) {
@@ -1270,6 +1274,8 @@ impl Layout {
     ) -> Frame {
         self.window = window;
         self.bounds = bounds;
+        // (No zoom box or strip without a world: e.g. on a title screen.)
+        self.world_shown = scene.shape.cols > 0 && scene.shape.rows > 0;
         let dt = std::mem::take(&mut self.step).min(MAX_STEP);
         let base = crate::scene_cameras(scene, window, overhang);
         // Its own views show the world as the driver's do (their world
@@ -1496,7 +1502,7 @@ impl Layout {
         // over a screen fitted into a pane. The magnifier beside the
         // pointer is on top.
         let fit_rect = fit.map(|f| if f.hit == Hit::Main { main_rect } else { pane_rect.unwrap_or(main_rect) });
-        let magnifier = magnifier.filter(|m| m.place == ZoomPlace::Beside || !fit_rect.is_some_and(|f| overlap(f, self.magnifier_geometry(m).0)));
+        let magnifier = magnifier.filter(|m| m.place == ZoomPlace::Beside || (self.world_shown && !fit_rect.is_some_and(|f| overlap(f, self.magnifier_geometry(m).0))));
         self.magnifier_shown = magnifier.is_some();
         let zoom_box = magnifier.filter(|m| m.place != ZoomPlace::Beside);
         if let Some(m) = zoom_box {
@@ -2988,6 +2994,22 @@ mod tests {
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert!(!f.cameras.iter().any(|c| c.cells && c.zoom == (2, 1) && c.origin == (483, 120)), "{:?}", f.cameras);
         assert_eq!(l.hit((600, 300)), Hit::Pane);
+    }
+
+    #[test]
+    fn no_zoom_box_or_strip_without_a_world() {
+        let title = Scene { shape: scene::WorldShape::default(), ..scene() };
+        for zoom in [Zoom::Floating131, Zoom::TopStrip] {
+            let mut l = arranged(&settings(|s| s.zoom = zoom));
+            let f = l.frame(&title, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert!(!f.cameras.iter().any(|c| c.zoom == (2, 1)), "{zoom:?}: {:?}", f.cameras);
+            // The window is the driver's as without a zoom box.
+            assert_eq!(l.panes().0, [0, 0, 800, 600]);
+            assert_eq!(l.hit((400, 300)), Hit::Main);
+            // Once a world shows: there.
+            let f = frame(&mut l, vec![]);
+            assert!(f.cameras.iter().any(|c| c.zoom == (2, 1)), "{zoom:?}");
+        }
     }
 
     #[test]
