@@ -127,6 +127,17 @@ impl Frames {
             Frames::Indexed { frames, .. } => (frames[frame].pixels.width, frames[frame].pixels.height),
         }
     }
+
+    /// The colour of pixel (`x`, `y`) of `frame`.
+    fn pixel(&self, frame: usize, x: u32, y: u32) -> [u8; 4] {
+        match self {
+            Frames::Rgba(f) => f[frame].get(x, y),
+            Frames::Indexed { frames, .. } => {
+                let f = &frames[frame];
+                f.palette.get(f.pixels.get(x, y) as usize).copied().unwrap_or_default()
+            }
+        }
+    }
 }
 
 /// The sprites of one sheet as compiled (named by the compile: the same
@@ -389,6 +400,12 @@ pub struct SheetDesc {
     /// Where the sprite's top-left goes relative to the cell origin.
     #[serde(default)]
     pub anchor: [i32; 2],
+    /// Each sprite's anchor marked in the image next to its cell, as games
+    /// mark a mouse cursor's hot spot: a pixel of this colour (RGB, each
+    /// channel within 8) in the row just above the cell is the hot spot's
+    /// x, one in the column just left of it its y; the sprite's anchor is
+    /// minus that offset (`anchor` where a cell has no marks).
+    pub anchor_marks: Option<[u8; 3]>,
     /// Only these sprite indices (default: all).
     pub only: Option<Vec<u32>>,
     /// Name sprites `"{group}/{first_index + i}"` instead of
@@ -1027,7 +1044,9 @@ impl Description {
         shared: &mut SharedTexels,
         source_id: &str,
     ) -> Result<Sliced, DescError> {
-        let all = if pixels { Some(frames(&sheet.image, false)?) } else { None };
+        // (The image is read for its anchor marks even without pixels: the
+        // anchors are the same either way.)
+        let all = if pixels || sheet.anchor_marks.is_some() { Some(frames(&sheet.image, false)?) } else { None };
         // The images again as the sprite format sees them, for the sheets
         // that sample from their boxes (the boxes are found once, here).
         let boxed = sheet.sample_from == SampleFrom::Box;
@@ -1037,7 +1056,7 @@ impl Description {
         let mut out = Sliced { sprites: Vec::new(), cells: 0 };
         for k in 0..count {
             let frame = if sheet.all_frames { k } else { sheet.frame };
-            let one = self.slice_frame(name, sheet, frame, all.as_ref(), all_blank.as_ref(), sizes, shared, source_id)?;
+            let one = self.slice_frame(name, sheet, frame, (all.as_ref(), pixels), all_blank.as_ref(), sizes, shared, source_id)?;
             out.sprites.extend(one.sprites.into_iter().map(|s| SlicedSprite { index: s.index + out.cells, ..s }));
             out.cells += one.cells;
         }
@@ -1052,7 +1071,7 @@ impl Description {
         name: &str,
         sheet: &SheetDesc,
         frame: usize,
-        all: Option<&Frames>,
+        (all, pixels): (Option<&Frames>, bool),
         all_blank: Option<&Frames>,
         sizes: &mut dyn FnMut(&str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, DescError>,
         shared: &mut SharedTexels,
@@ -1101,7 +1120,7 @@ impl Description {
         // A cell's pixels and what a view showing the world smaller samples
         // of it: its box (empty if it is all blank) or all of it.
         let mut cut = |x: u32, y: u32| -> (Option<Cut>, [u32; 4]) {
-            let image = all.map(|f| match f {
+            let image = all.filter(|_| pixels).map(|f| match f {
                 Frames::Rgba(frames) => Cut::Rgba(shape(frames[frame].crop(x, y, cw, ch))),
                 Frames::Indexed { frames, rows } => {
                     let key = (source.to_owned(), frame, [x, y, cw, ch]);
@@ -1134,7 +1153,12 @@ impl Description {
                 let (x, y) = at(o);
                 cut(x, y)
             });
-            let anchor = (sheet.anchor[0] - grow as i32, sheet.anchor[1] - grow as i32);
+            let marked = match (sheet.anchor_marks, all) {
+                (Some(mark), Some(f)) => anchor_marked(f, frame, (iw, ih), (x, y), (cw, ch), mark),
+                _ => None,
+            };
+            let [ax, ay] = marked.unwrap_or(sheet.anchor);
+            let anchor = (ax - grow as i32, ay - grow as i32);
             sprites.push(SlicedSprite { index: i, image, size: (gw, gh), anchor, sample_box, scaled });
         }
         Ok(Sliced { sprites, cells: cols * rows })
@@ -1539,6 +1563,11 @@ impl Compiled {
 
     /// The set (sprite, or named animation) for a free sprite, and how it
     /// blends.
+    /// The sets whose names start with `prefix`, by name.
+    pub fn sets_with_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (&'a str, SpriteSetId)> + 'a {
+        self.set_ids.range::<str, _>((std::ops::Bound::Included(prefix), std::ops::Bound::Unbounded)).take_while(move |(n, _)| n.starts_with(prefix)).map(|(n, id)| (n.as_str(), *id))
+    }
+
     pub fn set(&self, name: &str) -> Option<(SpriteSetId, Blend)> {
         let id = *self.set_ids.get(name)?;
         Some((id, self.set_blend.get(&id).copied().unwrap_or_default()))
@@ -1566,6 +1595,18 @@ impl Compiled {
     }
 }
 
+
+/// The anchor marked for the `size` cell at `at` of `frame` (an image of
+/// `image` size; see `SheetDesc::anchor_marks`): minus the offsets of the
+/// `mark` pixels in the row above and the column left of it, if both are
+/// there.
+fn anchor_marked(f: &Frames, frame: usize, image: (u32, u32), (x, y): (u32, u32), (w, h): (u32, u32), mark: [u8; 3]) -> Option<[i32; 2]> {
+    let is_mark = |px: [u8; 4]| px[3] != 0 && (0..3).all(|c| px[c].abs_diff(mark[c]) <= 8);
+    let (x0, y0) = (x.checked_sub(1)?, y.checked_sub(1)?);
+    let hx = (0..w).find(|&i| x + i < image.0 && is_mark(f.pixel(frame, x + i, y0)))?;
+    let hy = (0..h).find(|&j| y + j < image.1 && is_mark(f.pixel(frame, x0, y + j)))?;
+    Some([-(hx as i32), -(hy as i32)])
+}
 
 /// The smallest box `[x, y, width, height]` holding every pixel of `img`
 /// that is not blank (alpha 0); `None` if all are.
@@ -2170,6 +2211,37 @@ mod tests {
         let c = Description::parse(text).unwrap().compile(&Columns, 64).unwrap();
         let img = render_small(&c, "s/0", n);
         (0..img.height).map(|y| (0..img.width).map(|x| Some(img.get(x, y)).filter(|p| p[3] != 0).map(|p| p[0])).collect()).collect()
+    }
+
+    /// Two 4 × 4 cursor cells at (1, 1) and (6, 1), a 1-pixel grid of grey
+    /// between them; the first's hot spot (2, 3) marked in orange in the
+    /// grid, the second unmarked.
+    struct Marked;
+    impl ImageLoader for Marked {
+        fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<RgbaImage>, String> {
+            Ok(vec![RgbaImage::from_fn(11, 6, |x, y| match (x, y) {
+                (3, 0) | (0, 4) => [228, 152, 24, 255],
+                (_, 0) | (0, _) | (5, _) | (10, _) | (_, 5) => [70, 70, 70, 255],
+                _ => [1, 2, 3, 255],
+            })])
+        }
+    }
+
+    #[test]
+    fn anchor_marks_beside_a_cell_give_its_hot_spot() {
+        let text = "[grid]\nlayout = \"orthogonal\"\nstep = [4, 4]\n\
+            [images.c]\nsource = \"c\"\n\
+            [sheets.c]\nimage = \"c\"\ncell = [4, 4]\ngrid = [2, 1]\norigin = [1, 1]\nspacing = [1, 0]\nanchor = [-1, -1]\nanchor_marks = [230, 150, 20]\n";
+        let d = Description::parse(text).unwrap();
+        for c in [d.compile(&Marked, 64).unwrap(), d.compile_with(&Marked, 64, false, None).unwrap()] {
+            let anchor = |name: &str| {
+                let s = c.atlas.sprites[c.sets.frame(c.set(name).unwrap().0, 0).unwrap().0 as usize];
+                (s.anchor_x, s.anchor_y)
+            };
+            assert_eq!(anchor("c/0"), (-2, -3));
+            // No marks: the sheet's anchor.
+            assert_eq!(anchor("c/1"), (-1, -1));
+        }
     }
 
     const BOXED: &str = "[grid]\nlayout = \"orthogonal\"\nstep = [8, 4]\n\
