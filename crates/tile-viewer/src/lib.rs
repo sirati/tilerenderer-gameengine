@@ -414,6 +414,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         woken_idle: false,
         cursor_cameras: None,
         next_frame: None,
+        map_drawn: false,
     };
     // The arrangement to start with: the user's settings.
     app.set_settings(load_settings());
@@ -524,6 +525,8 @@ struct App {
     cursor_cameras: Option<Vec<Camera>>,
     /// When the next frame is due (the animation clock), without updates.
     next_frame: Option<Instant>,
+    /// Whether a scene with the world in a view was drawn yet.
+    map_drawn: bool,
 }
 
 /// What happens to the system pointer once a frame went out after it was
@@ -985,6 +988,11 @@ impl App {
         }
         if matches {
             self.drawn_seq = scene.seq;
+        }
+        // (For measuring how long a game takes to show its map.)
+        if !self.map_drawn && matches && scene.shape.cols > 0 && scene.views.iter().any(|v| !v.view.interface_only) {
+            self.map_drawn = true;
+            log::info!("viewer: first map drawn (scene {})", scene.seq);
         }
         // A software renderer draws a frame only when it differs from the last.
         let unchanged = !new_assets && !rebuilt && !markers_moved && scene.tick == self.drawn_tick && window == self.drawn_window;
