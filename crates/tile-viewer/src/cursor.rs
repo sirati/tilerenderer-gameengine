@@ -7,10 +7,12 @@
 //!   custom system cursor made from its sprite, or a standard one; over a
 //!   view that a click captures the mouse in, the description's
 //!   [`CAPTURE_SPRITES`] (else the system's crosshair).
-//! - While the mouse is captured or the pointer snaps to buttons, the
-//!   system pointer is hidden and the viewer draws the cursor itself at its
-//!   logical place: the world cursor in every view that shows it, the
-//!   snapping pointer where it flies.
+//! - While the mouse is captured, the system pointer is hidden and the
+//!   viewer draws the cursor itself at its logical place: the world cursor
+//!   in every view that shows it.
+//! - While button snapping is on ([`SnapMode`]), its own pointer and ghost
+//!   (`crate::snap`) are the only cursor: no system pointer, nothing drawn
+//!   here.
 //! - But while the view following the world cursor is held at the edge of
 //!   a world that does not wrap (the cursor off its middle), the system
 //!   pointer shows at the world cursor and moves it, kept inside the
@@ -176,13 +178,27 @@ pub fn sprite_set(compiled: &Compiled, cursor: scene::Cursor) -> Option<SpriteSe
     .or_else(|| FALLBACK_SPRITES.iter().find_map(|n| compiled.set(n).map(|(s, _)| s)))
 }
 
+/// A pointer aid that, while it is on, is the only cursor (button snapping,
+/// `crate::snap`, which draws its own pointer and ghost).
+pub trait SnapMode {
+    fn snap_mode_active(&self) -> bool;
+}
+
+/// (Snapping is on while its pointer is out; a persistent snap mode
+/// answers here.)
+impl SnapMode for crate::snap::SnapInput {
+    fn snap_mode_active(&self) -> bool {
+        self.snapper.pointer().is_some()
+    }
+}
+
 /// What decides how the cursor shows, as of a frame.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Facts {
     /// The mouse is captured (its motion moves the world cursor).
     pub captured: bool,
-    /// The snapping pointer (window pixels), while it snaps.
-    pub snap: Option<(i32, i32)>,
+    /// Button snapping is on ([`SnapMode`]): its pointer is the only cursor.
+    pub snap_mode: bool,
     /// The system pointer waits for a frame to be let go of (or to be
     /// shown at the world cursor): it is still hidden.
     pub unlocking: bool,
@@ -221,7 +237,8 @@ pub struct Plan {
 /// world cursor drawn in the middle of the view following it and wherever
 /// else the world shows it), captured at the world's edge (the system
 /// pointer at the world cursor, moving it, which then moves freely in its
-/// view: drawn only in the other views), snapping (the snapping pointer
+/// view: drawn only in the other views), snapping (nothing of ours: only
+/// the snapping pointer
 /// drawn). At any moment the cursor shows once per place: where the
 /// system pointer shows, nothing is drawn; the world cursor is drawn only
 /// while the mouse is captured.
@@ -247,7 +264,7 @@ impl Machine {
     /// Takes the facts of a frame: how the cursor shows.
     pub fn step(&mut self, f: &Facts) -> Plan {
         let mut plan = Plan::default();
-        let active = f.captured && f.snap.is_none();
+        let active = f.captured && !f.snap_mode;
         match f.cursor_view.filter(|_| active) {
             Some((rect, at, held)) => {
                 let inside = |(x, y): (i32, i32)| x >= rect[0] && y >= rect[1] && x < rect[0] + rect[2] && y < rect[1] + rect[3];
@@ -273,9 +290,9 @@ impl Machine {
         // at the world cursor, after this frame: the cursor is drawn till
         // then.)
         let entering = plan.enter_edge.is_some();
-        plan.hidden = (f.captured && !self.edge) || f.snap.is_some() || f.unlocking || entering;
-        plan.marks = if let Some(p) = f.snap {
-            Marks { world: vec![], window: vec![p], system: None }
+        plan.hidden = (f.captured && !self.edge) || f.snap_mode || f.unlocking || entering;
+        plan.marks = if f.snap_mode {
+            Marks::default()
         } else if f.captured {
             let at = f.cursor_view.map(|(_, at, _)| at);
             Marks { world: f.world_cursor.clone(), window: vec![], system: if self.edge && !f.unlocking && !entering { at } else { None } }
@@ -449,8 +466,9 @@ mod tests {
         for (i, a) in s.iter().enumerate() {
             assert!(s[i + 1..].iter().all(|b| (a.x, a.y) != (b.x, b.y)), "twice at {:?}", (a.x, a.y));
         }
-        if let Some(q) = f.snap {
-            assert!(p.hidden && p.marks.world.is_empty() && p.marks.window == [q]);
+        if f.snap_mode {
+            // Snapping: only its own pointer, nothing of ours.
+            assert!(p.hidden && s.is_empty() && p.marks == Marks::default());
         } else if f.captured {
             // The world cursor, and only it, is drawn while captured.
             assert_eq!(p.marks.world, f.world_cursor);
@@ -530,9 +548,9 @@ mod tests {
         let p = m.step(&captured((20, 120), (420, 150), true, (420, 150), 1.1));
         check(&captured((20, 120), (420, 150), true, (420, 150), 1.1), &p, &cams);
         assert!(!p.hidden);
-        // Snapping: hidden, the snapping pointer drawn, the edge mode over.
+        // Snapping: hidden, nothing drawn, the edge mode over.
         let mut f = captured((20, 120), (420, 150), true, (420, 150), 1.2);
-        f.snap = Some((30, 280));
+        f.snap_mode = true;
         let p = m.step(&f);
         check(&f, &p, &cams);
         assert!(p.leave_edge && p.hidden && !m.edge());

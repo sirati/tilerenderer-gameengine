@@ -11,6 +11,7 @@ pub mod snap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cursor::SnapMode;
 use render_desc::Compiled;
 use scene::{Display, Input, Scene};
 use tile_render::{Camera, RgbaImage, TileRenderer, TileWorld};
@@ -535,7 +536,7 @@ impl App {
     /// Whether the viewer draws the cursor itself rather than the system:
     /// while the mouse is captured, or the pointer snaps to buttons.
     fn pointer_hidden(&self) -> bool {
-        (self.layout.captured() && !self.machine.edge()) || self.snap.snapper.pointer().is_some() || self.unlock_pending.is_some()
+        (self.layout.captured() && !self.machine.edge()) || self.snap.snap_mode_active() || self.unlock_pending.is_some()
     }
 
     /// The driver's cursor, as long as its scene refers to the art the
@@ -744,7 +745,7 @@ impl App {
         if gpu.software && !done() {
             let _ = gpu.device.poll(wgpu::PollType::Poll);
             // The cursor drawn here waits for nothing but that frame.
-            let cursor_waits = self.pointer_since.is_some() && (self.layout.captured() || self.snap.snapper.pointer().is_some() || !self.drawn_cursor.is_empty());
+            let cursor_waits = self.pointer_since.is_some() && (self.layout.captured() || self.snap.snap_mode_active() || !self.drawn_cursor.is_empty());
             if !done() && cursor_waits {
                 let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(Duration::from_millis(100)) });
             }
@@ -813,15 +814,14 @@ impl App {
         }
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
-        // The snapping pointer's ghost (the pointer itself is the cursor's).
-        let solid: Vec<_> = [snap::POINTER_SPRITE, CURSOR_SPRITE].iter().filter_map(|n| self.compiled.set(n).map(|(s, _)| s)).collect();
-        markers.extend(self.snap.sprites(&self.compiled, scene, &arranged, &self.layout).into_iter().filter(|s| !solid.contains(&s.set)));
+        // The snapping pointer and its ghost (while snapping, the only cursor).
+        markers.extend(self.snap.sprites(&self.compiled, scene, &arranged, &self.layout));
         // The cursor where the viewer draws it, in a camera of its own on
         // top (only when there is one: the frame is as before otherwise).
         let captured = self.layout.captured();
         let facts = cursor::Facts {
             captured,
-            snap: self.snap.snapper.pointer().map(|(x, y)| (x.round() as i32, y.round() as i32)),
+            snap_mode: self.snap.snap_mode_active(),
             unlocking: self.unlock_pending.is_some(),
             world_cursor: arranged.markers.iter().filter_map(|m| if let layout::Marker::Cursor(p) = m { Some(*p) } else { None }).collect(),
             cursor_view: self.layout.world_cursor_view(),
