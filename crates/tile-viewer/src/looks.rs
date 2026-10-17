@@ -294,7 +294,7 @@ impl Feedback {
 }
 
 /// Where a view's overlay lies among the renderer's sprites: from `start`,
-/// `len` of them, drawn by camera `camera`.
+/// `len` of them, each drawn by its entry in `cameras`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     pub view: u32,
@@ -305,7 +305,7 @@ pub struct Span {
 
 /// `base` (the renderer's sprites, the views' overlays at `spans`) with
 /// `replacements` made, their sprites placed by `place` (with the camera of
-/// the view). Ranges that do not fit their overlay, or overlap one made
+/// each original sprite). Ranges that do not fit their overlay, or overlap one made
 /// before, are left alone.
 pub fn splice<T: Clone>(base: &[T], spans: &[Span], replacements: &[Replacement], place: impl Fn(&FreeSprite, u32) -> T) -> Vec<T> {
     let mut cuts: Vec<(usize, usize, &Replacement, &[u32])> = replacements
@@ -476,4 +476,21 @@ mod tests {
         assert_eq!(splice(&base_marked, &spans, &r, |s, camera| (s.set, camera)), want);
         assert_eq!(splice(&base_marked, &spans, &[], |s, c| (s.set, c)), base_marked);
     }
+
+    #[test]
+    fn replacements_keep_each_scaled_panels_camera() {
+        let spans = [Span { view: 1, start: 1, len: 4, cameras: vec![3, 3, 7, 7] }];
+        let base = vec![(100, 0), (0, 3), (1, 3), (2, 7), (3, 7)];
+        let sprites = [sprite(10), sprite(11)];
+        // A control spanning panel cameras keeps their separate transforms.
+        let r = [Replacement { view: 1, range: (1, 3), sprites: &sprites }];
+        assert_eq!(splice(&base, &spans, &r, |s, c| (s.set, c)), [(100, 0), (0, 3), (10, 3), (11, 7), (3, 7)]);
+        // A state with more sprites can stay inside one panel.
+        let r = [Replacement { view: 1, range: (2, 3), sprites: &sprites }];
+        assert_eq!(splice(&base, &spans, &r, |s, c| (s.set, c)), [(100, 0), (0, 3), (1, 3), (10, 7), (11, 7), (3, 7)]);
+        // Different-length states across panels cannot be assigned safely.
+        let r = [Replacement { view: 1, range: (1, 4), sprites: &sprites }];
+        assert_eq!(splice(&base, &spans, &r, |s, c| (s.set, c)), base);
+    }
+
 }
