@@ -256,6 +256,12 @@ pub struct Interface {
     /// not have it). A renderer may draw it elsewhere (and map pointer input
     /// there back to where the driver put it).
     pub popup: Option<u32>,
+    /// An interface-only view holding the named screen (`screen`) where it
+    /// lies over the window, smaller than it, and what is drawn over it
+    /// (its `origin` and `viewport` are its rectangle; the other interface
+    /// views do not have it). A renderer may move it out from under its own
+    /// views over the window (and map pointer input there back).
+    pub screen_view: Option<u32>,
     /// A rectangle (x, y, w, h) of controls the pointer has to reach from
     /// every view of the renderer's (e.g. the active unit's orders), while
     /// they are shown.

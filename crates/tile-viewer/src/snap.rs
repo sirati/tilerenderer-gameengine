@@ -762,7 +762,25 @@ fn to_inputs(actions: Vec<Action>, layout: &Layout) -> Vec<Input> {
 impl SnapInput {
     /// The targets in `scene` as `layout` shows them.
     fn targets(scene: &scene::Scene, layout: &Layout) -> Vec<Target> {
-        targets(&scene.interactables, layout.screen_mapping(), layout.window())
+        let mut out = targets(&scene.interactables, layout.screen_mapping(), layout.window());
+        // What lies in a part of the interface drawn elsewhere (a popup moved
+        // into a view, a screen moved below the zoom strip) is there.
+        for t in &mut out {
+            let c = t.center();
+            let moved = layout.moved_parts().iter().find(|([x, y, w, h], (dx, dy))| {
+                let (ox, oy) = ((x - dx) as f64, (y - dy) as f64);
+                c.0 >= ox && c.1 >= oy && c.0 < ox + *w as f64 && c.1 < oy + *h as f64
+            });
+            if let Some((_, (dx, dy))) = moved {
+                t.rect[0] += *dx as f64;
+                t.rect[1] += *dy as f64;
+                if let TargetKind::List { scroll, .. } = &mut t.kind {
+                    scroll[0] += *dx as f64;
+                    scroll[1] += *dy as f64;
+                }
+            }
+        }
+        out
     }
 
     /// A window input at time `now`: what goes to the driver.

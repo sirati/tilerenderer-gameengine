@@ -1287,7 +1287,7 @@ impl Layout {
         // The parts of the driver's interface the viewer arranges.
         let parts = &scene.interface;
         let part = |id: Option<u32>| id.and_then(|id| scene.views.iter().position(|v| v.id == id && v.view.interface_only));
-        let (roaming, popup) = (part(parts.roaming), part(parts.popup));
+        let (roaming, popup, screen_part) = (part(parts.roaming), part(parts.popup), part(parts.screen_view));
         self.reachable = parts.reachable;
         if parts.screen != self.screen {
             match &parts.screen {
@@ -1424,8 +1424,17 @@ impl Layout {
         } else {
             let roaming_shift = self.roaming_shift(main_rect, pane_rect);
             let popup_shift = popup.map(|i| self.popup_shift(rect_of(&base[i]), main_rect));
+            let screen_shift = screen_part.map(|i| Some(self.screen_shift(rect_of(&base[i]))));
             for (i, (v, camera)) in scene.views.iter().zip(&base).enumerate() {
-                let shift = if Some(i) == roaming { Some(roaming_shift) } else if Some(i) == popup { Some(popup_shift) } else { None };
+                let shift = if Some(i) == roaming {
+                    Some(roaming_shift)
+                } else if Some(i) == popup {
+                    Some(popup_shift)
+                } else if Some(i) == screen_part {
+                    screen_shift
+                } else {
+                    None
+                };
                 if Some(i) == main {
                     let camera = self.arranged_main(camera, main_rect, overhang);
                     frame.view_cameras[i] = Some(push(&mut frame, camera));
@@ -1583,6 +1592,23 @@ impl Layout {
             return (0, 0);
         }
         (x.clamp(a[0], a[0] + a[2] - w) - x, y.clamp(a[1], a[1] + a[3] - h) - y)
+    }
+
+    /// How far the driver's named screen at `rect` moves: below the zoom
+    /// box or strip where it would be under it and there is room below (it
+    /// lies over the views, under the driver's interface); else nowhere
+    /// (the box or strip goes under it).
+    fn screen_shift(&self, [x, y, w, h]: [i32; 4]) -> (i32, i32) {
+        let Some(m) = self.magnifier.filter(|m| self.world_shown && matches!(m.place, ZoomPlace::Box(_) | ZoomPlace::Strip(_))) else { return (0, 0) };
+        let boxed = self.magnifier_geometry(&m).0;
+        let below = boxed[1] + boxed[3] + GAP;
+        if overlap(boxed, [x, y, w, h]) && below > y && below + h <= self.window.1 as i32 { (0, below - y) } else { (0, 0) }
+    }
+
+    /// The parts of the driver's interface drawn elsewhere (as of the last
+    /// frame): their window rectangle and how far they were moved.
+    pub fn moved_parts(&self) -> &[([i32; 4], (i32, i32))] {
+        if self.fit.is_some() { &[] } else { &self.moved }
     }
 
     /// What shows the panes' pictures in the divider's open stretches: for
@@ -3010,6 +3036,32 @@ mod tests {
             let f = frame(&mut l, vec![]);
             assert!(f.cameras.iter().any(|c| c.zoom == (2, 1)), "{zoom:?}");
         }
+    }
+
+    #[test]
+    fn a_screen_over_the_window_goes_below_the_zoom_strip_where_there_is_room() {
+        let mut s = with_screen("F1");
+        let part = scene::ViewState { id: 258, view: scene::View { interface_only: true, origin: (100, 100), viewport: (600, 400), ..Default::default() }, overlay: vec![] };
+        s.views.push(part);
+        s.interface.screen_view = Some(258);
+        let screen_camera = |f: &Frame| f.cameras[f.view_cameras[2].unwrap() as usize];
+        // Below the strip (150 high): moved down, clicks go where the driver has it.
+        let mut l = arranged(&settings(|s| (s.zoom, s.zoom_strip) = (Zoom::TopStrip, 0.25)));
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!((screen_camera(&f).origin, screen_camera(&f).screen_shift), ((100, 154), (0, 54)));
+        assert_eq!(click(&mut l, (300, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 300, y: 246 });
+        // Its top, under the strip where it was: the strip's world.
+        assert!(!matches!(click(&mut l, (300, 120))[0], Input::MouseButton { x: 300, y: 120, .. }));
+        // A box in the middle leaves no room below: it stays, over the box.
+        let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(screen_camera(&f).screen_shift, (0, 0));
+        assert!(f.view_cameras[2].unwrap() as usize > f.cameras.iter().position(|c| c.zoom == (2, 1) && c.origin == (160, 120)).unwrap());
+        assert_eq!(click(&mut l, (300, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 300, y: 300 });
+        // No zoom box: where the driver put it.
+        let mut l = arranged(&Settings::default());
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!((screen_camera(&f).origin, screen_camera(&f).screen_shift), ((100, 100), (0, 0)));
     }
 
     #[test]

@@ -254,7 +254,7 @@ fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u3
 /// may draw elsewhere, `scene::Interface`, which it knows itself).
 fn interface_rects(compiled: &Compiled, scene: &Scene) -> Vec<[i32; 4]> {
     let mut out = Vec::new();
-    let parts = [scene.interface.roaming, scene.interface.popup];
+    let parts = [scene.interface.roaming, scene.interface.popup, scene.interface.screen_view];
     for v in scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id))) {
         for s in &v.overlay {
             let Some(id) = compiled.sets.frame(tile_render::SpriteSetId::from_raw(s.set), 0) else { continue };
