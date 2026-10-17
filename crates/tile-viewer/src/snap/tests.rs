@@ -264,7 +264,7 @@ fn updates_come_at_most_at_the_configured_rate() {
     assert!(picks.len() >= 3, "{picks:?}");
     assert!(picks.windows(2).all(|w| w[1] - w[0] >= 1.0 / 3.0 - 1e-9), "{picks:?}");
     // From the settings, kept sane.
-    let r = Rates::of(&viewer_settings::Input { snap_updates_per_second: 0.0, snap_ghost_fps: 1000.0 });
+    let r = Rates::of(&viewer_settings::Input { snap_updates_per_second: 0.0, snap_ghost_fps: 1000.0, ..Default::default() });
     assert_eq!((r.updates_per_second, r.ghost_fps), (0.5, 240.0));
     assert_eq!(Rates::default(), Rates { updates_per_second: 3.0, ghost_fps: 30.0 });
 }
