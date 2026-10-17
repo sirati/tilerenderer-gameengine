@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
-use tile_render::{AtlasBuilder, Blend, ColorModel, Grid, LayerSpec, Layout, RgbaImage, SpriteId, SpriteSetId, SpriteSets};
+use tile_render::{AtlasBuilder, Blend, ColorModel, Grid, IndexImage, LayerSpec, Layout, RgbaImage, SpriteId, SpriteSetId, SpriteSets};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DescError {
@@ -66,6 +66,58 @@ pub trait ImageLoader {
     fn font(&self, source: &str) -> Result<Vec<u8>, String> {
         Err(format!("{source}: this loader has no fonts"))
     }
+
+    /// The frames of `source` as palette indices, each with the colour every
+    /// index is drawn in (see [`IndexedFrame`]), where the loader can tell
+    /// the image so with these options: its pixels are a palette's indices
+    /// and the options change only which colour an index stands for. `None`:
+    /// not so (e.g. colours computed per pixel); [`ImageLoader::load`] then
+    /// makes the image. Indexed sprites take a quarter of the memory, and
+    /// sprites of the same pixels in other colours share theirs.
+    fn indexed(&self, _source: &str, _options: &toml::Table) -> Result<Option<Vec<IndexedFrame>>, String> {
+        Ok(None)
+    }
+
+    /// The colours of palette `source` (see [`Description::palettes`]): up to
+    /// 256 RGBA8 entries, as the loader would draw an image's pixels of
+    /// those colours (the same colour reduction).
+    fn palette(&self, source: &str, _options: &toml::Table) -> Result<Vec<[u8; 4]>, String> {
+        Err(format!("{source}: this loader has no palettes"))
+    }
+}
+
+/// One frame of an indexed image (see [`ImageLoader::indexed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedFrame {
+    /// Palette indices; they must not depend on the load's options.
+    pub pixels: IndexImage,
+    /// The colour each index is drawn in, as [`ImageLoader::load`] would
+    /// draw it with the same options (transparent and translucent ones too).
+    pub palette: Vec<[u8; 4]>,
+}
+
+/// An image's frames as loaded: colours, or palette indices with each
+/// frame's own palette row (frames of one palette sharing it).
+#[derive(Clone)]
+enum Frames {
+    Rgba(std::rc::Rc<Vec<RgbaImage>>),
+    Indexed { frames: std::rc::Rc<Vec<IndexedFrame>>, rows: Vec<std::sync::Arc<Vec<u32>>> },
+}
+
+impl Frames {
+    fn len(&self) -> usize {
+        match self {
+            Frames::Rgba(f) => f.len(),
+            Frames::Indexed { frames, .. } => frames.len(),
+        }
+    }
+
+    fn size(&self, frame: usize) -> (u32, u32) {
+        match self {
+            Frames::Rgba(f) => (f[frame].width, f[frame].height),
+            Frames::Indexed { frames, .. } => (frames[frame].pixels.width, frames[frame].pixels.height),
+        }
+    }
 }
 
 /// The sprites of one sheet as compiled (named by the compile: the same
@@ -76,11 +128,24 @@ struct Sliced {
     cells: u32,
 }
 
+/// Where an indexed sprite's indices come from: image source, frame, and
+/// the cell (x, y, width, height). Sprites of the same pixels share them in
+/// the atlas, whatever their colours (e.g. a unit's body and its shadow).
+type TexelKey = (String, usize, [u32; 4]);
+
+/// A sprite's pixels as sliced.
+enum Cut {
+    Rgba(RgbaImage),
+    /// Palette indices, the colours of its own palette row (entry `i` of
+    /// `row` for index `i`) and where the indices come from.
+    Indexed { image: IndexImage, row: std::sync::Arc<Vec<u32>>, key: TexelKey },
+}
+
 struct SlicedSprite {
     /// The cell's index in the sheet.
     index: u32,
     /// The pixels, if compiled with them.
-    image: Option<RgbaImage>,
+    image: Option<Cut>,
     size: (u32, u32),
     anchor: (i32, i32),
     /// What a view showing the world smaller samples (x, y, width, height;
@@ -89,13 +154,13 @@ struct SlicedSprite {
     sample_box: [u32; 4],
     /// The cell drawn instead there (`scaled_origin`): its pixels (with
     /// the pixels) and sample box.
-    scaled: Option<(Option<RgbaImage>, [u32; 4])>,
+    scaled: Option<(Option<Cut>, [u32; 4])>,
 }
 
 /// The sheets of the last [`Description::compile_cached`], by what makes
 /// them, so that the next compile of a description that has them too (e.g.
 /// one that grew) only loads and slices the new ones. Holds the sprites'
-/// pixels: about the atlas's size.
+/// pixels (indexed ones one byte a pixel): about the atlas's size.
 #[derive(Default)]
 pub struct SheetCache {
     sheets: Option<HashMap<String, std::sync::Arc<Sliced>>>,
@@ -114,6 +179,74 @@ impl SheetCache {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Places a compile's sprites: with their pixels into an atlas (indexed
+/// sprites of the same pixels sharing them, own palette rows of the same
+/// colours shared), or (without pixels) their sizes only.
+struct Placer {
+    pixels: bool,
+    page_size: u32,
+    atlas: AtlasBuilder,
+    /// Without pixels: the sprites' sizes and anchors.
+    placed: Vec<tile_render_shared::SpriteDesc>,
+    /// The first sprite of each indexed sprite's pixels.
+    texels: HashMap<TexelKey, SpriteId>,
+    /// Own palette rows (row 0, then one per distinct colouring), and each
+    /// colouring's row.
+    own: Vec<u32>,
+    rows: HashMap<std::sync::Arc<Vec<u32>>, u32>,
+}
+
+impl Placer {
+    fn new(page_size: u32, pixels: bool) -> Self {
+        Self { pixels, page_size, atlas: AtlasBuilder::new(page_size), placed: Vec::new(), texels: HashMap::new(), own: tile_render::atlas::no_palettes(), rows: HashMap::new() }
+    }
+
+    fn sprite_mut(&mut self, id: SpriteId) -> &mut tile_render_shared::SpriteDesc {
+        if self.pixels { self.atlas.sprite_mut(id) } else { &mut self.placed[id.0 as usize] }
+    }
+
+    /// Adds a sprite (`cut`: its pixels, `None` without pixels), drawn
+    /// with `scaling` from `sample_box` by views showing the world smaller;
+    /// an indexed one with its indices in `remap` remapped.
+    fn add(&mut self, cut: Option<&Cut>, (w, h): (u32, u32), anchor: (i32, i32), scaling: u32, sample_box: [u32; 4], remap: u32) -> Result<SpriteId, DescError> {
+        let id = match cut {
+            None => {
+                if w > self.page_size || h > self.page_size {
+                    return Err(tile_render::atlas::AtlasError::TooLarge(w, h, self.page_size).into());
+                }
+                self.placed.push(tile_render_shared::SpriteDesc { width: w, height: h, anchor_x: anchor.0, anchor_y: anchor.1, ..Default::default() });
+                SpriteId(self.placed.len() as u32 - 1)
+            }
+            Some(Cut::Rgba(image)) => self.atlas.add(image, anchor)?,
+            Some(Cut::Indexed { image, row, key }) => {
+                let own = match self.rows.get(row) {
+                    Some(&r) => r,
+                    None => {
+                        let r = (self.own.len() / tile_render_shared::PALETTE_SIZE as usize) as u32;
+                        self.own.extend_from_slice(row);
+                        self.rows.insert(row.clone(), r);
+                        r
+                    }
+                };
+                let id = match self.texels.get(key) {
+                    Some(&first) => self.atlas.alias(first, anchor),
+                    None => {
+                        let id = self.atlas.add_indexed(image, anchor, own, remap)?;
+                        self.texels.insert(key.clone(), id);
+                        id
+                    }
+                };
+                let s = self.atlas.sprite_mut(id);
+                (s.palette, s.remap) = (own, remap);
+                id
+            }
+        };
+        let desc = self.sprite_mut(id);
+        (desc.scaling, desc.box_x, desc.box_y, desc.box_w, desc.box_h) = (scaling, sample_box[0], sample_box[1], sample_box[2], sample_box[3]);
+        Ok(id)
     }
 }
 
@@ -148,6 +281,32 @@ pub struct Description {
     /// its text is then not drawn from outlines.
     #[serde(default)]
     pub fonts: BTreeMap<String, FontDesc>,
+    /// Named palettes (see [`PaletteDesc`]): rows an indexed image's
+    /// remapped indices (`remap = [lo, hi]`) are drawn through, picked per
+    /// draw: by a layer with `palettes = true` ([`Compiled::value_in`]) or a
+    /// free sprite ([`Compiled::palette`]). One copy of the art for every
+    /// colouring (e.g. a unit in each nation's colours). Images are indexed
+    /// (one byte a pixel, their own palette a row) wherever the loader can
+    /// load them so ([`ImageLoader::indexed`]; `indexed = false` asks for
+    /// colours).
+    #[serde(default)]
+    pub palettes: BTreeMap<String, PaletteDesc>,
+}
+
+/// A palette row: the colours of `source` (loaded by
+/// [`ImageLoader::palette`], with the image options of `loader`), or those of
+/// palette `base`; then `copy` entries `[palette, from, to, count]`: `count`
+/// entries of another palette from `from` on, written from `to` on.
+/// `variants` as for images.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PaletteDesc {
+    pub source: Option<String>,
+    pub base: Option<String>,
+    #[serde(default)]
+    pub copy: Vec<(String, u32, u32, u32)>,
+    /// Everything else, for the loader.
+    #[serde(flatten)]
+    pub options: toml::Table,
 }
 
 /// A font face (see [`Description::fonts`]).
@@ -243,6 +402,10 @@ pub struct SheetDesc {
     pub outline: Option<OutlineDesc>,
     /// See [`Description::parse`].
     pub variants: Option<Vec<i64>>,
+    /// Cut every frame of the image (`frame` aside), one after the other:
+    /// sprite `f·n + i` is cell `i` of frame `f` (`n` cells a frame).
+    #[serde(default)]
+    pub all_frames: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -299,6 +462,10 @@ pub struct LayerDesc {
     /// must agree.
     #[serde(default)]
     pub blend: BlendDesc,
+    /// Values also pick the named palette the layer's indexed sprites'
+    /// remapped indices are drawn through (see [`Compiled::value_in`]).
+    #[serde(default)]
+    pub palettes: bool,
 }
 
 /// `blend = "alpha"` (default) or `blend = { scale = 16 }` (the
@@ -310,6 +477,9 @@ pub enum BlendDesc {
     Alpha,
     Scale(u32),
 }
+
+/// Sources made without the loader (full colour).
+const GENERATED: [&str; 7] = ["solid:", "line:", "arrow:", "crosshair:", "panes:", "pointer:", "rects:"];
 
 /// `source = "solid:R,G,B,A:WxH"`: a single-colour image, made without the
 /// loader (bars, lines).
@@ -745,23 +915,31 @@ impl Description {
             }
         }
         desc.sheets = sheets;
+        let mut palettes = BTreeMap::new();
+        for (name, mut p) in std::mem::take(&mut desc.palettes) {
+            match p.options.remove("variants") {
+                None => {
+                    palettes.insert(name, p);
+                }
+                Some(values) => {
+                    let values: Vec<i64> = values.try_into().map_err(|e: toml::de::Error| DescError::Toml(e))?;
+                    for v in values {
+                        let copy = p.copy.iter().map(|(n, a, b, c)| (substitute(n, v), *a, *b, *c)).collect();
+                        let options = p.options.iter().map(|(k, o)| (k.clone(), substitute_value(o, v))).collect();
+                        let (source, base) = (p.source.as_deref().map(|s| substitute(s, v)), p.base.as_deref().map(|s| substitute(s, v)));
+                        palettes.insert(format!("{name}@{v}"), PaletteDesc { source, base, copy, options });
+                    }
+                }
+            }
+        }
+        desc.palettes = palettes;
         Ok(desc)
     }
 
     /// The frames of image `name`; with `blank`, as the load that finds
     /// boxes makes them (`blank_loader`, then the image's own `blank`).
     fn load_frames(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc, blank: bool) -> Result<Vec<RgbaImage>, DescError> {
-        let mut options = self.loader.clone();
-        options.extend(img.options.clone());
-        // (`blank` is no loader option.)
-        let image_blank = match options.remove("blank") {
-            Some(toml::Value::Table(table)) => table,
-            _ => toml::Table::new(),
-        };
-        if blank {
-            options.extend(self.blank_loader.clone());
-            options.extend(image_blank);
-        }
+        let options = self.image_options(img, blank);
         let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 7] =
             [("solid:", solid), ("line:", line), ("arrow:", arrow), ("crosshair:", crosshair), ("panes:", panes), ("pointer:", pointer), ("rects:", rects)];
         let generated = generators.iter().find_map(|(prefix, make)| img.source.strip_prefix(prefix).map(make));
@@ -775,7 +953,7 @@ impl Description {
     /// The sizes of image `name`'s frames, without its pixels where the
     /// loader can tell them so (see [`ImageLoader::sizes`]).
     fn frame_sizes(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc) -> Result<Vec<(u32, u32)>, DescError> {
-        let generated = ["solid:", "line:", "arrow:", "crosshair:", "panes:", "pointer:", "rects:"].iter().any(|p| img.source.starts_with(p));
+        let generated = GENERATED.iter().any(|p| img.source.starts_with(p));
         if generated {
             return Ok(self.load_frames(loader, name, img, false)?.iter().map(|f| (f.width, f.height)).collect());
         }
@@ -823,39 +1001,54 @@ impl Description {
     /// sizes only), from the frames of its image (`frames` loads an image's
     /// frames, `blank` them as the load that finds boxes makes them, `sizes`
     /// gives their sizes).
-    fn slice(
-        &self,
-        name: &str,
-        sheet: &SheetDesc,
-        pixels: bool,
-        frames: &mut dyn FnMut(&str, bool) -> Result<std::rc::Rc<Vec<RgbaImage>>, DescError>,
-        sizes: &mut dyn FnMut(&str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, DescError>,
-    ) -> Result<Sliced, DescError> {
-        let err = |message: String| DescError::Sheet { sheet: name.to_owned(), message };
-        let no_frame = || err(format!("image has no frame {}", sheet.frame));
+    fn slice(&self, name: &str, sheet: &SheetDesc, pixels: bool, frames: &mut dyn FnMut(&str, bool) -> Result<Frames, DescError>, sizes: &mut dyn FnMut(&str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, DescError>) -> Result<Sliced, DescError> {
         let all = if pixels { Some(frames(&sheet.image, false)?) } else { None };
-        let img = match &all {
-            Some(all) => Some(all.get(sheet.frame).ok_or_else(no_frame)?),
-            None => None,
-        };
-        let (iw, ih) = match img {
-            Some(img) => (img.width, img.height),
-            None => *sizes(&sheet.image)?.get(sheet.frame).ok_or_else(no_frame)?,
-        };
         // The images again as the sprite format sees them, for the sheets
         // that sample from their boxes (the boxes are found once, here).
         let boxed = sheet.sample_from == SampleFrom::Box;
         let all_blank = if boxed && pixels { Some(frames(&sheet.image, true)?) } else { None };
-        let blank_img = match &all_blank {
-            Some(all) => {
-                let blank = all.get(sheet.frame).ok_or_else(no_frame)?;
-                if (blank.width, blank.height) != (iw, ih) {
-                    return Err(err(format!("the image loads as {}×{} for its box but as {iw}×{ih} to draw", blank.width, blank.height)));
-                }
-                Some(blank)
-            }
-            None => None,
+        // (`all_frames`: every frame of the image, one after the other.)
+        let count = if !sheet.all_frames { 1 } else if let Some(all) = &all { all.len() } else { sizes(&sheet.image)?.len() };
+        let mut out = Sliced { sprites: Vec::new(), cells: 0 };
+        for k in 0..count {
+            let frame = if sheet.all_frames { k } else { sheet.frame };
+            let one = self.slice_frame(name, sheet, frame, all.as_ref(), all_blank.as_ref(), sizes)?;
+            out.sprites.extend(one.sprites.into_iter().map(|s| SlicedSprite { index: s.index + out.cells, ..s }));
+            out.cells += one.cells;
+        }
+        Ok(out)
+    }
+
+    /// [`Description::slice`] for frame `frame` of the image (`all`,
+    /// `all_blank`: its frames, if made).
+    fn slice_frame(
+        &self,
+        name: &str,
+        sheet: &SheetDesc,
+        frame: usize,
+        all: Option<&Frames>,
+        all_blank: Option<&Frames>,
+        sizes: &mut dyn FnMut(&str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, DescError>,
+    ) -> Result<Sliced, DescError> {
+        let err = |message: String| DescError::Sheet { sheet: name.to_owned(), message };
+        let no_frame = || err(format!("image has no frame {frame}"));
+        if let Some(f) = all.filter(|f| frame >= f.len()) {
+            let _ = f;
+            return Err(no_frame());
+        }
+        let (iw, ih) = match all {
+            Some(f) => f.size(frame),
+            None => *sizes(&sheet.image)?.get(frame).ok_or_else(no_frame)?,
         };
+        if let Some(blank) = all_blank {
+            if frame >= blank.len() {
+                return Err(no_frame());
+            }
+            let (bw, bh) = blank.size(frame);
+            if (bw, bh) != (iw, ih) {
+                return Err(err(format!("the image loads as {bw}×{bh} for its box but as {iw}×{ih} to draw")));
+            }
+        }
         let [cw, ch] = sheet.cell;
         let [ox, oy] = sheet.origin;
         let [sx, sy] = sheet.spacing;
@@ -868,18 +1061,35 @@ impl Description {
         if exceeds(sheet.origin) || sheet.scaled_origin.is_some_and(exceeds) {
             return Err(err(format!("{cols}×{rows} cells of {cw}×{ch} exceed the {iw}×{ih} image")));
         }
+        if matches!(all, Some(Frames::Indexed { .. })) && sheet.outline.is_some() {
+            return Err(err("an indexed image cannot be outlined".into()));
+        }
         let grow = sheet.outline.as_ref().map_or(0, |o| o.width);
         let (gw, gh) = (cw + 2 * grow, ch + 2 * grow);
         let shape = |cell: RgbaImage| match &sheet.outline {
             Some(o) => outline(&cell, o.width, o.color),
             None => cell,
         };
+        let source = self.images.get(&sheet.image).map_or("", |i| i.source.as_str());
         // A cell's pixels and what a view showing the world smaller samples
         // of it: its box (empty if it is all blank) or all of it.
-        let cut = |x: u32, y: u32| -> (Option<RgbaImage>, [u32; 4]) {
-            let image = img.map(|img| shape(img.crop(x, y, cw, ch)));
-            let sample_box = match blank_img {
-                Some(blank) => opaque_box(&shape(blank.crop(x, y, cw, ch))).unwrap_or_default(),
+        let cut = |x: u32, y: u32| -> (Option<Cut>, [u32; 4]) {
+            let image = all.map(|f| match f {
+                Frames::Rgba(frames) => Cut::Rgba(shape(frames[frame].crop(x, y, cw, ch))),
+                Frames::Indexed { frames, rows } => Cut::Indexed {
+                    image: frames[frame].pixels.crop(x, y, cw, ch),
+                    row: rows[frame].clone(),
+                    key: (source.to_owned(), frame, [x, y, cw, ch]),
+                },
+            });
+            let sample_box = match all_blank {
+                Some(Frames::Rgba(blank)) => opaque_box(&shape(blank[frame].crop(x, y, cw, ch))).unwrap_or_default(),
+                Some(Frames::Indexed { frames, rows }) => {
+                    let f = &frames[frame];
+                    let row = &rows[frame];
+                    let cell = RgbaImage::from_fn(cw, ch, |i, j| [0, 0, 0, (row[f.pixels.get(x + i, y + j) as usize] >> 24) as u8]);
+                    opaque_box(&cell).unwrap_or_default()
+                }
                 None => [0, 0, gw, gh],
             };
             (image, sample_box)
@@ -903,16 +1113,67 @@ impl Description {
         Ok(Sliced { sprites, cells: cols * rows })
     }
 
+    /// The remapped range of image `name`'s indexed sprites (`remap = [lo,
+    /// hi]`, default none; see `tile_render_shared::SpriteDesc::remap`).
+    fn remap(&self, name: &str) -> u32 {
+        let r = self.images.get(name).and_then(|i| i.options.get("remap")).and_then(toml::Value::as_array);
+        let n = |i: usize| r.and_then(|r| r.get(i)).and_then(toml::Value::as_integer).unwrap_or(0).clamp(0, 256) as u32;
+        tile_render_shared::remap_range(n(0), n(1))
+    }
+
+    /// The frames of image `name` (`blank`: as the load that finds boxes
+    /// makes them): indexed where the loader can make them so (see
+    /// [`ImageLoader::indexed`]) and the image does not say `indexed =
+    /// false`, else colours.
+    fn load_any(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc, blank: bool) -> Result<Frames, DescError> {
+        let generated = GENERATED.iter().any(|p| img.source.starts_with(p));
+        let wanted = img.options.get("indexed").and_then(toml::Value::as_bool).unwrap_or(true);
+        if !generated && wanted {
+            let options = self.image_options(img, blank);
+            let image_error = |message: String| DescError::Image { name: name.to_owned(), message };
+            if let Some(frames) = loader.indexed(&img.source, &options).map_err(image_error)? {
+                let mut rows: Vec<std::sync::Arc<Vec<u32>>> = Vec::with_capacity(frames.len());
+                for f in &frames {
+                    let mut row: Vec<u32> = f.palette.iter().map(|&c| tile_render::atlas::palette_entry(c)).collect();
+                    row.resize(tile_render_shared::PALETTE_SIZE as usize, 0);
+                    // (Frames of one palette share its row.)
+                    match rows.last().filter(|r| ***r == row) {
+                        Some(r) => rows.push(r.clone()),
+                        None => rows.push(std::sync::Arc::new(row)),
+                    }
+                }
+                return Ok(Frames::Indexed { frames: std::rc::Rc::new(frames), rows });
+            }
+        }
+        Ok(Frames::Rgba(std::rc::Rc::new(self.load_frames(loader, name, img, blank)?)))
+    }
+
+    /// The loader options of `img` (`blank`: for the load that finds boxes).
+    fn image_options(&self, img: &ImageDesc, blank: bool) -> toml::Table {
+        let mut options = self.loader.clone();
+        options.extend(img.options.clone());
+        // (`blank` is no loader option.)
+        let image_blank = match options.remove("blank") {
+            Some(toml::Value::Table(table)) => table,
+            _ => toml::Table::new(),
+        };
+        if blank {
+            options.extend(self.blank_loader.clone());
+            options.extend(image_blank);
+        }
+        options
+    }
+
     fn compile_with(&self, loader: &dyn ImageLoader, page_size: u32, pixels: bool, mut cache: Option<&mut SheetCache>) -> Result<Compiled, DescError> {
         use std::rc::Rc;
         // Images are loaded when a sheet needs them, once per compile.
-        let mut loaded: HashMap<(String, bool), Rc<Vec<RgbaImage>>> = HashMap::new();
-        let mut frames = |name: &str, blank: bool| -> Result<Rc<Vec<RgbaImage>>, DescError> {
+        let mut loaded: HashMap<(String, bool), Frames> = HashMap::new();
+        let mut frames = |name: &str, blank: bool| -> Result<Frames, DescError> {
             if let Some(f) = loaded.get(&(name.to_owned(), blank)) {
                 return Ok(f.clone());
             }
             let img = self.images.get(name).ok_or(DescError::Unknown { kind: "image", name: name.to_owned() })?;
-            let f = Rc::new(self.load_frames(loader, name, img, blank)?);
+            let f = self.load_any(loader, name, img, blank)?;
             loaded.insert((name.to_owned(), blank), f.clone());
             Ok(f)
         };
@@ -928,11 +1189,10 @@ impl Description {
         };
         let globals = format!("{:?}|{:?}", self.loader, self.blank_loader);
         let mut kept: HashMap<String, std::sync::Arc<Sliced>> = HashMap::new();
-        let mut atlas = AtlasBuilder::new(page_size);
-        let mut placed: Vec<tile_render_shared::SpriteDesc> = Vec::new();
+        let mut placer = Placer::new(page_size, pixels);
         // Sprites with a twin for views showing the world smaller
         // (`scaled_origin`): which, and where their twin's cell is.
-        let mut twins: Vec<(SpriteId, std::sync::Arc<Sliced>, usize, u32)> = Vec::new();
+        let mut twins: Vec<(SpriteId, std::sync::Arc<Sliced>, usize, u32, u32)> = Vec::new();
 
         // Sprites, named "sheet/index".
         let mut sprites: BTreeMap<String, SpriteId> = BTreeMap::new();
@@ -955,10 +1215,11 @@ impl Description {
                 SheetScaling::ScaleKeepAnchor => tile_render_shared::SHRINK_KEEP_ANCHOR,
                 SheetScaling::Keep => tile_render_shared::KEEP_SIZE,
             };
+            let remap = self.remap(&sheet.image);
             for (k, s) in sliced.sprites.iter().enumerate() {
-                let id = add_sprite(&mut atlas, &mut placed, page_size, s.image.as_ref(), s.size, s.anchor, scaling, s.sample_box)?;
+                let id = placer.add(s.image.as_ref(), s.size, s.anchor, scaling, s.sample_box, remap)?;
                 if s.scaled.is_some() {
-                    twins.push((id, sliced.clone(), k, scaling));
+                    twins.push((id, sliced.clone(), k, scaling, remap));
                 }
                 let name = match &sheet.group {
                     Some(g) => format!("{g}/{}", sheet.first_index + s.index * sheet.index_stride),
@@ -975,17 +1236,26 @@ impl Description {
         // The cells drawn instead in views showing the world smaller, after
         // all named sprites (so that a compile without the pixels numbers
         // those the same).
-        for (id, sliced, k, scaling) in twins {
+        for (id, sliced, k, scaling, remap) in twins {
             let s = &sliced.sprites[k];
             let Some((image, sample_box)) = &s.scaled else { continue };
-            let twin = add_sprite(&mut atlas, &mut placed, page_size, image.as_ref(), s.size, s.anchor, scaling, *sample_box)?;
-            let desc = if pixels { atlas.sprite_mut(id) } else { &mut placed[id.0 as usize] };
-            desc.downscaled = twin.0 + 1;
+            let twin = placer.add(image.as_ref(), s.size, s.anchor, scaling, *sample_box, remap)?;
+            placer.sprite_mut(id).downscaled = twin.0 + 1;
         }
         if let Some(cache) = cache {
             cache.sheets = Some(kept);
         }
-        let atlas = if pixels { atlas.finish() } else { tile_render::Atlas { page_size, pages: Vec::new(), sprites: placed } };
+        // The palette table: row 0, the sprites' own rows, the named ones.
+        let (named, palette_rows) = self.palette_rows(loader)?;
+        let Placer { atlas, placed, own, .. } = placer;
+        let mut atlas = if pixels {
+            atlas.finish()
+        } else {
+            tile_render::Atlas { page_size, pages: Vec::new(), index_pages: Vec::new(), sprites: placed, palettes: Vec::new(), named_palettes: 1 }
+        };
+        atlas.named_palettes = (own.len() / tile_render_shared::PALETTE_SIZE as usize) as u32;
+        atlas.palettes = own;
+        atlas.palettes.extend_from_slice(&named[tile_render_shared::PALETTE_SIZE as usize..]);
 
         // Sets: explicit ones, plus an implicit single-frame set per sprite.
         let mut sets = SpriteSets::default();
@@ -1052,6 +1322,8 @@ impl Description {
             spec.cull_offset = (layer.cull_offset[0], layer.cull_offset[1]);
             spec.blend = blend_of(layer.blend)
                 .ok_or_else(|| DescError::Unknown { kind: "blend (scale denominator 1..=32) of layer", name: layer.name.clone() })?;
+            // (Enough bits for every row, and row 0.)
+            spec.palette_bits = if layer.palettes { (u32::BITS - (palette_rows.len() as u32).leading_zeros()).max(1) } else { 0 };
             if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
                 return Err(DescError::Unknown { kind: "pass order for layer", name: layer.name.clone() });
             }
@@ -1086,7 +1358,54 @@ impl Description {
             set_ids,
             set_blend,
             fonts,
+            palette_rows,
+            sprite_ids: sprites.into_iter().collect(),
         })
+    }
+
+    /// The palette table (row 0 clear, then the palettes in name order, see
+    /// `tile_render::Atlas::palettes`) and each palette's row.
+    fn palette_rows(&self, loader: &dyn ImageLoader) -> Result<(Vec<u32>, HashMap<String, u32>), DescError> {
+        let size = tile_render_shared::PALETTE_SIZE as usize;
+        let mut made: HashMap<String, Vec<[u8; 4]>> = HashMap::new();
+        fn make(desc: &Description, loader: &dyn ImageLoader, name: &str, made: &mut HashMap<String, Vec<[u8; 4]>>, depth: u32) -> Result<Vec<[u8; 4]>, DescError> {
+            if let Some(p) = made.get(name) {
+                return Ok(p.clone());
+            }
+            let err = |message: String| DescError::Image { name: format!("palette {name}"), message };
+            let p = desc.palettes.get(name).ok_or(DescError::Unknown { kind: "palette", name: name.to_owned() })?;
+            if depth > 8 {
+                return Err(err("palettes based on each other".into()));
+            }
+            let mut colors = match (&p.source, &p.base) {
+                (Some(source), None) => {
+                    let mut options = desc.loader.clone();
+                    options.extend(p.options.clone());
+                    loader.palette(source, &options).map_err(err)?
+                }
+                (None, Some(base)) => make(desc, loader, base, made, depth + 1)?,
+                _ => return Err(err("needs a source or a base (one of them)".into())),
+            };
+            colors.resize(tile_render_shared::PALETTE_SIZE as usize, [0; 4]);
+            for (other, from, to, count) in &p.copy {
+                let other = make(desc, loader, other, made, depth + 1)?;
+                for k in 0..*count as usize {
+                    if let (Some(&c), Some(slot)) = (other.get(*from as usize + k), colors.get_mut(*to as usize + k)) {
+                        *slot = c;
+                    }
+                }
+            }
+            made.insert(name.to_owned(), colors.clone());
+            Ok(colors)
+        }
+        let mut table = tile_render::atlas::no_palettes();
+        let mut rows = HashMap::new();
+        for (i, name) in self.palettes.keys().enumerate() {
+            let colors = make(self, loader, name, &mut made, 0)?;
+            table.extend(colors.iter().take(size).map(|&c| tile_render::atlas::palette_entry(c)));
+            rows.insert(name.clone(), i as u32 + 1);
+        }
+        Ok((table, rows))
     }
 }
 
@@ -1106,6 +1425,10 @@ pub struct Compiled {
     /// The font faces that loaded, by name, in the order of
     /// `TileWorld::fonts` (see [`Compiled::font`]).
     pub fonts: Vec<(String, std::sync::Arc<tile_render::gpu_text::Face>)>,
+    /// The row of every palette (see [`Description::palettes`]).
+    palette_rows: HashMap<String, u32>,
+    /// Every sprite by name.
+    sprite_ids: HashMap<String, SpriteId>,
 }
 
 impl Compiled {
@@ -1117,7 +1440,14 @@ impl Compiled {
             layout: self.layout,
             step: self.step,
             color: self.color,
-            atlas: tile_render::Atlas { page_size: self.atlas.page_size, pages: Vec::new(), sprites: self.atlas.sprites.clone() },
+            atlas: tile_render::Atlas {
+                page_size: self.atlas.page_size,
+                pages: Vec::new(),
+                index_pages: Vec::new(),
+                sprites: self.atlas.sprites.clone(),
+                palettes: self.atlas.palettes.clone(),
+                named_palettes: self.atlas.named_palettes,
+            },
             sets: self.sets.clone(),
             layers: self.layers.clone(),
             sprite_names: self.sprite_names.clone(),
@@ -1125,7 +1455,26 @@ impl Compiled {
             set_ids: self.set_ids.clone(),
             set_blend: self.set_blend.clone(),
             fonts: self.fonts.clone(),
+            palette_rows: self.palette_rows.clone(),
+            sprite_ids: self.sprite_ids.clone(),
         }
+    }
+
+    /// The row of palette `name` (for a free sprite, `FreeSprite::palette`).
+    pub fn palette(&self, name: &str) -> Option<u32> {
+        self.palette_rows.get(name).copied()
+    }
+
+    /// Sprite `name`.
+    pub fn sprite(&self, name: &str) -> Option<SpriteId> {
+        self.sprite_ids.get(name).copied()
+    }
+
+    /// The cell value that draws set `set` on layer `layer` with palette row
+    /// `palette` (0: none; else the layer must have `palettes = true`).
+    pub fn value_in(&self, layer: &str, set: &str, palette: u32) -> Option<u32> {
+        let index = self.value(layer, set)?;
+        self.layers.iter().find(|l| l.name == layer)?.value_in(index, palette)
     }
 
     /// The cell value that draws set `set` on layer `layer` (0 = nothing).
@@ -1162,37 +1511,6 @@ impl Compiled {
     }
 }
 
-
-/// Adds a sprite: with its pixels to `atlas`, else (a compile without them)
-/// its size and anchor to `placed`, checked against the page size; with
-/// how views showing the world smaller draw it.
-#[allow(clippy::too_many_arguments)]
-fn add_sprite(
-    atlas: &mut AtlasBuilder,
-    placed: &mut Vec<tile_render_shared::SpriteDesc>,
-    page_size: u32,
-    image: Option<&RgbaImage>,
-    (w, h): (u32, u32),
-    anchor: (i32, i32),
-    scaling: u32,
-    [box_x, box_y, box_w, box_h]: [u32; 4],
-) -> Result<SpriteId, DescError> {
-    let (id, desc) = match image {
-        Some(image) => {
-            let id = atlas.add(image, anchor)?;
-            (id, atlas.sprite_mut(id))
-        }
-        None => {
-            if w > page_size || h > page_size {
-                return Err(tile_render::atlas::AtlasError::TooLarge(w, h, page_size).into());
-            }
-            placed.push(tile_render_shared::SpriteDesc { width: w, height: h, anchor_x: anchor.0, anchor_y: anchor.1, ..Default::default() });
-            (SpriteId(placed.len() as u32 - 1), placed.last_mut().expect("just pushed"))
-        }
-    };
-    (desc.scaling, desc.box_x, desc.box_y, desc.box_w, desc.box_h) = (scaling, box_x, box_y, box_w, box_h);
-    Ok(id)
-}
 
 /// The smallest box `[x, y, width, height]` holding every pixel of `img`
 /// that is not blank (alpha 0); `None` if all are.
