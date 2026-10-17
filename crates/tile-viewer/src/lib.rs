@@ -3,12 +3,13 @@
 //!
 //! Nothing here knows which game it is showing.
 
+pub mod cursor;
 mod input;
 pub mod layout;
 pub mod snap;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use render_desc::Compiled;
 use scene::{Display, Input, Scene};
@@ -223,10 +224,11 @@ fn world_bounds(compiled: &Compiled, scene: &Scene) -> layout::WorldBounds {
 pub const CURSOR_SPRITE: &str = "Viewer@cursor/0";
 pub const ARROW_SPRITE: &str = "Viewer@arrow/0";
 
-/// The markers as world sprites on top of everything. The arrow blinks
-/// twice every three seconds (`time`: since the viewer started). The
-/// markers' points are in the pixels of views showing the world `downscale`
-/// times smaller; world sprites are placed at full size.
+/// The markers as world sprites on top of everything (but the world
+/// cursor, which `cursor` draws). The arrow blinks twice every three
+/// seconds (`time`: since the viewer started). The markers' points are in
+/// the pixels of views showing the world `downscale` times smaller; world
+/// sprites are placed at full size.
 fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u32, time: Duration) -> Vec<tile_render::PlacedSprite> {
     let blink = time.as_millis() % 3000;
     let arrow_off = blink < 150 || (300..450).contains(&blink);
@@ -234,7 +236,7 @@ fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u3
         .iter()
         .filter_map(|m| {
             let (name, (x, y)) = match *m {
-                layout::Marker::Cursor(p) => (CURSOR_SPRITE, p),
+                layout::Marker::Cursor(_) => return None,
                 layout::Marker::Focus(_) if arrow_off => return None,
                 layout::Marker::Focus(p) => (ARROW_SPRITE, p),
             };
@@ -318,6 +320,12 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
     winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
     let event_loop = builder.build()?;
     event_loop.set_control_flow(ControlFlow::Poll);
+    // The driver's updates wake the event loop (it waits for its window's
+    // events, which are taken at once, the pointer's among them).
+    let proxy = event_loop.create_proxy();
+    display.set_wake(move || {
+        let _ = proxy.send_event(());
+    });
     let (assets_version, compiled) = assets.current();
     let mut app = App {
         config,
@@ -343,6 +351,22 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         settings: viewer_settings::Settings::default(),
         error: None,
         snap: snap::SnapInput::default(),
+        cursor_art: cursor::Art::default(),
+        custom_cursors: std::collections::HashMap::new(),
+        shown_pointer: None,
+        capture_icon: false,
+        pointer_inside: true,
+        pointer_since: None,
+        drawn_cursor: Vec::new(),
+        latency: cursor::Latency::default(),
+        latency_logged: Instant::now(),
+        frames_presented: 0,
+        release_pending: false,
+        cursor: scene::Cursor::Default,
+        presented: false,
+        woken_idle: false,
+        cursor_cameras: None,
+        next_frame: None,
     };
     // The arrangement to start with: the user's settings.
     app.set_settings(load_settings());
@@ -414,6 +438,50 @@ struct App {
     settings: viewer_settings::Settings,
     /// Button snapping (Alt while the mouse is captured).
     snap: snap::SnapInput,
+    /// The cursor art kept for the system pointer, the system cursors made
+    /// of it (by set), what the system pointer shows, and whether it is the
+    /// capture pointer (the layout's `PointerIcon::Capture`).
+    cursor_art: cursor::Art,
+    custom_cursors: std::collections::HashMap<u32, winit::window::CustomCursor>,
+    shown_pointer: Option<cursor::Shown>,
+    capture_icon: bool,
+    /// Whether the system pointer is in the window.
+    pointer_inside: bool,
+    /// The first pointer motion not drawn yet, the cursor sprites drawn
+    /// last, and how long they took to show (`TILE_VIEWER_LATENCY` logs it).
+    pointer_since: Option<Instant>,
+    drawn_cursor: Vec<tile_render::PlacedSprite>,
+    latency: cursor::Latency,
+    latency_logged: Instant,
+    frames_presented: u32,
+    /// The mouse is let go after the next frame (see
+    /// `release_after_frame`).
+    release_pending: bool,
+    /// The driver's cursor (see `driver_cursor`).
+    cursor: scene::Cursor,
+    /// A frame was presented since `release_after_frame` last looked.
+    presented: bool,
+    /// The event loop was woken without an event of its own (see
+    /// `about_to_wait`).
+    woken_idle: bool,
+    /// The cameras of the frame drawn last (for the latency: the motion
+    /// moved them).
+    cursor_cameras: Option<Vec<Camera>>,
+    /// When the next frame is due (the animation clock), without updates.
+    next_frame: Option<Instant>,
+}
+
+/// The longest time between frames (the animation clock).
+const FRAME: Duration = Duration::from_millis(16);
+
+/// How long the event loop waits for the driver when it was woken for
+/// nothing (see `about_to_wait`).
+const IDLE_WAIT: Duration = Duration::from_millis(1);
+
+/// Whether to log the cursor's latency (`TILE_VIEWER_LATENCY=1`).
+fn log_latency() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TILE_VIEWER_LATENCY").is_ok_and(|v| !v.is_empty() && v != "0"))
 }
 
 impl App {
@@ -435,33 +503,125 @@ impl App {
         self.started.elapsed().as_secs_f64()
     }
 
-    /// Shows or hides the system pointer as button snapping wants it
-    /// (hidden while the mouse is captured anyway).
-    fn snap_pointer(&mut self) {
-        if let (Some(hide), Some(gpu)) = (self.snap.take_hide_pointer(), &self.gpu) {
-            gpu.window.set_cursor_visible(!hide && !self.layout.captured());
+    /// Whether the viewer draws the cursor itself rather than the system:
+    /// while the mouse is captured, or the pointer snaps to buttons.
+    fn pointer_hidden(&self) -> bool {
+        self.layout.captured() || self.snap.snapper.pointer().is_some() || self.release_pending
+    }
+
+    /// The driver's cursor, as long as its scene refers to the art the
+    /// renderer has (its sprite set ids are that art's), else the last one
+    /// that did.
+    fn driver_cursor(&mut self) -> scene::Cursor {
+        let scene = self.display.scene();
+        if scene.assets == 0 || scene.assets == self.assets_version {
+            self.cursor = scene.cursor;
+        }
+        self.cursor
+    }
+
+    /// Shows the system pointer as it is to be now (`cursor`): hidden
+    /// while the viewer draws the cursor, else the driver's cursor (made
+    /// from its art), or the capture pointer.
+    fn update_system_pointer(&mut self, event_loop: &ActiveEventLoop) {
+        // (Button snapping says when it hides the pointer; whether it is
+        // hidden is asked anew every time.)
+        let _ = self.snap.take_hide_pointer();
+        let shown = cursor::system_pointer(self.driver_cursor(), &self.cursor_art, self.pointer_hidden(), self.capture_icon);
+        let Some(gpu) = &self.gpu else { return };
+        if self.shown_pointer == Some(shown) {
+            return;
+        }
+        self.shown_pointer = Some(shown);
+        log::debug!("viewer: system pointer {shown:?}");
+        match shown {
+            cursor::Shown::Hidden => gpu.window.set_cursor_visible(false),
+            cursor::Shown::Icon(icon) => {
+                gpu.window.set_cursor(icon);
+                gpu.window.set_cursor_visible(true);
+            }
+            cursor::Shown::Custom(set) => {
+                let made = match self.custom_cursors.get(&set) {
+                    Some(c) => Some(c.clone()),
+                    None => self.cursor_art.get(set).and_then(|image| {
+                        let source = winit::window::CustomCursor::from_rgba(image.rgba.clone(), image.size.0, image.size.1, image.hotspot.0, image.hotspot.1);
+                        match source {
+                            Ok(source) => {
+                                let c = event_loop.create_custom_cursor(source);
+                                self.custom_cursors.insert(set, c.clone());
+                                Some(c)
+                            }
+                            Err(e) => {
+                                log::warn!("viewer: cursor of set {set}: {e}");
+                                None
+                            }
+                        }
+                    }),
+                };
+                match made {
+                    Some(c) => gpu.window.set_cursor(c),
+                    None => gpu.window.set_cursor(winit::window::CursorIcon::Default),
+                }
+                gpu.window.set_cursor_visible(true);
+            }
         }
     }
 
     /// What the layout asks of the window: the mouse captured or let go,
-    /// the system pointer moved back (held at the divider), another pointer
-    /// shape.
-    fn apply_layout_requests(&mut self) {
-        if let Some(lock) = self.layout.take_grab() {
-            self.grab(lock);
+    /// the system pointer moved (held at the divider, or put where the world
+    /// cursor was), another pointer shape. The pointer never shows where it
+    /// is moved from: it is hidden before the mouse is captured, and moved
+    /// before it shows again (while still captured: on Wayland the place
+    /// is a hint the release takes).
+    fn apply_layout_requests(&mut self, event_loop: &ActiveEventLoop) {
+        let grab = self.layout.take_grab();
+        let warp = self.layout.take_warp();
+        if let Some(icon) = self.layout.take_pointer_icon() {
+            // A click captures the mouse there.
+            self.capture_icon = icon == layout::PointerIcon::Capture;
         }
-        let Some(gpu) = &self.gpu else { return };
-        if let Some((x, y)) = self.layout.take_warp() {
+        if grab == Some(true) {
+            self.update_system_pointer(event_loop);
+            self.grab(true);
+        }
+        if let (Some((x, y)), Some(gpu)) = (warp, &self.gpu) {
             if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
-                log::debug!("viewer: moving the pointer back to the divider: {e}");
+                log::debug!("viewer: moving the pointer to {x}, {y}: {e}");
             }
         }
-        if let Some(icon) = self.layout.take_pointer_icon() {
-            gpu.window.set_cursor(match icon {
-                layout::PointerIcon::Default => winit::window::CursorIcon::Default,
-                // A click captures the mouse there.
-                layout::PointerIcon::Capture => winit::window::CursorIcon::Crosshair,
-            });
+        if grab == Some(false) {
+            if warp.is_some() {
+                // (On Wayland the place is applied with the window's next
+                // frame: the mouse is let go after it, `release_after_frame`.)
+                self.release_pending = true;
+                self.presented = false;
+                if let Some(gpu) = &self.gpu {
+                    gpu.window.request_redraw();
+                }
+            } else {
+                self.release_pending = false;
+                self.grab(false);
+            }
+        }
+        self.update_system_pointer(event_loop);
+    }
+
+    /// Lets go of the mouse once a frame went out after the pointer was
+    /// moved (see `apply_layout_requests`); the pointer shows then.
+    fn release_after_frame(&mut self) {
+        if std::mem::take(&mut self.presented) && std::mem::take(&mut self.release_pending) {
+            self.grab(false);
+            self.shown_pointer = None;
+        }
+    }
+
+    /// The pointer moved: if the viewer draws the cursor, a frame at once.
+    fn pointer_moved(&mut self) {
+        self.pointer_since.get_or_insert_with(Instant::now);
+        if self.pointer_hidden() || !self.drawn_cursor.is_empty() {
+            if let Some(gpu) = &self.gpu {
+                gpu.window.request_redraw();
+            }
         }
     }
 
@@ -499,7 +659,9 @@ impl App {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 2,
+            // No frame waits behind another: the cursor drawn here lags as
+            // little as it can.
+            desired_maximum_frame_latency: 1,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Auto,
@@ -507,6 +669,7 @@ impl App {
         surface.configure(&device, &config);
         let mut renderer = TileRenderer::new(&device, config.format);
         renderer.set_atlas(&device, &queue, &self.compiled.atlas);
+        self.cursor_art = cursor::Art::of(&self.compiled);
         let light = Arc::new(self.compiled.without_pixels());
         self.assets.uploaded(self.assets_version, light.clone());
         self.compiled = light;
@@ -519,7 +682,8 @@ impl App {
         Ok(())
     }
 
-    /// Captures (hides, holds) or releases the mouse.
+    /// Captures (holds) or releases the mouse (the pointer is hidden and
+    /// shown by `update_system_pointer`).
     fn grab(&self, lock: bool) {
         let Some(gpu) = &self.gpu else { return };
         use winit::window::CursorGrabMode;
@@ -531,16 +695,21 @@ impl App {
         } else {
             let _ = gpu.window.set_cursor_grab(CursorGrabMode::None);
         }
-        gpu.window.set_cursor_visible(!lock);
     }
 
     fn draw(&mut self) {
+        let started = Instant::now();
         let Some(gpu) = &mut self.gpu else { return };
         // A software renderer still at the last frame: no new one yet (the
         // event loop goes on meanwhile).
         let done = || self.frame_done.load(std::sync::atomic::Ordering::Acquire);
         if gpu.software && !done() {
             let _ = gpu.device.poll(wgpu::PollType::Poll);
+            // The cursor drawn here waits for nothing but that frame.
+            let cursor_waits = self.pointer_since.is_some() && (self.layout.captured() || self.snap.snapper.pointer().is_some() || !self.drawn_cursor.is_empty());
+            if !done() && cursor_waits {
+                let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(Duration::from_millis(100)) });
+            }
             if !done() {
                 return;
             }
@@ -557,6 +726,10 @@ impl App {
         if new_assets {
             let started = std::time::Instant::now();
             gpu.renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
+            // (Set ids change with every compile.)
+            self.cursor_art = cursor::Art::of(&compiled);
+            self.custom_cursors.clear();
+            self.shown_pointer = None;
             log::info!("viewer: new assets ({} sprites, uploaded in {} ms)", compiled.sprite_names.len(), started.elapsed().as_millis());
             // The pixels are on the GPU now: keep only the rest.
             let light = Arc::new(compiled.without_pixels());
@@ -602,7 +775,29 @@ impl App {
         }
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
-        markers.extend(self.snap.sprites(&self.compiled, scene, &arranged, &self.layout));
+        // The snapping pointer's ghost (the pointer itself is the cursor's).
+        let solid: Vec<_> = [snap::POINTER_SPRITE, CURSOR_SPRITE].iter().filter_map(|n| self.compiled.set(n).map(|(s, _)| s)).collect();
+        markers.extend(self.snap.sprites(&self.compiled, scene, &arranged, &self.layout).into_iter().filter(|s| !solid.contains(&s.set)));
+        // The cursor where the viewer draws it, in a camera of its own on
+        // top (only when there is one: the frame is as before otherwise).
+        let marks = Self::cursor_marks_of(&self.layout, &self.snap, self.pointer_inside, &arranged);
+        let mut cameras = arranged.cameras.clone();
+        if scene.assets == 0 || scene.assets == self.assets_version {
+            self.cursor = scene.cursor;
+        }
+        let cursor_sprites = match cursor::sprite_set(&self.compiled, self.cursor) {
+            Some(set) if cameras.len() < tile_render::MAX_VIEWS => {
+                let bounds = world_bounds(&self.compiled, scene);
+                let period = (if bounds.wrap.0 { bounds.size.0 } else { 0 }, if bounds.wrap.1 { bounds.size.1 } else { 0 });
+                cursor::sprites(set, &marks, &cameras, cameras.len() as u32, period)
+            }
+            _ => Vec::new(),
+        };
+        if !cursor_sprites.is_empty() {
+            cameras.push(cursor::overlay_camera(window));
+        }
+        let cursor_moved = cursor_sprites != self.drawn_cursor;
+        markers.extend_from_slice(&cursor_sprites);
         let world = self.world.as_mut().expect("built above");
         let own = world.free.len();
         world.free.extend_from_slice(&markers);
@@ -617,6 +812,7 @@ impl App {
         }
         world.free.truncate(own);
         self.drawn_markers = markers;
+        self.drawn_cursor = cursor_sprites;
         self.drawn_views = arranged.view_cameras.clone();
         if new_assets || (scene.seq != self.drawn_seq && matches) {
             apply_patches(&gpu.renderer, &gpu.queue, &self.compiled, self.patches.values());
@@ -626,7 +822,13 @@ impl App {
         }
         // A software renderer draws a frame only when it differs from the last.
         let unchanged = !new_assets && !rebuilt && !markers_moved && scene.tick == self.drawn_tick && window == self.drawn_window;
-        if gpu.software && unchanged {
+        // The pointer's motion is drawn (or there was nothing to draw): the
+        // cursor moved, or the views following it.
+        let views_followed = self.drawn_frame.as_ref().map(|f| &f.cameras) != self.cursor_cameras.as_ref();
+        self.cursor_cameras = self.drawn_frame.as_ref().map(|f| f.cameras.clone());
+        let since = self.pointer_since.take().filter(|_| cursor_moved || views_followed);
+        // (Not while the mouse waits to be let go after a frame.)
+        if gpu.software && unchanged && !self.release_pending {
             return;
         }
         self.drawn_tick = scene.tick;
@@ -644,9 +846,13 @@ impl App {
         };
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         let target = &frame.texture;
-        let (cameras, copies) = (&arranged.cameras, &arranged.copies);
-        gpu.renderer.render_composed(&gpu.device, &gpu.queue, &mut encoder, target, cameras, copies, scene.tick, self.config.clear);
+        let copies = &arranged.copies;
+        gpu.renderer.render_composed(&gpu.device, &gpu.queue, &mut encoder, target, &cameras, copies, scene.tick, self.config.clear);
         gpu.queue.submit([encoder.finish()]);
+        if let (Some(since), true) = (since, log_latency()) {
+            let done = self.latency.done.clone();
+            gpu.queue.on_submitted_work_done(move || done.lock().unwrap_or_else(|e| e.into_inner()).push(since.elapsed().as_secs_f64() * 1000.0));
+        }
         if gpu.software {
             // (Called back from a later poll once this submission is done.)
             self.frame_done.store(false, std::sync::atomic::Ordering::Release);
@@ -655,10 +861,53 @@ impl App {
         }
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
+        self.frames_presented += 1;
+        self.presented = true;
+        if let (Some(since), true) = (since, log_latency()) {
+            self.latency.start.push(started.saturating_duration_since(since).as_secs_f64() * 1000.0);
+            self.latency.present.push(since.elapsed().as_secs_f64() * 1000.0);
+            self.latency.last = Some(Instant::now());
+        }
+        // Logged every 10 s, and once the pointer has rested for 2 s.
+        let rested = self.latency.last.is_some_and(|t| t.elapsed() >= Duration::from_secs(2));
+        if !self.latency.present.is_empty() && (self.latency_logged.elapsed() >= Duration::from_secs(10) || rested) {
+            let span = std::mem::replace(&mut self.latency_logged, Instant::now()).elapsed();
+            let _ = gpu.device.poll(wgpu::PollType::Poll);
+            let frames = std::mem::take(&mut self.frames_presented);
+            let mut done = std::mem::take(&mut *self.latency.done.lock().unwrap_or_else(|e| e.into_inner()));
+            let fmt = |s: Option<(f64, f64, f64, usize)>| s.map_or("-".to_owned(), |(p50, p95, max, n)| format!("p50 {p50:.1} ms, p95 {p95:.1} ms, max {max:.1} ms ({n})"));
+            log::info!(
+                "viewer: cursor latency, motion to its frame started: {}; to frame presented: {}; to frame done on the GPU: {}; {frames} frames in {:.1} s",
+                fmt(cursor::Latency::summary(&mut std::mem::take(&mut self.latency.start))),
+                fmt(cursor::Latency::summary(&mut std::mem::take(&mut self.latency.present))),
+                fmt(cursor::Latency::summary(&mut done)),
+                span.as_secs_f64()
+            );
+        }
+    }
+
+    /// Where the viewer draws the cursor this frame (see `cursor`).
+    fn cursor_marks_of(layout: &layout::Layout, snap: &snap::SnapInput, pointer_inside: bool, frame: &layout::Frame) -> cursor::Marks {
+        if let Some((x, y)) = snap.snapper.pointer() {
+            return cursor::Marks { world: vec![], window: vec![(x.round() as i32, y.round() as i32)], system: None };
+        }
+        // Captured: the world cursor. Free: the world pixel under the
+        // system pointer, in the other views showing it (the world cursor
+        // waiting in the view a click captures in is not the pointer).
+        if layout.captured() {
+            let world = frame.markers.iter().filter_map(|m| if let layout::Marker::Cursor(p) = m { Some(*p) } else { None }).collect();
+            return cursor::Marks { world, window: vec![], system: None };
+        }
+        let world = layout.pointer_world().filter(|_| pointer_inside).into_iter().collect();
+        cursor::Marks { world, window: vec![], system: Some(layout.pointer_in_window()) }
     }
 }
 
 impl ApplicationHandler for App {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        self.woken_idle = matches!(cause, winit::event::StartCause::WaitCancelled { .. });
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gpu.is_none() {
             if let Err(e) = self.init(event_loop) {
@@ -670,6 +919,7 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        self.woken_idle = false;
         match &event {
             WindowEvent::CloseRequested => {
                 self.display.send_input(Input::Quit);
@@ -683,7 +933,13 @@ impl ApplicationHandler for App {
                     gpu.surface.configure(&gpu.device, &gpu.config);
                 }
             }
-            WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::RedrawRequested => {
+                self.draw();
+                self.release_after_frame();
+            }
+            WindowEvent::CursorMoved { .. } => self.pointer_moved(),
+            WindowEvent::CursorEntered { .. } => self.pointer_inside = true,
+            WindowEvent::CursorLeft { .. } => self.pointer_inside = false,
             _ => {}
         }
         if let WindowEvent::Focused(false) = event {
@@ -708,8 +964,7 @@ impl ApplicationHandler for App {
             }
         }
         // (After a redraw too: what the pointer is over may have changed.)
-        self.apply_layout_requests();
-        self.snap_pointer();
+        self.apply_layout_requests(event_loop);
         if let Some(zooms) = self.layout.take_zooms_change() {
             self.display.send_input(Input::Zooms(zooms));
         }
@@ -718,7 +973,8 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+        self.woken_idle = false;
         // While the mouse is captured its motion moves the world cursor.
         // (While snapping, it moves the snapping pointer's hidden pointer.)
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
@@ -726,13 +982,29 @@ impl ApplicationHandler for App {
             for input in inputs {
                 self.display.send_input(input);
             }
+            if self.pointer_hidden() {
+                self.pointer_moved();
+            }
+            // (The world cursor may have left the view a click captures in.)
+            self.apply_layout_requests(event_loop);
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Take what the driver sent (waiting a frame's time for it), then
-        // redraw: the animation clock moves on even without updates.
-        self.display.receive(Duration::from_millis(16));
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, (): ()) {
+        // The driver sent updates: taken in `about_to_wait`, next.
+        self.woken_idle = false;
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Take what the driver sent (it wakes the loop when it sends), then
+        // redraw: at once for new updates, and on the animation clock's
+        // beat without them. The loop waits for events meanwhile, so the
+        // pointer's are taken (and drawn) the moment they come. Woken for
+        // nothing (some systems' message loops wake the event loop over and
+        // over, e.g. Wine's), it waits for the driver a little instead of
+        // spinning; the window's events wait at most that long.
+        let idle = std::mem::take(&mut self.woken_idle) && self.next_frame.is_some_and(|t| t > Instant::now());
+        let changed = self.display.receive(if idle { IDLE_WAIT } else { Duration::ZERO });
         if let Some(settings) = self.display.take_settings() {
             if settings != self.settings {
                 log::info!("viewer: new settings from the driver");
@@ -743,11 +1015,17 @@ impl ApplicationHandler for App {
         for input in self.snap.tick(&mut self.layout, self.display.scene(), now, rates) {
             self.display.send_input(input);
         }
-        self.snap_pointer();
+        self.update_system_pointer(event_loop);
+        let now = Instant::now();
+        let due = self.next_frame.is_none_or(|t| now >= t);
+        if due {
+            self.next_frame = Some(now + FRAME);
+        }
         if let Some(gpu) = &self.gpu {
-            if self.display.scene().seq != 0 {
+            if self.display.scene().seq != 0 && (changed || due) {
                 gpu.window.request_redraw();
             }
         }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame.unwrap_or(now + FRAME)));
     }
 }

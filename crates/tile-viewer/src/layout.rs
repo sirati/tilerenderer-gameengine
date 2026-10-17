@@ -1720,6 +1720,13 @@ impl Layout {
         self.locked
     }
 
+    /// The world pixel under the system pointer while the mouse is free, if
+    /// a view of the last frame shows one there (for drawing the cursor in
+    /// the other views showing it).
+    pub fn pointer_world(&self) -> Option<(i32, i32)> {
+        if self.locked { None } else { self.world_under(self.pointer) }
+    }
+
     /// The window size of the last frame.
     pub fn window(&self) -> (u32, u32) {
         self.window
