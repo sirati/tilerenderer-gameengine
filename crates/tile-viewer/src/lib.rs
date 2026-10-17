@@ -130,6 +130,7 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
             2 => tile_render::ZoomArt::Zoomed { zoom: (u32::from(s.zoom.0), u32::from(s.zoom.1)), offset: s.zoom_offset },
             _ => tile_render::ZoomArt::Any,
         },
+        text: None,
     };
     world.free = scene.sprites.iter().map(|s| placed(s, None)).collect();
     for (v, camera) in scene.views.iter().zip(view_cameras) {
