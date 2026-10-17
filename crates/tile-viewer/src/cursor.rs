@@ -79,19 +79,33 @@ impl Art {
     }
 }
 
-/// The first frame of `set` as a cursor image: its anchor is minus the hot
-/// spot (a hot spot outside the image is moved onto its edge).
+/// The first frame of `set` as a cursor image (a colour sprite, or an
+/// indexed one through its palette row): its anchor is minus the hot spot
+/// (a hot spot outside the image is moved onto its edge).
 fn image(compiled: &Compiled, set: SpriteSetId) -> Option<Image> {
     let id = compiled.sets.frame(set, 0)?;
-    let s = compiled.atlas.sprites.get(id.0 as usize)?;
-    let page = compiled.atlas.pages.get(s.page as usize)?;
+    let atlas = &compiled.atlas;
+    let s = atlas.sprites.get(id.0 as usize)?;
     if s.width == 0 || s.height == 0 || s.width > 256 || s.height > 256 {
         return None;
     }
-    let cut = page.crop(s.atlas_x, s.atlas_y, s.width, s.height);
+    let rgba: Vec<u8> = if s.palette == 0 {
+        atlas.pages.get(s.page as usize)?.crop(s.atlas_x, s.atlas_y, s.width, s.height).as_bytes().to_vec()
+    } else {
+        let page = atlas.index_pages.get(s.page as usize)?;
+        let row = (s.palette * tile_render::PALETTE_SIZE) as usize;
+        let mut out = Vec::with_capacity((s.width * s.height * 4) as usize);
+        for y in s.atlas_y..s.atlas_y + s.height {
+            for x in s.atlas_x..s.atlas_x + s.width {
+                let i = page.get(x, y) as usize;
+                out.extend_from_slice(&atlas.palettes.get(row + i).copied().unwrap_or(0).to_le_bytes());
+            }
+        }
+        out
+    };
     let clamp = |a: i32, len: u32| (-a).clamp(0, len as i32 - 1) as u16;
     Some(Image {
-        rgba: cut.as_bytes().to_vec(),
+        rgba,
         size: (s.width as u16, s.height as u16),
         hotspot: (clamp(s.anchor_x, s.width), clamp(s.anchor_y, s.height)),
     })
