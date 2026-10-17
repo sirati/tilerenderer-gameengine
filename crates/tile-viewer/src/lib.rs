@@ -73,17 +73,17 @@ struct Slot {
     generation: u64,
     whole: Option<Arc<Compiled>>,
     /// Its growths not yet applied by the viewer, in order.
-    growths: Vec<(u64, Arc<render_desc::Growth>)>,
+    growths: std::collections::VecDeque<(u64, Arc<render_desc::Growth>)>,
     /// The latest generation given (whole or grown).
     latest: u64,
     /// Atlas pages (colour, index) to make room for, if asked (see
     /// [`Assets::reserve`]).
-    reserve: Option<(u32, u32)>,
+    reserve: Option<(u64, u32, u32)>,
 }
 
 impl Assets {
     pub fn new(compiled: Arc<Compiled>) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Slot { generation: 1, whole: Some(compiled), growths: Vec::new(), latest: 1, reserve: None })))
+        Self(Arc::new(std::sync::Mutex::new(Slot { generation: 1, whole: Some(compiled), growths: Default::default(), latest: 1, reserve: None })))
     }
 
     fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
@@ -98,14 +98,14 @@ impl Assets {
     /// Replaces the description by `compiled` of generation `generation`
     /// (what scenes refer to, `Scene::assets`).
     pub fn set(&self, compiled: Arc<Compiled>, generation: u64) {
-        *self.slot() = Slot { generation, whole: Some(compiled), growths: Vec::new(), latest: generation, reserve: None };
+        *self.slot() = Slot { generation, whole: Some(compiled), growths: Default::default(), latest: generation, reserve: None };
     }
 
     /// Grows the latest description by `growth` (made for it as grown so
     /// far), as generation `generation`.
     pub fn grow(&self, growth: Arc<render_desc::Growth>, generation: u64) {
         let mut slot = self.slot();
-        slot.growths.push((generation, growth));
+        slot.growths.push_back((generation, growth));
         slot.latest = slot.latest.max(generation);
     }
 
@@ -113,11 +113,33 @@ impl Assets {
     /// `index_pages` index pages (art expected soon), so that growing it
     /// does not move it again and again (`TileRenderer::reserve_atlas`).
     pub fn reserve(&self, pages: u32, index_pages: u32) {
-        self.slot().reserve = Some((pages, index_pages));
+        let mut slot = self.slot();
+        reserve_in(&mut slot, pages, index_pages);
     }
 
-    fn take_reserve(&self) -> Option<(u32, u32)> {
-        self.slot().reserve.take()
+    /// Publishes whole art and its reservation together. A reservation
+    /// from an older whole description never resizes its replacement.
+    pub fn set_with_reserve(&self, compiled: Arc<Compiled>, generation: u64, pages: u32, index_pages: u32) {
+        let mut slot = self.slot();
+        *slot = Slot { generation, whole: Some(compiled), growths: Default::default(), latest: generation, reserve: None };
+        reserve_in(&mut slot, pages, index_pages);
+    }
+
+    /// Publishes an addition and its reservation in the same update.
+    pub fn grow_with_reserve(&self, growth: Arc<render_desc::Growth>, generation: u64, pages: u32, index_pages: u32) {
+        let mut slot = self.slot();
+        slot.growths.push_back((generation, growth));
+        slot.latest = slot.latest.max(generation);
+        reserve_in(&mut slot, pages, index_pages);
+    }
+
+    fn take_reserve(&self, generation: u64) -> Option<(u32, u32)> {
+        let mut slot = self.slot();
+        if slot.reserve.is_some_and(|(base, _, _)| base == generation) {
+            slot.reserve.take().map(|(_, pages, index)| (pages, index))
+        } else {
+            None
+        }
     }
 
     /// The latest generation given (whole or grown).
@@ -142,9 +164,55 @@ impl Assets {
     }
 
     /// The growths of whole generation `generation` not applied yet.
-    fn take_growths(&self, generation: u64) -> Vec<(u64, Arc<render_desc::Growth>)> {
+    fn take_growth(&self, generation: u64) -> Option<(u64, Arc<render_desc::Growth>)> {
         let mut slot = self.slot();
-        if slot.generation == generation { std::mem::take(&mut slot.growths) } else { Vec::new() }
+        if slot.generation == generation { slot.growths.pop_front() } else { None }
+    }
+}
+
+fn reserve_in(slot: &mut Slot, pages: u32, index_pages: u32) {
+    if pages == 0 && index_pages == 0 {
+        return;
+    }
+    let (old_pages, old_index) = slot.reserve.filter(|(base, _, _)| *base == slot.generation)
+        .map_or((0, 0), |(_, p, i)| (p, i));
+    slot.reserve = Some((slot.generation, pages.max(old_pages), index_pages.max(old_index)));
+}
+
+#[cfg(test)]
+mod art_queue_tests {
+    use super::{Assets, Slot};
+    use std::sync::{Arc, Mutex};
+
+    fn assets() -> Assets {
+        Assets(Arc::new(Mutex::new(Slot { generation: 7, whole: None, growths: Default::default(), latest: 7, reserve: None })))
+    }
+
+    #[test]
+    fn growths_stay_ordered_while_one_transfer_is_in_flight() {
+        let assets = assets();
+        assets.grow_with_reserve(Arc::new(render_desc::Growth::default()), 8, 0, 12);
+        assets.grow_with_reserve(Arc::new(render_desc::Growth::default()), 9, 0, 20);
+        assert!(assets.take_growth(6).is_none());
+        assert_eq!(assets.take_growth(7).map(|(generation, _)| generation), Some(8));
+        assert_eq!(assets.slot().growths.len(), 1);
+        assert_eq!(assets.take_growth(7).map(|(generation, _)| generation), Some(9));
+        assert!(assets.take_growth(7).is_none());
+        assert_eq!(assets.take_reserve(7), Some((0, 20)));
+    }
+
+    #[test]
+    fn reservations_coalesce_only_with_their_whole_atlas() {
+        let assets = assets();
+        assets.reserve(3, 12);
+        assets.reserve(2, 20);
+        assert_eq!(assets.take_reserve(8), None);
+        assert_eq!(assets.take_reserve(7), Some((3, 20)));
+        assets.reserve(8, 24);
+        assets.slot().generation = 10;
+        assets.reserve(2, 4);
+        assert_eq!(assets.take_reserve(7), None);
+        assert_eq!(assets.take_reserve(10), Some((2, 4)));
     }
 }
 
@@ -549,6 +617,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         layout: layout::Layout::default(),
         drawn_views: Vec::new(),
         world: None,
+        world_assets_version: 0,
         drawn_markers: Vec::new(),
         frame_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         drawn_tick: 0,
@@ -562,8 +631,8 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         sized_to_screen: None,
         fitted_on_screen: None,
         started: std::time::Instant::now(),
-        art_waiting: None,
         drawn_frame: None,
+        cached_picture: None,
         drawn_at: None,
         settings: viewer_settings::Settings::default(),
         error: None,
@@ -571,6 +640,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         fps: fps::Overlay::default(),
         snap_grabbed: false,
         cursor_art: cursor::Art::default(),
+        pending_cursor_art: None,
         custom_cursors: std::collections::HashMap::new(),
         cursor_builds: CursorBuilds::default(),
         shown_pointer: None,
@@ -583,7 +653,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         frames_presented: 0,
         frame_log: frame_times().then(fps::FrameLog::default),
         beside_drawn: None,
-        staged: None,
+        pending_art: None,
         unlock_pending: None,
         machine: cursor::Machine::default(),
         system_pointer: (0, 0),
@@ -657,6 +727,9 @@ struct App {
     drawn_views: Vec<Option<u32>>,
     /// The renderer's world without the markers, and the markers drawn.
     world: Option<TileWorld>,
+    /// Art generation paired with the renderer's currently built world.
+    /// An intermediate atlas commit may precede its compatible scene.
+    world_assets_version: u64,
     drawn_markers: Vec<tile_render::PlacedSprite>,
     /// Whether the last frame submitted is done (see `Gpu::software`).
     frame_done: Arc<std::sync::atomic::AtomicBool>,
@@ -687,11 +760,12 @@ struct App {
     /// its screen.
     fitted_on_screen: Option<((u32, u32), ((u32, u32), u64))>,
     started: std::time::Instant,
-    /// Since when newer art is waiting for a scene that refers to it.
-    art_waiting: Option<std::time::Instant>,
     /// The arrangement drawn last (drawn again while a scene waits for its
     /// art).
     drawn_frame: Option<layout::Frame>,
+    /// Mapping and copies of the last compatible picture. Its composed
+    /// pixels can be replayed while a new atlas awaits its scene.
+    cached_picture: Option<CachedPicture>,
     /// When the last frame was drawn (the layout's smooth movement).
     drawn_at: Option<std::time::Instant>,
     error: Option<ViewerError>,
@@ -710,6 +784,9 @@ struct App {
     /// of it (by set), what the system pointer shows, and whether it is the
     /// capture pointer (the layout's `PointerIcon::Capture`).
     cursor_art: cursor::Art,
+    /// A committed whole atlas's cursor pixels, activated only when its
+    /// scene becomes drawable. Old custom cursors remain usable meanwhile.
+    pending_cursor_art: Option<(u64, cursor::Art)>,
     custom_cursors: std::collections::HashMap<(u32, u32), winit::window::CustomCursor>,
     /// System cursors being made (off the event loop: the picture never
     /// waits for one).
@@ -729,8 +806,8 @@ struct App {
     /// last drawn beside a screen (`scene::Beside`, for the log).
     frame_log: Option<fps::FrameLog>,
     beside_drawn: Option<(scene::WorldShape, Option<[i32; 4]>)>,
-    /// New art on its way to the GPU (see `ATLAS_PART`).
-    staged: Option<Staged>,
+    /// One art transfer, including its source until the GPU is finished.
+    pending_art: Option<PendingArt>,
     /// What happens to the system pointer after the next frame (see
     /// `unlock_after_frame`).
     unlock_pending: Option<Unlock>,
@@ -991,18 +1068,113 @@ fn present_mode(asked: viewer_settings::Present, modes: &[wgpu::PresentMode]) ->
 /// How long the event loop waits for the driver when it was woken for
 /// nothing (see `about_to_wait`).
 const IDLE_WAIT: Duration = Duration::from_millis(1);
-/// About how many bytes of new art go up to the GPU a frame (at least a
-/// page; a colour page of 2048² is 16 MiB).
-const ATLAS_PART: u64 = 16 << 20;
+/// Explicit atlas transfer allowance per frame. Large pages and copies
+/// are split into strips. Driver initialization may also clear a whole
+/// texture layer; that extra GPU work is not part of this byte allowance.
+const ATLAS_PART: u64 = 4 << 20;
 
-/// New art being uploaded (`TileRenderer::stage_atlas`), and since when, in
-/// how many frames.
-struct Staged {
-    version: u64,
-    atlas: tile_render::StagedAtlas,
-    compiled: Arc<Compiled>,
+enum PendingArtPayload {
+    Whole { version: u64, compiled: Arc<Compiled> },
+    Growth { base: u64, version: u64, growth: Arc<render_desc::Growth> },
+    Reserve { base: u64 },
+}
+
+impl PendingArtPayload {
+    fn base(&self) -> u64 {
+        match self {
+            Self::Whole { version, .. } => *version,
+            Self::Growth { base, .. } | Self::Reserve { base } => *base,
+        }
+    }
+
+    fn source(&self) -> tile_render::renderer::AtlasTransferSource<'_> {
+        use tile_render::renderer::AtlasTransferSource;
+        match self {
+            Self::Whole { compiled, .. } => AtlasTransferSource::Whole(&compiled.atlas),
+            Self::Growth { growth, .. } => AtlasTransferSource::Growth(&growth.atlas),
+            Self::Reserve { .. } => AtlasTransferSource::Reserve,
+        }
+    }
+}
+
+struct PendingArt {
+    payload: PendingArtPayload,
+    reserve: (u32, u32),
+    started: bool,
+    failed: bool,
     since: Instant,
     frames: u32,
+}
+
+impl PendingArt {
+    fn new(payload: PendingArtPayload, reserve: (u32, u32)) -> Self {
+        Self { payload, reserve, started: false, failed: false, since: Instant::now(), frames: 0 }
+    }
+}
+
+/// The last composed picture keeps its own canvas and magnifier sources
+/// when the window resizes. No future scene IDs are needed to present it.
+struct CachedPicture {
+    plan: scaling::Plan,
+    copies: Vec<tile_render::ScreenCopy>,
+}
+
+impl CachedPicture {
+    fn plan_for_target(&self, target: (u32, u32)) -> scaling::Plan {
+        let mut plan = self.plan;
+        let shift = |at: i32, old: u32, new: u32| {
+            (i64::from(at) + (i64::from(new) - i64::from(old)).div_euclid(2))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        plan.present.at = (
+            shift(plan.present.at.0, plan.present.target.0, target.0),
+            shift(plan.present.at.1, plan.present.target.1, target.1),
+        );
+        plan.present.target = target;
+        plan
+    }
+}
+
+#[cfg(test)]
+mod cached_picture_tests {
+    use super::{CachedPicture, scaling};
+    use tile_render::{Present, ScreenCopy};
+
+    fn picture() -> CachedPicture {
+        let mut plan = scaling::plan((1280, 960), 1.0, (640, 480), &Default::default());
+        plan.present = Present { canvas: (640, 480), zoom: (2, 1), at: (0, 0), target: (1280, 960) };
+        CachedPicture {
+            plan,
+            copies: vec![ScreenCopy { source: [100, 80, 120, 100], at: (300, 180), zoom: (2, 1) }],
+        }
+    }
+
+    #[test]
+    fn resized_cached_picture_keeps_input_on_the_same_canvas_pixel() {
+        let picture = picture();
+        let before = picture.plan.to_screen((640.0, 480.0));
+        for target in [(1600, 1000), (320, 200), (1280, 960)] {
+            let plan = picture.plan_for_target(target);
+            assert_eq!(plan.to_screen((target.0 as f64 / 2.0, target.1 as f64 / 2.0)), before);
+            assert_eq!(plan.canvas(), picture.plan.canvas());
+            assert_eq!(plan.screen, picture.plan.screen);
+            assert_eq!(plan.present.zoom, picture.plan.present.zoom);
+            assert_eq!(plan.present.target, target);
+        }
+    }
+
+    #[test]
+    fn repeated_resize_uses_the_original_picture_without_mapping_drift() {
+        let picture = picture();
+        let original = picture.plan;
+        let small = picture.plan_for_target((319, 201));
+        assert!(small.present.at.0 < 0 && small.present.at.1 < 0);
+        assert_eq!(picture.plan_for_target(original.present.target), original);
+        // Copies still address the retained canvas, including after the
+        // target becomes smaller than a magnifier's destination.
+        assert_eq!(picture.copies[0].scissor(small.canvas()), Some([300, 180, 240, 200]));
+        assert_eq!(picture.plan, original);
+    }
 }
 
 /// Whether frame times are logged (`TILE_VIEWER_FRAME_TIMES`, see `fps::FrameLog`).
@@ -1080,13 +1252,31 @@ impl App {
         (self.layout.captured() && !self.machine.edge()) || self.snap.snap_mode_active() || self.unlock_pending.is_some() || self.constraints.moving()
     }
 
+    fn scene_matches_art(&self) -> bool {
+        let assets = self.display.scene().assets;
+        assets == 0 || (self.whole_version..=self.assets_version).contains(&assets)
+    }
+
+    fn activate_cursor_art(&mut self) {
+        if !self.scene_matches_art() {
+            return;
+        }
+        if self.pending_cursor_art.as_ref().is_some_and(|(base, _)| *base == self.whole_version) {
+            let (_, art) = self.pending_cursor_art.take().expect("checked above");
+            self.cursor_art = art;
+            self.custom_cursors.clear();
+            self.cursor_builds.forget();
+            self.shown_pointer = None;
+        }
+    }
+
     /// The driver's cursor, as long as its scene refers to the art the
     /// renderer has (its sprite set ids are that art's), else the last one
     /// that did.
     fn driver_cursor(&mut self) -> scene::Cursor {
-        let scene = self.display.scene();
-        if scene.assets == 0 || scene.assets == self.assets_version {
-            self.cursor = scene.cursor;
+        if self.scene_matches_art() {
+            self.activate_cursor_art();
+            self.cursor = self.display.scene().cursor;
         }
         self.cursor
     }
@@ -1327,7 +1517,15 @@ impl App {
     fn update_plan(&mut self) {
         let Some(gpu) = &self.gpu else { return };
         let window = (gpu.config.width, gpu.config.height);
-        let screen = self.display.scene().screen_size;
+        let waiting = !self.scene_matches_art();
+        let screen = if waiting {
+            self.cached_picture.as_ref().map_or_else(
+                || self.plan.map_or((0, 0), |p| p.screen),
+                |picture| picture.plan.screen,
+            )
+        } else {
+            self.display.scene().screen_size
+        };
         // A window: as large as the driver's screen at the desktop's scale,
         // if the compositor lets it.
         let scale = gpu.window.scale_factor();
@@ -1384,7 +1582,11 @@ impl App {
             self.reported_window = native;
             self.display.send_input(Input::Window { width: native.0, height: native.1, scale_milli: native.2 });
         }
-        let plan = scaling::plan(window, desktop, screen, &self.settings.resolution);
+        let plan = if waiting {
+            self.cached_picture.as_ref().map(|picture| picture.plan_for_target(window))
+        } else {
+            None
+        }.unwrap_or_else(|| scaling::plan(window, desktop, screen, &self.settings.resolution));
         if Some(plan) != self.plan {
             let p = plan.present;
             log::info!(
@@ -1465,10 +1667,186 @@ impl App {
         }
     }
 
+    /// Advances one bounded transfer without waiting for its GPU work.
+    /// Metadata and the drawable generation move together at commit.
+    fn upload_art(&mut self) -> bool {
+        use tile_render::renderer::AtlasTransferError;
+        let Some(gpu) = self.gpu.as_mut() else { return false };
+        gpu.renderer.poll_atlas_transfers(&gpu.device);
+        let (version, whole) = self.assets.whole();
+        if self.pending_art.as_ref().is_some_and(|p| p.payload.base() != version) {
+            gpu.renderer.cancel_atlas_transfer(&gpu.queue);
+            self.pending_art = None;
+        }
+        if self.pending_art.is_none() {
+            let payload = if version != self.whole_version {
+                whole.map(|compiled| PendingArtPayload::Whole { version, compiled })
+            } else if let Some((generation, growth)) = self.assets.take_growth(version) {
+                Some(PendingArtPayload::Growth { base: version, version: generation, growth })
+            } else {
+                self.assets.take_reserve(version).map(|reserve| {
+                    self.pending_art = Some(PendingArt::new(PendingArtPayload::Reserve { base: version }, reserve));
+                });
+                None
+            };
+            if let Some(payload) = payload {
+                let reserve = self.assets.take_reserve(version).unwrap_or_default();
+                self.pending_art = Some(PendingArt::new(payload, reserve));
+            }
+        }
+        let Some(p) = self.pending_art.as_mut().filter(|p| !p.failed) else { return false };
+        if !p.started {
+            match gpu.renderer.begin_atlas_transfer(&gpu.device, p.payload.source(), p.reserve) {
+                Ok(()) => p.started = true,
+                Err(AtlasTransferError::Busy) => return false,
+                Err(e) => {
+                    log::error!("viewer: cannot prepare atlas generation {}: {e}", p.payload.base());
+                    p.failed = true;
+                    return false;
+                }
+            }
+        }
+        p.frames += 1;
+        let ready = match gpu.renderer.advance_atlas_transfer(&gpu.device, &gpu.queue, p.payload.source(), ATLAS_PART) {
+            Ok(progress) => {
+                if let Some(profile) = &mut self.profile {
+                    profile.count("art transfer bytes", progress.bytes as usize);
+                }
+                progress.ready
+            }
+            Err(AtlasTransferError::Invalidated) => {
+                // A larger live palette table needs a larger candidate.
+                // Keep its source and retry after the retired allocation
+                // is released, without advancing any art generation.
+                gpu.renderer.cancel_atlas_transfer(&gpu.queue);
+                p.started = false;
+                return false;
+            }
+            Err(e) => {
+                log::error!("viewer: atlas generation {} transfer failed: {e}", p.payload.base());
+                gpu.renderer.cancel_atlas_transfer(&gpu.queue);
+                p.failed = true;
+                false
+            }
+        };
+        // Whole descriptions change sprite IDs. Wait for their scene,
+        // including after an upload finishes before the publisher sends it.
+        let compatible = match &p.payload {
+            PendingArtPayload::Whole { version, .. } => {
+                let assets = self.display.scene().assets;
+                assets == 0 || assets >= *version
+            }
+            _ => true,
+        };
+        if !ready || !compatible {
+            return false;
+        }
+        // The producer can supersede a whole description while a frame
+        // advances its upload. Keep the version check and GPU adoption
+        // atomic with respect to publication of that replacement.
+        let assets = self.assets.clone();
+        let slot = assets.slot();
+        if slot.generation != version {
+            drop(slot);
+            gpu.renderer.cancel_atlas_transfer(&gpu.queue);
+            self.pending_art = None;
+            return false;
+        }
+        let committed = gpu.renderer.commit_atlas_transfer(&gpu.device, &gpu.queue);
+        drop(slot);
+        if !committed {
+            return false;
+        }
+        let p = self.pending_art.take().expect("committed transfer");
+        let changed = match p.payload {
+            PendingArtPayload::Whole { version, compiled } => {
+                self.pending_cursor_art = Some((version, cursor::Art::of(&compiled)));
+                self.compiled = compiled.without_pixels();
+                self.assets.uploaded(version);
+                self.whole_version = version;
+                self.assets_version = version;
+                log::info!("viewer: new assets ({} sprites, uploaded over {} ms in {} frames)", self.compiled.sprite_names.len(), p.since.elapsed().as_millis(), p.frames);
+                true
+            }
+            PendingArtPayload::Growth { version, growth, .. } => {
+                self.compiled.apply(&growth);
+                self.assets_version = version;
+                log::info!("viewer: grown by {} sprites ({} KiB of pixels) over {} ms in {} frames; {} sprites", growth.atlas.sprites.len(), growth.atlas.bytes() >> 10, p.since.elapsed().as_millis(), p.frames, self.compiled.atlas.sprites.len());
+                true
+            }
+            PendingArtPayload::Reserve { .. } => {
+                let (rgba, index) = gpu.renderer.atlas_room();
+                log::info!("viewer: atlas room for {rgba} colour and {index} index pages prepared over {} ms in {} frames", p.since.elapsed().as_millis(), p.frames);
+                false
+            }
+        };
+        changed
+    }
+
+    /// Counts actual presentations, including a replay whose cursor and
+    /// counter pixels remain the previous snapshot.
+    fn record_presented(&mut self, started: Instant) {
+        let now = Instant::now();
+        self.frame_clock.presented(now);
+        let seconds = now.duration_since(self.started).as_secs_f64();
+        if self.settings.display.show_fps {
+            self.fps.counter.presented(seconds);
+        }
+        self.frames_presented += 1;
+        if let Some(line) = self.frame_log.as_mut().and_then(|l| l.presented(seconds, now.duration_since(started).as_secs_f64() * 1000.0)) {
+            log::info!("viewer: {line}");
+        }
+        self.presented = true;
+    }
+
+    fn draw_cached_picture(&mut self, started: Instant) {
+        let Some(picture) = &self.cached_picture else { return };
+        let Some(gpu) = &mut self.gpu else { return };
+        let plan = picture.plan_for_target((gpu.config.width, gpu.config.height));
+        let mut t = Instant::now();
+        let frame = match gpu.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                gpu.surface.configure(&gpu.device, &gpu.config);
+                return;
+            }
+            other => {
+                log::warn!("surface: {other:?}");
+                return;
+            }
+        };
+        mark(&mut self.profile, "cached acquire", &mut t);
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        if !gpu.renderer.render_cached_picture(&gpu.device, &gpu.queue, &mut encoder, &frame.texture, &picture.copies, self.config.clear, plan.present) {
+            // Direct rendering has no composed scratch picture. Retain the
+            // compositor's last frame rather than rendering mismatched IDs.
+            return;
+        }
+        mark(&mut self.profile, "cached output", &mut t);
+        gpu.queue.submit([encoder.finish()]);
+        if gpu.software {
+            self.frame_done.store(false, std::sync::atomic::Ordering::Release);
+            let done = self.frame_done.clone();
+            gpu.queue.on_submitted_work_done(move || done.store(true, std::sync::atomic::Ordering::Release));
+        }
+        mark(&mut self.profile, "submit", &mut t);
+        gpu.window.pre_present_notify();
+        gpu.queue.present(frame);
+        gpu.reconfigured = false;
+        self.record_presented(started);
+        mark(&mut self.profile, "present", &mut t);
+        if let Some(profile) = &mut self.profile {
+            profile.event("frames replayed while art waits", 1);
+        }
+        // No new cursor pixels were drawn. Keep pointer_since for the
+        // first compatible render and do not report a latency sample here.
+    }
+
     fn draw_frame(&mut self, started: Instant) {
         let mut t = started;
+        let matched_before_upload = self.scene_matches_art();
         self.update_plan();
-        let Some(plan) = self.plan else { return };
+        if self.plan.is_none() { return; }
         let Some(gpu) = &mut self.gpu else { return };
         // A software renderer still at the last frame: no new one yet (the
         // event loop goes on meanwhile).
@@ -1476,7 +1854,8 @@ impl App {
         if gpu.software && !done() {
             let _ = gpu.device.poll(wgpu::PollType::Poll);
             // The cursor drawn here waits for nothing but that frame.
-            let cursor_waits = self.pointer_since.is_some() && (self.layout.captured() || self.snap.snap_mode_active() || !self.drawn_cursor.is_empty());
+            let cursor_waits = matched_before_upload && self.pointer_since.is_some()
+                && (self.layout.captured() || self.snap.snap_mode_active() || !self.drawn_cursor.is_empty());
             if !done() && cursor_waits {
                 let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(Duration::from_millis(100)) });
             }
@@ -1484,129 +1863,56 @@ impl App {
                 return;
             }
         }
-        let (version, whole) = self.assets.whole();
-        // A new whole description goes up to the GPU a part a frame
-        // (`ATLAS_PART`), frames drawn with the art before meanwhile (nothing
-        // waits for the GPU); a newer one replaces it on the way.
-        if let Some(c) = whole.as_ref().filter(|_| version != self.whole_version && self.staged.as_ref().is_none_or(|s| s.version != version)) {
-            self.staged = Some(Staged { version, atlas: gpu.renderer.stage_atlas(&gpu.device, &c.atlas), compiled: c.clone(), since: Instant::now(), frames: 0 });
-        }
-        drop(whole);
-        let uploaded = match &mut self.staged {
-            Some(s) if s.version == version => {
-                s.frames += 1;
-                gpu.renderer.upload_staged(&gpu.queue, &mut s.atlas, &s.compiled.atlas, ATLAS_PART)
-            }
-            _ => false,
-        };
-        // It is taken, once all of it is there, together with a scene that
-        // refers to it (sprite ids change with every compile: taken before,
-        // the scenes drawn till then would show other sprites); growths of
-        // the one drawn at once (they keep what was there).
-        let refers_to = self.display.scene().assets;
-        let drawable = |from: u64, to: u64| refers_to == 0 || (from..=to).contains(&refers_to);
-        let waits = self.art_waiting.get_or_insert_with(std::time::Instant::now).elapsed();
-        let gave_up = waits > Duration::from_secs(3);
-        let new_assets = version != self.whole_version && uploaded && (refers_to == 0 || refers_to >= version);
-        if let Some(s) = new_assets.then(|| self.staged.take()).flatten() {
-            let started = std::time::Instant::now();
-            gpu.renderer.adopt_atlas(&gpu.device, s.atlas, &s.compiled.atlas);
-            // (Set ids change with every compile.)
-            self.cursor_art = cursor::Art::of(&s.compiled);
-            self.custom_cursors.clear();
-            self.cursor_builds.forget();
-            self.shown_pointer = None;
-            log::info!(
-                "viewer: new assets ({} sprites, uploaded over {} ms in {} frames, taken in {} ms)",
-                s.compiled.sprite_names.len(),
-                s.since.elapsed().as_millis(),
-                s.frames,
-                started.elapsed().as_millis()
-            );
-            // The pixels are on the GPU now: keep only the rest.
-            self.compiled = s.compiled.without_pixels();
-            self.assets.uploaded(s.version);
-            self.whole_version = s.version;
-            self.assets_version = s.version;
-            mark(&mut self.profile, "new assets", &mut t);
-        }
-        if let Some((pages, index_pages)) = self.assets.take_reserve() {
-            let started = std::time::Instant::now();
-            gpu.renderer.reserve_atlas(&gpu.device, &gpu.queue, pages, index_pages);
-            let (rgba, index) = gpu.renderer.atlas_room();
-            log::info!("viewer: atlas room for {rgba} colour and {index} index pages made in {} ms", started.elapsed().as_millis());
-        }
-        let mut grown = false;
-        if version == self.whole_version {
-            let growths = self.assets.take_growths(version);
-            if !growths.is_empty() {
-                let started = std::time::Instant::now();
-                let (mut sprites, mut bytes) = (0, 0);
-                for (generation, growth) in growths {
-                    self.compiled.apply(&growth);
-                    gpu.renderer.grow_atlas(&gpu.device, &gpu.queue, &growth.atlas);
-                    sprites += growth.atlas.sprites.len();
-                    bytes += growth.atlas.bytes();
-                    self.assets_version = generation;
-                }
-                let (rgba, index) = gpu.renderer.atlas_room();
-                log::info!(
-                    "viewer: grown by {sprites} sprites ({} KiB of pixels) in {} ms; {} sprites, atlas room for {rgba} colour and {index} index pages",
-                    bytes >> 10,
-                    started.elapsed().as_millis(),
-                    self.compiled.atlas.sprites.len(),
-                );
-                grown = true;
-            }
-        }
-        if version == self.whole_version && drawable(self.whole_version, self.assets_version) {
-            self.art_waiting = None;
-        }
-        let new_assets = new_assets || grown;
+        let art_committed = self.upload_art();
+        let new_assets = art_committed || self.world_assets_version != self.assets_version;
+        mark(&mut self.profile, "art transfers", &mut t);
         for p in self.display.take_patches() {
             self.patches.insert(p.sprite.clone(), p);
         }
         if self.display.scene().seq == 0 {
             return;
         }
-        // The picture (the viewer arranges and draws in its pixels; the
-        // driver's interface goes onto it, `scaling`).
+        let matches = self.scene_matches_art();
+        if !matches {
+            // Intermediate atlas generations cannot draw either the old
+            // world's IDs or the future scene. Replay the last composed
+            // picture without consuming changes or repainting its overlays.
+            self.draw_cached_picture(started);
+            return;
+        }
+        self.activate_cursor_art();
+        if !matched_before_upload {
+            // The final needed growth just committed. Switch from the
+            // cached mapping to this scene before rebuilding its layout.
+            self.update_plan();
+        }
+        let plan = self.plan.expect("checked above");
+        let gpu = self.gpu.as_mut().expect("checked above");
         let window = plan.canvas();
-        // A scene for other art than the renderer has waits: the last frame
-        // is drawn meanwhile as it was, its world in its arrangement (the
-        // waiting scene's views may differ, e.g. a screen opened with a view
-        // of its own).
-        let assets = self.display.scene().assets;
-        let matches = assets == 0 || (self.whole_version..=self.assets_version).contains(&assets) || gave_up;
-        // What changed since the renderer's world was made of the scene
-        // (taken when it is made of it: not while the scene waits).
-        let changes = if matches || new_assets || self.world.is_none() { self.display.take_changes().0 } else { scene::Changes::default() };
+        let changes = self.display.take_changes().0;
         let scene = self.display.scene();
-        let arranged = match &self.drawn_frame {
-            Some(frame) if !matches && self.world.is_some() && window == self.drawn_window => frame.clone(),
-            _ => {
-                let now = std::time::Instant::now();
-                if let Some(at) = self.drawn_at.replace(now) {
-                    self.layout.advance(now - at);
-                }
-                let bounds = world_bounds(&self.compiled, scene);
-                self.layout.grid_step = self.compiled.step;
-                self.layout.driver_screen = Some(plan.screen);
-                // (What the interface covers changes with the scene only.)
-                let key = (scene.seq, self.assets_version);
-                if self.interface.as_ref().is_none_or(|(k, _)| *k != key) {
-                    self.interface = Some((key, interface_rects(&self.compiled, scene)));
-                }
-                let rects = self.interface.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
-                let mut arranged = self.layout.frame(scene, window, self.config.overhang, rects, Some(bounds));
-                let compiled = &self.compiled;
-                let shown = scaling::arrange(&plan, scene, &mut arranged, |s| sprite_rect(compiled, s));
-                self.layout.interface_shown = shown.shown;
-                self.drawn_overlay = shown.overlay_cameras;
-                self.overlay_camera = shown.overlay;
-                self.drawn_frame = Some(arranged.clone());
-                arranged
+        let arranged = {
+            let now = std::time::Instant::now();
+            if let Some(at) = self.drawn_at.replace(now) {
+                self.layout.advance(now - at);
             }
+            let bounds = world_bounds(&self.compiled, scene);
+            self.layout.grid_step = self.compiled.step;
+            self.layout.driver_screen = Some(plan.screen);
+            // (What the interface covers changes with the scene only.)
+            let key = (scene.seq, self.assets_version);
+            if self.interface.as_ref().is_none_or(|(k, _)| *k != key) {
+                self.interface = Some((key, interface_rects(&self.compiled, scene)));
+            }
+            let rects = self.interface.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
+            let mut arranged = self.layout.frame(scene, window, self.config.overhang, rects, Some(bounds));
+            let compiled = &self.compiled;
+            let shown = scaling::arrange(&plan, scene, &mut arranged, |s| sprite_rect(compiled, s));
+            self.layout.interface_shown = shown.shown;
+            self.drawn_overlay = shown.overlay_cameras;
+            self.overlay_camera = shown.overlay;
+            self.drawn_frame = Some(arranged.clone());
+            arranged
         };
         mark(&mut self.profile, "layout", &mut t);
         // Views following something move without input: tell the driver.
@@ -1641,6 +1947,9 @@ impl App {
                 self.built_overlay = self.drawn_overlay.clone();
                 mark(&mut self.profile, "world build", &mut t);
             }
+        }
+        if matches {
+            self.world_assets_version = self.assets_version;
         }
         if let Some(p) = &mut self.profile {
             p.count("cells changed", changes.cells.len());
@@ -1684,9 +1993,7 @@ impl App {
             log::info!("viewer: world cursor centred again: drawn, the system pointer captured (locked: {locked})");
         }
         let mut cameras = arranged.cameras.clone();
-        if scene.assets == 0 || scene.assets == self.assets_version {
-            self.cursor = scene.cursor;
-        }
+        self.cursor = scene.cursor;
         let cursor_sprites = match cursor::sprite_set(&self.compiled, self.cursor) {
             Some(set) if cameras.len() < tile_render::MAX_VIEWS => {
                 let bounds = world_bounds(&self.compiled, scene);
@@ -1836,16 +2143,9 @@ impl App {
         }
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
-        self.frame_clock.presented(Instant::now());
+        self.cached_picture = Some(CachedPicture { plan, copies: copies.to_vec() });
+        self.record_presented(started);
         mark(&mut self.profile, "present", &mut t);
-        if show_fps {
-            self.fps.counter.presented(seconds);
-        }
-        self.frames_presented += 1;
-        if let Some(line) = self.frame_log.as_mut().and_then(|l| l.presented(seconds, started.elapsed().as_secs_f64() * 1000.0)) {
-            log::info!("viewer: {line}");
-        }
-        self.presented = true;
         if let (Some(since), true) = (since, log_latency()) {
             self.latency.start.push(started.saturating_duration_since(since).as_secs_f64() * 1000.0);
             self.latency.present.push(since.elapsed().as_secs_f64() * 1000.0);
@@ -1855,7 +2155,7 @@ impl App {
         let rested = self.latency.last.is_some_and(|t| t.elapsed() >= Duration::from_secs(2));
         if !self.latency.present.is_empty() && (self.latency_logged.elapsed() >= Duration::from_secs(10) || rested) {
             let span = std::mem::replace(&mut self.latency_logged, Instant::now()).elapsed();
-            let _ = gpu.device.poll(wgpu::PollType::Poll);
+            let _ = self.gpu.as_ref().expect("checked above").device.poll(wgpu::PollType::Poll);
             let frames = std::mem::take(&mut self.frames_presented);
             let mut done = std::mem::take(&mut *self.latency.done.lock().unwrap_or_else(|e| e.into_inner()));
             let fmt = |s: Option<(f64, f64, f64, usize)>| s.map_or("-".to_owned(), |(p50, p95, max, n)| format!("p50 {p50:.1} ms, p95 {p95:.1} ms, max {max:.1} ms ({n})"));
