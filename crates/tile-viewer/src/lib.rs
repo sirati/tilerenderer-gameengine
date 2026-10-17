@@ -224,6 +224,10 @@ fn world_bounds(compiled: &Compiled, scene: &Scene) -> layout::WorldBounds {
 /// Sprite sets the viewer draws its markers with, if the description has
 /// them (anchored at the point they mark).
 pub const CURSOR_SPRITE: &str = "Viewer@cursor/0";
+/// The divider's line, light, drawn over the dark gap where it is closed
+/// (side by side: a column; stacked: a row); its top-left at the anchor.
+pub const DIVIDER_SPRITE: &str = "Viewer@divider_v/0";
+pub const DIVIDER_ROW_SPRITE: &str = "Viewer@divider_h/0";
 pub const ARROW_SPRITE: &str = "Viewer@arrow/0";
 
 /// The markers as world sprites on top of everything (but the world
@@ -247,6 +251,23 @@ fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u3
             Some(tile_render::PlacedSprite::new(set, x * n, y * n))
         })
         .collect()
+}
+
+/// The divider's line over its closed stretches (`layout::Frame::divider`):
+/// a light line two pixels wide in the middle of the dark four-pixel gap,
+/// seen on any background; nothing without the art.
+fn divider_sprites(compiled: &Compiled, pieces: &[(u32, [i32; 4], bool)]) -> Vec<tile_render::PlacedSprite> {
+    let mut out = Vec::new();
+    for &(camera, [x, y, w, h], vertical) in pieces {
+        let Some((set, _)) = compiled.set(if vertical { DIVIDER_SPRITE } else { DIVIDER_ROW_SPRITE }) else { continue };
+        let clip = Some([x, y, x + w, y + h]);
+        let (len, step) = if vertical { (h, 64) } else { (w, 64) };
+        for k in (0..len).step_by(step) {
+            let (px, py) = if vertical { (x + (w - 2) / 2, y + k) } else { (x + k, y + (h - 2) / 2) };
+            out.push(tile_render::PlacedSprite { screen: true, view: Some(camera), clip, ..tile_render::PlacedSprite::new(set, px, py) });
+        }
+    }
+    out
 }
 
 /// The window rectangles (x, y, w, h) the scene's interface-only views
@@ -831,6 +852,7 @@ impl App {
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
         // The snapping pointer and its ghost (while snapping, the only cursor).
         markers.extend(self.snap.sprites(&self.compiled, scene, &arranged, &self.layout));
+        markers.extend(divider_sprites(&self.compiled, &arranged.divider));
         // The cursor where the viewer draws it, in a camera of its own on
         // top (only when there is one: the frame is as before otherwise).
         let captured = self.layout.captured();

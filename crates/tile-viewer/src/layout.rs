@@ -380,6 +380,11 @@ pub struct Frame {
     pub view_cameras: Vec<Option<u32>>,
     pub copies: Vec<ScreenCopy>,
     pub markers: Vec<Marker>,
+    /// The divider's line where it is closed: per piece, the camera
+    /// (clearing the gap there) to draw it in, the gap's rectangle there
+    /// (x, y, w, h), and whether the split is side by side. A light core in
+    /// a dark gap, seen on any background (`crate::DIVIDER_SPRITE`).
+    pub divider: Vec<(u32, [i32; 4], bool)>,
 }
 
 /// Where a point of the window shows the world.
@@ -1155,6 +1160,24 @@ impl Layout {
         spans
     }
 
+    /// The gap's closed stretches (x, y, w, h), and whether the split is
+    /// side by side.
+    fn divider_pieces(&self) -> Vec<([i32; 4], bool)> {
+        let (Some(((g0, g1), (s0, s1))), Some(split)) = (self.gap(), self.split) else { return vec![] };
+        let vertical = split.axis == Axis::Vertical;
+        let mut spans = self.open_spans();
+        spans.sort();
+        let mut pieces = Vec::new();
+        let mut at = s0;
+        for (a, b) in spans.into_iter().chain(std::iter::once((s1, s1))) {
+            if a > at {
+                pieces.push(if vertical { [g0, at, g1 - g0, a - at] } else { [at, g0, a - at, g1 - g0] });
+            }
+            at = at.max(b);
+        }
+        pieces.into_iter().map(|r| (r, vertical)).collect()
+    }
+
     /// The divider's rectangle (the gap and two pixels into each pane).
     fn divider(&self) -> Option<[i32; 4]> {
         let ((g0, g1), (s0, s1)) = self.gap()?;
@@ -1620,6 +1643,16 @@ impl Layout {
         let fillers: Vec<Camera> = self.fillers();
         for filler in fillers.into_iter().filter(|_| take(1)) {
             push(&mut frame, filler);
+        }
+        // The divider's line where it is closed (all of it while the mouse
+        // is captured): the gap cleared there, its line drawn over it.
+        for (rect, vertical) in self.divider_pieces() {
+            if !take(1) {
+                break;
+            }
+            let camera = Camera { zoom: (2, 1), origin: (rect[0], rect[1]), cells: false, ..Camera::new((rect[2].max(1) as u32, rect[3].max(1) as u32)) };
+            let index = push(&mut frame, camera);
+            frame.divider.push((index, rect, vertical));
         }
         for (k, inset) in self.insets.iter().enumerate().take(insets) {
             push(&mut frame, frame_of(inset.rect));
@@ -2637,8 +2670,8 @@ mod tests {
         l.split.as_mut().unwrap().view = FreeView { center: (5000, 2000), ..FreeView::new((0, 0), ONE, Follow::Free) };
         let f = frame(&mut l, vec![]);
         // The panes, the pictures going on into the divider's open middle
-        // third, the interface.
-        assert_eq!(f.cameras.len(), 5);
+        // third, its line above and below that, the interface.
+        assert_eq!(f.cameras.len(), 7);
         assert_eq!(f.cameras[0].viewport, (400, 600));
         assert_eq!(f.cameras[1].origin, (404, 0));
         assert_eq!((f.cameras[2].origin, f.cameras[2].viewport), ((400, 200), (2, 200)));
@@ -2879,7 +2912,8 @@ mod tests {
             // (The pictures going on into the divider's middle third: the
             // pane's, and the main pane's unless it is the fitted screen.)
             let fillers = if ui == "pane" { 1 } else { 2 };
-            assert_eq!(f.cameras.len(), 2 + 1 + 2 * MAX_INSETS + 2 + fillers, "ui={ui}");
+            // (And the divider's line above and below its open middle.)
+            assert_eq!(f.cameras.len(), 2 + 1 + 2 * MAX_INSETS + 2 + fillers + 2, "ui={ui}");
             assert!(f.cameras.len() <= tile_render::MAX_VIEWS);
             // The interface on top of the viewer's own views (bar the
             // magnifier), or in the pane.
@@ -3767,6 +3801,24 @@ mod tests {
         assert_eq!(camera_at(&after, (404, 0)), b);
         let (w, h) = b.source_size();
         assert_eq!(l.cursor, (b.x + w as i32 / 2, b.y + h as i32 / 2));
+    }
+
+    #[test]
+    fn the_divider_is_drawn_where_it_is_closed() {
+        let mut l = split_1to1();
+        let f = frame(&mut l, vec![]);
+        let pieces: Vec<[i32; 4]> = f.divider.iter().map(|d| d.1).collect();
+        assert_eq!(pieces, [[400, 0, 4, 200], [400, 400, 4, 200]]);
+        assert!(f.divider.iter().all(|&(c, r, vertical)| vertical && f.cameras[c as usize].origin == (r[0], r[1]) && !f.cameras[c as usize].cells));
+        // Captured: all of it.
+        let mut l = arranged(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse)));
+        click(&mut l, (600, 300));
+        let f = frame(&mut l, vec![]);
+        assert_eq!(f.divider.iter().map(|d| d.1).collect::<Vec<_>>(), [[400, 0, 4, 600]]);
+        // Stacked: across.
+        let mut h = arranged(&settings(|s| s.split = S::Horizontal1To1));
+        let f = frame(&mut h, vec![]);
+        assert_eq!(f.divider.iter().map(|d| (d.1, d.2)).collect::<Vec<_>>(), [([0, 300, 266, 4], false), ([534, 300, 266, 4], false)]);
     }
 
     #[test]
