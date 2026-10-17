@@ -4,6 +4,7 @@
 //! Nothing here knows which game it is showing.
 
 pub mod cursor;
+pub mod fps;
 mod input;
 pub mod layout;
 pub mod snap;
@@ -352,6 +353,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         settings: viewer_settings::Settings::default(),
         error: None,
         snap: snap::SnapInput::default(),
+        fps: fps::Overlay::default(),
         cursor_art: cursor::Art::default(),
         custom_cursors: std::collections::HashMap::new(),
         shown_pointer: None,
@@ -441,6 +443,8 @@ struct App {
     settings: viewer_settings::Settings,
     /// Button snapping (Alt while the mouse is captured).
     snap: snap::SnapInput,
+    /// The frame counter (`settings.display.show_fps`).
+    fps: fps::Overlay,
     /// The cursor art kept for the system pointer, the system cursors made
     /// of it (by set), what the system pointer shows, and whether it is the
     /// capture pointer (the layout's `PointerIcon::Capture`).
@@ -524,6 +528,10 @@ impl App {
             if let Err(e) = self.layout.configure(&spec) {
                 log::warn!("TILE_VIEWER_LAYOUT: {e}");
             }
+        }
+        // The counter counts while it shows, afresh each time it is shown.
+        if settings.display.show_fps && !self.settings.display.show_fps {
+            self.fps = fps::Overlay::default();
         }
         self.settings = settings;
     }
@@ -865,6 +873,16 @@ impl App {
         if !cursor_sprites.is_empty() {
             cameras.push(cursor::overlay_camera(window));
         }
+        // The frame counter over everything (the cursor too), by a camera of
+        // its own showing the whole window 1:1 (whatever the split and
+        // scales).
+        let show_fps = self.settings.display.show_fps && cameras.len() < tile_render::MAX_VIEWS;
+        let seconds = self.started.elapsed().as_secs_f64();
+        if show_fps {
+            let camera = cameras.len() as u32;
+            markers.extend_from_slice(self.fps.sprites(&self.compiled, self.assets_version, seconds, window, camera, gpu.software));
+            cameras.push(Camera { cells: false, ..Camera::new(window) });
+        }
         let cursor_moved = cursor_sprites != self.drawn_cursor;
         markers.extend_from_slice(&cursor_sprites);
         let world = self.world.as_mut().expect("built above");
@@ -898,6 +916,9 @@ impl App {
         let since = self.pointer_since.take().filter(|_| cursor_moved || views_followed);
         // (Not while the mouse waits to be let go after a frame.)
         if gpu.software && unchanged && self.unlock_pending.is_none() {
+            if show_fps {
+                self.fps.counter.skipped(seconds);
+            }
             return;
         }
         self.drawn_tick = scene.tick;
@@ -930,6 +951,9 @@ impl App {
         }
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
+        if show_fps {
+            self.fps.counter.presented(seconds);
+        }
         self.frames_presented += 1;
         self.presented = true;
         if let (Some(since), true) = (since, log_latency()) {
