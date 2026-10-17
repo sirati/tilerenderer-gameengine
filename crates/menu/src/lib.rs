@@ -335,6 +335,23 @@ impl Menus {
         })
     }
 
+    /// The buttons of `menu` in `viewport` as things to point at (in the
+    /// viewport's pixels, ids from the buttons' ids, the same for the same id).
+    pub fn interactables(&self, menu: &Menu, viewport: (u32, u32)) -> Vec<scene::Interactable> {
+        let (ox, oy) = menu.anchor.place(menu.size, viewport);
+        menu.items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Button { id, at, size, .. } => Some(scene::Interactable {
+                    rect: [ox + at.0, oy + at.1, size.0 as i32, size.1 as i32],
+                    kind: scene::InteractableKind::Button,
+                    id: id_hash(&menu.name, id),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Updates hover/pressed state from pointer input; reports clicks.
     pub fn input(&self, menu: &Menu, state: &mut MenuState, viewport: (u32, u32), input: &Input) -> Option<MenuEvent> {
         match *input {
@@ -356,6 +373,16 @@ impl Menus {
             _ => None,
         }
     }
+}
+
+/// A stable id for button `id` of menu `menu` (FNV-1a, top bit set so it
+/// stays clear of a game's object addresses).
+fn id_hash(menu: &str, id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in menu.bytes().chain([0]).chain(id.bytes()) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h | 1 << 63
 }
 
 /// Pointer state of an open menu.
@@ -444,5 +471,22 @@ mod tests {
         menus.input(m, &mut state, viewport, &down);
         let away = Input::MouseButton { button: Button::Left, down: false, x: 5, y: 5 };
         assert_eq!(menus.input(m, &mut state, viewport, &away), None);
+    }
+
+    #[test]
+    fn buttons_are_interactables_where_they_are_hit() {
+        let c = compiled();
+        let menus = Menus::parse(MENUS, &c).unwrap();
+        let m = menus.menu("m").unwrap();
+        let items = menus.interactables(m, (300, 150));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].rect, [110, 60, 32, 16]);
+        assert_eq!(items[0].kind, scene::InteractableKind::Button);
+        let [x, y, w, h] = items[0].rect;
+        assert_eq!(menus.hit(m, (300, 150), x + w - 1, y + h - 1), Some("ok"));
+        // The same button keeps its id wherever the menu is.
+        assert_eq!(menus.interactables(m, (640, 480))[0].id, items[0].id);
+        assert_ne!(id_hash("m", "ok"), id_hash("m", "cancel"));
+        assert_ne!(id_hash("a", "bc"), id_hash("ab", "c"));
     }
 }
