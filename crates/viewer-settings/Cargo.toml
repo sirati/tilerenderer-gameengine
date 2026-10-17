@@ -1,0 +1,11 @@
+[package]
+name = "viewer-settings"
+description = "The viewer's own settings (resolution, layout, input), saved as TOML; game-agnostic."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+thiserror.workspace = true

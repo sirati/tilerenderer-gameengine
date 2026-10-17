@@ -12,6 +12,7 @@ members = [
     "crates/wine-unixlib",
     "crates/civ3r-native",
     "crates/tile-viewer",
+    "crates/viewer-settings",
     "crates/inproc",
     "crates/civ3-sys",
     "crates/civ3-bridge",
