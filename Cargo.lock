@@ -893,6 +893,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu-text"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "tile-render-shared",
+ "ttf-parser",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2527,6 +2536,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cargo-gpu-install",
+ "gpu-text",
  "image",
  "log",
  "pollster",

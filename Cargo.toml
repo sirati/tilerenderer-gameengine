@@ -8,6 +8,7 @@ members = [
     "crates/scene",
     "crates/menu",
     "crates/gdi-text",
+    "crates/gpu-text",
     "crates/wine-unixlib",
     "crates/civ3r-native",
     "crates/tile-viewer",
@@ -27,6 +28,7 @@ version = "0.1.0"
 [workspace.dependencies]
 tile-render-shared = { path = "crates/tile-render-shared" }
 tile-render = { path = "crates/tile-render" }
+gpu-text = { path = "crates/gpu-text" }
 bytemuck = { version = "1.24", features = ["derive", "min_const_generics"] }
 glam = "0.30"
 wgpu = { version = "30", features = ["spirv"] }
