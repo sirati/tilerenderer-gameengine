@@ -625,6 +625,8 @@ impl App {
         if let (Some((x, y)), Some(gpu)) = (warp, &self.gpu) {
             if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
                 log::debug!("viewer: moving the pointer to {x}, {y}: {e}");
+                // (The divider cannot hold back what it cannot move.)
+                self.layout.pointer_cannot_be_moved();
             }
         }
         if grab == Some(false) {

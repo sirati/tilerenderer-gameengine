@@ -474,6 +474,9 @@ pub struct Layout {
     /// it back), and where the window is to move the system pointer.
     raw_pointer: (i32, i32),
     warp: Option<(i32, i32)>,
+    /// Whether the divider holds the pointer back (not where the window
+    /// cannot move the system pointer).
+    walls: bool,
     /// Ctrl went down with no other key or button since (and none held).
     ctrl_alone: bool,
     /// The keys held.
@@ -576,6 +579,7 @@ impl Default for Layout {
             against: None,
             raw_pointer: (i32::MIN, i32::MIN),
             warp: None,
+            walls: true,
             ctrl_alone: false,
             keys_down: Vec::new(),
             icon: PointerIcon::Default,
@@ -779,6 +783,20 @@ impl Layout {
     /// back), if it is to.
     pub fn take_warp(&mut self) -> Option<(i32, i32)> {
         self.warp.take()
+    }
+
+    /// The window cannot move the system pointer (e.g. on Wayland): the
+    /// divider lets the pointer through everywhere while the mouse is free,
+    /// the pointer the user sees being where the layout has it.
+    pub fn pointer_cannot_be_moved(&mut self) {
+        if self.walls {
+            self.walls = false;
+            // Where the system pointer really is.
+            self.pointer = self.raw_pointer;
+            self.side = self.side_of(self.pointer);
+            self.against = None;
+            log::info!("viewer: the system pointer cannot be moved back here; the divider lets it through while the mouse is free");
+        }
     }
 
     /// The pointer the window is to show, when that changed.
@@ -1109,6 +1127,12 @@ impl Layout {
     /// pushes against the divider.
     fn constrain(&mut self, from: (i32, i32), to: (i32, i32)) -> (i32, i32) {
         self.against = None;
+        // (Where the system pointer cannot be moved back, a wall would hold
+        // the pointer where it is not seen: it passes.)
+        if !self.walls {
+            self.side = self.side_of(to);
+            return to;
+        }
         let Some(((g0, g1), _)) = self.gap().filter(|_| !self.locked && self.drag.is_none()) else {
             self.side = None;
             return to;
@@ -3284,6 +3308,20 @@ mod tests {
         mv(&mut l, (300, 500));
         mv(&mut l, (600, 500));
         assert_eq!(l.pointer, (399, 500));
+    }
+
+    #[test]
+    fn where_the_pointer_cannot_be_moved_back_the_divider_lets_it_through() {
+        let mut l = split_1to1();
+        mv(&mut l, (100, 100));
+        mv(&mut l, (600, 100));
+        assert_eq!((l.pointer, l.take_warp()), ((399, 100), Some((399, 100))));
+        // The window says it cannot: the pointer is where the user sees it.
+        l.pointer_cannot_be_moved();
+        assert_eq!((l.pointer, l.side, l.against), ((600, 100), Some(Side::B), None));
+        mv(&mut l, (100, 100));
+        assert_eq!((l.pointer, l.side, l.take_warp()), ((100, 100), Some(Side::A), None));
+        assert_eq!(click(&mut l, (100, 100))[0], Input::MouseButton { button: Button::Left, down: true, x: 100, y: 100 });
     }
 
     #[test]
