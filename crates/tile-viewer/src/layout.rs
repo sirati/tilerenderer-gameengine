@@ -85,9 +85,11 @@
 //! except in its middle third (drawn without the line there) and where the
 //! driver's always reachable controls are (`Interface::reachable`, e.g. the
 //! unit's orders): the pointer pushed against it stays in its view (the
-//! window is asked to move the system pointer back, [`Layout::take_warp`])
+//! window is asked to move the system pointer back, [`Layout::take_warp`],
+//! or the system holds it out of [`Layout::pointer_walls`], [`Walls`])
 //! and scrolls that view instead (`Input::Edge` for the driver's view, else
-//! the viewer pans it; with edge scrolling on). Through the gaps it moves freely. The
+//! the viewer pans it; with edge scrolling on). Through the gaps it moves
+//! freely. The
 //! driver's roaming controls (`Interface::roaming`, a game's corner menu
 //! buttons) are drawn in the view the pointer is in. While the mouse is
 //! captured the whole divider is a wall. Ctrl pressed and released on its
@@ -447,6 +449,20 @@ pub enum Side {
     B,
 }
 
+/// How the divider's walls hold the pointer back while the mouse is free.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Walls {
+    /// The window moves the system pointer back ([`Layout::take_warp`]).
+    Warp,
+    /// The system holds the pointer out of the walls
+    /// ([`Layout::pointer_walls`], e.g. a Wayland pointer confinement): it
+    /// is not moved back.
+    Confined,
+    /// Nothing holds it: the pointer passes (where the system pointer can
+    /// neither be moved back nor confined).
+    Open,
+}
+
 impl Side {
     fn hit(self) -> Hit {
         match self {
@@ -517,9 +533,8 @@ pub struct Layout {
     /// it back), and where the window is to move the system pointer.
     raw_pointer: (i32, i32),
     warp: Option<(i32, i32)>,
-    /// Whether the divider holds the pointer back (not where the window
-    /// cannot move the system pointer).
-    walls: bool,
+    /// How the divider holds the pointer back (see [`Walls`]).
+    walls: Walls,
     /// Ctrl went down with no other key or button since (and none held).
     ctrl_alone: bool,
     /// The keys held.
@@ -676,7 +691,7 @@ impl Default for Layout {
             against: None,
             raw_pointer: (i32::MIN, i32::MIN),
             warp: None,
-            walls: true,
+            walls: Walls::Warp,
             ctrl_alone: false,
             keys_down: Vec::new(),
             icon: PointerIcon::Default,
@@ -756,6 +771,19 @@ const DOUBLE_CLICK_PIXELS: i32 = 6;
 /// Whether rectangles (x, y, w, h) share a pixel.
 fn overlap(a: [i32; 4], b: [i32; 4]) -> bool {
     a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+}
+
+/// Span `(a, b)` less the spans `cut`: what is left of it, in order.
+fn subtract_spans((a, b): (i32, i32), cut: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    let mut left = vec![(a, b)];
+    for &(c0, c1) in cut.iter().filter(|(c0, c1)| c1 > c0) {
+        left = left
+            .into_iter()
+            .flat_map(|(l0, l1)| [(l0, l1.min(c0)), (l0.max(c1), l1)])
+            .filter(|(l0, l1)| l1 > l0)
+            .collect();
+    }
+    left
 }
 
 fn inside([x, y, w, h]: [i32; 4], (px, py): (i32, i32)) -> bool {
@@ -1011,14 +1039,72 @@ impl Layout {
     /// divider lets the pointer through everywhere while the mouse is free,
     /// the pointer the user sees being where the layout has it.
     pub fn pointer_cannot_be_moved(&mut self) {
-        if self.walls {
-            self.walls = false;
+        if self.walls == Walls::Warp {
+            self.walls = Walls::Open;
             // Where the system pointer really is.
             self.pointer = self.raw_pointer;
             self.side = self.side_of(self.pointer);
             self.against = None;
             log::info!("viewer: the system pointer cannot be moved back here; the divider lets it through while the mouse is free");
         }
+    }
+
+    /// How the divider holds the pointer back from now on (the window says
+    /// whether the system confines the pointer to [`Layout::pointer_walls`]).
+    pub fn set_walls(&mut self, walls: Walls) {
+        if walls == self.walls {
+            return;
+        }
+        log::debug!("viewer: the divider's walls: {:?} (were {:?})", walls, self.walls);
+        if walls == Walls::Open {
+            // Where the system pointer really is.
+            self.pointer = self.raw_pointer;
+            self.side = self.side_of(self.pointer);
+            self.against = None;
+        }
+        self.walls = walls;
+    }
+
+    /// The divider's walls as of the last frame, for the system to keep the
+    /// pointer out of ([`Walls::Confined`]): canvas rectangles; none where
+    /// the divider holds nothing back (no split, the mouse captured, the
+    /// divider dragged, a screen beside its world, button snapping). They
+    /// are the gap's closed stretches less where the driver's interface
+    /// reaches across the gap (and the always reachable controls, a little
+    /// around them), as [`Layout::constrain`] lets the pointer through.
+    pub fn pointer_walls(&self) -> Option<Vec<[i32; 4]>> {
+        if self.locked || self.drag.is_some() || self.beside.is_some() || self.snapping {
+            return None;
+        }
+        let (((g0, g1), _), split) = (self.gap()?, self.split?);
+        let vertical = split.axis == Axis::Vertical;
+        // (across from, across to, along from, along to)
+        let spans = |r: [i32; 4]| if vertical { (r[0], r[0] + r[2], r[1], r[1] + r[3]) } else { (r[1], r[1] + r[3], r[0], r[0] + r[2]) };
+        // Along the divider: where the interface reaches across the gap.
+        let mut open: Vec<(i32, i32)> = Vec::new();
+        if self.fit.is_none() {
+            let moved = self.moved.iter().map(|(r, _)| r);
+            for &r in self.interface.iter().chain(&self.driver_rects).chain(moved) {
+                let (lo, hi, a0, a1) = spans(r);
+                if lo < g0 && hi > g1 {
+                    open.push((a0, a1));
+                }
+            }
+        }
+        if let Some(r) = self.reachable {
+            let (lo, hi, a0, a1) = spans([r[0] - GAP, r[1] - GAP, r[2] + 2 * GAP, r[3] + 2 * GAP]);
+            if lo < g1 && hi > g0 {
+                open.push((a0, a1));
+            }
+        }
+        let mut walls = Vec::new();
+        for (r, _) in self.divider_pieces() {
+            let (_, _, a0, a1) = spans(r);
+            for (b0, b1) in subtract_spans((a0, a1), &open) {
+                walls.push(if vertical { [g0, b0, g1 - g0, b1 - b0] } else { [b0, g0, b1 - b0, g1 - g0] });
+            }
+        }
+        (!walls.is_empty()).then_some(walls)
     }
 
     /// The pointer the window is to show, when that changed.
@@ -1355,7 +1441,7 @@ impl Layout {
         self.against = None;
         // (Where the system pointer cannot be moved back, a wall would hold
         // the pointer where it is not seen: it passes.)
-        if !self.walls {
+        if self.walls == Walls::Open {
             self.side = self.side_of(to);
             return to;
         }
@@ -2665,7 +2751,11 @@ impl Layout {
                 let (x, y) = self.constrain(from, (x, y));
                 if (x, y) != self.raw_pointer {
                     log::debug!("viewer: the divider holds the pointer at {:?} (it went to {:?})", (x, y), self.raw_pointer);
-                    self.warp = Some((x, y));
+                    // (Confined, the system pointer is where the system
+                    // holds it: at most a pixel into the wall.)
+                    if self.walls == Walls::Warp {
+                        self.warp = Some((x, y));
+                    }
                 }
                 self.pointer = (x, y);
                 if let Some(drag) = self.drag {
@@ -4243,6 +4333,102 @@ mod tests {
         mv(&mut l, (300, 500));
         mv(&mut l, (600, 500));
         assert_eq!(l.pointer, (399, 500));
+    }
+
+    #[test]
+    fn the_walls_the_system_holds_the_pointer_out_of_are_the_gaps_closed_stretches() {
+        let mut l = split_1to1();
+        assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 200], [400, 400, 4, 200]]));
+        // Always reachable unit controls open a gap with the same margin
+        // as pointer routing, even when only part overlaps the divider.
+        l.reachable = Some([398, 100, 20, 30]);
+        assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 96], [400, 134, 4, 66], [400, 400, 4, 200]]));
+        l.reachable = None;
+        let h = arranged(&settings(|s| s.split = S::Horizontal1To1));
+        assert_eq!(h.pointer_walls(), Some(vec![[0, 300, 266, 4], [534, 300, 266, 4]]));
+        // None where the divider holds nothing back.
+        assert_eq!(arranged(&settings(|_| {})).pointer_walls(), None);
+        l.locked = true;
+        assert_eq!(l.pointer_walls(), None);
+        l.locked = false;
+        l.set_snapping(true);
+        assert_eq!(l.pointer_walls(), None);
+        l.set_snapping(false);
+        l.drag = Some(Drag::Divider);
+        assert_eq!(l.pointer_walls(), None);
+    }
+
+    #[test]
+    fn the_walls_the_system_holds_open_where_the_drivers_interface_lies_over_the_divider() {
+        let mut l = split_1to1();
+        let mut s = with_parts(None);
+        let part = |id, origin, viewport| scene::ViewState { id, view: scene::View { interface_only: true, origin, viewport, ..Default::default() }, overlay: vec![] };
+        s.views.push(part(257, (300, 450), (450, 100)));
+        s.interface.popup = Some(257);
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![[200, 20, 400, 100], [100, 250, 250, 300]], BOUNDS);
+        // (The rectangle on A's side only leaves the wall as it is.)
+        assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 20], [400, 120, 4, 80], [400, 400, 4, 50], [400, 550, 4, 50]]));
+    }
+
+    #[test]
+    fn where_the_system_holds_the_pointer_the_divider_does_not_move_it_back() {
+        let mut l = split_1to1();
+        l.set_walls(Walls::Confined);
+        mv(&mut l, (100, 100));
+        // Held by the system at A's last pixel: it pushes against the wall.
+        assert_eq!(mv(&mut l, (399, 100)), [Input::MouseMove { x: 599, y: 100 }, Input::Edge { x: 1, y: 0 }]);
+        assert_eq!((l.side, l.against, l.take_warp()), (Some(Side::A), Some(Side::A), None));
+        // A pixel into the wall (the system's rounding): held there, not
+        // moved back.
+        mv(&mut l, (400, 120));
+        assert_eq!((l.pointer, l.against, l.take_warp()), ((399, 120), Some(Side::A), None));
+        // Through the open middle third as ever.
+        mv(&mut l, (300, 300));
+        mv(&mut l, (600, 300));
+        assert_eq!((l.pointer, l.side), ((600, 300), Some(Side::B)));
+        // The system not holding it (yet): the pointer passes.
+        mv(&mut l, (600, 100));
+        l.set_walls(Walls::Open);
+        mv(&mut l, (100, 100));
+        assert_eq!((l.pointer, l.side, l.take_warp()), ((100, 100), Some(Side::A), None));
+        // Placing the pointer still moves the system pointer.
+        l.set_walls(Walls::Confined);
+        l.place_pointer((250, 250));
+        assert_eq!(l.take_warp(), Some((250, 250)));
+    }
+
+    #[test]
+    fn a_stationary_confined_pointer_keeps_scrolling_both_sides() {
+        let mut l = split_1to1();
+        l.set_walls(Walls::Confined);
+        mv(&mut l, (100, 100));
+        mv(&mut l, (399, 100));
+        for _ in 0..2 {
+            l.advance(std::time::Duration::from_millis(100));
+            frame(&mut l, vec![]);
+            assert_eq!(l.against, Some(Side::A));
+            assert_eq!(l.driver_edge(l.pointer), (1, 0));
+            assert_eq!(l.take_warp(), None);
+        }
+        mv(&mut l, (300, 300));
+        mv(&mut l, (600, 300));
+        mv(&mut l, (600, 500));
+        mv(&mut l, (404, 500));
+        let center = l.split.unwrap().view.center;
+        for i in 1..=2 {
+            l.advance(std::time::Duration::from_millis(100));
+            frame(&mut l, vec![]);
+            assert_eq!(l.against, Some(Side::B));
+            assert_eq!(l.split.unwrap().view.center, (center.0 - 60 * i, center.1));
+            assert_eq!(l.take_warp(), None);
+        }
+    }
+
+    #[test]
+    fn spans_less_spans() {
+        assert_eq!(subtract_spans((0, 10), &[]), [(0, 10)]);
+        assert_eq!(subtract_spans((0, 10), &[(2, 4), (6, 20), (5, 5)]), [(0, 2), (4, 6)]);
+        assert_eq!(subtract_spans((0, 10), &[(-5, 15)]), []);
     }
 
     #[test]
