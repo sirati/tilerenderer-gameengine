@@ -4,17 +4,42 @@ use scene::{Button, Input};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
+use crate::scaling::Plan;
+
 #[derive(Default)]
 pub struct InputState {
+    /// The pointer in window pixels, and in the driver's (see
+    /// [`InputState::set_plan`]).
+    window: (f64, f64),
     cursor: (i32, i32),
+    plan: Option<Plan>,
 }
 
 impl InputState {
+    /// The driver's screen is now shown so in the window: pointer positions
+    /// are reported in its pixels (the pointer where it is now, if that
+    /// moved it).
+    pub fn set_plan(&mut self, plan: Plan) -> Option<Input> {
+        if Some(plan) == self.plan {
+            return None;
+        }
+        self.plan = Some(plan);
+        let cursor = plan.to_screen(self.window);
+        (cursor != self.cursor).then(|| {
+            self.cursor = cursor;
+            Input::MouseMove { x: cursor.0, y: cursor.1 }
+        })
+    }
+
     pub fn translate(&mut self, event: &WindowEvent) -> Vec<Input> {
         let (x, y) = self.cursor;
         match event {
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x as i32, position.y as i32);
+                self.window = (position.x, position.y);
+                self.cursor = match &self.plan {
+                    Some(plan) => plan.to_screen(self.window),
+                    None => (position.x as i32, position.y as i32),
+                };
                 vec![Input::MouseMove { x: self.cursor.0, y: self.cursor.1 }]
             }
             WindowEvent::MouseInput { state, button, .. } => {

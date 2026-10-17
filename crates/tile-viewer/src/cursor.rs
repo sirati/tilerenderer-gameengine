@@ -56,6 +56,24 @@ pub struct Image {
     pub hotspot: (u16, u16),
 }
 
+/// RGBA rows of `size` with each pixel an `n`×`n` box (nearest pixel), and
+/// their size.
+pub fn upscaled(rgba: &[u8], size: (u16, u16), n: u32) -> (Vec<u8>, (u16, u16)) {
+    let n = n.max(1) as usize;
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    if n == 1 || rgba.len() < w * h * 4 {
+        return (rgba.to_vec(), size);
+    }
+    let mut out = Vec::with_capacity(w * h * 4 * n * n);
+    for row in rgba.chunks_exact(w * 4).take(h) {
+        let wide: Vec<u8> = row.chunks_exact(4).flat_map(|p| std::iter::repeat_n(p, n).flatten().copied()).collect();
+        for _ in 0..n {
+            out.extend_from_slice(&wide);
+        }
+    }
+    (out, ((w * n) as u16, (h * n) as u16))
+}
+
 /// The pixels of the sets [`KEPT_SETS`] names, by set (taken from a
 /// description before its pixels are dropped).
 #[derive(Clone, Debug, Default)]
@@ -392,6 +410,17 @@ impl Latency {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cursor_upscaled_is_whole_boxes() {
+        let px = |v: u8| [v, v, v, 255];
+        let rgba: Vec<u8> = [px(1), px(2), px(3), px(4)].concat();
+        let (out, size) = upscaled(&rgba, (2, 2), 3);
+        assert_eq!(size, (6, 6));
+        let at = |x: usize, y: usize| out[(y * 6 + x) * 4];
+        assert_eq!((at(0, 0), at(2, 2), at(3, 0), at(5, 2), at(0, 3), at(5, 5)), (1, 1, 2, 2, 3, 4));
+        assert_eq!(upscaled(&rgba, (2, 2), 1), (rgba.clone(), (2, 2)));
+    }
 
     fn cam(origin: (i32, i32), viewport: (u32, u32), at: (i32, i32), zoom: (u32, u32)) -> Camera {
         Camera { x: at.0, y: at.1, origin, zoom, ..Camera::new(viewport) }

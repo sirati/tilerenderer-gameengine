@@ -162,9 +162,10 @@ impl Settings {
     pub fn control(&self, key: &str) -> Option<ControlValue> {
         let (r, l, i) = (&self.resolution, &self.layout, &self.input);
         match key {
-            "resolution.pixel_scale" => {
-                Some(ControlValue::Choice(r.pixel_scale.clamp(1, Resolution::MAX_PIXEL_SCALE).to_string()))
-            }
+            "resolution.pixel_scale" => Some(ControlValue::Choice(match r.pixel_scale {
+                Resolution::AUTO => "auto".into(),
+                n => n.min(Resolution::MAX_PIXEL_SCALE).to_string(),
+            })),
             "resolution.menu_scale" => Some(ControlValue::Number(r.menu_scale)),
             "resolution.frame_scale" => Some(ControlValue::Number(r.frame_scale)),
             "resolution.world_scale" => Some(ControlValue::Number(r.world_scale)),
@@ -205,6 +206,10 @@ impl Settings {
             let (r, l, i, d) = (&mut self.resolution, &mut self.layout, &mut self.input, &mut self.display);
             match key {
                 "resolution.pixel_scale" => match value {
+                    ControlValue::Choice(n) if n == "auto" => {
+                        r.pixel_scale = Resolution::AUTO;
+                        true
+                    }
                     ControlValue::Choice(n) => match n.parse::<u32>() {
                         Ok(n) if (1..=Resolution::MAX_PIXEL_SCALE).contains(&n) => {
                             r.pixel_scale = n;
@@ -289,6 +294,9 @@ mod tests {
             assert_eq!(s.control(key), Some(value), "{key}");
         }
         assert_eq!(s.resolution.pixel_scale, 4);
+        assert!(s.set_control("resolution.pixel_scale", &ControlValue::Choice("auto".into())));
+        assert_eq!(s.resolution.pixel_scale, Resolution::AUTO);
+        assert_eq!(s.control("resolution.pixel_scale"), Some(ControlValue::Choice("auto".into())));
         assert_eq!(s.layout.split, Split::Vertical2To1);
         assert_eq!(s.layout.zoom, Zoom::TopStrip);
         assert_eq!(s.layout.roles, Roles::UnitMouse);
@@ -344,6 +352,6 @@ mod tests {
         let controls = s.controls();
         assert_eq!(controls.len(), KEYS.len() + 1 + Layout::SCREENS.len());
         assert!(controls.contains(&("layout.screens.Help".into(), ControlValue::Choice("Floating".into()))));
-        assert!(controls.contains(&("resolution.pixel_scale".into(), ControlValue::Choice("1".into()))));
+        assert!(controls.contains(&("resolution.pixel_scale".into(), ControlValue::Choice("auto".into()))));
     }
 }

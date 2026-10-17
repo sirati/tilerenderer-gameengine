@@ -1,8 +1,8 @@
 //! How the viewer arranges the world in its window beyond what the driver
 //! asks for: the driver's main view zoomed or moved, a second pane beside
 //! it, floating insets and a magnifier beside the pointer. The driver's
-//! interface (interface-only views) stays on top, unscaled, where the driver
-//! put it.
+//! interface (interface-only views) stays on top where the driver put it
+//! (unless the viewer shows it elsewhere, [`Layout::interface_shown`]).
 //!
 //! Every arranged view follows something ([`Follow`]): what the driver's
 //! main view shows, the driver's point of interest (`Scene::focus`, e.g. the
@@ -255,16 +255,23 @@ impl FreeView {
         self.glide.snap(center);
     }
 
-    /// World pixels it shows in a rectangle `rect` wide and high.
-    fn source(&self, rect: [i32; 4]) -> (i32, i32) {
-        let zoom = ZOOMS[self.zoom];
+    /// Its zoom with the world shown `scale` times larger besides
+    /// ([`Layout::world_scale`]).
+    fn zoom_by(&self, scale: (u32, u32)) -> (u32, u32) {
+        times(ZOOMS[self.zoom], scale)
+    }
+
+    /// World pixels it shows in a rectangle `rect` wide and high (at zoom
+    /// [`FreeView::zoom_by`] `scale`).
+    fn source(&self, rect: [i32; 4], scale: (u32, u32)) -> (i32, i32) {
+        let zoom = self.zoom_by(scale);
         ((rect[2].max(1) as u32 * zoom.1).div_ceil(zoom.0) as i32, (rect[3].max(1) as u32 * zoom.1).div_ceil(zoom.0) as i32)
     }
 
     /// Its camera in `rect`: centred, but not past an edge of the world
-    /// that does not wrap.
-    fn camera(&self, rect: [i32; 4], overhang: (u32, u32, u32, u32), bounds: Option<WorldBounds>) -> Camera {
-        let (sw, sh) = self.source(rect);
+    /// that does not wrap; the world `scale` times larger besides.
+    fn camera(&self, rect: [i32; 4], overhang: (u32, u32, u32, u32), bounds: Option<WorldBounds>, scale: (u32, u32)) -> Camera {
+        let (sw, sh) = self.source(rect, scale);
         // (Not placed yet: where the world starts.)
         let center = if self.center == UNPLACED { (0, 0) } else { self.center };
         let (cx, cy) = match bounds {
@@ -274,7 +281,7 @@ impl FreeView {
         Camera {
             x: cx - sw / 2,
             y: cy - sh / 2,
-            zoom: ZOOMS[self.zoom],
+            zoom: self.zoom_by(scale),
             origin: (rect[0], rect[1]),
             overhang,
             ..Camera::new((rect[2].max(1) as u32, rect[3].max(1) as u32))
@@ -596,6 +603,19 @@ pub struct Layout {
     /// The pointer's place at the window's edge as last told to the driver
     /// (`Input::Edge`).
     edge: (i32, i32),
+    /// Every world view shows the world this many times larger besides its
+    /// own zoom (the viewer's resolution settings); the main view following
+    /// the driver at zoom 1 times this still has the driver's edges.
+    pub world_scale: (u32, u32),
+    /// Where the viewer shows the driver's interface and its other views,
+    /// if elsewhere than the layout put them (e.g. scaled): these take the
+    /// pointer instead of the layout's own rectangles, and map it back to
+    /// the driver's pixels.
+    pub interface_shown: Option<Vec<crate::scaling::ShownPiece>>,
+    /// The driver's screen, if other than the window (the viewer draws its
+    /// interface on its own, `crate::scaling`): its views filling its
+    /// screen are as large as that.
+    pub driver_screen: Option<(u32, u32)>,
 }
 
 impl Default for Layout {
@@ -665,6 +685,9 @@ impl Default for Layout {
             world_frames: 0,
             bounds: None,
             edge: (0, 0),
+            world_scale: (1, 1),
+            interface_shown: None,
+            driver_screen: None,
         }
     }
 }
@@ -772,6 +795,13 @@ fn fit_world(camera: &Camera, bounds: WorldBounds, rect: [i32; 4], step: (u32, u
 
 fn gcd(a: u32, b: u32) -> u32 {
     if b == 0 { a.max(1) } else { gcd(b, a % b) }
+}
+
+/// The product of two zooms, reduced.
+fn times(a: (u32, u32), b: (u32, u32)) -> (u32, u32) {
+    let (n, d) = (a.0.max(1) * b.0.max(1), a.1.max(1) * b.1.max(1));
+    let g = gcd(n, d);
+    (n / g, d / g)
 }
 
 fn parse_zoom(s: &str) -> Option<usize> {
@@ -942,9 +972,11 @@ impl Layout {
         let mut zooms = [(0, 0); 8];
         if self.sharp_text {
             let views = std::iter::once(self.main_view).chain(self.split.map(|s| s.view)).chain(self.insets.iter().map(|i| i.view));
-            let used = views.map(|v| v.zoom).chain(self.magnifier.filter(|m| m.mode == MagnifierMode::World).map(|m| m.zoom)).filter(|&z| z != ONE);
+            let scale = self.world_scale;
+            let world = self.magnifier.filter(|m| m.mode == MagnifierMode::World).map(|m| ZOOMS[m.zoom]);
+            let used = views.map(|v| v.zoom_by(scale)).chain(world).filter(|&z| z != (1, 1));
             // (The fitted screen's zoom, too.)
-            let mut used: Vec<(u32, u32)> = used.map(|z| ZOOMS[z]).chain(self.fit.map(|f| f.zoom)).filter(|z| z.0 <= 255 && z.1 <= 255).collect();
+            let mut used: Vec<(u32, u32)> = used.chain(self.fit.map(|f| f.zoom)).filter(|z| z.0 <= 255 && z.1 <= 255).collect();
             used.sort();
             used.dedup();
             for (slot, z) in zooms.iter_mut().zip(used) {
@@ -1016,7 +1048,7 @@ impl Layout {
 
     /// The zoom fitting the window into `rect` (reduced).
     fn screen_fit(&self, rect: [i32; 4]) -> (u32, u32) {
-        let (ww, wh) = (self.window.0.max(1), self.window.1.max(1));
+        let (ww, wh) = (self.driver_screen().0.max(1), self.driver_screen().1.max(1));
         let (pw, ph) = (rect[2].max(1) as u32, rect[3].max(1) as u32);
         // The smaller of the two ratios, as a fraction.
         let (n, d) = if pw as u64 * wh as u64 <= ph as u64 * ww as u64 { (pw, ww) } else { (ph, wh) };
@@ -1482,7 +1514,8 @@ impl Layout {
         }
         self.beside = None;
         let dt = std::mem::take(&mut self.step).min(MAX_STEP);
-        let base = crate::scene_cameras(scene, window, overhang);
+        // (The driver's views filling its screen: as large as that.)
+        let base = crate::scene_cameras(scene, self.driver_screen(), overhang);
         // Its own views show the world as the driver's do (their world
         // pixels are those views' pixels).
         let downscale = crate::world_downscale(scene);
@@ -1645,7 +1678,7 @@ impl Layout {
             let head = Camera {
                 zoom,
                 origin: fit.origin,
-                viewport: ((window.0 * zoom.0).div_ceil(zoom.1), (window.1 * zoom.0).div_ceil(zoom.1)),
+                viewport: ((self.driver_screen().0 * zoom.0).div_ceil(zoom.1), (self.driver_screen().1 * zoom.0).div_ceil(zoom.1)),
                 zoomed_art: self.zoomed_art(zoom),
                 ..base[m]
             };
@@ -1661,7 +1694,7 @@ impl Layout {
             // The screen in the second pane: the main pane shows the world.
             if fit.hit == Hit::Pane {
                 let v = self.main_view;
-                let mut camera = v.camera(main_rect, overhang, if v.follow == Follow::Driver { None } else { bounds });
+                let mut camera = v.camera(main_rect, overhang, if v.follow == Follow::Driver { None } else { bounds }, self.world_scale);
                 camera.zoomed_art = self.zoomed_art(camera.zoom);
                 camera.downscale = downscale;
                 push(&mut frame, camera);
@@ -1733,7 +1766,7 @@ impl Layout {
             Camera { zoom: (2, 1), origin: (r[0], r[1]), cells: false, ..Camera::new((r[2].max(1) as u32, r[3].max(1) as u32)) }
         };
         if let (Some(split), Some(rect)) = (self.split, pane) {
-            let mut camera = split.view.camera(rect, overhang, bounds);
+            let mut camera = split.view.camera(rect, overhang, bounds, self.world_scale);
             camera.zoomed_art = self.zoomed_art(camera.zoom);
             camera.downscale = downscale;
             push(&mut frame, camera);
@@ -1757,7 +1790,7 @@ impl Layout {
         }
         for (k, inset) in self.insets.iter().enumerate().take(insets) {
             push(&mut frame, frame_of(inset.rect));
-            let mut camera = inset.view.camera(inset.rect, overhang, bounds);
+            let mut camera = inset.view.camera(inset.rect, overhang, bounds, self.world_scale);
             camera.zoomed_art = self.zoomed_art(camera.zoom);
             camera.downscale = downscale;
             push(&mut frame, camera);
@@ -1778,7 +1811,7 @@ impl Layout {
             // is captured; where it looked last while nothing is under it).
             let center = if self.locked { Some(self.cursor) } else { self.world_under(self.pointer) }.or(self.magnifier_center);
             self.magnifier_center = center;
-            let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None);
+            let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None, (1, 1));
             camera.zoomed_art = self.zoomed_art(camera.zoom);
             camera.downscale = downscale;
             push(&mut frame, camera);
@@ -1802,7 +1835,7 @@ impl Layout {
                     // nothing is under it).
                     let center = if self.locked { Some(self.cursor) } else { self.world_under(self.pointer) }.or(self.magnifier_center);
                     self.magnifier_center = center;
-                    let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None);
+                    let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None, (1, 1));
                     camera.zoomed_art = self.zoomed_art(camera.zoom);
                     camera.downscale = downscale;
                     push(&mut frame, camera);
@@ -1936,12 +1969,16 @@ impl Layout {
     }
 
     /// Where driver window pixel `p` shows in the window (as of this frame):
-    /// in the screen fitted into a pane, in a part drawn elsewhere, or where
-    /// the driver has it.
+    /// in the screen fitted into a pane, in a part drawn elsewhere (by the
+    /// viewer, or the layout), or where the driver has it.
     fn driver_to_window(&self, (x, y): (i32, i32)) -> (i32, i32) {
         if let Some(Fit { origin: (ox, oy), zoom: (n, d), .. }) = self.fit {
             let (n, d) = (n as i32, d.max(1) as i32);
             return (ox + x * n / d, oy + y * n / d);
+        }
+        if self.interface_shown.is_some() {
+            let [x, y, _, _] = self.driver_rect_to_window([x, y, 0, 0]);
+            return (x.round() as i32, y.round() as i32);
         }
         match self.moved.iter().find(|(r, d)| inside([r[0] - d.0, r[1] - d.1, r[2], r[3]], (x, y))) {
             Some((_, (dx, dy))) => (x + dx, y + dy),
@@ -2059,27 +2096,28 @@ impl Layout {
         let v = self.main_view;
         let driver = v.follow == Follow::Driver;
         let crop = (camera.x + rect[0] - camera.origin.0, camera.y + rect[1] - camera.origin.1);
-        let unmoved = driver && v.zoom == ONE && v.center == (crop.0 + rect[2] / 2, crop.1 + rect[3] / 2);
+        let zoom = v.zoom_by(self.world_scale);
+        let unmoved = driver && zoom == (1, 1) && v.center == (crop.0 + rect[2] / 2, crop.1 + rect[3] / 2);
         let (x, y, cull) = if unmoved {
             (crop.0, crop.1, camera.cull)
         } else {
             let placed = if driver { v } else { FreeView { follow: Follow::Free, ..v } };
-            let c = placed.camera(rect, overhang, if driver { None } else { self.bounds });
+            let c = placed.camera(rect, overhang, if driver { None } else { self.bounds }, self.world_scale);
             // Zoomed in on what the driver shows, its cell range still holds.
             let centred = v.center == (camera.x + camera.viewport.0 as i32 / 2, camera.y + camera.viewport.1 as i32 / 2);
-            let cull = if driver && v.zoom > ONE && centred { camera.cull } else { None };
+            let cull = if driver && zoom.0 > zoom.1 && centred { camera.cull } else { None };
             (c.x, c.y, cull)
         };
         let shift = (camera.x - x + camera.origin.0 - rect[0], camera.y - y + camera.origin.1 - rect[1]);
         Camera {
             x,
             y,
-            zoom: ZOOMS[v.zoom],
+            zoom,
             viewport: (rect[2].max(1) as u32, rect[3].max(1) as u32),
             origin: (rect[0], rect[1]),
             screen_shift: shift,
             cull,
-            zoomed_art: self.zoomed_art(ZOOMS[v.zoom]),
+            zoomed_art: self.zoomed_art(zoom),
             ..*camera
         }
     }
@@ -2114,6 +2152,10 @@ impl Layout {
     fn interface_at(&self, p: (i32, i32)) -> Option<Hit> {
         if self.fit.is_some() {
             return None;
+        }
+        // (Shown elsewhere by the viewer, the moved parts too.)
+        if let Some(shown) = &self.interface_shown {
+            return shown.iter().any(|s| inside(s.rect, p)).then_some(Hit::Interface);
         }
         if let Some(k) = self.moved.iter().rposition(|&(r, _)| inside(r, p)) {
             return Some(Hit::Moved(k));
@@ -2385,7 +2427,7 @@ impl Layout {
     /// [`Layout::route_point`] for the pointer at `p` (not the world cursor).
     fn route_free(&self, p: (i32, i32)) -> Result<(i32, i32), Option<(i32, i32)>> {
         match self.hit(p) {
-            Hit::Interface => Ok(p),
+            Hit::Interface => Ok(self.to_driver(p)),
             Hit::Divider => Err(None),
             // (Not the driver's view: nothing reaches it.)
             Hit::Beside => Err(None),
@@ -2423,6 +2465,36 @@ impl Layout {
                 self.route_world(world_at(camera, p))
             }
         }
+    }
+
+    /// The driver's screen (the window but where told otherwise).
+    fn driver_screen(&self) -> (u32, u32) {
+        self.driver_screen.unwrap_or(self.window)
+    }
+
+    /// Where driver rectangle `r` (its window's pixels, e.g. a button) shows
+    /// in the window: in the driver's screen fitted into a pane, else where
+    /// the interface piece holding it is shown (`interface_shown`), else
+    /// where the driver put it.
+    pub fn driver_rect_to_window(&self, r: [i32; 4]) -> [f64; 4] {
+        if let Some(Fit { origin: (ox, oy), zoom: (n, d), .. }) = self.fit {
+            let s = n.max(1) as f64 / d.max(1) as f64;
+            return [ox as f64 + r[0] as f64 * s, oy as f64 + r[1] as f64 * s, r[2] as f64 * s, r[3] as f64 * s];
+        }
+        let middle = (r[0] + r[2] / 2, r[1] + r[3] / 2);
+        let shown = self.interface_shown.as_deref().unwrap_or_default();
+        match shown.iter().rev().find(|s| inside(s.driver, middle)) {
+            Some(s) => s.to_canvas(r),
+            None => [r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64],
+        }
+    }
+
+    /// The driver's pixel for window pixel `p` on its interface: where the
+    /// piece shown there is in the driver's window, if the viewer shows it
+    /// elsewhere ([`Layout::interface_shown`]).
+    fn to_driver(&self, p: (i32, i32)) -> (i32, i32) {
+        let shown = self.interface_shown.as_deref().unwrap_or_default();
+        shown.iter().rev().find(|s| inside(s.rect, p)).map_or(p, |s| s.to_driver(p))
     }
 
     /// Relative mouse motion while the mouse is captured: moves the world

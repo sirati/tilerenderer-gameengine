@@ -111,6 +111,7 @@ impl Writer {
         self.i32(v.origin.0);
         self.i32(v.origin.1);
         self.bool(v.interface_only);
+        self.bool(v.menu);
         self.u32(v.downscale);
     }
 
@@ -171,8 +172,9 @@ impl Reader<'_> {
         let cull = (self.i32()?, self.i32()?, self.i32()?, self.i32()?);
         let origin = (self.i32()?, self.i32()?);
         let interface_only = self.bool()?;
+        let menu = self.bool()?;
         let downscale = self.u32()?;
-        Ok(View { camera_x, camera_y, zoom, viewport, cull: has_cull.then_some(cull), origin, interface_only, downscale })
+        Ok(View { camera_x, camera_y, zoom, viewport, cull: has_cull.then_some(cull), origin, interface_only, menu, downscale })
     }
 
     fn sprites(&mut self) -> Result<Vec<FreeSprite>, WireError> {
@@ -394,6 +396,11 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u8(tag);
                 w.u32(value);
             }
+            Update::ScreenSize((width, height)) => {
+                w.u8(16);
+                w.u32(*width);
+                w.u32(*height);
+            }
         }
     }
     w.0
@@ -548,6 +555,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     t => return Err(WireError::Tag(t)),
                 })
             }
+            16 => Update::ScreenSize((r.u32()?, r.u32()?)),
             t => return Err(WireError::Tag(t)),
         });
     }
@@ -642,6 +650,12 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                     w.i32(v);
                 }
             }
+            Input::Window { width, height, scale_milli } => {
+                w.u8(13);
+                w.u32(width);
+                w.u32(height);
+                w.u32(scale_milli);
+            }
         }
     }
     w.0
@@ -681,6 +695,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
             11 => Input::Edge { x: r.i32()?, y: r.i32()? },
             12 => Input::MainView { x: r.i32()?, y: r.i32()?, w: r.i32()?, h: r.i32()? },
+            13 => Input::Window { width: r.u32()?, height: r.u32()?, scale_milli: r.u32()? },
             8 => {
                 let mut views = [(0, 0, 0, 0); 4];
                 for v in &mut views {
@@ -763,7 +778,7 @@ mod tests {
     fn updates_and_input_round_trip() {
         let mut s = Scene::empty(WorldShape { cols: 3, rows: 2, wrap_x: true, wrap_y: false }, 2);
         s.tick = 7;
-        s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false, downscale: 2 };
+        s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false, menu: true, downscale: 2 };
         s.set(1, 2, 1, 0xABCDEF);
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
         s.layers[1].offsets = Some(vec![(0, 0), (-300, 7), (0, 0), (5, -1), (0, 0), (0, 0)]);
@@ -796,6 +811,7 @@ mod tests {
             Interactable { rect: [5, 50, 200, 300], kind: InteractableKind::List { scroll: [5, 60, 190, 280], step: 20 }, id: 7 },
             Interactable { rect: [5, 60, 190, 20], kind: InteractableKind::ListItem, id: 8 },
         ];
+        s.screen_size = (1920, 1080);
         let mut updates = s.updates_since(&Scene::default());
         assert!(updates.iter().any(|u| matches!(u, Update::Settings(_))));
         updates.push(Update::Cells(vec![(1, 0, 9)]));
@@ -842,6 +858,7 @@ mod tests {
             Input::WorldKey { vk: 0x25, down: false, text: None, x: 1, y: 1 },
             Input::Edge { x: 16, y: -1 },
             Input::Edge { x: 0, y: 0 },
+            Input::Window { width: 3840, height: 2160, scale_milli: 1500 },
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
         let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], generation: 7, append: true, reserve: 300 };

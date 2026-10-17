@@ -7,6 +7,7 @@ pub mod cursor;
 pub mod fps;
 mod input;
 pub mod layout;
+pub mod scaling;
 pub mod snap;
 
 use std::sync::Arc;
@@ -31,11 +32,15 @@ pub struct ViewerConfig {
     /// Sprites may extend this far beyond their cell (left, top, right,
     /// bottom), see `tile_render::Camera::overhang`.
     pub overhang: (u32, u32, u32, u32),
+    /// On Windows: whether the viewer makes the whole process DPI aware
+    /// (winit's default). A viewer in someone else's process leaves that
+    /// to the process (its thread made aware on its own instead).
+    pub process_dpi_aware: bool,
 }
 
 impl Default for ViewerConfig {
     fn default() -> Self {
-        Self { title: "tile-viewer".into(), size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0) }
+        Self { title: "tile-viewer".into(), size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true }
     }
 }
 
@@ -152,6 +157,13 @@ pub fn scene_world(compiled: &Compiled, scene: &Scene) -> TileWorld {
 /// [`scene_world`] for cameras arranged otherwise: scene view `i`'s overlay
 /// is drawn by camera `view_cameras[i]` (none: not drawn).
 pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Option<u32>]) -> TileWorld {
+    scene_world_arranged(compiled, scene, view_cameras, &[])
+}
+
+/// [`scene_world_for`] with the overlays of some scene views drawn by
+/// several cameras: per such view (its index), each overlay sprite's camera
+/// (`scaling::Arranged::overlay_cameras`).
+pub fn scene_world_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[Option<u32>], overlay_cameras: &[(usize, Vec<u32>)]) -> TileWorld {
     let s = scene.shape;
     let mut world = compiled.world(s.cols.max(1), s.rows.max(1), s.wrap_x, s.wrap_y);
     let cells = s.cols * s.rows;
@@ -196,9 +208,14 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
         palette: s.palette,
     };
     world.free = scene.sprites.iter().map(|s| placed(s, None)).collect();
-    for (v, camera) in scene.views.iter().zip(view_cameras) {
-        if let Some(c) = camera {
-            world.free.extend(v.overlay.iter().map(|s| placed(s, Some(*c))));
+    for (i, (v, camera)) in scene.views.iter().zip(view_cameras).enumerate() {
+        match overlay_cameras.iter().find(|(view, _)| *view == i) {
+            Some((_, cameras)) => world.free.extend(v.overlay.iter().zip(cameras).map(|(s, c)| placed(s, Some(*c)))),
+            None => {
+                if let Some(c) = camera {
+                    world.free.extend(v.overlay.iter().map(|s| placed(s, Some(*c))));
+                }
+            }
         }
     }
     world
@@ -323,27 +340,34 @@ fn divider_sprites(compiled: &Compiled, pieces: &[(u32, [i32; 4], bool)]) -> Vec
     out
 }
 
+/// The window rectangle (x, y, w, h) a screen sprite covers: its first
+/// frame (a glyph: its em box), clipped.
+fn sprite_rect(compiled: &Compiled, s: &scene::FreeSprite) -> Option<[i32; 4]> {
+    let (mut x0, mut y0, mut x1, mut y1) = match s.glyph {
+        Some(g) => {
+            let em = (g.em64 as i32 + 63) / 64;
+            (s.x, s.y - em, s.x + g.advance.max(1), s.y + em / 3)
+        }
+        None => {
+            let id = compiled.sets.frame(tile_render::SpriteSetId::from_raw(s.set), 0)?;
+            let sprite = compiled.atlas.sprites.get(id.0 as usize)?;
+            let (x0, y0) = (s.x + sprite.anchor_x, s.y + sprite.anchor_y);
+            (x0, y0, x0 + sprite.width as i32, y0 + sprite.height as i32)
+        }
+    };
+    if let Some([cx0, cy0, cx1, cy1]) = s.clip {
+        (x0, y0, x1, y1) = (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1));
+    }
+    (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
+}
+
 /// The window rectangles (x, y, w, h) the scene's interface-only views
 /// cover: their sprites' first frames, clipped (not the parts the layout
 /// may draw elsewhere, `scene::Interface`, which it knows itself).
 fn interface_rects(compiled: &Compiled, scene: &Scene) -> Vec<[i32; 4]> {
-    let mut out = Vec::new();
     let parts = [scene.interface.roaming, scene.interface.popup, scene.interface.screen_view, scene.interface.capture_hint];
-    for v in scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id))) {
-        for s in &v.overlay {
-            let Some(id) = compiled.sets.frame(tile_render::SpriteSetId::from_raw(s.set), 0) else { continue };
-            let Some(sprite) = compiled.atlas.sprites.get(id.0 as usize) else { continue };
-            let (mut x0, mut y0) = (s.x + sprite.anchor_x, s.y + sprite.anchor_y);
-            let (mut x1, mut y1) = (x0 + sprite.width as i32, y0 + sprite.height as i32);
-            if let Some([cx0, cy0, cx1, cy1]) = s.clip {
-                (x0, y0, x1, y1) = (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1));
-            }
-            if x1 > x0 && y1 > y0 {
-                out.push([x0, y0, x1 - x0, y1 - y0]);
-            }
-        }
-    }
-    out
+    let views = scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id)));
+    views.flat_map(|v| v.overlay.iter().filter(|s| s.glyph.is_none()).filter_map(|s| sprite_rect(compiled, s))).collect()
 }
 
 /// Writes run-time sprite pixels into the atlas; patches for sprites the
@@ -405,13 +429,54 @@ pub fn render_arranged(
     gpu.render_views(&mut renderer, &frame.cameras, size, scene.tick, config.clear)
 }
 
+/// A device on `adapter` with `surface` configured for a window of `size`
+/// (a non-sRGB format, so atlas colours reach the screen unchanged); or the
+/// adapter and why not.
+async fn show_with(
+    surface: &wgpu::Surface<'static>,
+    adapter: wgpu::Adapter,
+    size: winit::dpi::PhysicalSize<u32>,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue, wgpu::SurfaceConfiguration), (wgpu::Adapter, String)> {
+    let (device, queue) = match tile_render::gpu::request_device(&adapter).await {
+        Ok(d) => d,
+        Err(e) => return Err((adapter, e.to_string())),
+    };
+    let caps = surface.get_capabilities(&adapter);
+    let Some(&first) = caps.formats.first() else { return Err((adapter, "no surface format".into())) };
+    let format = caps.formats.iter().copied().find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm)).unwrap_or(first);
+    // Scale-blend passes copy the target, so ask for COPY_SRC.
+    let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | (caps.usages & wgpu::TextureUsages::COPY_SRC);
+    let config = wgpu::SurfaceConfiguration {
+        usage,
+        format,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode: wgpu::PresentMode::AutoVsync,
+        // No frame waits behind another: the cursor drawn here lags as
+        // little as it can.
+        desired_maximum_frame_latency: 1,
+        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+        view_formats: vec![],
+        color_space: wgpu::SurfaceColorSpace::Auto,
+    };
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    surface.configure(&device, &config);
+    match scope.pop().await {
+        Some(e) => Err((adapter, e.to_string())),
+        None => Ok((adapter, device, queue, config)),
+    }
+}
+
 /// Opens the window and runs until it is closed, drawing what `display`
 /// receives. Blocks the calling thread, which need not be the process's
 /// main thread (the viewer usually runs inside someone else's process).
 pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(), ViewerError> {
     let mut builder = EventLoop::builder();
     #[cfg(windows)]
-    winit::platform::windows::EventLoopBuilderExtWindows::with_any_thread(&mut builder, true);
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        builder.with_any_thread(true).with_dpi_aware(config.process_dpi_aware);
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
     let event_loop = builder.build()?;
@@ -443,6 +508,14 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         frame_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         drawn_tick: 0,
         drawn_window: (0, 0),
+        plan: None,
+        drawn_overlay: Vec::new(),
+        built_overlay: Vec::new(),
+        overlay_camera: None,
+        reported_size: (0, 0),
+        reported_window: (0, 0, 0),
+        sized_to_screen: None,
+        fitted_on_screen: None,
         started: std::time::Instant::now(),
         art_waiting: None,
         drawn_frame: None,
@@ -454,6 +527,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         snap_grabbed: false,
         cursor_art: cursor::Art::default(),
         custom_cursors: std::collections::HashMap::new(),
+        cursor_builds: CursorBuilds::default(),
         shown_pointer: None,
         capture_icon: false,
         pointer_inside: true,
@@ -499,6 +573,9 @@ struct Gpu {
     /// last is done (it would pile up frames and their uploads) and only if
     /// it differs; hardware ones keep the surface's own frame latency.
     software: bool,
+    /// The surface was configured anew since the last frame (drawn even if
+    /// unchanged: the old picture may be gone).
+    reconfigured: bool,
 }
 
 struct App {
@@ -532,6 +609,29 @@ struct App {
     /// The animation tick and window size drawn last.
     drawn_tick: u32,
     drawn_window: (u32, u32),
+    /// How the driver's screen is shown in the window
+    /// ([`scaling::plan`]), and its size as last told to the driver
+    /// (`Input::Resized`).
+    plan: Option<scaling::Plan>,
+    reported_size: (u32, u32),
+    /// The window and the desktop's scale as last told to the driver
+    /// (`Input::Window`).
+    reported_window: (u32, u32, u32),
+    /// Which camera drew each sprite of overlays drawn by several
+    /// (`scaling::Arranged::overlay_cameras`).
+    drawn_overlay: Vec<(usize, Vec<u32>)>,
+    /// The same, as the renderer's world was built.
+    built_overlay: Vec<(usize, Vec<u32>)>,
+    /// The camera for the viewer's own screen sprites, if the driver's
+    /// screen is mapped onto the picture (`scaling::Arranged::overlay`).
+    overlay_camera: Option<u32>,
+    /// The driver's screen and the desktop's scale a window (not
+    /// fullscreen) last asked to be sized for (asked again when either
+    /// changes, e.g. the game switching its screen as it starts).
+    sized_to_screen: Option<((u32, u32), u64)>,
+    /// The window size (and `sized_to_screen` key) last checked for being on
+    /// its screen.
+    fitted_on_screen: Option<((u32, u32), ((u32, u32), u64))>,
     started: std::time::Instant,
     /// Since when newer art is waiting for a scene that refers to it.
     art_waiting: Option<std::time::Instant>,
@@ -556,7 +656,10 @@ struct App {
     /// of it (by set), what the system pointer shows, and whether it is the
     /// capture pointer (the layout's `PointerIcon::Capture`).
     cursor_art: cursor::Art,
-    custom_cursors: std::collections::HashMap<u32, winit::window::CustomCursor>,
+    custom_cursors: std::collections::HashMap<(u32, u32), winit::window::CustomCursor>,
+    /// System cursors being made (off the event loop: the picture never
+    /// waits for one).
+    cursor_builds: CursorBuilds,
     shown_pointer: Option<cursor::Shown>,
     capture_icon: bool,
     /// Whether the system pointer is in the window.
@@ -674,6 +777,11 @@ impl App {
         // (Button snapping says when it hides the pointer; whether it is
         // hidden is asked anew every time.)
         let _ = self.snap.take_hide_pointer();
+        // System cursors made since (each asked for again).
+        for (key, source) in self.cursor_builds.take_ready() {
+            self.custom_cursors.insert(key, event_loop.create_custom_cursor(source));
+            self.shown_pointer = None;
+        }
         let shown = cursor::system_pointer(self.driver_cursor(), &self.cursor_art, self.pointer_hidden(), self.capture_icon);
         let Some(gpu) = &self.gpu else { return };
         if self.shown_pointer == Some(shown) {
@@ -688,26 +796,22 @@ impl App {
                 gpu.window.set_cursor_visible(true);
             }
             cursor::Shown::Custom(set) => {
-                let made = match self.custom_cursors.get(&set) {
-                    Some(c) => Some(c.clone()),
-                    None => self.cursor_art.get(set).and_then(|image| {
-                        let source = winit::window::CustomCursor::from_rgba(image.rgba.clone(), image.size.0, image.size.1, image.hotspot.0, image.hotspot.1);
-                        match source {
-                            Ok(source) => {
-                                let c = event_loop.create_custom_cursor(source);
-                                self.custom_cursors.insert(set, c.clone());
-                                Some(c)
-                            }
-                            Err(e) => {
-                                log::warn!("viewer: cursor of set {set}: {e}");
-                                None
-                            }
+                // At the pixel scale: each of its pixels an n×n box, as the
+                // picture's (a custom cursor's pixels are the window's
+                // physical ones, on Wayland too). Over menus or the frame
+                // at a scale of their own it stays at the pixel scale.
+                let n = self.plan.map_or(1, |p| p.present.zoom.0.max(1) / p.present.zoom.1.max(1)).clamp(1, 8);
+                match self.custom_cursors.get(&(set, n)) {
+                    Some(c) => gpu.window.set_cursor(c.clone()),
+                    None => match self.cursor_art.get(set) {
+                        // Made on a thread of its own; until it is, the
+                        // pointer stays as it is (asked again next frame).
+                        Some(image) => {
+                            self.cursor_builds.start((set, n), image.clone());
+                            self.shown_pointer = None;
                         }
-                    }),
-                };
-                match made {
-                    Some(c) => gpu.window.set_cursor(c),
-                    None => gpu.window.set_cursor(winit::window::CursorIcon::Default),
+                        None => gpu.window.set_cursor(winit::window::CursorIcon::Default),
+                    },
                 }
                 gpu.window.set_cursor_visible(true);
             }
@@ -731,7 +835,9 @@ impl App {
             self.update_system_pointer(event_loop);
             self.grab(true);
         }
-        if let (Some((x, y)), Some(gpu)) = (warp, &self.gpu) {
+        // (The layout's pixels are the driver's: in the window's.)
+        if let (Some(p), Some(gpu)) = (warp, &self.gpu) {
+            let (x, y) = self.plan.map_or(p, |plan| plan.to_window(p));
             if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
                 log::debug!("viewer: moving the pointer to {x}, {y}: {e}");
                 // (The divider cannot hold back what it cannot move.)
@@ -809,47 +915,60 @@ impl App {
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<(), ViewerError> {
+        // A window: as large as the screen allows from the start (the
+        // driver's screen is the desktop's at its scale; the compositor
+        // places a new window in the middle, but may not move it again).
+        let mut size = winit::dpi::PhysicalSize::new(self.config.size.0, self.config.size.1);
+        // (Wayland has no primary monitor: the first one.)
+        let monitor = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next());
+        if let Some(m) = monitor.map(|m| m.size()).filter(|m| m.width > 0 && m.height > 0) {
+            size = within_screen(m, m);
+        }
         let mut attrs = Window::default_attributes()
             .with_title(self.config.title.clone())
-            .with_inner_size(winit::dpi::PhysicalSize::new(self.config.size.0, self.config.size.1))
+            .with_inner_size(size)
             .with_resizable(true);
         if self.config.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
-        let window = Arc::new(event_loop.create_window(attrs)?);
+        // (Shown once it has its size: a system placing a new window where
+        // it first shows, e.g. Wine's on Wayland at a default size, places
+        // it for that size.)
+        let window = Arc::new(event_loop.create_window(attrs.with_visible(false))?);
         let instance = wgpu::Instance::new(tile_render::gpu::instance_descriptor());
         let surface = instance.create_surface(window.clone())?;
-        let (adapter, device, queue) = pollster::block_on(async {
-            let adapter = tile_render::gpu::select_adapter(&instance, Some(&surface), None).await?;
-            let (device, queue) = tile_render::gpu::request_device(&adapter).await?;
-            Ok::<_, ViewerError>((adapter, device, queue))
-        })?;
-        log::info!("viewer adapter: {:?}", adapter.get_info());
-        // A non-sRGB format, so atlas colours reach the screen unchanged.
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
-            .unwrap_or(caps.formats[0]);
         let size = window.inner_size();
-        // Scale-blend passes copy the target, so ask for COPY_SRC.
-        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT | (caps.usages & wgpu::TextureUsages::COPY_SRC);
-        let config = wgpu::SurfaceConfiguration {
-            usage,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            // No frame waits behind another: the cursor drawn here lags as
-            // little as it can.
-            desired_maximum_frame_latency: 1,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![],
-            color_space: wgpu::SurfaceColorSpace::Auto,
-        };
-        surface.configure(&device, &config);
+        // The window's size is in physical pixels (winit follows the
+        // compositor's scale, `wl_output` / fractional scale on Wayland),
+        // and so is the surface: the picture reaches the screen 1:1.
+        log::info!(
+            "viewer: window {}×{} pixels at scale {} ({}×{} logical)",
+            size.width,
+            size.height,
+            window.scale_factor(),
+            (size.width as f64 / window.scale_factor()).round(),
+            (size.height as f64 / window.scale_factor()).round()
+        );
+        // The adapter asked for (`TILE_RENDER_ADAPTER`); if it cannot show
+        // this window after all (e.g. a GPU that does not drive the
+        // display), the default one for it.
+        let shown = pollster::block_on(async {
+            let adapter = tile_render::gpu::select_adapter(&instance, Some(&surface), None).await?;
+            match show_with(&surface, adapter, size).await {
+                Ok(shown) => Ok(shown),
+                Err((adapter, e)) => {
+                    let name = adapter.get_info().name;
+                    log::error!("viewer: {name} cannot show this window ({e}); trying the default adapter for it");
+                    let adapter = tile_render::gpu::default_adapter(&instance, Some(&surface)).await?;
+                    show_with(&surface, adapter, size).await.map_err(|(a, e)| {
+                        log::error!("viewer: {} cannot show this window either ({e})", a.get_info().name);
+                        ViewerError::Gpu(tile_render::gpu::GpuError::NoAdapter(Some(name)))
+                    })
+                }
+            }
+        })?;
+        let (adapter, device, queue, config) = shown;
+        log::info!("viewer adapter: {:?}", adapter.get_info());
         let mut renderer = TileRenderer::new(&device, config.format);
         if let Some(whole) = self.upload.take() {
             renderer.set_atlas(&device, &queue, &whole.atlas);
@@ -861,8 +980,113 @@ impl App {
         if software {
             log::info!("viewer: software renderer, one frame in flight, unchanged frames skipped");
         }
-        self.gpu = Some(Gpu { window, surface, device, queue, config, renderer, software });
+        window.set_visible(true);
+        self.gpu = Some(Gpu { window, surface, device, queue, config, renderer, software, reconfigured: true });
+        self.update_plan();
         Ok(())
+    }
+
+    /// Follows the window's size, the driver's screen and the resolution
+    /// settings ([`scaling::plan`]): tells the driver the size of its screen
+    /// as the viewer arranges it when that changes, and maps the pointer
+    /// accordingly.
+    fn update_plan(&mut self) {
+        let Some(gpu) = &self.gpu else { return };
+        let window = (gpu.config.width, gpu.config.height);
+        let screen = self.display.scene().screen_size;
+        // A window: as large as the driver's screen at the desktop's scale,
+        // if the compositor lets it.
+        let scale = gpu.window.scale_factor();
+        let key = (screen, (scale * 1000.0).round() as u64);
+        if !self.config.fullscreen && self.sized_to_screen != Some(key) && screen.0 > 0 && screen.1 > 0 {
+            self.sized_to_screen = Some(key);
+            let mut want = winit::dpi::PhysicalSize::new((screen.0 as f64 * scale).round() as u32, (screen.1 as f64 * scale).round() as u32);
+            // (No larger than the screen it is on, with room for its frame:
+            // nine tenths of it at most, the same shape.)
+            if let Some(m) = gpu.window.current_monitor().map(|m| m.size()).filter(|m| m.width > 0 && m.height > 0) {
+                want = within_screen(want, m);
+            }
+            log::info!("viewer: asking for a {}×{} window (the driver's {}×{} screen at scale {scale})", want.width, want.height, screen.0, screen.1);
+            let _ = gpu.window.request_inner_size(want);
+            // In the middle of its screen (where a system lets windows place
+            // themselves; Wayland's compositors place them).
+            if let Some(m) = gpu.window.current_monitor() {
+                let (at, size) = (m.position(), m.size());
+                let x = at.x + (size.width as i32 - want.width as i32) / 2;
+                let y = at.y + (size.height as i32 - want.height as i32) / 2;
+                gpu.window.set_outer_position(winit::dpi::PhysicalPosition::new(x.max(at.x), y.max(at.y)));
+            }
+        }
+        // A window the system placed partly off its screen (e.g. Wine's
+        // windows on Wayland, placed at a first size, not moved after): as
+        // large as fits where it is, and moved into the middle where the
+        // system lets it.
+        if !self.config.fullscreen && self.fitted_on_screen != Some((window, key)) {
+            self.fitted_on_screen = Some((window, key));
+            if let (Ok(at), Some(m)) = (gpu.window.outer_position(), gpu.window.current_monitor()) {
+                let (outer, (mp, ms)) = (gpu.window.outer_size(), (m.position(), m.size()));
+                let over = |at: i32, len: u32, from: i32, side: u32| (at + len as i32 - (from + side as i32)).max(0) as u32;
+                let (ox, oy) = (over(at.x, outer.width, mp.x, ms.width), over(at.y, outer.height, mp.y, ms.height));
+                if ox > 0 || oy > 0 {
+                    let inner = gpu.window.inner_size();
+                    let fits = winit::dpi::PhysicalSize::new(inner.width.saturating_sub(ox).max(160), inner.height.saturating_sub(oy).max(120));
+                    log::info!("viewer: the window is {ox}×{oy} pixels off its screen: {}×{} instead", fits.width, fits.height);
+                    let _ = gpu.window.request_inner_size(fits);
+                    let frame = (outer.width - inner.width, outer.height - inner.height);
+                    let x = mp.x + (ms.width as i32 - (fits.width + frame.0) as i32) / 2;
+                    let y = mp.y + (ms.height as i32 - (fits.height + frame.1) as i32) / 2;
+                    gpu.window.set_outer_position(winit::dpi::PhysicalPosition::new(x.max(mp.x), y.max(mp.y)));
+                }
+            }
+        }
+        // The desktop's scale (pixel scale Auto): the window's, or a native
+        // viewer's launcher's (`CIV3R_SCALE`, which sizes the game too; a
+        // viewer in a Wine program has its window in Wine's own pixels,
+        // which Wine scales for the desktop itself).
+        let launcher = std::env::var("CIV3R_SCALE").ok().and_then(|s| s.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s >= 1.0);
+        let desktop = if cfg!(windows) { scale } else { launcher.unwrap_or(scale) };
+        let native = (window.0, window.1, (desktop * 1000.0).round() as u32);
+        if native != self.reported_window {
+            self.reported_window = native;
+            self.display.send_input(Input::Window { width: native.0, height: native.1, scale_milli: native.2 });
+        }
+        let plan = scaling::plan(window, desktop, screen, &self.settings.resolution);
+        if Some(plan) != self.plan {
+            let p = plan.present;
+            log::info!(
+                "viewer: a {}×{} picture shown {}×{} in the {}×{} window at {:?} (pixel scale {}); the driver's screen {}×{}{}",
+                p.canvas.0,
+                p.canvas.1,
+                p.zoom.0,
+                p.zoom.0,
+                window.0,
+                window.1,
+                p.at,
+                self.settings.resolution.describe_pixel_scale(desktop),
+                plan.screen.0,
+                plan.screen.1,
+                if plan.menu.zoom != (1, 1) || plan.frame != (1, 1) || plan.world != (1, 1) {
+                    format!("; menus {}/{}, frame {}/{}, world {}/{}", plan.menu.zoom.0, plan.menu.zoom.1, plan.frame.0, plan.frame.1, plan.world.0, plan.world.1)
+                } else {
+                    String::new()
+                }
+            );
+            // (The system pointer's art at the new pixel scale.)
+            if self.plan.map(|p| p.present.zoom) != Some(plan.present.zoom) {
+                self.shown_pointer = None;
+            }
+            self.plan = Some(plan);
+            self.layout.world_scale = plan.world;
+            if let Some(moved) = self.input.set_plan(plan) {
+                for input in self.layout.route(moved) {
+                    self.display.send_input(input);
+                }
+            }
+        }
+        if plan.screen != self.reported_size {
+            self.reported_size = plan.screen;
+            self.display.send_input(Input::Resized { width: plan.screen.0, height: plan.screen.1 });
+        }
     }
 
     /// Captures (holds) or releases the mouse (the pointer is hidden and
@@ -892,6 +1116,8 @@ impl App {
 
     fn draw_frame(&mut self) {
         let started = Instant::now();
+        self.update_plan();
+        let Some(plan) = self.plan else { return };
         let Some(gpu) = &mut self.gpu else { return };
         // A software renderer still at the last frame: no new one yet (the
         // event loop goes on meanwhile).
@@ -924,6 +1150,7 @@ impl App {
                 // (Set ids change with every compile.)
                 self.cursor_art = cursor::Art::of(&compiled);
                 self.custom_cursors.clear();
+                self.cursor_builds.forget();
                 self.shown_pointer = None;
                 log::info!("viewer: new assets ({} sprites, uploaded in {} ms)", compiled.sprite_names.len(), started.elapsed().as_millis());
                 // The pixels are on the GPU now: keep only the rest.
@@ -973,7 +1200,9 @@ impl App {
         if scene.seq == 0 {
             return;
         }
-        let window = (gpu.config.width, gpu.config.height);
+        // The picture (the viewer arranges and draws in its pixels; the
+        // driver's interface goes onto it, `scaling`).
+        let window = plan.canvas();
         // A scene for other art than the renderer has waits: the last frame
         // is drawn meanwhile as it was, its world in its arrangement (the
         // waiting scene's views may differ, e.g. a screen opened with a view
@@ -988,7 +1217,13 @@ impl App {
                 }
                 let bounds = world_bounds(&self.compiled, scene);
                 self.layout.grid_step = self.compiled.step;
-                let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
+                self.layout.driver_screen = Some(plan.screen);
+                let mut arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
+                let compiled = &self.compiled;
+                let shown = scaling::arrange(&plan, scene, &mut arranged, |s| sprite_rect(compiled, s));
+                self.layout.interface_shown = shown.shown;
+                self.drawn_overlay = shown.overlay_cameras;
+                self.overlay_camera = shown.overlay;
                 self.drawn_frame = Some(arranged.clone());
                 arranged
             }
@@ -1001,10 +1236,11 @@ impl App {
             log::debug!("viewer: own views now show {views:?}");
             self.display.send_input(Input::Views(views));
         }
-        let views_moved = arranged.view_cameras != self.drawn_views;
+        let views_moved = arranged.view_cameras != self.drawn_views || self.drawn_overlay != self.built_overlay;
         let rebuilt = new_assets || ((scene.seq != self.drawn_seq || views_moved) && matches) || self.world.is_none();
         if rebuilt {
-            self.world = Some(scene_world_for(&self.compiled, scene, &arranged.view_cameras));
+            self.world = Some(scene_world_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay));
+            self.built_overlay = self.drawn_overlay.clone();
         }
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
@@ -1023,13 +1259,14 @@ impl App {
             pointer_world: self.layout.pointer_world(),
             now: self.started.elapsed().as_secs_f64(),
         };
-        let plan = self.machine.step(&facts);
-        let marks = plan.marks;
-        if let Some(q) = plan.enter_edge {
+        let steps = self.machine.step(&facts);
+        let marks = steps.marks;
+        if let Some(q) = steps.enter_edge {
             // The view following the world cursor is held at the world's
             // edge: the system pointer goes where the drawn cursor is and
             // shows there once this frame is out (`unlock_after_frame`).
-            if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(q.0, q.1)) {
+            let w = plan.to_window(q);
+            if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(w.0, w.1)) {
                 log::debug!("viewer: moving the pointer to the world cursor: {e}");
             }
             self.system_pointer = q;
@@ -1037,7 +1274,7 @@ impl App {
             self.presented = false;
             log::info!("viewer: world cursor at the world's edge: the system pointer shows it at {q:?}");
         }
-        if plan.leave_edge {
+        if steps.leave_edge {
             // Centred again: captured and hidden (at once; this frame
             // draws the cursor where the pointer is).
             let locked = layout_captured_grab(&gpu.window);
@@ -1102,7 +1339,7 @@ impl App {
             log::info!("viewer: first map drawn (scene {})", scene.seq);
         }
         // A software renderer draws a frame only when it differs from the last.
-        let unchanged = !new_assets && !rebuilt && !markers_moved && scene.tick == self.drawn_tick && window == self.drawn_window;
+        let unchanged = !new_assets && !rebuilt && !markers_moved && scene.tick == self.drawn_tick && window == self.drawn_window && !gpu.reconfigured;
         // The pointer's motion is drawn (or there was nothing to draw): the
         // cursor moved, or the views following it.
         let views_followed = self.drawn_frame.as_ref().map(|f| &f.cameras) != self.cursor_cameras.as_ref();
@@ -1131,7 +1368,8 @@ impl App {
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         let target = &frame.texture;
         let copies = &arranged.copies;
-        gpu.renderer.render_composed(&gpu.device, &gpu.queue, &mut encoder, target, &cameras, copies, scene.tick, self.config.clear);
+        gpu.reconfigured = false;
+        gpu.renderer.render_presented(&gpu.device, &gpu.queue, &mut encoder, target, &cameras, copies, scene.tick, self.config.clear, plan.present);
         gpu.queue.submit([encoder.finish()]);
         if let (Some(since), true) = (since, log_latency()) {
             let done = self.latency.done.clone();
@@ -1198,12 +1436,17 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                self.display.send_input(Input::Resized { width: size.width, height: size.height });
                 if let Some(gpu) = &mut self.gpu {
                     gpu.config.width = size.width.max(1);
                     gpu.config.height = size.height.max(1);
                     gpu.surface.configure(&gpu.device, &gpu.config);
+                    gpu.reconfigured = true;
+                    log::debug!("viewer: window {}×{} pixels at scale {}", size.width, size.height, gpu.window.scale_factor());
                 }
+                self.update_plan();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                log::info!("viewer: the window's scale is now {scale_factor}");
             }
             WindowEvent::RedrawRequested => {
                 self.draw();
@@ -1211,7 +1454,8 @@ impl ApplicationHandler for App {
                 self.update_system_pointer(event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.system_pointer = (position.x as i32, position.y as i32);
+                // (In the layout's pixels, the driver's.)
+                self.system_pointer = self.plan.map_or((position.x as i32, position.y as i32), |p| p.to_screen((position.x, position.y)));
                 // At the world's edge the system pointer moves the world
                 // cursor (`cursor::Machine::edge`).
                 if self.machine.edge() && self.unlock_pending.is_none() {
@@ -1265,8 +1509,11 @@ impl ApplicationHandler for App {
         // While the mouse is captured its motion moves the world cursor.
         // (While snapping, it moves the snapping pointer's hidden pointer.)
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            // (At the world's edge the system pointer moves it instead.)
+            // (At the world's edge the system pointer moves it instead; in
+            // the driver's pixels.)
             let edge = self.machine.edge() && self.unlock_pending.is_none();
+            let s = self.plan.map_or(1.0, |p| p.factor());
+            let delta = (delta.0 / s, delta.1 / s);
             let inputs = self.snap.motion(delta).unwrap_or_else(|| if edge { vec![] } else { self.layout.motion(delta) });
             for input in inputs {
                 self.display.send_input(input);
@@ -1317,5 +1564,71 @@ impl ApplicationHandler for App {
             }
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame.unwrap_or(now + FRAME)));
+    }
+}
+
+/// A window's inner size `want` no larger than a screen `screen` with room
+/// for its frame: nine tenths of it at most, the same shape.
+fn within_screen(want: winit::dpi::PhysicalSize<u32>, screen: winit::dpi::PhysicalSize<u32>) -> winit::dpi::PhysicalSize<u32> {
+    let room = (screen.width as f64 * 0.9 / want.width.max(1) as f64).min(screen.height as f64 * 0.9 / want.height.max(1) as f64);
+    if room < 1.0 {
+        winit::dpi::PhysicalSize::new((want.width as f64 * room) as u32, (want.height as f64 * room) as u32)
+    } else {
+        want
+    }
+}
+
+/// System cursors made from cursor art at a pixel scale, each on a thread
+/// of its own; by (sprite set, pixel scale).
+#[derive(Default)]
+struct CursorBuilds {
+    /// What is being made, and of which art (see `forget`).
+    pending: std::collections::HashSet<(u32, u32)>,
+    generation: u64,
+    ready: Option<(std::sync::mpsc::Sender<CursorBuilt>, std::sync::mpsc::Receiver<CursorBuilt>)>,
+}
+
+type CursorBuilt = (u64, (u32, u32), Option<winit::window::CustomCursorSource>);
+
+impl CursorBuilds {
+    /// Makes `image` at pixel scale `key.1`, unless it is being made.
+    fn start(&mut self, key: (u32, u32), image: cursor::Image) {
+        if !self.pending.insert(key) {
+            return;
+        }
+        let tx = self.ready.get_or_insert_with(std::sync::mpsc::channel).0.clone();
+        let generation = self.generation;
+        std::thread::spawn(move || {
+            let n = key.1;
+            let (rgba, (w, h)) = cursor::upscaled(&image.rgba, image.size, n);
+            let hotspot = (image.hotspot.0 * n as u16, image.hotspot.1 * n as u16);
+            let source = winit::window::CustomCursor::from_rgba(rgba, w, h, hotspot.0, hotspot.1)
+                .inspect_err(|e| log::warn!("viewer: cursor of set {}: {e}", key.0))
+                .ok();
+            let _ = tx.send((generation, key, source));
+        });
+    }
+
+    /// The cursors made since last asked (of the current art).
+    fn take_ready(&mut self) -> Vec<((u32, u32), winit::window::CustomCursorSource)> {
+        let Some((_, rx)) = &self.ready else { return Vec::new() };
+        let mut out = Vec::new();
+        while let Ok((generation, key, source)) = rx.try_recv() {
+            if generation != self.generation {
+                continue;
+            }
+            // (One that could not be made is not tried again.)
+            if let Some(source) = source {
+                self.pending.remove(&key);
+                out.push((key, source));
+            }
+        }
+        out
+    }
+
+    /// New art (new set ids): what is being made is of no use.
+    fn forget(&mut self) {
+        self.generation += 1;
+        self.pending.clear();
     }
 }

@@ -436,6 +436,7 @@ dependencies = [
  "log",
  "render-desc",
  "scene",
+ "tile-render",
  "tile-viewer",
  "wine-unixlib",
 ]

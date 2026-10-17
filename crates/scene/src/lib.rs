@@ -32,6 +32,10 @@ pub struct View {
     pub origin: (i32, i32),
     /// Shows only its overlay, not the world (an interface on top).
     pub interface_only: bool,
+    /// An interface-only view showing menus (screens and popups over the
+    /// game), rather than the frame of the game around the world (its
+    /// buttons and panels): a renderer may scale the two differently.
+    pub menu: bool,
     /// Shows the world this many times smaller (0 or 1: as it is), from the
     /// same art, as a game's zoomed-out view (see
     /// `tile_render::Camera::downscale`): the camera and the cull rectangle
@@ -177,6 +181,10 @@ pub struct Scene {
     /// The mouse pointer the driver's interface shows now (e.g. a game's
     /// targeting cursor while the player picks a target).
     pub cursor: Cursor,
+    /// The size of the driver's screen (its interface's window pixels;
+    /// (0, 0): unknown, the renderer's window). A renderer whose window is
+    /// larger may show it scaled up (see [`Input::Resized`]).
+    pub screen_size: (u32, u32),
 }
 
 /// A mouse pointer.
@@ -379,6 +387,8 @@ pub enum Update {
     Interactables(Vec<Interactable>),
     /// See [`Scene::cursor`].
     Cursor(Cursor),
+    /// See [`Scene::screen_size`].
+    ScreenSize((u32, u32)),
 }
 
 impl Scene {
@@ -492,6 +502,7 @@ impl Scene {
             Update::Interface(i) => self.interface = i,
             Update::Interactables(i) => self.interactables = i,
             Update::Cursor(c) => self.cursor = c,
+            Update::ScreenSize(s) => self.screen_size = s,
         }
     }
 
@@ -577,6 +588,9 @@ impl Scene {
         if self.cursor != old.cursor {
             out.push(Update::Cursor(self.cursor));
         }
+        if self.screen_size != old.screen_size {
+            out.push(Update::ScreenSize(self.screen_size));
+        }
         out
     }
 }
@@ -597,9 +611,16 @@ pub enum Input {
     /// A key, as a Windows virtual-key code (the de-facto lingua franca of
     /// keyboard input), with the character it produced, if any.
     Key { vk: u32, down: bool, text: Option<char> },
-    /// The renderer's drawing area now has this size (sent at start and on
-    /// every resize).
+    /// The renderer's drawing area now has this size in the driver's pixels
+    /// (sent at start and on every change): its window's, or the driver's
+    /// screen ([`Scene::screen_size`]) where the renderer shows that scaled up
+    /// in a larger window (pointer positions are then in its pixels too).
     Resized { width: u32, height: u32 },
+    /// The renderer's window in the screen's own (physical) pixels, and the
+    /// desktop's scale there in thousandths (2000 at 200 %), sent at start
+    /// and on every change: for showing what the renderer's settings make
+    /// of them (e.g. the size it renders at).
+    Window { width: u32, height: u32, scale_milli: u32 },
     /// The renderer's window was closed.
     Quit,
     /// The world rectangles (x, y, w, h; w 0: unused) the renderer shows in

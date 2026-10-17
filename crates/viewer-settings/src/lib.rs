@@ -40,9 +40,12 @@ pub struct Settings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Resolution {
-    /// Every rendered pixel shown as an n×n box (1..=6): the picture is
-    /// rendered at the window size divided by n (rounded down) and scaled up
-    /// by nearest pixel.
+    /// Every rendered pixel shown as an n×n box of window pixels (1..=6,
+    /// whole numbers only): the viewer renders at the window size divided
+    /// by n (rounded down; what is left is a border of fewer than n
+    /// pixels), never scaled by a fraction or filtered. [`Resolution::AUTO`]
+    /// (0, the default): n is the desktop's scale rounded down (2 at 200 %,
+    /// 1 at 150 %).
     pub pixel_scale: u32,
     /// Fractional scale of menus (full-screen and floating screens).
     pub menu_scale: f32,
@@ -55,18 +58,53 @@ pub struct Resolution {
 
 impl Default for Resolution {
     fn default() -> Self {
-        Self { pixel_scale: 1, menu_scale: 1.0, frame_scale: 1.0, world_scale: 1.0 }
+        Self { pixel_scale: Self::AUTO, menu_scale: 1.0, frame_scale: 1.0, world_scale: 1.0 }
     }
 }
 
 impl Resolution {
     /// Most pixels per rendered pixel.
     pub const MAX_PIXEL_SCALE: u32 = 6;
+    /// `pixel_scale`: the desktop's scale.
+    pub const AUTO: u32 = 0;
 
-    /// The resolution actually rendered for a window of `window` pixels.
-    pub fn realised(&self, (w, h): (u32, u32)) -> (u32, u32) {
-        let n = self.pixel_scale.clamp(1, Self::MAX_PIXEL_SCALE);
+    /// Window pixels per rendered pixel on a desktop scaled `desktop` times
+    /// (e.g. 2.0 at 200 %; the operating system's scale for the window):
+    /// the pixel scale, or for [`Resolution::AUTO`] the desktop's rounded
+    /// down (between 1 and [`Resolution::MAX_PIXEL_SCALE`]).
+    pub fn effective_pixel_scale(&self, desktop: f64) -> u32 {
+        match self.pixel_scale {
+            Self::AUTO => if desktop.is_finite() { (desktop.floor() as u32).clamp(1, Self::MAX_PIXEL_SCALE) } else { 1 },
+            n => n.min(Self::MAX_PIXEL_SCALE),
+        }
+    }
+
+    /// The smallest resolution a pixel scale renders at, where the window
+    /// allows: in a smaller window the pixel scale is lowered (to 1 at
+    /// least) rather than leave too few pixels to show anything.
+    pub const MIN_RENDERED: (u32, u32) = (320, 240);
+
+    /// The pixel scale in a window of `window` pixels: the effective one
+    /// ([`Resolution::effective_pixel_scale`]), lowered as far as needed
+    /// to render at least [`Resolution::MIN_RENDERED`] (or the window).
+    pub fn pixel_scale_in(&self, (w, h): (u32, u32), desktop: f64) -> u32 {
+        let most = (w / Self::MIN_RENDERED.0).min(h / Self::MIN_RENDERED.1).max(1);
+        self.effective_pixel_scale(desktop).min(most)
+    }
+
+    /// The resolution actually rendered for a window of `window` pixels on
+    /// a desktop scaled `desktop` times ([`Resolution::pixel_scale_in`]):
+    /// rounded down, at least 1.
+    pub fn realised(&self, (w, h): (u32, u32), desktop: f64) -> (u32, u32) {
+        let n = self.pixel_scale_in((w, h), desktop);
         ((w / n).max(1), (h / n).max(1))
+    }
+
+    /// The pixel scale in words, e.g. "×3", or "Auto (×2)" (`desktop` as
+    /// for [`Resolution::realised`]).
+    pub fn describe_pixel_scale(&self, desktop: f64) -> String {
+        let n = self.effective_pixel_scale(desktop);
+        if self.pixel_scale == Self::AUTO { format!("Auto (×{n})") } else { format!("×{n}") }
     }
 }
 
@@ -322,7 +360,31 @@ mod tests {
     #[test]
     fn realised_resolution_divides_by_the_pixel_scale() {
         let r = Resolution { pixel_scale: 3, ..Default::default() };
-        assert_eq!(r.realised((3840, 2160)), (1280, 720));
-        assert_eq!(Resolution { pixel_scale: 9, ..Default::default() }.realised((100, 100)), (16, 16));
+        assert_eq!(r.realised((3840, 2160), 2.0), (1280, 720));
+        assert_eq!(r.describe_pixel_scale(2.0), "×3");
+        assert_eq!(Resolution { pixel_scale: 9, ..Default::default() }.realised((3840, 2160), 1.0), (640, 360));
+        // A small window: the pixel scale lowered to keep 320×240 at least.
+        assert_eq!(r.realised((800, 600), 1.0), (400, 300));
+        assert_eq!(r.realised((100, 100), 1.0), (100, 100));
+        assert_eq!(r.realised((0, 0), 1.0), (1, 1));
+        // Auto, the default: the desktop's scale, fractional ones too.
+        let auto = Resolution::default();
+        assert_eq!(auto.realised((3840, 2160), 2.0), (1920, 1080));
+        assert_eq!(auto.describe_pixel_scale(2.0), "Auto (×2)");
+        // At 150 %: rounded down, whole boxes only.
+        assert_eq!(auto.realised((3840, 2160), 1.5), (3840, 2160));
+        assert_eq!(auto.describe_pixel_scale(1.5), "Auto (×1)");
+        assert_eq!(auto.realised((3840, 2160), 2.5), (1920, 1080));
+        assert_eq!(auto.realised((1920, 1080), 1.0), (1920, 1080));
+        assert_eq!(auto.realised((1920, 1080), f64::NAN), (1920, 1080));
+    }
+
+    #[test]
+    fn a_saved_pixel_scale_stays_what_it_was() {
+        // Files from before Auto: their number; without one: Auto.
+        let one: Settings = toml::from_str("[resolution]\npixel_scale = 1\n").unwrap();
+        assert_eq!(one.resolution.pixel_scale, 1);
+        let none: Settings = toml::from_str("[resolution]\nmenu_scale = 1.5\n").unwrap();
+        assert_eq!(none.resolution.pixel_scale, Resolution::AUTO);
     }
 }

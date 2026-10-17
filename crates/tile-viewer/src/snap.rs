@@ -209,7 +209,14 @@ impl Target {
 pub fn targets(items: &[Interactable], mapping: ((i32, i32), (u32, u32)), window: (u32, u32)) -> Vec<Target> {
     let ((ox, oy), (n, d)) = mapping;
     let scale = n.max(1) as f64 / d.max(1) as f64;
-    let map = |[x, y, w, h]: [i32; 4]| [ox as f64 + x as f64 * scale, oy as f64 + y as f64 * scale, w as f64 * scale, h as f64 * scale];
+    targets_mapped(items, |[x, y, w, h]| [ox as f64 + x as f64 * scale, oy as f64 + y as f64 * scale, w as f64 * scale, h as f64 * scale], window)
+}
+
+/// [`targets`] with each rectangle placed by `map` (driver's pixels to the
+/// window's).
+pub fn targets_mapped(items: &[Interactable], map: impl Fn([i32; 4]) -> [f64; 4], window: (u32, u32)) -> Vec<Target> {
+    // (A unit's size as shown: for the guessed scroll step.)
+    let scale = map([0, 0, 1000, 1000])[3] / 1000.0;
     let on_screen = |[x, y, w, h]: [f64; 4]| w > 0.0 && h > 0.0 && x + w > 0.0 && y + h > 0.0 && x < window.0 as f64 && y < window.1 as f64;
     let mut out: Vec<Target> = items
         .iter()
@@ -218,7 +225,12 @@ pub fn targets(items: &[Interactable], mapping: ((i32, i32), (u32, u32)), window
             kind: match i.kind {
                 InteractableKind::Button => TargetKind::Button,
                 InteractableKind::ListItem => TargetKind::ListItem { list: None },
-                InteractableKind::List { scroll, step } => TargetKind::List { scroll: map(scroll), step: step.max(0) as f64 * scale, has_items: false },
+                InteractableKind::List { scroll, step } => {
+                    // (Its step as large as it shows.)
+                    let shown = map(scroll);
+                    let scale = if scroll[3] > 0 { shown[3] / scroll[3] as f64 } else { 1.0 };
+                    TargetKind::List { scroll: shown, step: step.max(0) as f64 * scale, has_items: false }
+                }
             },
             id: i.id,
         })
@@ -982,21 +994,26 @@ impl SnapInput {
     /// The targets in `scene` as `layout` shows them, and the view a click
     /// captures the mouse in.
     fn targets(scene: &scene::Scene, layout: &Layout) -> Vec<Target> {
-        let mut out = targets(&scene.interactables, layout.screen_mapping(), layout.window());
-        // What lies in a part of the interface drawn elsewhere (the corner's
-        // buttons, a popup moved into a view) is there.
-        for t in &mut out {
-            let c = t.center();
-            let moved = layout.moved_parts().iter().find(|([x, y, w, h], (dx, dy))| {
-                let (ox, oy) = ((x - dx) as f64, (y - dy) as f64);
-                c.0 >= ox && c.1 >= oy && c.0 < ox + *w as f64 && c.1 < oy + *h as f64
-            });
-            if let Some((_, (dx, dy))) = moved {
-                t.rect[0] += *dx as f64;
-                t.rect[1] += *dy as f64;
-                if let TargetKind::List { scroll, .. } = &mut t.kind {
-                    scroll[0] += *dx as f64;
-                    scroll[1] += *dy as f64;
+        // (Where the viewer shows each piece of the driver's interface.)
+        let mut out = targets_mapped(&scene.interactables, |r| layout.driver_rect_to_window(r), layout.window());
+        // What lies in a part of the interface drawn elsewhere by the layout
+        // (the corner's buttons, a popup moved into a view) is there, unless
+        // the viewer arranged the interface itself (then the pieces as shown
+        // say so).
+        if layout.interface_shown.is_none() {
+            for t in &mut out {
+                let c = t.center();
+                let moved = layout.moved_parts().iter().find(|([x, y, w, h], (dx, dy))| {
+                    let (ox, oy) = ((x - dx) as f64, (y - dy) as f64);
+                    c.0 >= ox && c.1 >= oy && c.0 < ox + *w as f64 && c.1 < oy + *h as f64
+                });
+                if let Some((_, (dx, dy))) = moved {
+                    t.rect[0] += *dx as f64;
+                    t.rect[1] += *dy as f64;
+                    if let TargetKind::List { scroll, .. } = &mut t.kind {
+                        scroll[0] += *dx as f64;
+                        scroll[1] += *dy as f64;
+                    }
                 }
             }
         }
