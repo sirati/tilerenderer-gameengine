@@ -316,12 +316,20 @@ impl Placer {
         }
     }
 
-    /// Adds a sprite (`cut`: its pixels, `None` without pixels), drawn
-    /// with `scaling` from `sample_box` by views showing the world smaller;
-    /// an indexed one with its indices in `remap` remapped. `known`: the
-    /// art a growth is appended to.
+    /// Adds sprite `name` (`cut`: its pixels, `None` without pixels),
+    /// drawn with `scaling` from `sample_box` by views showing the world
+    /// smaller; an indexed one with its indices in `remap` remapped.
+    /// `known`: the art a growth is appended to. A sprite larger than the
+    /// pages is left out (logged): it keeps its id but is a clear 1×1
+    /// pixel, the same with or without the pixels, so that one such sprite
+    /// does not cost all the others.
     #[allow(clippy::too_many_arguments)]
-    fn add(&mut self, cut: Option<&Cut>, (w, h): (u32, u32), anchor: (i32, i32), scaling: u32, sample_box: [u32; 4], remap: u32, known: Option<&Compiled>) -> Result<SpriteId, DescError> {
+    fn add(&mut self, name: &str, cut: Option<&Cut>, (w, h): (u32, u32), anchor: (i32, i32), scaling: u32, sample_box: [u32; 4], remap: u32, known: Option<&Compiled>) -> Result<SpriteId, DescError> {
+        if w > self.page_size || h > self.page_size {
+            log::warn!("sprite {name} of {w}×{h} does not fit an atlas page of {0}×{0}: left out", self.page_size);
+            let blank = cut.map(|_| Cut::Rgba(RgbaImage::new(1, 1)));
+            return self.add(name, blank.as_ref(), (1, 1), anchor, scaling, [0, 0, 1, 1], 0, known);
+        }
         let id = match cut {
             None => {
                 if w > self.page_size || h > self.page_size {
@@ -410,6 +418,12 @@ pub struct Description {
     /// its text is then not drawn from outlines.
     #[serde(default)]
     pub fonts: BTreeMap<String, FontDesc>,
+    /// The largest sprite art grown onto this description may bring (e.g.
+    /// a picture of a whole screen), if larger than its own sheets': its
+    /// atlas pages are made for it from the start ([`Description::largest_sprite`]),
+    /// as pages do not grow.
+    #[serde(default)]
+    pub largest: u32,
     /// Named palettes (see [`PaletteDesc`]): rows an indexed image's
     /// remapped indices (`remap = [lo, hi]`) are drawn through, picked per
     /// draw: by a layer with `palettes = true` ([`Compiled::value_in`]) or a
@@ -1188,17 +1202,26 @@ impl Description {
     }
 
     /// Loads the images, slices the sheets and builds the tile renderer's
-    /// tables. `page_size` is the atlas page size (e.g. 4096).
-    pub fn compile(&self, loader: &dyn ImageLoader, page_size: u32) -> Result<Compiled, DescError> {
-        self.compile_with(loader, page_size, true, None)
+    /// tables. `max_page` is the largest atlas page the renderer can take
+    /// (its device's `max_texture_dimension_2d`); the pages are as big as
+    /// [`page_size`] makes them for the description's largest sprite.
+    pub fn compile(&self, loader: &dyn ImageLoader, max_page: u32) -> Result<Compiled, DescError> {
+        self.compile_with(loader, max_page, true, None)
+    }
+
+    /// The side of the largest sprite the sheets cut (outlines included),
+    /// from the description alone.
+    pub fn largest_sprite(&self) -> u32 {
+        let grow = |s: &SheetDesc| 2 * s.outline.as_ref().map_or(0, |o| o.width);
+        self.sheets.values().map(|s| (s.cell[0] + grow(s)).max(s.cell[1] + grow(s))).max().unwrap_or(0).max(self.largest)
     }
 
     /// Like [`Description::compile`], reusing the sprites of every sheet
     /// `cache` has from an earlier compile (the same sheet of the same image,
     /// loaded the same way): only new sheets load their images. The cache
     /// keeps this compile's sheets afterwards, no others.
-    pub fn compile_cached(&self, loader: &dyn ImageLoader, page_size: u32, cache: &mut SheetCache) -> Result<Compiled, DescError> {
-        self.compile_with(loader, page_size, true, Some(cache))
+    pub fn compile_cached(&self, loader: &dyn ImageLoader, max_page: u32, cache: &mut SheetCache) -> Result<Compiled, DescError> {
+        self.compile_with(loader, max_page, true, Some(cache))
     }
 
     /// The tables [`Description::compile`] makes without the pixels: sprite
@@ -1207,8 +1230,8 @@ impl Description {
     /// atlas are not decided). Only the images' sizes are needed
     /// ([`ImageLoader::sizes`]), not their pixels: for a side that draws
     /// nothing itself.
-    pub fn compile_layout(&self, loader: &dyn ImageLoader, page_size: u32) -> Result<Compiled, DescError> {
-        self.compile_with(loader, page_size, false, None)
+    pub fn compile_layout(&self, loader: &dyn ImageLoader, max_page: u32) -> Result<Compiled, DescError> {
+        self.compile_with(loader, max_page, false, None)
     }
 
     /// What `sheet`'s sprites are made from, beyond `self.loader` and
@@ -1423,8 +1446,8 @@ impl Description {
         options
     }
 
-    fn compile_with(&self, loader: &dyn ImageLoader, page_size: u32, pixels: bool, cache: Option<&mut SheetCache>) -> Result<Compiled, DescError> {
-        self.compile_full(loader, page_size, pixels, cache, None)
+    fn compile_with(&self, loader: &dyn ImageLoader, max_page: u32, pixels: bool, cache: Option<&mut SheetCache>) -> Result<Compiled, DescError> {
+        self.compile_full(loader, page_size(self.largest_sprite(), max_page), pixels, cache, None)
     }
 
     /// A whole compile ([`Description::compile_with`]); with `growing`, the
@@ -1736,7 +1759,7 @@ impl Description {
                 if existing(&name).is_some() {
                     continue;
                 }
-                let id = placer.add(s.image.as_ref(), s.size, s.anchor, scaling, s.sample_box, remap, known)?;
+                let id = placer.add(&name, s.image.as_ref(), s.size, s.anchor, scaling, s.sample_box, remap, known)?;
                 if s.scaled.is_some() {
                     twins.push((id, sliced.clone(), k, scaling, remap));
                 }
@@ -1753,7 +1776,7 @@ impl Description {
         for (id, sliced, k, scaling, remap) in twins {
             let s = &sliced.sprites[k];
             let Some((image, sample_box)) = &s.scaled else { continue };
-            let twin = placer.add(image.as_ref(), s.size, s.anchor, scaling, *sample_box, remap, known)?;
+            let twin = placer.add("(a zoomed-out twin)", image.as_ref(), s.size, s.anchor, scaling, *sample_box, remap, known)?;
             placer.sprite_mut(id).downscaled = twin.0 + 1;
         }
         if let Some(cache) = cache {
@@ -1896,8 +1919,12 @@ impl Growth {
 
 impl Description {
     /// [`Description::compile`] (`pixels`: with the atlas pixels, else
-    /// [`Description::compile_layout`]), to be appended to (see [`Growing`]).
-    pub fn compile_growing(&self, loader: &dyn ImageLoader, page_size: u32, pixels: bool) -> Result<(Compiled, Growing), DescError> {
+    /// [`Description::compile_layout`]), to be appended to (see [`Growing`]):
+    /// its pages as [`page_size`] makes them for the largest sprite
+    /// ([`Description::largest_sprite`], the art it may grow by too), at most
+    /// `max_page`; a sprite grown later that is larger is left out.
+    pub fn compile_growing(&self, loader: &dyn ImageLoader, max_page: u32, pixels: bool) -> Result<(Compiled, Growing), DescError> {
+        let page_size = page_size(self.largest_sprite(), max_page);
         let mut growing = Growing {
             pixels,
             page_size,
@@ -1975,6 +2002,7 @@ impl Growing {
             layers: Vec::new(),
             fonts: a.fonts,
             palettes: a.palettes,
+            largest: 0,
         };
         desc.expand_variants()?;
         let first = compiled.atlas.sprites.len() as u32;
@@ -2229,6 +2257,25 @@ fn anchor_marked(f: &Frames, frame: usize, image: (u32, u32), (x, y): (u32, u32)
     let hx = (0..w).find(|&i| x + i < image.0 && is_mark(f.pixel(frame, x + i, y0)))?;
     let hy = (0..h).find(|&j| y + j < image.1 && is_mark(f.pixel(frame, x0, y + j)))?;
     Some([-(hx as i32), -(hy as i32)])
+}
+
+/// The atlas page size of most descriptions: small enough for 32-bit
+/// processes and software renderers (the atlas texture holds as many pages
+/// as are in use, all of this size).
+pub const DEFAULT_PAGE: u32 = 2048;
+
+/// The largest page every device takes (wgpu's default limits): for
+/// compiles not tied to one, or when its limit is unknown.
+pub const ANY_DEVICE_PAGE: u32 = 8192;
+
+/// The side of the (square) atlas pages for a description whose largest
+/// sprite has side `largest`, on a renderer taking pages of at most
+/// `max_page` (its device's `max_texture_dimension_2d`): [`DEFAULT_PAGE`],
+/// larger only as far as that sprite needs (in steps of 256), never past
+/// `max_page`. Every side compiling a description (one that draws, one that
+/// keeps only the tables) gets the same size from the same two numbers.
+pub fn page_size(largest: u32, max_page: u32) -> u32 {
+    largest.next_multiple_of(256).max(DEFAULT_PAGE).min(max_page.max(1))
 }
 
 /// The smallest box `[x, y, width, height]` holding every pixel of `img`
@@ -2672,6 +2719,18 @@ mod tests {
     }
 
     #[test]
+    fn pages_are_as_large_as_the_largest_sprite_needs() {
+        // 2048² unless a sprite is larger; then in steps of 256 up to the
+        // device's limit, never beyond it.
+        assert_eq!(page_size(128, 16384), 2048);
+        assert_eq!(page_size(3840, 16384), 3840);
+        assert_eq!(page_size(3841, 16384), 4096);
+        assert_eq!(page_size(3840, 4000), 3840);
+        assert_eq!(page_size(5000, 4096), 4096);
+        assert_eq!(page_size(10, 256), 256);
+    }
+
+    #[test]
     fn the_layout_alone_is_the_compiled_layout_without_loading_pixels() {
         let d = Description::parse(MIXED).unwrap();
         let full = d.compile(&Checker, 256).unwrap();
@@ -2681,8 +2740,12 @@ mod tests {
         assert_eq!(layout.set("anim").map(|s| s.0), full.set("anim").map(|s| s.0));
         assert!(layout.atlas.pages.is_empty());
         assert_eq!(counting.0.get(), 0, "sizes only");
-        // A sheet too big for a page fails as compiling it would.
-        assert!(d.compile_layout(&Checker, 8).is_err());
+        // Sprites too big for any page are left out (a clear pixel), the same
+        // with or without the pixels: they do not cost the others.
+        let (small, small_full) = (d.compile_layout(&Checker, 8).unwrap(), d.compile(&Checker, 8).unwrap());
+        assert_eq!(tables(&small), tables(&small_full));
+        assert!(small.atlas.sprites.iter().any(|s| (s.width, s.height) == (1, 1)));
+        assert!(small_full.atlas.sprites.iter().all(|s| s.width <= 8 && s.height <= 8));
     }
 
     #[test]
@@ -2810,6 +2873,22 @@ mod tests {
     fn frame_names(c: &Compiled, set: &str) -> Vec<String> {
         let (id, _) = c.set(set).unwrap();
         (0..).map_while(|i| c.sets.frame(id, i)).map(|s| c.sprite_names[s.0 as usize].clone()).collect()
+    }
+
+    #[test]
+    fn growing_art_has_pages_for_the_largest_sprite_it_may_grow_by() {
+        // The art may grow by a picture of a 3000-pixel screen: pages for it
+        // from the start, as far as the device takes them.
+        let base = Description::parse(&format!("largest = 3000\n{BASE}")).unwrap();
+        assert_eq!(base.largest_sprite(), 3000);
+        let (grown, _) = base.compile_growing(&Checker, 16384, true).unwrap();
+        assert_eq!(grown.atlas.page_size, 3072);
+        let (tables, _) = base.compile_growing(&Checker, 16384, false).unwrap();
+        assert_eq!(tables.atlas.page_size, 3072);
+        let (small, _) = base.compile_growing(&Checker, 2048, true).unwrap();
+        assert_eq!(small.atlas.page_size, 2048);
+        let (plain, _) = Description::parse(BASE).unwrap().compile_growing(&Checker, 16384, true).unwrap();
+        assert_eq!(plain.atlas.page_size, DEFAULT_PAGE);
     }
 
     #[test]
