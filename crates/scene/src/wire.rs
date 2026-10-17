@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Glyph, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 20;
+pub const VERSION: u32 = 21;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -15,6 +15,8 @@ pub enum WireError {
     Version(u32),
     #[error("bad tag {0}")]
     Tag(u8),
+    #[error("settings: {0}")]
+    Settings(String),
 }
 
 #[derive(Default)]
@@ -291,6 +293,13 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     w.u32(d);
                 }
             }
+            // As their TOML (as they are saved).
+            Update::Settings(s) => {
+                w.u8(10);
+                let text = toml::to_string(s).unwrap_or_default();
+                w.u32(text.len() as u32);
+                w.0.extend_from_slice(text.as_bytes());
+            }
         }
     }
     w.0
@@ -357,6 +366,11 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
             9 => {
                 let n = r.len(8)?;
                 Update::Zooms((0..n).map(|_| Ok((r.u32()?, r.u32()?))).collect::<Result<_, WireError>>()?)
+            }
+            10 => {
+                let n = r.len(1)?;
+                let text = String::from_utf8_lossy(r.take(n)?).into_owned();
+                Update::Settings(toml::from_str(&text).map_err(|e| WireError::Settings(e.to_string()))?)
             }
             t => return Err(WireError::Tag(t)),
         });
@@ -567,7 +581,14 @@ mod tests {
         s.focus = Some((-64, 96));
         s.assets = 3;
         s.zooms = vec![(3, 2)];
+        let mut settings = viewer_settings::Settings::default();
+        settings.resolution.pixel_scale = 3;
+        settings.layout.split = viewer_settings::Split::Horizontal1To1;
+        settings.layout.screens.insert("Spy".into(), viewer_settings::ScreenPlace { vertical: viewer_settings::Place::RightOrTop, horizontal: viewer_settings::Place::LeftOrBottom });
+        settings.input.snap_updates_per_second = 4.5;
+        s.settings = Some(settings);
         let mut updates = s.updates_since(&Scene::default());
+        assert!(updates.iter().any(|u| matches!(u, Update::Settings(_))));
         updates.push(Update::Cells(vec![(1, 0, 9)]));
         updates.push(Update::View { id: 2, view: None });
         assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
@@ -576,6 +597,15 @@ mod tests {
             got.apply(u);
         }
         assert_eq!(got.layers[1].values[0], 9);
+        assert_eq!(got.settings, s.settings);
+        // Settings that are no TOML of settings: an error, not a panic.
+        let mut bad = Writer::default();
+        bad.u32(VERSION);
+        bad.u32(1);
+        bad.u8(10);
+        bad.u32(3);
+        bad.0.extend_from_slice(b"x=[");
+        assert!(matches!(decode_updates(&bad.0), Err(WireError::Settings(_))));
         assert_eq!(got.views.len(), 1);
         let events = vec![
             Input::MouseMove { x: 1, y: -2 },

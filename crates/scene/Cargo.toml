@@ -7,3 +7,5 @@ version.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+viewer-settings = { path = "../viewer-settings" }
+toml = "0.9"

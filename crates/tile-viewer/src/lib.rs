@@ -331,6 +331,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         art_waiting: None,
         drawn_frame: None,
         error: None,
+        settings: load_settings(),
     };
     // The arrangement to start with (see `layout::Layout::configure`).
     if let Ok(spec) = std::env::var("TILE_VIEWER_LAYOUT") {
@@ -340,6 +341,16 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
     }
     event_loop.run_app(&mut app)?;
     app.error.map_or(Ok(()), Err)
+}
+
+/// The settings saved at `viewer_settings::Settings::default_path()`; the
+/// defaults if there are none or they do not load (logged).
+fn load_settings() -> viewer_settings::Settings {
+    let path = viewer_settings::Settings::default_path();
+    viewer_settings::Settings::load(&path).unwrap_or_else(|e| {
+        log::warn!("viewer settings: {e}; using the defaults");
+        viewer_settings::Settings::default()
+    })
 }
 
 struct Gpu {
@@ -387,6 +398,11 @@ struct App {
     /// art).
     drawn_frame: Option<layout::Frame>,
     error: Option<ViewerError>,
+    /// The viewer's own settings (resolution, layout, input): read from
+    /// `viewer_settings::Settings::default_path()` at start, replaced by those
+    /// the driver sends (`scene::Update::Settings`; the driver keeps and saves
+    /// them, e.g. edited on its preferences screen).
+    settings: viewer_settings::Settings,
 }
 
 impl App {
@@ -646,6 +662,12 @@ impl ApplicationHandler for App {
         // Take what the driver sent (waiting a frame's time for it), then
         // redraw: the animation clock moves on even without updates.
         self.display.receive(Duration::from_millis(16));
+        if let Some(settings) = self.display.take_settings() {
+            if settings != self.settings {
+                log::info!("viewer: new settings from the driver");
+            }
+            self.settings = settings;
+        }
         if let Some(gpu) = &self.gpu {
             if self.display.scene().seq != 0 {
                 gpu.window.request_redraw();

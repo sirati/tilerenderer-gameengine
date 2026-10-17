@@ -131,7 +131,7 @@ pub struct ViewState {
 /// What the renderer knows: the whole world and the views of it. Drivers
 /// send [`Update`]s; the renderer applies them ([`Scene::apply`]) and draws
 /// every view.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
     /// Increases with every applied batch of updates.
     pub seq: u64,
@@ -157,6 +157,10 @@ pub struct Scene {
     pub focus: Option<(i32, i32)>,
     /// New pixels for atlas sprites whose content changes at run time.
     pub patches: Vec<Patch>,
+    /// The renderer's own settings as the driver last sent them (the driver
+    /// keeps them, e.g. edited on a preferences screen; `None`: none sent,
+    /// the renderer goes by its own copy).
+    pub settings: Option<viewer_settings::Settings>,
 }
 
 /// The pixels of one atlas sprite (row-major RGBA, its exact size).
@@ -171,7 +175,7 @@ pub struct Patch {
 }
 
 /// One change of a [`Scene`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Update {
     /// A new world: shape and every layer (replaces all cells).
     World { shape: WorldShape, layers: Vec<LayerCells> },
@@ -192,6 +196,9 @@ pub enum Update {
     Assets(u64),
     /// See [`Scene::zooms`].
     Zooms(Vec<(u32, u32)>),
+    /// The renderer's settings changed (see [`Scene::settings`]): it takes them
+    /// in place of its own.
+    Settings(viewer_settings::Settings),
 }
 
 impl Scene {
@@ -252,6 +259,7 @@ impl Scene {
             Update::Focus(focus) => self.focus = focus,
             Update::Assets(n) => self.assets = n,
             Update::Zooms(z) => self.zooms = z,
+            Update::Settings(s) => self.settings = Some(s),
         }
     }
 
@@ -309,6 +317,9 @@ impl Scene {
         }
         if self.zooms != old.zooms {
             out.push(Update::Zooms(self.zooms.clone()));
+        }
+        if let Some(s) = self.settings.as_ref().filter(|s| old.settings.as_ref() != Some(s)) {
+            out.push(Update::Settings(s.clone()));
         }
         out
     }
@@ -380,7 +391,7 @@ pub fn connect() -> (Driver, Display) {
     let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     (
         Driver { updates: updates_tx, input: input_rx, in_flight: in_flight.clone() },
-        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight },
+        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None },
     )
 }
 
@@ -433,6 +444,8 @@ pub struct Display {
     input: InputSender,
     scene: Scene,
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Settings received and not taken yet (see [`Display::take_settings`]).
+    new_settings: Option<viewer_settings::Settings>,
 }
 
 impl Display {
@@ -453,6 +466,9 @@ impl Display {
 
     fn apply(&mut self, batch: Vec<Update>) {
         for u in batch {
+            if let Update::Settings(s) = &u {
+                self.new_settings = Some(s.clone());
+            }
             self.scene.apply(u);
         }
         self.scene.seq += 1;
@@ -467,6 +483,12 @@ impl Display {
     /// atlas once).
     pub fn take_patches(&mut self) -> Vec<Patch> {
         std::mem::take(&mut self.scene.patches)
+    }
+
+    /// The settings the driver sent since the last call, if it sent any (the
+    /// latest; [`Scene::settings`] keeps them too).
+    pub fn take_settings(&mut self) -> Option<viewer_settings::Settings> {
+        self.new_settings.take()
     }
 
     pub fn send_input(&self, input: Input) {
@@ -509,5 +531,28 @@ mod tests {
         other.send(Input::Quit).unwrap();
         assert_eq!(driver.take_input().len(), 2);
         assert!(driver.take_input().is_empty());
+    }
+
+    #[test]
+    fn settings_go_once_when_they_change_and_are_taken_once() {
+        let (driver, mut display) = connect();
+        let mut s = Scene::default();
+        let mut settings = viewer_settings::Settings::default();
+        s.settings = Some(settings.clone());
+        let first = s.updates_since(&Scene::default());
+        assert_eq!(first, vec![Update::Settings(settings.clone())]);
+        let before = s.clone();
+        assert!(s.updates_since(&before).is_empty());
+        settings.layout.smooth_world_movement = true;
+        s.settings = Some(settings.clone());
+        assert_eq!(s.updates_since(&before), vec![Update::Settings(settings.clone())]);
+        // No settings in a scene: the renderer keeps those it has.
+        assert!(Scene::default().updates_since(&s).is_empty());
+        driver.send(first);
+        driver.send(s.updates_since(&before));
+        assert!(display.receive(Duration::from_secs(5)));
+        assert_eq!(display.take_settings(), Some(settings.clone()));
+        assert_eq!(display.take_settings(), None);
+        assert_eq!(display.scene().settings, Some(settings));
     }
 }
