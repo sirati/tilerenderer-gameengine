@@ -1481,6 +1481,8 @@ impl Description {
         atlas.named_palettes = (own.len() / tile_render_shared::PALETTE_SIZE as usize) as u32;
         atlas.palettes = own;
         atlas.palettes.extend_from_slice(&named[tile_render_shared::PALETTE_SIZE as usize..]);
+        // What of each sprite draws nothing: left out of its drawn rectangle.
+        atlas.trim_blank();
         if let Some(g) = growing {
             g.shelves = shelves;
             g.texels = texels;

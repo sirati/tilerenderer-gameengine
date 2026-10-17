@@ -374,7 +374,7 @@ fn interface_rects(compiled: &Compiled, scene: &Scene) -> Vec<[i32; 4]> {
 /// Writes run-time sprite pixels into the atlas; patches for sprites the
 /// description does not have (yet) wait for one that has.
 fn apply_patches<'p>(
-    renderer: &TileRenderer,
+    renderer: &mut TileRenderer,
     queue: &wgpu::Queue,
     compiled: &Compiled,
     patches: impl IntoIterator<Item = &'p scene::Patch>,
@@ -406,7 +406,7 @@ pub fn render_offscreen(
     let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world(compiled, scene));
-    apply_patches(&renderer, &gpu.queue, compiled, &scene.patches);
+    apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
     gpu.render_views(&mut renderer, &scene_cameras(scene, size, config.overhang), size, scene.tick, config.clear)
 }
 
@@ -424,7 +424,7 @@ pub fn render_arranged(
     let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world_for(compiled, scene, &frame.view_cameras));
-    apply_patches(&renderer, &gpu.queue, compiled, &scene.patches);
+    apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
     gpu.render_views(&mut renderer, &frame.cameras, size, scene.tick, config.clear)
 }
 
@@ -1374,7 +1374,7 @@ impl App {
         self.drawn_cursor = cursor_sprites;
         self.drawn_views = arranged.view_cameras.clone();
         if new_assets || (scene.seq != self.drawn_seq && matches) {
-            apply_patches(&gpu.renderer, &gpu.queue, &self.compiled, self.patches.values());
+            apply_patches(&mut gpu.renderer, &gpu.queue, &self.compiled, self.patches.values());
             mark(&mut self.profile, "patches", &mut t);
         }
         if matches {
