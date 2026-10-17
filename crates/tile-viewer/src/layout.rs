@@ -1899,7 +1899,11 @@ impl Layout {
     /// pixels), if it shows it.
     fn in_main(&self, (wx, wy): (i32, i32)) -> Option<(i32, i32)> {
         let m = self.main?;
-        let (x, y) = (wx - m.x + m.origin.0, wy - m.y + m.origin.1);
+        // (The same world pixel round a world that wraps: the copy the
+        // driver's view shows.)
+        let near = |v: i32, wraps: bool, size: i32| if wraps && size > 0 { v.rem_euclid(size) } else { v };
+        let (wrap, size) = self.bounds.map_or(((false, false), (0, 0)), |b| (b.wrap, b.size));
+        let (x, y) = (near(wx - m.x, wrap.0, size.0) + m.origin.0, near(wy - m.y, wrap.1, size.1) + m.origin.1);
         inside([m.origin.0, m.origin.1, m.viewport.0 as i32, m.viewport.1 as i32], (x, y)).then_some((x, y))
     }
 
@@ -3006,6 +3010,16 @@ mod tests {
         l.main_view.zoom = ONE + 2;
         frame(&mut l, vec![]);
         assert_eq!(l.take_main_view_change(), Some((1200, 650, 400, 300)));
+    }
+
+    #[test]
+    fn a_click_on_a_world_pixel_the_drivers_view_shows_round_the_wrap_goes_to_it() {
+        // The driver's view at x 1000..1800 of a world 8000 wide that wraps;
+        // B looks at the same place one turn further round.
+        let mut l = arranged(&settings(|s| s.split = S::Vertical1To1));
+        l.split.as_mut().unwrap().view.center = (9400, 800);
+        frame(&mut l, vec![]);
+        assert_eq!(click(&mut l, (602, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 400, y: 300 });
     }
 
     #[test]
