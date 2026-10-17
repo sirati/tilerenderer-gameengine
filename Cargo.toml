@@ -48,3 +48,4 @@ opt-level = 2
 # subobject alignment), see vendor/wgpu-hal/src/dx12/pipeline_desc.rs.
 [patch.crates-io]
 wgpu-hal = { path = "vendor/wgpu-hal" }
+winit = { path = "vendor/winit" }
