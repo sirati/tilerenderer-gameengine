@@ -736,6 +736,7 @@ impl App {
     /// for testing.
     fn set_settings(&mut self, settings: viewer_settings::Settings) {
         self.layout.apply_settings(&settings.layout);
+        self.layout.set_map_movement(settings.input.map_movement);
         if let Ok(spec) = std::env::var("TILE_VIEWER_LAYOUT") {
             if let Err(e) = self.layout.configure(&spec) {
                 log::warn!("TILE_VIEWER_LAYOUT: {e}");
