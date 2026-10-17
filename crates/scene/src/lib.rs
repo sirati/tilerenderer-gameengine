@@ -32,6 +32,13 @@ pub struct View {
     pub origin: (i32, i32),
     /// Shows only its overlay, not the world (an interface on top).
     pub interface_only: bool,
+    /// Shows the world this many times smaller (0 or 1: as it is), from the
+    /// same art, as a game's zoomed-out view (see
+    /// `tile_render::Camera::downscale`): the camera and the cull rectangle
+    /// are then in the view's own pixels (the world's divided), as are the
+    /// world pixels the renderer reports for it (`Input::Look`, ...) and
+    /// [`Scene::focus`]; cells and world sprites stay at full size.
+    pub downscale: u32,
 }
 
 /// Shape of the cell grid (layout and spacing come from the description).
@@ -119,7 +126,8 @@ pub struct Scene {
     /// refer to; 0: whatever the renderer has.
     pub assets: u64,
     /// The world pixel the driver considers its point of interest (e.g. the
-    /// unit a player is moving), if any.
+    /// unit a player is moving), if any (in the pixels of its views, see
+    /// [`View::downscale`]).
     pub focus: Option<(i32, i32)>,
     /// New pixels for atlas sprites whose content changes at run time.
     pub patches: Vec<Patch>,

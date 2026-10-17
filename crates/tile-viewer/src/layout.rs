@@ -667,6 +667,9 @@ impl Layout {
         self.window = window;
         self.bounds = bounds;
         let base = crate::scene_cameras(scene, window, overhang);
+        // Its own views show the world as the driver's do (their world
+        // pixels are those views' pixels).
+        let downscale = crate::world_downscale(scene);
         // The driver's main view: its first world view filling the window.
         let main = scene.views.iter().position(|v| !v.view.interface_only && (v.view.viewport.0 == 0 || v.view.viewport.1 == 0));
         self.main = main.map(|i| base[i]);
@@ -788,6 +791,7 @@ impl Layout {
         if let (Some(split), Some(rect)) = (self.split, pane) {
             let mut camera = split.view.camera(rect, overhang, bounds);
             camera.zoomed_art = self.zoomed_art(camera.zoom);
+            camera.downscale = downscale;
             push(&mut frame, camera);
             self.shown.push((Hit::Pane, camera));
         }
@@ -795,6 +799,7 @@ impl Layout {
             push(&mut frame, frame_of(inset.rect));
             let mut camera = inset.view.camera(inset.rect, overhang, bounds);
             camera.zoomed_art = self.zoomed_art(camera.zoom);
+            camera.downscale = downscale;
             push(&mut frame, camera);
             self.shown.push((Hit::Inset(k), camera));
         }
@@ -814,6 +819,7 @@ impl Layout {
                     let center = if self.locked { Some(self.cursor) } else { self.world_under(self.pointer) };
                     let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None);
                     camera.zoomed_art = self.zoomed_art(camera.zoom);
+                    camera.downscale = downscale;
                     push(&mut frame, camera);
                 }
             }
@@ -1785,5 +1791,27 @@ mod tests {
         assert!(l.locked);
         l.released();
         assert!(!l.locked);
+    }
+
+    #[test]
+    fn the_viewers_views_show_the_world_as_small_as_the_drivers() {
+        // A zoomed-out game view (the world at half size): the main view
+        // zoomed 2/1, a pane, an inset and a world magnifier all draw the
+        // half-size world, in its pixels.
+        let mut s = scene();
+        s.views[0].view.downscale = 2;
+        assert_eq!(crate::world_downscale(&s), 2);
+        let mut l = Layout::default();
+        l.configure("split=vertical,main_zoom=2,magnifier=world").unwrap();
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        l.route(Input::MouseMove { x: 100, y: 100 });
+        ctrl_shift(&mut l, 0x49);
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let world: Vec<_> = f.cameras.iter().filter(|c| c.cells).collect();
+        assert_eq!(world.len(), 4, "{:?}", f.cameras);
+        assert!(world.iter().all(|c| c.downscale == 2), "{world:?}");
+        assert_eq!(f.cameras[0].zoom, (2, 1));
+        // The interface stays as it is.
+        assert_eq!(f.cameras[f.view_cameras[1].unwrap() as usize].downscale, 1);
     }
 }

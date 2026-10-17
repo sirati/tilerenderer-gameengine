@@ -163,20 +163,30 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
                 zoomed_art: false,
                 stacked: false,
                 hairline: false,
-                downscale: 1,
+                downscale: v.downscale.max(1),
             }
         })
         .collect()
 }
 
-/// The world's extent in pixels and how it wraps.
+/// How many times smaller the scene shows its world: the downscale of its
+/// first view showing the world (`scene::View::downscale`), whose pixels
+/// are the world pixels the viewer arranges its own views in.
+pub fn world_downscale(scene: &Scene) -> u32 {
+    scene.views.iter().find(|v| !v.view.interface_only).map_or(1, |v| v.view.downscale.max(1))
+}
+
+/// The world's extent in pixels (at the scale its views show it, see
+/// [`world_downscale`]) and how it wraps.
 fn world_bounds(compiled: &Compiled, scene: &Scene) -> layout::WorldBounds {
     let s = scene.shape;
+    let n = world_downscale(scene);
+    let step = (compiled.step.0 / n, compiled.step.1 / n);
     let col = match compiled.layout {
-        tile_render::Layout::Staggered => 2 * compiled.step.0,
-        tile_render::Layout::Orthogonal => compiled.step.0,
+        tile_render::Layout::Staggered => 2 * step.0,
+        tile_render::Layout::Orthogonal => step.0,
     };
-    layout::WorldBounds { size: ((s.cols * col) as i32, (s.rows * compiled.step.1) as i32), wrap: (s.wrap_x, s.wrap_y) }
+    layout::WorldBounds { size: ((s.cols * col) as i32, (s.rows * step.1) as i32), wrap: (s.wrap_x, s.wrap_y) }
 }
 
 /// Sprite sets the viewer draws its markers with, if the description has
@@ -185,8 +195,10 @@ pub const CURSOR_SPRITE: &str = "Viewer@cursor/0";
 pub const ARROW_SPRITE: &str = "Viewer@arrow/0";
 
 /// The markers as world sprites on top of everything. The arrow blinks
-/// twice every three seconds (`time`: since the viewer started).
-fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], time: Duration) -> Vec<tile_render::PlacedSprite> {
+/// twice every three seconds (`time`: since the viewer started). The
+/// markers' points are in the pixels of views showing the world `downscale`
+/// times smaller; world sprites are placed at full size.
+fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u32, time: Duration) -> Vec<tile_render::PlacedSprite> {
     let blink = time.as_millis() % 3000;
     let arrow_off = blink < 150 || (300..450).contains(&blink);
     markers
@@ -198,7 +210,8 @@ fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], time: Duratio
                 layout::Marker::Focus(p) => (ARROW_SPRITE, p),
             };
             let (set, _) = compiled.set(name)?;
-            Some(tile_render::PlacedSprite::new(set, x, y))
+            let n = downscale.max(1) as i32;
+            Some(tile_render::PlacedSprite::new(set, x * n, y * n))
         })
         .collect()
 }
@@ -487,7 +500,7 @@ impl App {
             self.world = Some(scene_world_for(&self.compiled, scene, &arranged.view_cameras));
         }
         // The viewer's markers on top of the world, for this frame only.
-        let markers = marker_sprites(&self.compiled, &arranged.markers, self.started.elapsed());
+        let markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
         let world = self.world.as_mut().expect("built above");
         let own = world.free.len();
         world.free.extend_from_slice(&markers);
