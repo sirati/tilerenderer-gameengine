@@ -2097,6 +2097,7 @@ dependencies = [
  "tile-render",
  "tile-render-shared",
  "toml 0.9.12+spec-1.1.0",
+ "wgpu",
 ]
 
 [[package]]

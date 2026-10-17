@@ -78,6 +78,13 @@ struct SlicedSprite {
     image: Option<RgbaImage>,
     size: (u32, u32),
     anchor: (i32, i32),
+    /// What a view showing the world smaller samples (x, y, width, height;
+    /// see `tile_render_shared::SpriteDesc::box_x`): the whole sprite, or
+    /// its box (`sample_from = "box"`, known with the pixels only).
+    sample_box: [u32; 4],
+    /// The cell drawn instead there (`scaled_origin`): its pixels (with
+    /// the pixels) and sample box.
+    scaled: Option<(Option<RgbaImage>, [u32; 4])>,
 }
 
 /// The sheets of the last [`Description::compile_cached`], by what makes
@@ -115,7 +122,8 @@ pub struct Description {
     #[serde(default)]
     pub loader: toml::Table,
     /// Options for the load that finds a sprite's box when its sheet says
-    /// `sample_from = "box"` (see [`SampleFrom`]): they override `loader`
+    /// `sample_from = "box"` (see [`SampleFrom`]; only that load, made once
+    /// at compile time, decides the boxes): they override `loader`
     /// and the image's own, and the pixels the loader then makes transparent
     /// (alpha 0) are the blank ones. A game's sprite format can call fewer
     /// pixels blank than its renderer draws transparent.
@@ -175,9 +183,10 @@ pub struct SheetDesc {
     /// Pixel position of sprite (0, 0) in the image.
     #[serde(default)]
     pub origin: [u32; 2],
-    /// Where sprite (0, 0) is instead once the description is scaled down
-    /// ([`Description::scaled_down`]): for art the game keeps in a second
-    /// place for its zoomed-out view.
+    /// Where sprite (0, 0) is for a view showing the world smaller
+    /// (`tile_render::Camera::downscale`): for art the game keeps in a
+    /// second place for its zoomed-out view. Those cells go into the atlas
+    /// too, as each sprite's `downscaled` twin.
     pub scaled_origin: Option<[u32; 2]>,
     /// Gap between sprites.
     #[serde(default)]
@@ -197,15 +206,13 @@ pub struct SheetDesc {
     /// two sheets into one collection).
     #[serde(default = "one")]
     pub index_stride: u32,
-    /// Sprites shrunk by this factor: every n-th pixel of every n-th row
-    /// (nearest neighbour), size rounded down — how games draw a zoomed-out
-    /// view; where from: [`SheetDesc::sample_from`].
-    #[serde(default = "one")]
-    pub downscale: u32,
-    /// Where the shrunk sprite's samples start.
+    /// Where a view showing the world `n` times smaller
+    /// (`tile_render::Camera::downscale`, a game's zoomed-out view) samples
+    /// the sprites: every `n`-th pixel of every `n`-th row (nearest
+    /// neighbour) from there, from the same art.
     #[serde(default)]
     pub sample_from: SampleFrom,
-    /// How a zoomed-out view (see [`Description::scaled_down`]) treats it.
+    /// How such a view draws them.
     #[serde(default)]
     pub scaling: SheetScaling,
     /// Each sprite replaced by a band `width` pixels wide just outside its
@@ -613,8 +620,8 @@ impl Description {
             None => *sizes(&sheet.image)?.get(sheet.frame).ok_or_else(no_frame)?,
         };
         // The images again as the sprite format sees them, for the sheets
-        // that sample from their boxes (only those shrunk need them).
-        let boxed = sheet.sample_from == SampleFrom::Box && sheet.downscale > 1;
+        // that sample from their boxes (the boxes are found once, here).
+        let boxed = sheet.sample_from == SampleFrom::Box;
         let all_blank = if boxed && pixels { Some(frames(&sheet.image, true)?) } else { None };
         let blank_img = match &all_blank {
             Some(all) => {
@@ -634,34 +641,41 @@ impl Description {
         }
         let fit = |total: u32, o: u32, c: u32, s: u32| if total < o + c { 0 } else { (total - o + s) / (c + s) };
         let [cols, rows] = sheet.grid.unwrap_or_else(|| [fit(iw, ox, cw, sx), fit(ih, oy, ch, sy)]);
-        if ox + cols * (cw + sx) - sx > iw || oy + rows * (ch + sy) - sy > ih {
+        let exceeds = |[ox, oy]: [u32; 2]| ox + cols * (cw + sx) - sx > iw || oy + rows * (ch + sy) - sy > ih;
+        if exceeds(sheet.origin) || sheet.scaled_origin.is_some_and(exceeds) {
             return Err(err(format!("{cols}×{rows} cells of {cw}×{ch} exceed the {iw}×{ih} image")));
         }
         let grow = sheet.outline.as_ref().map_or(0, |o| o.width);
+        let (gw, gh) = (cw + 2 * grow, ch + 2 * grow);
+        let shape = |cell: RgbaImage| match &sheet.outline {
+            Some(o) => outline(&cell, o.width, o.color),
+            None => cell,
+        };
+        // A cell's pixels and what a view showing the world smaller samples
+        // of it: its box (empty if it is all blank) or all of it.
+        let cut = |x: u32, y: u32| -> (Option<RgbaImage>, [u32; 4]) {
+            let image = img.map(|img| shape(img.crop(x, y, cw, ch)));
+            let sample_box = match blank_img {
+                Some(blank) => opaque_box(&shape(blank.crop(x, y, cw, ch))).unwrap_or_default(),
+                None => [0, 0, gw, gh],
+            };
+            (image, sample_box)
+        };
         let mut sprites = Vec::new();
         for i in 0..cols * rows {
             if sheet.only.as_ref().is_some_and(|o| !o.contains(&i)) {
                 continue;
             }
             let (c, r) = (i % cols, i / cols);
-            let (x, y) = (ox + c * (cw + sx), oy + r * (ch + sy));
-            let shape = |cell: RgbaImage| match &sheet.outline {
-                Some(o) => outline(&cell, o.width, o.color),
-                None => cell,
-            };
-            let image = img.map(|img| {
-                let sprite = shape(img.crop(x, y, cw, ch));
-                match blank_img {
-                    Some(blank) => downscale_from_box(&sprite, sheet.downscale, opaque_box(&shape(blank.crop(x, y, cw, ch)))),
-                    None if sheet.downscale > 1 => downscale(&sprite, sheet.downscale),
-                    None => sprite,
-                }
+            let at = |[ox, oy]: [u32; 2]| (ox + c * (cw + sx), oy + r * (ch + sy));
+            let (x, y) = at(sheet.origin);
+            let (image, sample_box) = cut(x, y);
+            let scaled = sheet.scaled_origin.map(|o| {
+                let (x, y) = at(o);
+                cut(x, y)
             });
-            // (Every way of shrinking rounds the grown cell's size down.)
-            let n = sheet.downscale.max(1);
-            let size = image.as_ref().map_or(((cw + 2 * grow) / n, (ch + 2 * grow) / n), |i| (i.width, i.height));
             let anchor = (sheet.anchor[0] - grow as i32, sheet.anchor[1] - grow as i32);
-            sprites.push(SlicedSprite { index: i, image, size, anchor });
+            sprites.push(SlicedSprite { index: i, image, size: (gw, gh), anchor, sample_box, scaled });
         }
         Ok(Sliced { sprites, cells: cols * rows })
     }
@@ -693,6 +707,9 @@ impl Description {
         let mut kept: HashMap<String, std::sync::Arc<Sliced>> = HashMap::new();
         let mut atlas = AtlasBuilder::new(page_size);
         let mut placed: Vec<tile_render_shared::SpriteDesc> = Vec::new();
+        // Sprites with a twin for views showing the world smaller
+        // (`scaled_origin`): which, and where their twin's cell is.
+        let mut twins: Vec<(SpriteId, std::sync::Arc<Sliced>, usize, u32)> = Vec::new();
 
         // Sprites, named "sheet/index".
         let mut sprites: BTreeMap<String, SpriteId> = BTreeMap::new();
@@ -710,18 +727,16 @@ impl Description {
                 }
                 None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes)?),
             };
-            for s in &sliced.sprites {
-                let id = match &s.image {
-                    Some(image) => atlas.add(image, s.anchor)?,
-                    None => {
-                        let (w, h) = s.size;
-                        if w > page_size || h > page_size {
-                            return Err(tile_render::atlas::AtlasError::TooLarge(w, h, page_size).into());
-                        }
-                        placed.push(tile_render_shared::SpriteDesc { width: w, height: h, anchor_x: s.anchor.0, anchor_y: s.anchor.1, ..Default::default() });
-                        SpriteId(placed.len() as u32 - 1)
-                    }
-                };
+            let scaling = match sheet.scaling {
+                SheetScaling::Scale => tile_render_shared::SHRINK,
+                SheetScaling::ScaleKeepAnchor => tile_render_shared::SHRINK_KEEP_ANCHOR,
+                SheetScaling::Keep => tile_render_shared::KEEP_SIZE,
+            };
+            for (k, s) in sliced.sprites.iter().enumerate() {
+                let id = add_sprite(&mut atlas, &mut placed, page_size, s.image.as_ref(), s.size, s.anchor, scaling, s.sample_box)?;
+                if s.scaled.is_some() {
+                    twins.push((id, sliced.clone(), k, scaling));
+                }
                 let name = match &sheet.group {
                     Some(g) => format!("{g}/{}", sheet.first_index + s.index * sheet.index_stride),
                     None => format!("{sheet_name}/{}", s.index),
@@ -733,6 +748,16 @@ impl Description {
             let group = sheet.group.clone().unwrap_or_else(|| sheet_name.clone());
             let len = sheet_len.entry(group).or_insert(0);
             *len = (*len).max(sheet.first_index + sliced.cells * sheet.index_stride);
+        }
+        // The cells drawn instead in views showing the world smaller, after
+        // all named sprites (so that a compile without the pixels numbers
+        // those the same).
+        for (id, sliced, k, scaling) in twins {
+            let s = &sliced.sprites[k];
+            let Some((image, sample_box)) = &s.scaled else { continue };
+            let twin = add_sprite(&mut atlas, &mut placed, page_size, image.as_ref(), s.size, s.anchor, scaling, *sample_box)?;
+            let desc = if pixels { atlas.sprite_mut(id) } else { &mut placed[id.0 as usize] };
+            desc.downscaled = twin.0 + 1;
         }
         if let Some(cache) = cache {
             cache.sheets = Some(kept);
@@ -889,9 +914,35 @@ impl Compiled {
 }
 
 
-/// Every `n`-th pixel of every `n`-th row, from the top-left.
-fn downscale(img: &RgbaImage, n: u32) -> RgbaImage {
-    RgbaImage::from_fn(img.width / n, img.height / n, |x, y| img.get(x * n, y * n))
+/// Adds a sprite: with its pixels to `atlas`, else (a compile without them)
+/// its size and anchor to `placed`, checked against the page size; with
+/// how views showing the world smaller draw it.
+#[allow(clippy::too_many_arguments)]
+fn add_sprite(
+    atlas: &mut AtlasBuilder,
+    placed: &mut Vec<tile_render_shared::SpriteDesc>,
+    page_size: u32,
+    image: Option<&RgbaImage>,
+    (w, h): (u32, u32),
+    anchor: (i32, i32),
+    scaling: u32,
+    [box_x, box_y, box_w, box_h]: [u32; 4],
+) -> Result<SpriteId, DescError> {
+    let (id, desc) = match image {
+        Some(image) => {
+            let id = atlas.add(image, anchor)?;
+            (id, atlas.sprite_mut(id))
+        }
+        None => {
+            if w > page_size || h > page_size {
+                return Err(tile_render::atlas::AtlasError::TooLarge(w, h, page_size).into());
+            }
+            placed.push(tile_render_shared::SpriteDesc { width: w, height: h, anchor_x: anchor.0, anchor_y: anchor.1, ..Default::default() });
+            (SpriteId(placed.len() as u32 - 1), placed.last_mut().expect("just pushed"))
+        }
+    };
+    (desc.scaling, desc.box_x, desc.box_y, desc.box_w, desc.box_h) = (scaling, box_x, box_y, box_w, box_h);
+    Ok(id)
 }
 
 /// The smallest box `[x, y, width, height]` holding every pixel of `img`
@@ -909,46 +960,31 @@ fn opaque_box(img: &RgbaImage) -> Option<[u32; 4]> {
     bounds.map(|[l, t, r, b]| [l, t, r - l + 1, b - t + 1])
 }
 
-/// `img` shrunk by `n` the way a game does that keeps its sprites cropped to
-/// `bounds` (their box, [`opaque_box`]): it samples the *box* at every
-/// `n`-th pixel from the box's top-left, covering `box size / n` pixels
-/// (rounded down), and draws the result at the box's origin divided by `n`
-/// (rounded down). Relative to the cell, pixel `(x, y)` of the result is
-/// `(n·x + box_x mod n, n·y + box_y mod n)` of it, wherever that lies in
-/// the covered rectangle `[box_x / n, box_x / n + box_w / n)` (likewise in y);
-/// the rest is clear. The cell's own size, rounded down, stays the size of
-/// the result, so anchors keep their meaning.
-fn downscale_from_box(img: &RgbaImage, n: u32, bounds: Option<[u32; 4]>) -> RgbaImage {
-    let (w, h) = (img.width / n, img.height / n);
-    let Some([bx, by, bw, bh]) = bounds else { return RgbaImage::new(w, h) };
-    let (x0, y0) = (bx / n, by / n);
-    RgbaImage::from_fn(w, h, |x, y| match (x.checked_sub(x0), y.checked_sub(y0)) {
-        (Some(i), Some(j)) if i < bw / n && j < bh / n => img.get(bx + n * i, by + n * j),
-        _ => [0; 4],
-    })
-}
-
-/// Where the samples of a shrunk sprite start (`sample_from = "..."`).
-#[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+/// Where a view showing the world `n` times smaller samples a sheet's
+/// sprites (`sample_from = "..."`): every `n`-th pixel of every `n`-th row
+/// from there (`tile_render_shared::placed`).
+#[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleFrom {
-    /// At the cell's top-left.
+    /// From the cell's top-left, all of it.
     #[default]
     Cell,
-    /// At the top-left of the sprite's *box*, the smallest rectangle holding
-    /// its non-blank pixels (see [`Description::blank_loader`]), as a game
-    /// does that keeps sprites cropped to it: the sampling phase is then the
-    /// box origin modulo the factor, so it varies from sprite to sprite, and
-    /// only `box size / n` pixels (rounded down) are drawn, from the box's
-    /// origin divided by `n` (rounded down) on.
+    /// From the top-left of the sprite's *box*, the smallest rectangle
+    /// holding its non-blank pixels (see [`Description::blank_loader`]), as
+    /// a game does that keeps sprites cropped to it: the sampling phase is
+    /// then the box origin modulo the factor, so it varies from sprite to
+    /// sprite, and only `box size / n` pixels (rounded down) are drawn, from
+    /// the box's origin divided by `n` (rounded down) on. The boxes are found
+    /// once, at compile time.
     Box,
 }
 
-/// How [`Description::scaled_down`] treats a sheet (`scaling = "..."`).
-#[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+/// How a view showing the world smaller draws a sheet's sprites
+/// (`scaling = "..."`).
+#[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum SheetScaling {
-    /// Shrunk, anchor divided.
+    /// Shrunk, anchor divided (rounded toward zero).
     #[default]
     Scale,
     /// Shrunk, anchor kept.
@@ -957,35 +993,6 @@ pub enum SheetScaling {
     Keep,
 }
 
-impl Description {
-    /// The same world `n` times smaller (a zoomed-out view): grid steps and
-    /// offsets divided by `n`, sprites shrunk by [`SheetDesc::downscale`]
-    /// (from where each sheet's [`SheetDesc::sample_from`] says) with their
-    /// anchors divided by `n` (rounded toward zero), as each sheet's
-    /// `scaling` says.
-    pub fn scaled_down(&self, n: u32) -> Description {
-        let n = n.max(1);
-        let ni = n as i32;
-        let mut d = self.clone();
-        d.grid.step = d.grid.step.map(|s| s / n);
-        for sheet in d.sheets.values_mut() {
-            if let Some(origin) = sheet.scaled_origin.take() {
-                sheet.origin = origin;
-            }
-            match sheet.scaling {
-                SheetScaling::Keep => continue,
-                SheetScaling::Scale => sheet.anchor = sheet.anchor.map(|a| a / ni),
-                SheetScaling::ScaleKeepAnchor => {}
-            }
-            sheet.downscale *= n;
-        }
-        for layer in &mut d.layers {
-            layer.offset = layer.offset.map(|o| o / ni);
-            layer.cull_offset = layer.cull_offset.map(|o| o / ni);
-        }
-        d
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,7 +1103,7 @@ mod tests {
         image = "b"
         cell = [8, 6]
         grid = [2, 1]
-        downscale = 2
+        scaled_origin = [0, 8]
         sample_from = "box"
         anchor = [-3, 1]
         [sheets.bar]
@@ -1239,8 +1246,26 @@ mod tests {
         assert!(line("1,2,3,4:10,20:2").is_err());
     }
 
+    /// Sprite `name` of `c` as a view showing the world `n` times smaller
+    /// draws it (the shaders' reference renderer), anchored at the corner
+    /// of a picture of the cell's size divided by `n`: what shrinking the
+    /// art itself made before.
+    fn render_small(c: &Compiled, name: &str, n: u32) -> RgbaImage {
+        let id = c.sprite_names.iter().position(|s| s == name).unwrap();
+        let s = c.atlas.sprites[id];
+        let mut world = c.world(1, 1, false, false);
+        let set = c.set(name).unwrap().0;
+        let p = tile_render_shared::placed(&s, n);
+        // (World positions are divided by `n` too.)
+        let n_i = n.max(1) as i32;
+        world.free.push(tile_render::PlacedSprite::new(set, -p.corner_x * n_i, -p.corner_y * n_i));
+        let size = if p.step == 1 { (s.width, s.height) } else { (s.width / n, s.height / n) };
+        let camera = tile_render::Camera { downscale: n, ..tile_render::Camera::new(size) };
+        tile_render::reference::render(&world, &c.atlas, &camera, 0, [0; 4])
+    }
+
     #[test]
-    fn scaled_down_keeps_even_pixels_and_halves_offsets() {
+    fn views_shown_smaller_keep_even_pixels_and_halve_offsets() {
         let d = Description::parse(
             "[grid]\nlayout = \"staggered\"\nstep = [64, 32]\n\
              [images.a]\nsource = \"a\"\n\
@@ -1249,21 +1274,22 @@ mod tests {
              [sheets.u]\nimage = \"a\"\ncell = [4, 4]\ngrid = [1, 1]\nanchor = [3, 3]\nscaling = \"keep\"\n\
              [[layers]]\nname = \"l\"\nsets = [\"s/*\", \"f/*\", \"u/*\"]\ncull_offset = [0, -32]\n",
         )
-        .unwrap()
-        .scaled_down(2);
-        assert_eq!(d.grid.step, [32, 16]);
-        assert_eq!(d.layers[0].cull_offset, [0, -16]);
+        .unwrap();
         let c = d.compile(&Checker, 64).unwrap();
+        // One copy of the art: the sprites at full size.
+        assert_eq!(c.step, (64, 32));
         let sprite = |name: &str| c.atlas.sprites[c.sprite_names.iter().position(|n| n == name).unwrap()];
-        let s = sprite("s/0");
-        assert_eq!((s.width, s.height, s.anchor_x, s.anchor_y), (2, 1, -9, -7));
-        let f = sprite("f/0");
-        assert_eq!((f.width, f.height, f.anchor_x, f.anchor_y), (2, 2, 0, -12));
-        let u = sprite("u/0");
-        assert_eq!((u.width, u.height, u.anchor_x, u.anchor_y), (4, 4, 3, 3));
+        let small = |name: &str| {
+            let p = tile_render_shared::placed(&sprite(name), 2);
+            (p.inset_x + p.width, p.inset_y + p.height, p.corner_x, p.corner_y)
+        };
+        assert_eq!((sprite("s/0").width, sprite("s/0").height), (5, 3));
+        assert_eq!(small("s/0"), (2, 1, -9, -7));
+        assert_eq!(small("f/0"), (2, 2, 0, -12));
+        assert_eq!(small("u/0"), (4, 4, 3, 3));
         // Pixel (1, 0) of the shrunk sprite is (2, 0) of the cell.
-        let page = &c.atlas.pages[s.page as usize];
-        assert_eq!(page.get(s.atlas_x + 1, s.atlas_y)[0], 2);
+        assert_eq!(render_small(&c, "s/0", 2).get(1, 0)[0], 2);
+        assert_eq!(render_small(&c, "u/0", 2).get(3, 2)[..2], [3, 2]);
     }
 
     /// Pixels `(x, y, ·)` of 8 × 4: red = column, green = row. Column 0 has
@@ -1286,10 +1312,9 @@ mod tests {
     /// The shrunk sprite `s/0` of `text` (a description with one 8 × 4 sheet
     /// `s`) as columns of red values, `None` where clear, per row.
     fn shrunk(text: &str, n: u32) -> Vec<Vec<Option<u8>>> {
-        let c = Description::parse(text).unwrap().scaled_down(n).compile(&Columns, 64).unwrap();
-        let s = c.atlas.sprites[c.sprite_names.iter().position(|name| name == "s/0").unwrap()];
-        let page = &c.atlas.pages[s.page as usize];
-        (0..s.height).map(|y| (0..s.width).map(|x| Some(page.get(s.atlas_x + x, s.atlas_y + y)).filter(|p| p[3] != 0).map(|p| p[0])).collect()).collect()
+        let c = Description::parse(text).unwrap().compile(&Columns, 64).unwrap();
+        let img = render_small(&c, "s/0", n);
+        (0..img.height).map(|y| (0..img.width).map(|x| Some(img.get(x, y)).filter(|p| p[3] != 0).map(|p| p[0])).collect()).collect()
     }
 
     const BOXED: &str = "[grid]\nlayout = \"orthogonal\"\nstep = [8, 4]\n\
@@ -1336,13 +1361,14 @@ mod tests {
         }
         let text = "[grid]\nlayout = \"orthogonal\"\nstep = [8, 4]\n[images.a]\nsource = \"a\"\n\
                     [sheets.s]\nimage = \"a\"\ncell = [2, 4]\ngrid = [1, 1]\nsample_from = \"box\"\n";
-        let c = Description::parse(text).unwrap().scaled_down(2).compile(&Rows, 64).unwrap();
+        let c = Description::parse(text).unwrap().compile(&Rows, 64).unwrap();
         let s = c.atlas.sprites[0];
-        assert_eq!((s.width, s.height), (1, 2));
-        let page = &c.atlas.pages[s.page as usize];
+        assert_eq!((s.box_x, s.box_y, s.box_w, s.box_h), (0, 1, 2, 3));
+        let img = render_small(&c, "s/0", 2);
+        assert_eq!((img.width, img.height), (1, 2));
         // Pixel row 0 holds cell row 1 (green 1), row 1 is past the box's 3 / 2 rows.
-        assert_eq!(page.get(s.atlas_x, s.atlas_y), [0, 1, 0, 255]);
-        assert_eq!(page.get(s.atlas_x, s.atlas_y + 1)[3], 0);
+        assert_eq!(img.get(0, 0), [0, 1, 0, 255]);
+        assert_eq!(img.get(0, 1)[3], 0);
     }
 
     #[test]
@@ -1358,20 +1384,22 @@ mod tests {
     }
 
     #[test]
-    fn scaled_down_art_can_come_from_another_cell() {
-        // A game that keeps a second sprite for its zoomed-out view.
+    fn art_for_views_shown_smaller_can_come_from_another_cell() {
+        // A game that keeps a second sprite for its zoomed-out view: it is in
+        // the atlas too, after the named sprites, drawn instead there.
         let text = "[grid]\nlayout = \"orthogonal\"\nstep = [8, 4]\n[images.a]\nsource = \"a\"\n\
                     [sheets.s]\nimage = \"a\"\ncell = [4, 4]\ngrid = [1, 1]\norigin = [0, 0]\nscaled_origin = [8, 4]\n";
-        let corner = |c: &Compiled| {
-            let s = c.atlas.sprites[0];
-            let page = &c.atlas.pages[s.page as usize];
-            [page.get(s.atlas_x, s.atlas_y), page.get(s.atlas_x + 1, s.atlas_y)]
-        };
-        let full = Description::parse(text).unwrap().compile(&Checker, 64).unwrap();
-        assert_eq!(corner(&full)[0][..2], [0, 0]);
-        let small = Description::parse(text).unwrap().scaled_down(2).compile(&Checker, 64).unwrap();
+        let c = Description::parse(text).unwrap().compile(&Checker, 64).unwrap();
+        assert_eq!((c.sprite_names.len(), c.atlas.sprites.len()), (1, 2));
+        assert_eq!(c.atlas.sprites[0].downscaled, 2);
+        let full = render_small(&c, "s/0", 1);
+        assert_eq!(full.get(0, 0)[..2], [0, 0]);
         // The cell at (8, 4), every second pixel.
-        assert_eq!(corner(&small).map(|p| [p[0], p[1]]), [[8, 4], [10, 4]]);
+        let small = render_small(&c, "s/0", 2);
+        assert_eq!([small.get(0, 0), small.get(1, 0)].map(|p| [p[0], p[1]]), [[8, 4], [10, 4]]);
+        // A compile without the pixels numbers them the same.
+        let layout = Description::parse(text).unwrap().compile_layout(&Counting(std::cell::Cell::new(0)), 64).unwrap();
+        assert_eq!((layout.atlas.sprites.len(), layout.atlas.sprites[0].downscaled), (2, 2));
     }
 
     #[test]
@@ -1382,18 +1410,157 @@ mod tests {
         assert_eq!((s.width, s.height, s.anchor_x, s.anchor_y), (8, 4, 0, 0));
         let page = &c.atlas.pages[s.page as usize];
         assert_eq!(page.get(s.atlas_x + 3, s.atlas_y + 2), [3, 2, 7, 255]);
+        assert_eq!(render_small(&c, "s/0", 1).get(3, 2), [3, 2, 7, 255]);
     }
 
     #[test]
-    fn boxes_are_found_and_empty_ones_stay_clear() {
+    fn boxes_are_found_and_empty_ones_draw_nothing() {
         let img = RgbaImage::from_fn(6, 5, |x, y| if (2..=4).contains(&x) && (1..=2).contains(&y) { [1, 1, 1, 9] } else { [7, 7, 7, 0] });
         assert_eq!(opaque_box(&img), Some([2, 1, 3, 2]));
         assert_eq!(opaque_box(&RgbaImage::new(3, 3)), None);
+        // A cell that is all blank: an empty box, nothing drawn shrunk
+        // (columns 1 and 2 of `Columns`, made blank; drawn they are not).
+        let text = format!("{BOXED}cell = [2, 4]\norigin = [1, 0]\nsample_from = \"box\"\n[blank_loader]\ntransparent = [1, 2]\n").replace("cell = [8, 4]\n", "");
+        let c = Description::parse(&text).unwrap().compile(&Columns, 64).unwrap();
+        let s = c.atlas.sprites[0];
+        assert_eq!((s.box_w, s.box_h), (0, 0));
+        assert!(render_small(&c, "s/0", 2).pixels.iter().all(|p| p[3] == 0));
+        assert_eq!(render_small(&c, "s/0", 1).get(1, 0), [2, 0, 7, 255]);
+    }
+
+    // What compiling a description smaller made before views shown smaller
+    // sampled the full-size art themselves: the art shrunk on the CPU. Kept
+    // here only to show that the renderer draws exactly the same.
+
+    /// Every `n`-th pixel of every `n`-th row, from the top-left.
+    fn downscale(img: &RgbaImage, n: u32) -> RgbaImage {
+        RgbaImage::from_fn(img.width / n, img.height / n, |x, y| img.get(x * n, y * n))
+    }
+
+    /// `img` shrunk by `n` the way a game does that keeps its sprites
+    /// cropped to `bounds` (their box): it samples the box at every `n`-th
+    /// pixel from the box's top-left, covering `box size / n` pixels
+    /// (rounded down), drawn at the box's origin divided by `n` (rounded
+    /// down); the cell's own size, rounded down, is the size of the result.
+    fn downscale_from_box(img: &RgbaImage, n: u32, bounds: Option<[u32; 4]>) -> RgbaImage {
+        let (w, h) = (img.width / n, img.height / n);
+        let Some([bx, by, bw, bh]) = bounds else { return RgbaImage::new(w, h) };
+        let (x0, y0) = (bx / n, by / n);
+        RgbaImage::from_fn(w, h, |x, y| match (x.checked_sub(x0), y.checked_sub(y0)) {
+            (Some(i), Some(j)) if i < bw / n && j < bh / n => img.get(bx + n * i, by + n * j),
+            _ => [0; 4],
+        })
+    }
+
+    #[test]
+    fn the_old_cpu_shrink_samples_the_box() {
+        let img = RgbaImage::from_fn(6, 5, |x, y| if (2..=4).contains(&x) && (1..=2).contains(&y) { [1, 1, 1, 9] } else { [7, 7, 7, 0] });
         assert!(downscale_from_box(&img, 2, None).pixels.iter().all(|p| p[3] == 0));
-        // Sampling reaches only what the box covers: 3 / 2 = 1 column, 2 / 2 = 1 row.
         let small = downscale_from_box(&img, 2, opaque_box(&img));
         assert_eq!((small.width, small.height), (3, 2));
         assert_eq!(small.pixels.iter().filter(|p| p[3] != 0).count(), 1);
         assert_eq!(small.get(1, 0), [1, 1, 1, 9]);
+    }
+
+    /// A 64 × 48 picture of palette indices: a blob of index 9 and 10 in
+    /// every 16 × 12 cell, off centre by the cell's position (so boxes start
+    /// at odd and even columns and rows), the rest index 255 or (cell
+    /// corners) 254; drawn with 254 and 255 clear unless the options' list
+    /// `transparent` says otherwise.
+    struct Blobs;
+    impl ImageLoader for Blobs {
+        fn load(&self, _: &str, options: &toml::Table) -> Result<Vec<RgbaImage>, String> {
+            let clear: Vec<i64> = match options.get("transparent").and_then(|t| t.as_array()) {
+                Some(list) => list.iter().filter_map(|v| v.as_integer()).collect(),
+                None => vec![254, 255],
+            };
+            Ok(vec![RgbaImage::from_fn(64, 48, |x, y| {
+                let (c, r, cx, cy) = (x / 16, y / 12, x % 16, y % 12);
+                let index = if (cx < 2 && cy < 2) || (cx > 13 && cy > 9 && c % 2 == 1) {
+                    254
+                } else if (1 + c + r..10 + c).contains(&cx) && (r + c % 2..7 + r).contains(&cy) {
+                    9 + (cx + cy) % 2
+                } else {
+                    255
+                };
+                if clear.contains(&(index as i64)) { [0; 4] } else { [x as u8 * 3, y as u8 * 5, index as u8, 255] }
+            })])
+        }
+    }
+
+    #[test]
+    fn views_shown_smaller_draw_what_the_cpu_shrink_did() {
+        // A sheet of 4 × 4 cells drawn on a grid both ways: compiled once and
+        // drawn by a view at downscale 2, and (as before) each sprite shrunk
+        // on the CPU from the same cells (from its box: the box of what the
+        // blank load leaves) and drawn 1:1 on a grid of half the steps, with
+        // its layers' offsets and anchors halved (or kept) as each sheet
+        // says. Sheets sampling from the cell and from the box, each scaling.
+        let text = "[grid]\nlayout = \"staggered\"\nstep = [8, 6]\n\
+            [blank_loader]\ntransparent = [255]\n\
+            [images.a]\nsource = \"a\"\n\
+            [sheets.cells]\nimage = \"a\"\ncell = [16, 12]\nanchor = [-3, -7]\n\
+            [sheets.boxes]\nimage = \"a\"\ncell = [16, 12]\nanchor = [-5, 9]\nsample_from = \"box\"\n\
+            [sheets.kept]\nimage = \"a\"\ncell = [16, 12]\nanchor = [-11, 1]\nsample_from = \"box\"\nscaling = \"scale_keep_anchor\"\n\
+            [sheets.screen]\nimage = \"a\"\ncell = [16, 12]\ngrid = [1, 1]\nanchor = [1, -1]\nscaling = \"keep\"\n\
+            [[layers]]\nname = \"a\"\nsets = [\"cells/*\"]\noffset = [-1, 3]\n\
+            [[layers]]\nname = \"b\"\nsets = [\"boxes/*\"]\noffset = [5, -7]\n\
+            [[layers]]\nname = \"c\"\nsets = [\"kept/*\", \"screen/*\"]\noffset = [-3, 0]\n";
+        let desc = Description::parse(text).unwrap();
+        let c = desc.compile(&Blobs, 256).unwrap();
+        let (cols, rows) = (9, 14);
+        let fill = |world: &mut tile_render::TileWorld, c: &Compiled| {
+            for row in 0..rows {
+                for col in 0..cols {
+                    let k = (col * 7 + row * 3) % 16;
+                    for (l, set) in [("a", format!("cells/{k}")), ("b", format!("boxes/{}", (k + 5) % 16)), ("c", format!("kept/{}", (k + 9) % 16))] {
+                        world.set(tile_render::LayerId(c.layer_index(l).unwrap()), col, row, c.value(l, &set).unwrap());
+                    }
+                    if (col + row) % 5 == 0 {
+                        world.set(tile_render::LayerId(2), col, row, c.value("c", "screen/0").unwrap());
+                    }
+                }
+            }
+        };
+        let mut world = c.world(cols, rows, true, false);
+        fill(&mut world, &c);
+        // The old way: an atlas of the shrunk sprites, in the same order.
+        let blank = Blobs.load("a", &desc.blank_loader).unwrap().remove(0);
+        let full = Blobs.load("a", &toml::Table::new()).unwrap().remove(0);
+        let mut atlas = AtlasBuilder::new(256);
+        for name in &c.sprite_names {
+            let (sheet, k) = name.split_once('/').unwrap();
+            let k: u32 = k.parse().unwrap();
+            let s = &desc.sheets[sheet];
+            let (x, y) = (k % 4 * 16, k / 4 * 12);
+            let cell = full.crop(x, y, 16, 12);
+            let (image, anchor) = match (sheet, s.sample_from) {
+                ("screen", _) => (cell, s.anchor),
+                (_, SampleFrom::Box) => (downscale_from_box(&cell, 2, opaque_box(&blank.crop(x, y, 16, 12))), s.anchor),
+                (_, SampleFrom::Cell) => (downscale(&cell, 2), s.anchor),
+            };
+            let anchor = if s.scaling == SheetScaling::Scale { anchor.map(|a| a / 2) } else { anchor };
+            atlas.add(&image, (anchor[0], anchor[1])).unwrap();
+        }
+        let atlas = atlas.finish();
+        let mut old = c.world(cols, rows, true, false);
+        old.grid.step = (4, 3);
+        for (l, spec) in c.layers.iter().enumerate() {
+            old.layer_mut(tile_render::LayerId(l)).offset = (spec.offset.0 / 2, spec.offset.1 / 2);
+        }
+        fill(&mut old, &c);
+        let gpu = tile_render::Headless::new().expect("GPU");
+        for (x, y) in [(0, 0), (-7, 3), (11, -5), (29, 17)] {
+            let camera = tile_render::Camera { x, y, overhang: (8, 8, 8, 8), ..tile_render::Camera::new((40, 36)) };
+            let want = tile_render::reference::render(&old, &atlas, &camera, 0, [0, 0, 0, 255]);
+            let got = tile_render::reference::render(&world, &c.atlas, &tile_render::Camera { downscale: 2, ..camera }, 0, [0, 0, 0, 255]);
+            assert_eq!(got, want, "camera at ({x}, {y})");
+            // The shaders draw the same.
+            let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+            renderer.set_atlas(&gpu.device, &gpu.queue, &c.atlas);
+            renderer.set_world(&gpu.device, &world);
+            assert_eq!(gpu.render(&mut renderer, &tile_render::Camera { downscale: 2, ..camera }, 0, [0, 0, 0, 255]), want, "GPU, camera at ({x}, {y})");
+            assert!(want.pixels.iter().filter(|p| p[..3] != [0, 0, 0]).count() > 400);
+        }
     }
 }

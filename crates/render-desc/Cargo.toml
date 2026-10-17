@@ -12,3 +12,6 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 thiserror.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+wgpu.workspace = true
