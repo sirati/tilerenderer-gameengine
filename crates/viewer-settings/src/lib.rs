@@ -278,6 +278,40 @@ pub struct Display {
     /// the frame time, and with a software renderer the share of frames it
     /// skipped (unchanged).
     pub show_fps: bool,
+    /// How frames reach the screen (`TILE_VIEWER_PRESENT` overrides it).
+    pub present: Present,
+    /// The most frames per second the viewer draws; 0: as many as the
+    /// display shows (its refresh rate) with `Vsync`, with the others as
+    /// many as it can (`TILE_VIEWER_MAX_FPS` overrides it).
+    pub max_fps: u32,
+}
+
+/// How the viewer's frames reach the screen.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Present {
+    /// Each frame waits for the display's refresh (no tearing; at most its
+    /// rate, e.g. 60 or 120 frames per second).
+    #[default]
+    Vsync,
+    /// Frames as fast as they are drawn, the newest shown at each refresh
+    /// (no tearing; where the system has it, else `Vsync`).
+    Mailbox,
+    /// Frames as fast as they are drawn, shown at once (may tear; where the
+    /// system has it, else `Mailbox`, else `Vsync`).
+    Immediate,
+}
+
+impl Present {
+    /// From `TILE_VIEWER_PRESENT`-style names (`vsync`/`fifo`, `mailbox`,
+    /// `immediate`), any case.
+    pub fn parse(name: &str) -> Option<Present> {
+        match name.to_ascii_lowercase().as_str() {
+            "vsync" | "fifo" => Some(Present::Vsync),
+            "mailbox" => Some(Present::Mailbox),
+            "immediate" => Some(Present::Immediate),
+            _ => None,
+        }
+    }
 }
 
 impl Settings {
@@ -349,6 +383,10 @@ mod tests {
         assert_eq!((old.resolution.pixel_scale, old.layout.split), (2, Split::Vertical1To1));
         let on: Settings = toml::from_str("[display]\nshow_fps = true\n").unwrap();
         assert!(on.display.show_fps);
+        assert_eq!((on.display.present, on.display.max_fps), (Present::Vsync, 0));
+        let fast: Settings = toml::from_str("[display]\npresent = \"Mailbox\"\nmax_fps = 240\n").unwrap();
+        assert_eq!((fast.display.present, fast.display.max_fps), (Present::Mailbox, 240));
+        assert_eq!(Present::parse("IMMEDIATE"), Some(Present::Immediate));
         assert_eq!(on.layout, Layout::default());
         let text = toml::to_string_pretty(&on).unwrap();
         assert!(text.contains("[display]") && text.contains("show_fps = true"), "{text}");

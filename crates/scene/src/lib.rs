@@ -764,7 +764,7 @@ pub fn connect() -> (Driver, Display) {
     let wake = Waker::default();
     (
         Driver { updates: updates_tx, input: input_rx, in_flight: in_flight.clone(), wake: wake.clone() },
-        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake },
+        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() } },
     )
 }
 
@@ -836,6 +836,59 @@ pub struct Display {
     /// Settings received and not taken yet (see [`Display::take_settings`]).
     new_settings: Option<viewer_settings::Settings>,
     wake: Waker,
+    /// What changed since [`Display::take_changes`] last took it.
+    changes: Changes,
+}
+
+/// What of a [`Scene`] changed (see [`Display::take_changes`]), for a
+/// renderer that keeps what it made of it and updates only that.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Changes {
+    /// A new world: its shape and every cell (`cells` is then empty).
+    pub world: bool,
+    /// The cells whose value, phase or offset changed: (layer, cell
+    /// index), maybe more than once.
+    pub cells: Vec<(u32, u32)>,
+    /// The world's sprites.
+    pub sprites: bool,
+    /// A view (added, changed, removed) or the sprites over one.
+    pub views: bool,
+}
+
+/// More changed cells than this are a new world to a renderer (see
+/// [`Changes`]).
+const MOST_CHANGED_CELLS: usize = 1 << 16;
+
+impl Changes {
+    /// Adds what `update` changes.
+    fn note(&mut self, update: &Update) {
+        let mut cells = |c: &mut dyn Iterator<Item = (u32, u32)>| {
+            if !self.world {
+                self.cells.extend(c);
+                if self.cells.len() > MOST_CHANGED_CELLS {
+                    self.world = true;
+                    self.cells = Vec::new();
+                }
+            }
+        };
+        match update {
+            Update::World { .. } => {
+                self.world = true;
+                self.cells = Vec::new();
+            }
+            Update::Cells(c) => cells(&mut c.iter().map(|&(l, i, _)| (l, i))),
+            Update::Phases(c) => cells(&mut c.iter().map(|&(l, i, _)| (l, i))),
+            Update::Offsets(c) => cells(&mut c.iter().map(|&(l, i, _)| (l, i))),
+            Update::Sprites(_) => self.sprites = true,
+            Update::View { .. } | Update::Overlay { .. } => self.views = true,
+            _ => {}
+        }
+    }
+
+    /// Whether nothing changed.
+    pub fn is_empty(&self) -> bool {
+        *self == Changes::default()
+    }
 }
 
 impl Display {
@@ -867,6 +920,7 @@ impl Display {
             if let Update::Settings(s) = &u {
                 self.new_settings = Some(s.clone());
             }
+            self.changes.note(&u);
             self.scene.apply(u);
         }
         self.scene.seq += 1;
@@ -875,6 +929,18 @@ impl Display {
 
     pub fn scene(&self) -> &Scene {
         &self.scene
+    }
+
+    /// What changed in the scene since the last call (at first: the
+    /// world), and the scene.
+    pub fn take_changes(&mut self) -> (Changes, &Scene) {
+        (std::mem::take(&mut self.changes), &self.scene)
+    }
+
+    /// What changed in the scene since [`Display::take_changes`] was last
+    /// called, without taking it.
+    pub fn changes(&self) -> &Changes {
+        &self.changes
     }
 
     /// The sprite pixels received since the last call (to write into the
@@ -941,6 +1007,26 @@ mod tests {
         other.send(Input::Quit).unwrap();
         assert_eq!(driver.take_input().len(), 2);
         assert!(driver.take_input().is_empty());
+    }
+
+    #[test]
+    fn the_display_says_what_changed() {
+        let (driver, mut display) = connect();
+        let shape = WorldShape { cols: 3, rows: 2, ..Default::default() };
+        let mut s = Scene::empty_with(shape, [(true, false), (false, false)]);
+        driver.send(s.updates_since(&Scene::default()));
+        assert!(display.receive(Duration::from_secs(5)));
+        assert!(display.take_changes().0.world);
+        assert!(display.take_changes().0.is_empty());
+        let before = s.clone();
+        s.set(1, 2, 1, 7);
+        s.set_phase(0, 0, 1, 3);
+        s.view_mut(4).view.camera_x = 1;
+        driver.send(s.updates_since(&before));
+        assert!(display.receive(Duration::from_secs(5)));
+        let (changes, scene) = display.take_changes();
+        assert_eq!(changes, Changes { world: false, cells: vec![(1, 5), (0, 3)], sprites: false, views: true });
+        assert_eq!(scene.layers[1].values[5], 7);
     }
 
     #[test]

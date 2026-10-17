@@ -46,6 +46,15 @@ impl LookScene {
     pub fn of(scene: &Scene) -> Self {
         LookScene { interactables: scene.interactables.clone(), looks: scene.looks.clone() }
     }
+
+    /// Refreshes interaction metadata independently of world or sprite edits.
+    pub fn refresh(&mut self, scene: &Scene) -> bool {
+        if self.interactables == scene.interactables && self.looks == scene.looks {
+            return false;
+        }
+        *self = Self::of(scene);
+        true
+    }
 }
 
 /// A click's selection, until the driver shows it.
@@ -363,6 +372,119 @@ mod tests {
 
     fn sets(r: &[Replacement]) -> Vec<(u32, (u32, u32), Vec<u32>)> {
         r.iter().map(|r| (r.view, r.range, r.sprites.iter().map(|s| s.set).collect())).collect()
+    }
+
+    /// A nonempty world and overlay, so metadata-only updates exercise
+    /// the path that has no cell, world-sprite, or overlay changes.
+    fn connected_scene() -> (scene::Driver, scene::Display, LookScene) {
+        let metadata = scene();
+        let (driver, mut display) = scene::connect();
+        assert!(driver.send(vec![
+            scene::Update::World {
+                shape: scene::WorldShape { cols: 1, rows: 1, ..Default::default() },
+                layers: vec![scene::LayerCells { values: vec![3], ..Default::default() }],
+            },
+            scene::Update::Sprites(vec![sprite(100)]),
+            scene::Update::View { id: 5, view: Some(scene::View::default()) },
+            scene::Update::Overlay { view: 5, sprites: (0..5).map(sprite).collect() },
+            scene::Update::Interactables(metadata.interactables),
+            scene::Update::Looks(metadata.looks),
+        ]));
+        assert!(display.receive(std::time::Duration::ZERO));
+        assert!(display.take_changes().0.world);
+        let cached = LookScene::of(display.scene());
+        (driver, display, cached)
+    }
+
+    #[test]
+    fn looks_only_update_refreshes_driver_state_without_rebuilding_world_or_overlay() {
+        let (driver, mut display, mut cached) = connected_scene();
+        let before = display.scene().clone();
+        let mut feedback = Feedback::default();
+        feedback.sent(&Input::MouseMove { x: 15, y: 15 }, &cached, 0.0);
+        assert_eq!(sets(&feedback.replacements(&cached, 0.01)), [(5, (1, 3), vec![11])]);
+
+        let mut updated = before.looks.clone();
+        updated[0].shown = HOVER;
+        assert!(driver.send(vec![scene::Update::Looks(updated)]));
+        assert!(display.receive(std::time::Duration::ZERO));
+        assert!(display.changes().is_empty());
+        assert_eq!(display.scene().layers, before.layers);
+        assert_eq!(display.scene().sprites, before.sprites);
+        assert_eq!(display.scene().views, before.views);
+        assert!(cached.refresh(display.scene()));
+        assert!(feedback.replacements(&cached, 0.02).is_empty());
+    }
+
+    #[test]
+    fn replacement_art_refreshes_and_splices_without_a_look_state_change() {
+        let (driver, mut display, mut cached) = connected_scene();
+        let before = display.scene().clone();
+        let base: Vec<_> = before.sprites.iter().map(|s| (*s, 9))
+            .chain(before.views[0].overlay.iter().map(|s| (*s, 3))).collect();
+        let spans = [Span { view: 5, start: 1, len: 5, cameras: vec![3; 5] }];
+        let mut feedback = Feedback::default();
+        feedback.sent(&Input::MouseMove { x: 15, y: 15 }, &cached, 0.0);
+        let previous = splice(&base, &spans, &feedback.replacements(&cached, 0.01), |s, camera| (*s, camera));
+        let drawn = feedback.drawn().to_vec();
+        assert_eq!(drawn, [(7, HOVER)]);
+        assert_eq!(previous.iter().map(|(s, _)| s.set).collect::<Vec<_>>(), [100, 0, 11, 3, 4]);
+
+        let replacement = FreeSprite { x: 17, y: 19, ..sprite(21) };
+        let mut updated = before.looks.clone();
+        updated[0].views[0].states.iter_mut().find(|(state, _)| *state == HOVER).unwrap().1 = vec![replacement];
+        assert!(driver.send(vec![scene::Update::Looks(updated)]));
+        assert!(display.receive(std::time::Duration::ZERO));
+        assert!(display.changes().is_empty());
+        assert_eq!(display.scene().layers, before.layers);
+        assert_eq!(display.scene().sprites, before.sprites);
+        assert_eq!(display.scene().views, before.views);
+        assert!(cached.refresh(display.scene()));
+        let refreshed = splice(&base, &spans, &feedback.replacements(&cached, 0.02), |s, camera| (*s, camera));
+        // Comparing only Feedback::drawn would miss this changed art.
+        assert_eq!(feedback.drawn(), drawn);
+        assert_ne!(refreshed, previous);
+        assert_eq!(refreshed[2], (replacement, 3));
+        assert_eq!(refreshed.iter().map(|(s, _)| s.set).collect::<Vec<_>>(), [100, 0, 21, 3, 4]);
+    }
+
+    #[test]
+    fn identical_metadata_in_a_new_scene_does_not_invalidate_the_cached_looks() {
+        let (driver, mut display, mut cached) = connected_scene();
+        let before = cached.clone();
+        let old_seq = display.scene().seq;
+        let mut feedback = Feedback::default();
+        feedback.sent(&Input::MouseMove { x: 15, y: 15 }, &cached, 0.0);
+        let previous = sets(&feedback.replacements(&cached, 0.01));
+        let drawn = feedback.drawn().to_vec();
+
+        assert!(driver.send(vec![scene::Update::Looks(before.looks.clone())]));
+        assert!(display.receive(std::time::Duration::ZERO));
+        assert!(display.scene().seq > old_seq);
+        assert!(display.changes().is_empty());
+        assert!(!cached.refresh(display.scene()));
+        assert_eq!(cached, before);
+        assert_eq!(sets(&feedback.replacements(&cached, 0.02)), previous);
+        assert_eq!(feedback.drawn(), drawn);
+    }
+
+    #[test]
+    fn interactable_only_update_rechecks_a_stationary_pointer() {
+        let (driver, mut display, mut cached) = connected_scene();
+        let before = display.scene().clone();
+        let mut feedback = Feedback::default();
+        feedback.sent(&Input::MouseMove { x: 15, y: 15 }, &cached, 0.0);
+        assert_eq!(sets(&feedback.replacements(&cached, 0.01)), [(5, (1, 3), vec![11])]);
+
+        let mut moved = before.interactables.clone();
+        moved[0].rect = [50, 50, 20, 20];
+        assert!(driver.send(vec![scene::Update::Interactables(moved)]));
+        assert!(display.receive(std::time::Duration::ZERO));
+        assert!(display.changes().is_empty());
+        assert_eq!(display.scene().looks, before.looks);
+        assert_eq!(display.scene().views, before.views);
+        assert!(cached.refresh(display.scene()));
+        assert!(feedback.replacements(&cached, 0.02).is_empty());
     }
 
     #[test]

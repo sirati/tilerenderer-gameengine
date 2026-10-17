@@ -1485,6 +1485,8 @@ impl Description {
         atlas.named_palettes = (own.len() / tile_render_shared::PALETTE_SIZE as usize) as u32;
         atlas.palettes = own;
         atlas.palettes.extend_from_slice(&named[tile_render_shared::PALETTE_SIZE as usize..]);
+        // What of each sprite draws nothing: left out of its drawn rectangle.
+        atlas.trim_blank();
         if let Some(g) = growing {
             g.shelves = shelves;
             g.texels = texels;
@@ -2077,8 +2079,11 @@ impl Growing {
             Target::Sizes(sprites) => (self.shelves.clone(), sprites, Vec::new()),
             Target::Atlas(_) => unreachable!("a growth places its sprites itself"),
         };
+        let mut atlas = AtlasGrowth { first, pages: shelves.0.pages, index_pages: shelves.1.pages, sprites, blits, palettes: own };
+        // What of each new sprite draws nothing (where its pixels are new).
+        atlas.trim_blank(&compiled.atlas.palettes, compiled.atlas.named_palettes);
         let growth = Growth {
-            atlas: AtlasGrowth { first, pages: shelves.0.pages, index_pages: shelves.1.pages, sprites, blits, palettes: own },
+            atlas,
             sprite_names,
             sets,
             layer_values,
