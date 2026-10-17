@@ -77,6 +77,9 @@ struct Slot {
     growths: std::collections::VecDeque<(u64, Arc<render_desc::Growth>)>,
     /// The latest generation given (whole or grown).
     latest: u64,
+    /// Highest generation committed to the drawing renderer. CPU art
+    /// publication and replacement requests do not advance this.
+    uploaded: u64,
     /// Atlas pages (colour, index) to make room for, if asked (see
     /// [`Assets::reserve`]).
     reserve: Option<(u64, u32, u32)>,
@@ -84,7 +87,7 @@ struct Slot {
 
 impl Assets {
     pub fn new(compiled: Arc<Compiled>) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Slot { generation: 1, whole: Some(compiled), growths: Default::default(), latest: 1, reserve: None })))
+        Self(Arc::new(std::sync::Mutex::new(Slot { generation: 1, whole: Some(compiled), growths: Default::default(), latest: 1, uploaded: 0, reserve: None })))
     }
 
     fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
@@ -99,7 +102,8 @@ impl Assets {
     /// Replaces the description by `compiled` of generation `generation`
     /// (what scenes refer to, `Scene::assets`).
     pub fn set(&self, compiled: Arc<Compiled>, generation: u64) {
-        *self.slot() = Slot { generation, whole: Some(compiled), growths: Default::default(), latest: generation, reserve: None };
+        let mut slot = self.slot();
+        *slot = Slot { generation, whole: Some(compiled), growths: Default::default(), latest: generation, uploaded: slot.uploaded, reserve: None };
     }
 
     /// Grows the latest description by `growth` (made for it as grown so
@@ -122,7 +126,7 @@ impl Assets {
     /// from an older whole description never resizes its replacement.
     pub fn set_with_reserve(&self, compiled: Arc<Compiled>, generation: u64, pages: u32, index_pages: u32) {
         let mut slot = self.slot();
-        *slot = Slot { generation, whole: Some(compiled), growths: Default::default(), latest: generation, reserve: None };
+        *slot = Slot { generation, whole: Some(compiled), growths: Default::default(), latest: generation, uploaded: slot.uploaded, reserve: None };
         reserve_in(&mut slot, pages, index_pages);
     }
 
@@ -148,6 +152,14 @@ impl Assets {
         self.slot().latest
     }
 
+    /// The highest art generation committed to the drawing renderer.
+    /// Zero until the initial atlas is uploaded. Unlike [`Assets::latest`],
+    /// preparing CPU art cannot advance this acknowledgment. Replacement
+    /// requests preserve it until the replacement is committed.
+    pub fn uploaded_generation(&self) -> u64 {
+        self.slot().uploaded
+    }
+
     /// The latest whole description's generation, and the description if
     /// the viewer has not uploaded it yet.
     fn whole(&self) -> (u64, Option<Arc<Compiled>>) {
@@ -155,11 +167,12 @@ impl Assets {
         (slot.generation, slot.whole.clone())
     }
 
-    /// The viewer has uploaded `generation` (its pixels are on the GPU: the
-    /// slot lets go of them, unless a newer one came meanwhile).
-    fn uploaded(&self, generation: u64) {
+    /// A whole base and its required growth prefix are committed. Release
+    /// source pixels only for that base; a newer whole keeps its own pixels.
+    fn uploaded(&self, base: u64, through: u64) {
         let mut slot = self.slot();
-        if slot.generation == generation {
+        slot.uploaded = slot.uploaded.max(through);
+        if slot.generation == base {
             slot.whole = None;
         }
     }
@@ -186,7 +199,7 @@ mod art_queue_tests {
     use std::sync::{Arc, Mutex};
 
     fn assets() -> Assets {
-        Assets(Arc::new(Mutex::new(Slot { generation: 7, whole: None, growths: Default::default(), latest: 7, reserve: None })))
+        Assets(Arc::new(Mutex::new(Slot { generation: 7, whole: None, growths: Default::default(), latest: 7, uploaded: 0, reserve: None })))
     }
 
     #[test]
@@ -200,6 +213,54 @@ mod art_queue_tests {
         assert_eq!(assets.take_growth(7).map(|(generation, _)| generation), Some(9));
         assert!(assets.take_growth(7).is_none());
         assert_eq!(assets.take_reserve(7), Some((0, 20)));
+    }
+
+    fn empty_compiled() -> Arc<render_desc::Compiled> {
+        struct NoImages;
+        impl render_desc::ImageLoader for NoImages {
+            fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> {
+                panic!("the empty description has no images")
+            }
+        }
+        let description = render_desc::Description::parse(r#"
+            grid = { layout = "orthogonal", step = [1, 1] }
+        "#).unwrap();
+        Arc::new(description.compile(&NoImages, 16).unwrap())
+    }
+
+    #[test]
+    fn cpu_art_publication_does_not_acknowledge_gpu_upload() {
+        let assets = Assets::new(empty_compiled());
+        assert_eq!(assets.latest(), 1);
+        assert_eq!(assets.uploaded_generation(), 0);
+        assets.uploaded(1, 1);
+        assert_eq!(assets.uploaded_generation(), 1);
+        assets.grow(Arc::new(render_desc::Growth::default()), 2);
+        assert_eq!(assets.latest(), 2);
+        assert_eq!(assets.uploaded_generation(), 1);
+        assets.uploaded(1, 2);
+        assert_eq!(assets.uploaded_generation(), 2);
+    }
+
+    #[test]
+    fn replacement_preserves_acknowledgment_until_its_required_prefix_commits() {
+        let assets = assets();
+        assets.uploaded(7, 9);
+        assets.set(empty_compiled(), 10);
+        assert_eq!(assets.uploaded_generation(), 9);
+        assets.grow(Arc::new(render_desc::Growth::default()), 11);
+        assert_eq!(assets.uploaded_generation(), 9);
+        assets.uploaded(10, 11);
+        assert_eq!(assets.uploaded_generation(), 11);
+        assert!(assets.whole().1.is_none());
+        assets.set_with_reserve(empty_compiled(), 12, 0, 3);
+        assert_eq!(assets.uploaded_generation(), 11);
+        // Completion of an older transfer cannot release a newer whole's
+        // raw pixels or move the acknowledgment backward.
+        assets.uploaded(10, 10);
+        assert_eq!(assets.uploaded_generation(), 11);
+        assert!(assets.whole().1.is_some());
+        assert_eq!(assets.clone().uploaded_generation(), 11);
     }
 
     #[test]
@@ -643,6 +704,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         upload: Some(whole),
         display,
         shown_scene: Scene::default(),
+        pending_scene: None,
         gpu: None,
         drawn_seq: 0,
         patches: std::collections::BTreeMap::new(),
@@ -756,6 +818,9 @@ struct App {
     /// Last scene adopted with compatible active art. Kept live for local
     /// cursor, hover, layout and FPS drawing while newer art is prepared.
     shown_scene: Scene,
+    /// One immutable future snapshot prevents later optional art generations
+    /// from moving the adoption target. Display keeps coalescing newer work.
+    pending_scene: Option<PendingScene>,
     gpu: Option<Gpu>,
     /// The scene version the renderer's world was built from.
     drawn_seq: u64,
@@ -1190,9 +1255,50 @@ fn adopt_shown_scene(shown: &mut Scene, display: &mut Display, whole: u64, throu
     Some(SceneAdoption { changes, patches })
 }
 
+/// One future scene, separate from Display's coalesced latest scene. Its
+/// patch pixels stay isolated from the drawable atlas until adoption.
+struct PendingScene {
+    base: u64,
+    scene: Scene,
+}
+
+fn retain_pending_scene(pending: &mut Option<PendingScene>, shown: &Scene, display: &Display, base: u64, whole: u64, through: u64) {
+    if pending.as_ref().is_some_and(|p| p.base != base) {
+        *pending = None;
+    }
+    let latest = display.scene();
+    if pending.is_none() && latest.seq != 0 && latest.seq != shown.seq && latest.assets >= base
+        && !uses_art(latest.assets, whole, through) {
+        // Do not drain Display here. Its later deltas and newest patch per
+        // sprite must also survive cancellation by a replacement whole.
+        *pending = Some(PendingScene { base, scene: latest.clone() });
+    }
+}
+
+fn scene_art_target(pending: &Option<PendingScene>, display: &Display) -> u64 {
+    pending.as_ref().map_or_else(|| display.scene().assets, |p| p.scene.assets)
+}
+
+fn adopt_available_scene(shown: &mut Scene, pending: &mut Option<PendingScene>, display: &mut Display, whole: u64, through: u64) -> Option<SceneAdoption> {
+    // Prefer the newest scene whenever it is already compatible.
+    if let Some(adoption) = adopt_shown_scene(shown, display, whole, through) {
+        *pending = None;
+        return Some(adoption);
+    }
+    if !pending.as_ref().is_some_and(|p| uses_art(p.scene.assets, whole, through)) {
+        return None;
+    }
+    let mut next = pending.take().expect("compatible snapshot").scene;
+    let patches = std::mem::take(&mut next.patches);
+    *shown = next;
+    // Display's accumulated changes span both this snapshot and anything
+    // newer. Leave them there for the next adoption; rebuild this one.
+    Some(SceneAdoption { changes: scene::Changes { world: true, sprites: true, views: true, ..Default::default() }, patches })
+}
+
 #[cfg(test)]
 mod shown_scene_tests {
-    use super::{Display, Scene, adopt_shown_scene, looks};
+    use super::{Display, PendingScene, Scene, adopt_available_scene, adopt_shown_scene, looks, retain_pending_scene, scene_art_target};
     use scene::{FreeSprite, Input, Interactable, InteractableKind, LayerCells, LookState, Looks, PointerState, Update, View, ViewLooks, WorldShape};
     use std::time::Duration;
 
@@ -1281,6 +1387,117 @@ mod shown_scene_tests {
         assert!(adopted.changes.cells.contains(&(0, 0)) && adopted.changes.cells.contains(&(0, 1)));
         assert_eq!(shown.layers[0].values, [30, 20]);
         assert!(display.changes().is_empty());
+    }
+
+    fn hold(pending: &mut Option<PendingScene>, shown: &Scene, display: &Display, base: u64, through: u64) {
+        retain_pending_scene(pending, shown, display, base, base, through);
+    }
+
+    #[test]
+    fn future_snapshot_advances_while_optional_generations_keep_arriving() {
+        let (driver, mut display, mut shown) = connected();
+        let mut pending = None;
+        for generation in 8..=40 {
+            assert!(driver.send(vec![Update::Assets(generation), Update::Cells(vec![(0, 0, generation as u32)])]));
+            assert!(display.receive(Duration::ZERO));
+            hold(&mut pending, &shown, &display, 7, 7);
+            // Exactly one future snapshot remains fixed while Display
+            // coalesces all newer states into its own latest scene.
+            assert_eq!(pending.as_ref().unwrap().scene.assets, 8);
+            assert_eq!(scene_art_target(&pending, &display), 8);
+            assert!(adopt_available_scene(&mut shown, &mut pending, &mut display, 7, 7).is_none());
+            assert_eq!(shown.assets, 7);
+        }
+        // The former latest-only adoption is still blocked here even
+        // though the first complete snapshot's art is available.
+        assert!(adopt_shown_scene(&mut shown, &mut display, 7, 8).is_none());
+        let adoption = adopt_available_scene(&mut shown, &mut pending, &mut display, 7, 8).unwrap();
+        assert!(adoption.changes.world);
+        assert_eq!(shown.assets, 8);
+        assert_eq!(shown.layers[0].values[0], 8);
+        assert_eq!(display.scene().assets, 40);
+        assert_eq!(display.scene().layers[0].values[0], 40);
+        assert!(pending.is_none());
+        hold(&mut pending, &shown, &display, 7, 8);
+        assert_eq!(scene_art_target(&pending, &display), 40);
+        // The next fixed target can also become drawable without waiting
+        // for the producer's newest optional generation.
+        assert!(driver.send(vec![Update::Assets(41), Update::Cells(vec![(0, 0, 41)])]));
+        assert!(display.receive(Duration::ZERO));
+        hold(&mut pending, &shown, &display, 7, 39);
+        assert!(adopt_available_scene(&mut shown, &mut pending, &mut display, 7, 39).is_none());
+        assert!(adopt_available_scene(&mut shown, &mut pending, &mut display, 7, 40).is_some());
+        assert_eq!(shown.assets, 40);
+        assert_eq!(shown.layers[0].values[0], 40);
+        assert_eq!(display.scene().assets, 41);
+    }
+
+    #[test]
+    fn retained_future_patches_are_isolated_and_latest_deltas_survive() {
+        let (driver, mut display, mut shown) = connected();
+        let mut pending = None;
+        let old = scene::Patch { sprite: "minimap".into(), width: 1, height: 1, rgba: vec![1, 2, 3, 255] };
+        let new = scene::Patch { rgba: vec![4, 5, 6, 255], ..old.clone() };
+        assert!(driver.send(vec![Update::Assets(9), Update::Cells(vec![(0, 0, 9)]), Update::Patches(vec![old.clone()])]));
+        assert!(display.receive(Duration::ZERO));
+        hold(&mut pending, &shown, &display, 7, 7);
+        assert!(driver.send(vec![Update::Assets(10), Update::Cells(vec![(0, 1, 10)]), Update::Patches(vec![new.clone()])]));
+        assert!(display.receive(Duration::ZERO));
+        hold(&mut pending, &shown, &display, 7, 8);
+        assert!(adopt_available_scene(&mut shown, &mut pending, &mut display, 7, 8).is_none());
+        assert!(shown.patches.is_empty());
+        let adoption = adopt_available_scene(&mut shown, &mut pending, &mut display, 7, 9).unwrap();
+        assert_eq!(adoption.patches, [old]);
+        assert!(shown.patches.is_empty());
+        assert_eq!(shown.layers[0].values, [9, 5]);
+        assert_eq!(display.scene().patches, [new.clone()]);
+        assert_eq!(display.changes().cells.len(), 2);
+        let adoption = adopt_available_scene(&mut shown, &mut pending, &mut display, 7, 10).unwrap();
+        assert_eq!(adoption.patches, [new]);
+        assert_eq!(shown.layers[0].values, [9, 10]);
+        assert!(display.changes().is_empty());
+        assert!(display.scene().patches.is_empty());
+    }
+
+    #[test]
+    fn compatible_latest_scene_replaces_the_future_snapshot() {
+        let (driver, mut display, mut shown) = connected();
+        let mut pending = None;
+        assert!(driver.send(vec![Update::Assets(9), Update::Cells(vec![(0, 0, 9)])]));
+        assert!(display.receive(Duration::ZERO));
+        hold(&mut pending, &shown, &display, 7, 7);
+        assert!(pending.is_some());
+        // A newer scene can depend on a smaller prefix, for example after
+        // closing a screen whose new art has not arrived yet.
+        assert!(driver.send(vec![Update::Assets(8), Update::Cells(vec![(0, 0, 8)])]));
+        assert!(display.receive(Duration::ZERO));
+        assert!(adopt_available_scene(&mut shown, &mut pending, &mut display, 7, 8).is_some());
+        assert_eq!(shown.assets, 8);
+        assert_eq!(shown.layers[0].values[0], 8);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn superseding_whole_discards_only_its_snapshot_without_losing_latest_patches() {
+        let (driver, mut display, mut shown) = connected();
+        let mut pending = None;
+        let patch = scene::Patch { sprite: "minimap".into(), width: 1, height: 1, rgba: vec![7, 8, 9, 255] };
+        assert!(driver.send(vec![Update::Assets(9), Update::Patches(vec![patch.clone()])]));
+        assert!(display.receive(Duration::ZERO));
+        hold(&mut pending, &shown, &display, 7, 7);
+        assert!(pending.is_some());
+        retain_pending_scene(&mut pending, &shown, &display, 20, 7, 7);
+        assert!(pending.is_none());
+        assert_eq!(display.scene().patches, [patch.clone()]);
+        assert!(driver.send(vec![Update::Assets(20), Update::Cells(vec![(0, 0, 20)])]));
+        assert!(display.receive(Duration::ZERO));
+        retain_pending_scene(&mut pending, &shown, &display, 20, 7, 7);
+        assert_eq!(scene_art_target(&pending, &display), 20);
+        assert!(adopt_available_scene(&mut shown, &mut pending, &mut display, 7, 19).is_none());
+        let adoption = adopt_available_scene(&mut shown, &mut pending, &mut display, 20, 20).unwrap();
+        assert_eq!(adoption.patches, [patch]);
+        assert_eq!(shown.assets, 20);
+        assert!(pending.is_none());
     }
 
     #[test]
@@ -1992,7 +2209,7 @@ impl App {
             renderer.set_atlas(&device, &queue, &whole.atlas);
             self.cursor_art = cursor::Art::of(&whole);
         }
-        self.assets.uploaded(self.whole_version);
+        self.assets.uploaded(self.whole_version, self.assets_version);
         self.display.send_input(Input::Resized { width: config.width, height: config.height });
         let software = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
         if software {
@@ -2199,7 +2416,8 @@ impl App {
                 }
                 return false;
             }
-            let ready = match preparing.advance(&gpu.device, &gpu.queue, &gpu.renderer, &self.assets, self.display.scene().assets) {
+            let target = scene_art_target(&self.pending_scene, &self.display);
+            let ready = match preparing.advance(&gpu.device, &gpu.queue, &gpu.renderer, &self.assets, target) {
                 Ok((bytes, ready)) => {
                     if let Some(profile) = &mut self.profile { profile.count("art transfer bytes", bytes as usize); }
                     ready
@@ -2236,7 +2454,7 @@ impl App {
             self.compiled = prepared.compiled;
             self.whole_version = version;
             self.assets_version = prepared.through;
-            self.assets.uploaded(version);
+            self.assets.uploaded(version, prepared.through);
             log::info!("viewer: new assets through generation {} ({} sprites, prepared over {} ms in {} frames)", prepared.through, self.compiled.sprite_names.len(), prepared.since.elapsed().as_millis(), prepared.frames);
             return true;
         }
@@ -2297,6 +2515,7 @@ impl App {
             PendingArtPayload::Growth { version, growth, .. } => {
                 self.compiled.apply(&growth);
                 self.assets_version = version;
+                self.assets.uploaded(self.whole_version, version);
                 log::info!("viewer: grown by {} sprites ({} KiB of pixels) over {} ms in {} frames; {} sprites", growth.atlas.sprites.len(), growth.atlas.bytes() >> 10, p.since.elapsed().as_millis(), p.frames, self.compiled.atlas.sprites.len());
                 true
             }
@@ -2371,6 +2590,7 @@ impl App {
     fn draw_frame(&mut self, started: Instant) {
         let mut t = started;
         let matched_before_upload = self.shown_scene_matches_art();
+        retain_pending_scene(&mut self.pending_scene, &self.shown_scene, &self.display, self.assets.whole().0, self.whole_version, self.assets_version);
         self.update_plan();
         if self.plan.is_none() { return; }
         let Some(gpu) = &mut self.gpu else { return };
@@ -2392,7 +2612,7 @@ impl App {
         let art_committed = self.upload_art();
         let new_assets = art_committed || self.world_assets_version != self.assets_version;
         mark(&mut self.profile, "art transfers", &mut t);
-        let adoption = adopt_shown_scene(&mut self.shown_scene, &mut self.display, self.whole_version, self.assets_version);
+        let adoption = adopt_available_scene(&mut self.shown_scene, &mut self.pending_scene, &mut self.display, self.whole_version, self.assets_version);
         let adopted = adoption.is_some();
         let changes = match adoption {
             Some(adoption) => {
