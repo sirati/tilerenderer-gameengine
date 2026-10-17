@@ -2540,6 +2540,17 @@ impl Layout {
         true
     }
 
+    /// The system has finished placing the free pointer at `p`. A hint may
+    /// produce no motion event, or actual motion may have arrived while it
+    /// was pending. Confirm its side before routing so this never asks for
+    /// another warp across the divider.
+    pub fn system_pointer_placed(&mut self, p: (i32, i32)) -> Vec<Input> {
+        self.pointer = p;
+        self.raw_pointer = p;
+        self.side = self.side_of(p);
+        self.route(Input::MouseMove { x: p.0, y: p.1 })
+    }
+
     /// The pointer was put at window pixel `p` by other means than the
     /// mouse (e.g. the snapping pointer, `crate::snap`): it is there now
     /// (the system pointer moved there while the mouse is free), and while
@@ -4395,6 +4406,24 @@ mod tests {
         l.set_walls(Walls::Confined);
         l.place_pointer((250, 250));
         assert_eq!(l.take_warp(), Some((250, 250)));
+    }
+
+    #[test]
+    fn a_completed_system_placement_replaces_motion_received_while_pending() {
+        let mut l = split_1to1();
+        l.set_walls(Walls::Confined);
+        mv(&mut l, (100, 100));
+        l.place_pointer((600, 100));
+        assert_eq!(l.take_warp(), Some((600, 100)));
+        l.set_walls(Walls::Open);
+        mv(&mut l, (120, 100));
+        l.set_walls(Walls::Confined);
+        l.system_pointer_placed((600, 100));
+        assert_eq!((l.pointer, l.raw_pointer, l.side, l.take_warp()), ((600, 100), (600, 100), Some(Side::B), None));
+        // A completed placement at the physical boundary also establishes
+        // edge scrolling without waiting for another real motion event.
+        l.system_pointer_placed((404, 100));
+        assert_eq!((l.against, l.take_warp(), l.walls), (Some(Side::B), None, Walls::Confined));
     }
 
     #[test]

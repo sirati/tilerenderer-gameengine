@@ -31,15 +31,25 @@ impl InputState {
         })
     }
 
+    /// The latest known pointer in canvas pixels.
+    pub fn pointer(&self) -> (i32, i32) {
+        self.cursor
+    }
+
+    /// The pointer was placed in window pixels. Wayland position hints can
+    /// move it without a CursorMoved event, so the next click and wheel must
+    /// already use this position.
+    pub fn place_pointer(&mut self, window: (f64, f64)) -> (i32, i32) {
+        self.window = window;
+        self.cursor = self.plan.map_or((window.0 as i32, window.1 as i32), |p| p.to_screen(window));
+        self.cursor
+    }
+
     pub fn translate(&mut self, event: &WindowEvent) -> Vec<Input> {
         let (x, y) = self.cursor;
         match event {
             WindowEvent::CursorMoved { position, .. } => {
-                self.window = (position.x, position.y);
-                self.cursor = match &self.plan {
-                    Some(plan) => plan.to_screen(self.window),
-                    None => (position.x as i32, position.y as i32),
-                };
+                self.place_pointer((position.x, position.y));
                 vec![Input::MouseMove { x: self.cursor.0, y: self.cursor.1 }]
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -126,4 +136,34 @@ pub fn virtual_key(code: KeyCode) -> Option<u32> {
         Quote => 0xDE,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::event::{DeviceId, TouchPhase};
+
+    #[test]
+    fn placement_updates_clicks_and_wheels_without_a_motion_event() {
+        let mut input = InputState::default();
+        let plan = crate::scaling::plan((1920, 1080), 2.0, (960, 540), &viewer_settings::Resolution::default());
+        input.set_plan(plan);
+        input.place_pointer((100.0, 80.0));
+        let target = (1200.0, 700.0);
+        let at = plan.to_screen(target);
+        assert_eq!(input.place_pointer(target), at);
+        assert_eq!(input.translate(&WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(), state: ElementState::Pressed, button: MouseButton::Left,
+        }), vec![Input::MouseButton { button: Button::Left, down: true, x: at.0, y: at.1 }]);
+        assert_eq!(input.translate(&WindowEvent::MouseWheel {
+            device_id: DeviceId::dummy(), delta: MouseScrollDelta::LineDelta(0.0, 1.0), phase: TouchPhase::Moved,
+        }), vec![Input::Wheel { delta: 120, x: at.0, y: at.1 }]);
+        // A later physical motion replaces the hinted position normally.
+        input.translate(&WindowEvent::CursorMoved { device_id: DeviceId::dummy(), position: winit::dpi::PhysicalPosition::new(400.0, 200.0) });
+        assert_eq!(input.cursor, plan.to_screen((400.0, 200.0)));
+        // Scale changes also start from the placed window position.
+        input.place_pointer(target);
+        let smaller = crate::scaling::plan((1920, 1080), 1.0, (960, 540), &viewer_settings::Resolution::default());
+        assert_eq!(input.set_plan(smaller), Some(Input::MouseMove { x: smaller.to_screen(target).0, y: smaller.to_screen(target).1 }));
+    }
 }
