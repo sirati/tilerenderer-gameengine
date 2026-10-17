@@ -872,10 +872,17 @@ impl App {
             let (x, y) = self.plan.map_or(p, |plan| plan.to_window(p));
             if self.constraints.move_pointer(&gpu.window, (x, y)) {
                 log::debug!("viewer: moving the pointer to {x}, {y} (lock and hint)");
-            } else if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
-                log::debug!("viewer: moving the pointer to {x}, {y}: {e}");
-                // (The divider cannot hold back what it cannot move.)
-                self.layout.pointer_cannot_be_moved();
+                // Input follows it after the compositor activates the lock.
+            } else {
+                match gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
+                    Ok(()) => self.pointer_placed((x, y)),
+                    Err(e) => {
+                        log::debug!("viewer: moving the pointer to {x}, {y}: {e}");
+                        // (The divider cannot hold back what it cannot move.)
+                        self.layout.pointer_cannot_be_moved();
+                        self.pointer_placement_failed();
+                    }
+                }
             }
         }
         if grab == Some(false) {
@@ -919,7 +926,35 @@ impl App {
         }
         self.update_system_pointer(event_loop);
         if let Some(gpu) = &self.gpu {
-            self.constraints.update(&gpu.window, &mut self.layout, self.plan.map(|p| p.present), self.pointer_inside);
+            match self.constraints.update(&gpu.window, &mut self.layout, self.plan.map(|p| p.present), self.pointer_inside) {
+                Some(constraints::Placement::Hinted(at)) => self.pointer_placed(at),
+                Some(constraints::Placement::Cancelled) => self.pointer_placement_failed(),
+                None => {}
+            }
+        }
+    }
+
+    fn pointer_placed(&mut self, (x, y): (i32, i32)) {
+        // A Wayland hint can move the pointer without CursorMoved. Clicks
+        // and wheels must use its new position once the lock is released.
+        let at = (x as f64, y as f64);
+        self.system_pointer = self.input.place_pointer(at);
+        self.constraints.pointer_moved(at);
+        self.reconcile_system_pointer();
+    }
+
+    fn pointer_placement_failed(&mut self) {
+        // Use the latest physical motion, including any received while the
+        // move was pending. Do not replace a captured or snapping pointer.
+        self.system_pointer = self.input.pointer();
+        self.reconcile_system_pointer();
+    }
+
+    fn reconcile_system_pointer(&mut self) {
+        if self.pointer_inside && self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus()) && !self.layout.captured() && !self.snap.snap_mode_active() {
+            for input in self.layout.system_pointer_placed(self.system_pointer) {
+                self.display.send_input(input);
+            }
         }
     }
 
@@ -1324,10 +1359,19 @@ impl App {
             // edge: the system pointer goes where the drawn cursor is and
             // shows there once this frame is out (`unlock_after_frame`).
             let w = plan.to_window(q);
-            if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(w.0, w.1)) {
-                log::debug!("viewer: moving the pointer to the world cursor: {e}");
+            match gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(w.0, w.1)) {
+                Ok(()) => {
+                    // Like pointer_placed, without borrowing the whole App
+                    // while this frame still holds the GPU mutably.
+                    let at = (w.0 as f64, w.1 as f64);
+                    self.system_pointer = self.input.place_pointer(at);
+                    self.constraints.pointer_moved(at);
+                }
+                Err(e) => {
+                    log::debug!("viewer: moving the pointer to the world cursor: {e}");
+                    self.system_pointer = q;
+                }
             }
-            self.system_pointer = q;
             self.unlock_pending = Some(Unlock::Edge);
             self.presented = false;
             log::info!("viewer: world cursor at the world's edge: the system pointer shows it at {q:?}");

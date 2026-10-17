@@ -23,6 +23,12 @@ use crate::layout::Layout;
 #[cfg(target_os = "linux")]
 use crate::layout::Walls;
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum Placement {
+    Hinted((i32, i32)),
+    Cancelled,
+}
+
 #[derive(Default)]
 pub struct Constraints {
     #[cfg(target_os = "linux")]
@@ -35,6 +41,10 @@ pub struct Constraints {
     pointer: (f64, f64),
     #[cfg(target_os = "linux")]
     seen: Option<(i32, i32)>,
+    /// The requested physical point, committed to input state only after
+    /// the compositor activates the lock and its hint has been committed.
+    #[cfg(target_os = "linux")]
+    pending: Option<(i32, i32)>,
 }
 
 impl Constraints {
@@ -69,7 +79,8 @@ impl Constraints {
         #[cfg(target_os = "linux")]
         if let (false, Some(c)) = (self.grabbed, &mut self.wayland) {
             c.move_pointer(wl_pointer::point_in_surface(p, window.scale_factor()));
-            return true;
+            self.pending = c.is_moving().then_some(p);
+            return self.pending.is_some();
         }
         let _ = (window, p);
         false
@@ -94,10 +105,17 @@ impl Constraints {
     /// confines the pointer to the layout's walls (`present`: how the
     /// layout's canvas shows in the window; `inside`: whether the system
     /// pointer is in the window) and tells the layout.
-    pub fn update(&mut self, window: &Window, layout: &mut Layout, present: Option<Present>, inside: bool) {
+    pub fn update(&mut self, window: &Window, layout: &mut Layout, present: Option<Present>, inside: bool) -> Option<Placement> {
         #[cfg(target_os = "linux")]
         if let Some(c) = &mut self.wayland {
             c.dispatch();
+            let placement = c.take_move_result().and_then(|result| self.pending.take().map(|target| match result {
+                wl_pointer::MoveResult::Hinted(_) => {
+                    self.pointer = (target.0 as f64, target.1 as f64);
+                    Placement::Hinted(target)
+                }
+                wl_pointer::MoveResult::Cancelled => Placement::Cancelled,
+            }));
             let at = (self.pointer.0.floor() as i32, self.pointer.1.floor() as i32);
             let pointer = inside.then_some(at);
             if pointer != self.seen {
@@ -106,7 +124,7 @@ impl Constraints {
             }
             let Some(walls) = layout.pointer_walls().filter(|_| !self.grabbed) else {
                 c.unconfine();
-                return;
+                return placement;
             };
             let scale = window.scale_factor();
             let walls: Vec<_> = walls.into_iter().map(|r| in_window(present, r)).collect();
@@ -123,8 +141,10 @@ impl Constraints {
                 c.confine(size, &holes);
             }
             layout.set_walls(if c.is_confined() { Walls::Confined } else { Walls::Open });
+            return placement;
         }
         let _ = (window, layout, present, inside);
+        None
     }
 }
 
