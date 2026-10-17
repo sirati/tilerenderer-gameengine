@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Button, FreeSprite, Input, LayerCells, Patch, Update, View, WorldShape};
+use crate::{Button, FreeSprite, Glyph, Input, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 19;
+pub const VERSION: u32 = 20;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -71,6 +71,23 @@ impl<'a> Reader<'a> {
 }
 
 impl Writer {
+    /// A glyph drawn from outlines, if any: a flag, then its fields.
+    fn glyph(&mut self, g: Option<&Glyph>) {
+        self.bool(g.is_some());
+        let Some(g) = g else { return };
+        self.u32(g.font);
+        self.u32(g.ch as u32);
+        self.u32(g.em64);
+        self.i32(g.advance);
+        self.u8(g.bold as u8 | (g.italic as u8) << 1 | (g.key.is_some() as u8) << 2 | (g.bar.is_some() as u8) << 3);
+        for c in g.key.unwrap_or_default() {
+            self.u8(c);
+        }
+        let (top, height) = g.bar.unwrap_or_default();
+        self.i32(top);
+        self.i32(height);
+    }
+
     fn view(&mut self, v: &View) {
         self.i32(v.camera_x);
         self.i32(v.camera_y);
@@ -111,11 +128,32 @@ impl Writer {
             }
             self.bool(f.not_in_view.is_some());
             self.u32(f.not_in_view.unwrap_or(0));
+            self.glyph(f.glyph.as_ref());
         }
     }
 }
 
 impl Reader<'_> {
+    fn glyph(&mut self) -> Result<Option<Glyph>, WireError> {
+        if !self.bool()? {
+            return Ok(None);
+        }
+        let (font, ch, em64, advance) = (self.u32()?, self.u32()?, self.u32()?, self.i32()?);
+        let style = self.u8()?;
+        let key = [self.u8()?, self.u8()?, self.u8()?];
+        let bar = (self.i32()?, self.i32()?);
+        Ok(Some(Glyph {
+            font,
+            ch: char::from_u32(ch).unwrap_or('?'),
+            em64,
+            advance,
+            bold: style & 1 != 0,
+            italic: style & 2 != 0,
+            key: (style & 4 != 0).then_some(key),
+            bar: (style & 8 != 0).then_some(bar),
+        }))
+    }
+
     fn view(&mut self) -> Result<View, WireError> {
         let (camera_x, camera_y) = (self.i32()?, self.i32()?);
         let zoom = (self.u32()?, self.u32()?);
@@ -158,6 +196,7 @@ impl Reader<'_> {
                         let v = self.u32()?;
                         has.then_some(v)
                     },
+                    glyph: self.glyph()?,
                 })
             })
             .collect()
@@ -520,8 +559,10 @@ mod tests {
         s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false, downscale: 2 };
         s.set(1, 2, 1, 0xABCDEF);
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
-        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, tint: 0x123456, zoom_art: 2, zoom: (3, 2), zoom_offset: (-4, 7), clip: None, not_in_view: Some(3) });
-        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, tint: 0, zoom_art: 0, zoom: (0, 0), zoom_offset: (0, 0), clip: Some([1, -2, 300, 40]), not_in_view: None });
+        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, tint: 0x123456, zoom_art: 2, zoom: (3, 2), zoom_offset: (-4, 7), clip: None, not_in_view: Some(3), glyph: None });
+        s.sprites.push(FreeSprite { x: 7, y: 30, zoom_art: 2, tint: 0xFFFF00, glyph: Some(Glyph { font: 1, ch: 'é', em64: 640, advance: 6, bold: true, italic: false, key: Some([255, 0, 255]), bar: None }), ..Default::default() });
+        s.sprites.push(FreeSprite { x: 13, y: 30, zoom_art: 2, glyph: Some(Glyph { font: 0, ch: ' ', em64: 768, advance: 4, bold: false, italic: true, key: None, bar: Some((1, 2)) }), ..Default::default() });
+        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, tint: 0, zoom_art: 0, zoom: (0, 0), zoom_offset: (0, 0), clip: Some([1, -2, 300, 40]), not_in_view: None, glyph: None });
         s.patches.push(Patch { sprite: "Screen@x/0".into(), width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
         s.focus = Some((-64, 96));
         s.assets = 3;

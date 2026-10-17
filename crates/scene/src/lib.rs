@@ -90,6 +90,31 @@ pub struct FreeSprite {
     /// A world sprite drawn in every view but this one (a view id): what
     /// the driver's own view does not show there, other views do.
     pub not_in_view: Option<u32>,
+    /// A glyph of text drawn from its font's outline instead of the sprite
+    /// (`set` does not matter), in `tint`: zoomed art for every zoom
+    /// (`zoom_art` 2, `zoom` (0, 0)), its pen at the sprite's position on
+    /// the baseline.
+    pub glyph: Option<Glyph>,
+}
+
+/// A glyph drawn from a font's outline (see [`FreeSprite::glyph`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Glyph {
+    /// The font: an index into the render description's fonts.
+    pub font: u32,
+    pub ch: char,
+    /// The em at 1:1 in 64ths of a pixel.
+    pub em64: u32,
+    /// The pen advance at 1:1 in pixels: the glyph is centred in it, scaled.
+    pub advance: i32,
+    /// Emboldened, slanted (a regular face made bold or italic).
+    pub bold: bool,
+    pub italic: bool,
+    /// Drawn onto this colour key (opaque where it differs from it).
+    pub key: Option<[u8; 3]>,
+    /// An underline instead of the glyph: its top below the baseline and
+    /// its height, at 1:1 (`advance` wide).
+    pub bar: Option<(i32, i32)>,
 }
 
 /// One view of the world: where it sits in the window, what it looks at,
@@ -120,7 +145,8 @@ pub struct Scene {
     pub sprites: Vec<FreeSprite>,
     /// By id.
     pub views: Vec<ViewState>,
-    /// The zooms the scene has zoomed art for (see `FreeSprite::zoom_art`).
+    /// The zooms the scene has zoomed art for (see `FreeSprite::zoom_art`);
+    /// (0, 0): every zoom (text drawn from outlines, `FreeSprite::glyph`).
     pub zooms: Vec<(u32, u32)>,
     /// The generation of the art (render assets) the scene's sprite ids
     /// refer to; 0: whatever the renderer has.

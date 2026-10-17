@@ -130,7 +130,7 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
             2 => tile_render::ZoomArt::Zoomed { zoom: (u32::from(s.zoom.0), u32::from(s.zoom.1)), offset: s.zoom_offset },
             _ => tile_render::ZoomArt::Any,
         },
-        text: None,
+        text: s.glyph.and_then(|g| outline_glyph(compiled, &g, s.tint)),
     };
     world.free = scene.sprites.iter().map(|s| placed(s, None)).collect();
     for (v, camera) in scene.views.iter().zip(view_cameras) {
@@ -139,6 +139,27 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
         }
     }
     world
+}
+
+/// A scene's glyph (in `tint`, 0xRRGGBB) as the renderer draws it from its
+/// font's outline; `None` if the description has no such font (a
+/// character the font lacks shows its first glyph, as fonts draw them).
+fn outline_glyph(compiled: &Compiled, g: &scene::Glyph, tint: u32) -> Option<tile_render::OutlineGlyph> {
+    let face = &compiled.fonts.get(g.font as usize)?.1;
+    let shape = match g.bar {
+        Some((top, height)) => tile_render::GlyphShape::Bar { top, height },
+        None => tile_render::GlyphShape::Glyph(face.glyph(g.ch).unwrap_or(0)),
+    };
+    Some(tile_render::OutlineGlyph {
+        font: g.font,
+        shape,
+        em64: g.em64,
+        advance: g.advance,
+        bold: g.bold,
+        italic: g.italic,
+        color: [(tint >> 16) as u8, (tint >> 8) as u8, tint as u8],
+        key: g.key,
+    })
 }
 
 /// The cameras of the scene's views, in its view order, 1:1 (a view's

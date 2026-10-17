@@ -285,6 +285,7 @@ impl Menus {
                 zoom_offset: (0, 0),
                 clip: None,
                 not_in_view: None,
+                glyph: None,
             });
         };
         let text = |font: &Font, s: &str, (x, y): (i32, i32), put: &mut dyn FnMut(Art, (i32, i32))| {

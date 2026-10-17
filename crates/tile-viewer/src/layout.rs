@@ -276,7 +276,8 @@ pub struct Layout {
     /// The world rectangles of the viewer's own views as last told to the
     /// driver.
     reported_views: [(i32, i32, i32, i32); 4],
-    /// Zooms the scene has zoomed art (text) for, from the last frame.
+    /// Zooms the scene has zoomed art (text) for, from the last frame ((0, 0):
+    /// every zoom).
     art_zooms: Vec<(u32, u32)>,
     ctrl: bool,
     shift: bool,
@@ -496,7 +497,7 @@ impl Layout {
 
     /// Whether a view at `zoom` shows the driver's zoomed art.
     fn zoomed_art(&self, zoom: (u32, u32)) -> bool {
-        self.sharp_text && zoom.0 != zoom.1 && self.art_zooms.contains(&zoom)
+        self.sharp_text && zoom.0 != zoom.1 && self.art_zooms.iter().any(|&z| z == zoom || z == (0, 0))
     }
 
     /// A change of mouse capture for the window to make (true: capture and
@@ -1385,6 +1386,19 @@ mod tests {
             Input::MouseButton { button: Button::Left, down: true, x: 10, y: 20 },
             Input::MouseButton { button: Button::Left, down: false, x: 10, y: 20 }
         ]);
+    }
+
+    #[test]
+    fn zoomed_art_for_every_zoom_shows_in_every_zoomed_view() {
+        // Text drawn from outlines: art for every zoom (0, 0); for one zoom
+        // only, other zooms show the 1:1 twins; `text=pixel` none.
+        for (zooms, spec, want) in [(vec![(0, 0)], "main_zoom=3/2", true), (vec![(2, 1)], "main_zoom=3/2", false), (vec![(2, 1)], "main_zoom=2", true), (vec![(0, 0)], "main_zoom=2,text=pixel", false)] {
+            let mut l = Layout::default();
+            l.configure(spec).unwrap();
+            let s = Scene { zooms, ..scene() };
+            let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![[0, 500, 800, 100]], BOUNDS);
+            assert_eq!(f.cameras[0].zoomed_art, want, "{:?} {spec}", s.zooms);
+        }
     }
 
     #[test]
