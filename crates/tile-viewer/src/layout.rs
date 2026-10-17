@@ -3628,7 +3628,7 @@ mod tests {
         // A driver with many views: the viewer leaves out what does not
         // fit (insets last), never more than the renderer draws.
         let mut s = scene();
-        for id in 1..10 {
+        for id in 1..(tile_render::MAX_VIEWS - 6) as u32 {
             let v = View { camera_x: 100 * id as i32, origin: (10 * id as i32, 10), viewport: (40, 30), ..Default::default() };
             s.views.insert(id as usize, ViewState { id, view: v, overlay: vec![] });
         }
