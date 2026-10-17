@@ -353,6 +353,126 @@ fn crosshair(spec: &str) -> Result<RgbaImage, String> {
     Ok(outlined(w, h, color, inside))
 }
 
+/// How a [`panes`] picture divides its screen.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PanesSplit {
+    /// One pane.
+    Standard,
+    /// Side by side, equal widths.
+    Vertical1To1,
+    /// Side by side, the left twice as wide.
+    Vertical2To1,
+    /// One over the other, equal heights.
+    Horizontal1To1,
+}
+
+impl PanesSplit {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "standard" => Self::Standard,
+            "vertical11" => Self::Vertical1To1,
+            "vertical21" => Self::Vertical2To1,
+            "horizontal11" => Self::Horizontal1To1,
+            _ => return None,
+        })
+    }
+}
+
+/// The divider of a `w × h` [`panes`] picture: `Some((true, x))` the column
+/// of a vertical one, `Some((false, y))` the row of a horizontal one.
+fn panes_divider(split: PanesSplit, w: i32, h: i32) -> Option<(bool, i32)> {
+    let (iw, ih) = (w - 2, h - 2);
+    match split {
+        PanesSplit::Standard => None,
+        PanesSplit::Vertical1To1 => Some((true, 1 + iw / 2)),
+        PanesSplit::Vertical2To1 => Some((true, 1 + iw * 2 / 3)),
+        PanesSplit::Horizontal1To1 => Some((false, 1 + ih / 2)),
+    }
+}
+
+/// The panes of a `w × h` [`panes`] picture (inside its frame and apart from
+/// its divider), first pane first: x, y, width, height.
+pub fn panes_rects(split: PanesSplit, (w, h): (u32, u32)) -> Vec<[i32; 4]> {
+    let (w, h) = (w as i32, h as i32);
+    let (iw, ih) = (w - 2, h - 2);
+    match panes_divider(split, w, h) {
+        None => vec![[1, 1, iw, ih]],
+        Some((true, x)) => vec![[1, 1, x - 1, ih], [x + 1, 1, w - 2 - x, ih]],
+        Some((false, y)) => vec![[1, 1, iw, y - 1], [1, y + 1, iw, h - 2 - y]],
+    }
+}
+
+/// The middle of each pane of a [`panes`] picture (where a label goes).
+pub fn panes_centres(split: PanesSplit, size: (u32, u32)) -> Vec<(i32, i32)> {
+    panes_rects(split, size).iter().map(|[x, y, w, h]| (x + w / 2, y + h / 2)).collect()
+}
+
+/// `source = "panes:R,G,B,A:WxH:SPLIT"` or `"…:SPLIT:free"`: a screen
+/// divided into panes, as a small picture for choosing among arrangements:
+/// a one-pixel frame and divider in the colour, clear inside. `SPLIT`:
+/// `standard` (one pane), `vertical11`, `vertical21` (the left twice as
+/// wide), `horizontal11`. `free`: panes that move on their own: the middle
+/// third of the divider left out and small arrows pointing away from each
+/// pane's middle in the four directions ([`panes_centres`]; a label goes
+/// there).
+fn panes(spec: &str) -> Result<RgbaImage, String> {
+    let err = || format!("panes image {spec:?}: expected R,G,B,A:WxH:SPLIT[:free] (SPLIT standard, vertical11, vertical21 or horizontal11; at least 8x8)");
+    let mut parts = spec.splitn(3, ':');
+    let (Some(rgba), Some(size), Some(rest)) = (parts.next(), parts.next(), parts.next()) else { return Err(err()) };
+    let (color, (w, h)) = shape_spec(&format!("{rgba}:{size}"), "panes").map_err(|_| err())?;
+    let (split, free) = match rest.split_once(':') {
+        Some((s, "free")) => (s, true),
+        Some(_) => return Err(err()),
+        None => (rest, false),
+    };
+    let split = PanesSplit::parse(split).ok_or_else(err)?;
+    if w < 8 || h < 8 {
+        return Err(err());
+    }
+    let (wi, hi) = (w as i32, h as i32);
+    let mut img = RgbaImage::from_fn(w, h, |x, y| if x == 0 || y == 0 || x == w - 1 || y == h - 1 { color } else { [0; 4] });
+    let mut put = |x: i32, y: i32| {
+        if x >= 0 && y >= 0 && x < wi && y < hi {
+            img.put(x as u32, y as u32, color);
+        }
+    };
+    match panes_divider(split, wi, hi) {
+        Some((true, x)) => {
+            let (from, to) = (1 + (hi - 2) / 3, 1 + 2 * (hi - 2) / 3);
+            (1..hi - 1).filter(|&y| !free || y < from || y >= to).for_each(|y| put(x, y));
+        }
+        Some((false, y)) => {
+            let (from, to) = (1 + (wi - 2) / 3, 1 + 2 * (wi - 2) / 3);
+            (1..wi - 1).filter(|&x| !free || x < from || x >= to).for_each(|x| put(x, y));
+        }
+        None => {}
+    }
+    if free {
+        // Arrowheads 4 pixels long, their base 8 pixels from the middle,
+        // where the pane has room for them.
+        const BASE: i32 = 8;
+        const LONG: i32 = 4;
+        for [px, py, pw, ph] in panes_rects(split, (w, h)) {
+            let (cx, cy) = (px + pw / 2, py + ph / 2);
+            for (dx, dy) in [(0, -1), (0, 1), (-1, 0), (1, 0)] {
+                let room = if dx != 0 { pw / 2 } else { ph / 2 };
+                if room < BASE + LONG + 1 {
+                    continue;
+                }
+                for k in 0..LONG {
+                    // Row k from the base: half as wide as the head is long, less k.
+                    let along = BASE + k;
+                    for across in -(LONG - 1 - k)..=(LONG - 1 - k) {
+                        let (x, y) = if dx != 0 { (cx + dx * along, cy + across) } else { (cx + across, cy + dy * along) };
+                        put(x, y);
+                    }
+                }
+            }
+        }
+    }
+    Ok(img)
+}
+
 fn shape_spec(spec: &str, kind: &str) -> Result<([u8; 4], (u32, u32)), String> {
     let err = || format!("{kind} image {spec:?}: expected R,G,B,A:WxH (at least 4x4)");
     let (rgba, size) = spec.split_once(':').ok_or_else(err)?;
@@ -562,7 +682,8 @@ impl Description {
             options.extend(self.blank_loader.clone());
             options.extend(image_blank);
         }
-        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 4] = [("solid:", solid), ("line:", line), ("arrow:", arrow), ("crosshair:", crosshair)];
+        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 5] =
+            [("solid:", solid), ("line:", line), ("arrow:", arrow), ("crosshair:", crosshair), ("panes:", panes)];
         let generated = generators.iter().find_map(|(prefix, make)| img.source.strip_prefix(prefix).map(make));
         let image_error = |message: String| DescError::Image { name: name.to_owned(), message };
         Ok(match generated {
@@ -574,7 +695,7 @@ impl Description {
     /// The sizes of image `name`'s frames, without its pixels where the
     /// loader can tell them so (see [`ImageLoader::sizes`]).
     fn frame_sizes(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc) -> Result<Vec<(u32, u32)>, DescError> {
-        let generated = ["solid:", "line:", "arrow:", "crosshair:"].iter().any(|p| img.source.starts_with(p));
+        let generated = ["solid:", "line:", "arrow:", "crosshair:", "panes:"].iter().any(|p| img.source.starts_with(p));
         if generated {
             return Ok(self.load_frames(loader, name, img, false)?.iter().map(|f| (f.width, f.height)).collect());
         }
@@ -1070,6 +1191,36 @@ mod tests {
         assert!(wide(15) > 2 * wide(5));
         assert!(crosshair("1,2,3,255:15x15").unwrap().get(7, 7) == [0; 4]);
         assert!(arrow("1,2,3,4:2x9").is_err());
+    }
+
+    #[test]
+    fn panes_divide_the_frame_and_free_ones_have_arrows_and_a_gap() {
+        let c = [10, 20, 30, 255];
+        let plain = panes("10,20,30,255:100x60:vertical21").unwrap();
+        assert_eq!((plain.width, plain.height), (100, 60));
+        // The frame, the divider at 1 + 98·2/3 = 66, clear panes.
+        assert_eq!([plain.get(0, 0), plain.get(99, 59), plain.get(66, 30), plain.get(66, 1)], [c; 4]);
+        assert_eq!(plain.get(33, 30), [0; 4]);
+        assert_eq!(panes_centres(PanesSplit::Vertical2To1, (100, 60)), [(33, 30), (83, 30)]);
+        assert_eq!(panes_centres(PanesSplit::Vertical1To1, (100, 60)), [(25, 30), (75, 30)]);
+        assert_eq!(panes_centres(PanesSplit::Horizontal1To1, (100, 60)), [(50, 15), (50, 45)]);
+        assert_eq!(panes_centres(PanesSplit::Standard, (100, 60)), [(50, 30)]);
+        let free = panes("10,20,30,255:100x60:horizontal11:free").unwrap();
+        // The divider (row 30) without its middle third (x 33..66).
+        assert_eq!([free.get(10, 30), free.get(80, 30)], [c; 2]);
+        assert_eq!(free.get(50, 30), [0; 4]);
+        // Arrows around the top pane's middle (50, 15), their bases 8 and
+        // their tips 11 pixels out.
+        assert_eq!([free.get(42, 15), free.get(39, 15), free.get(58, 15), free.get(61, 15), free.get(50, 7), free.get(50, 4), free.get(50, 26)], [c; 7]);
+        assert_eq!([free.get(38, 15), free.get(62, 15), free.get(50, 3), free.get(50, 27), free.get(50, 15)], [[0; 4]; 5]);
+        // The head narrows: 7 pixels across at its base, 1 at its tip.
+        assert_eq!((12..=18).filter(|&y| free.get(42, y) == c).count(), 7);
+        assert_eq!((12..=18).filter(|&y| free.get(39, y) == c).count(), 1);
+        let standard = panes("1,1,1,255:40x40:standard:free").unwrap();
+        assert_eq!([standard.get(20, 12), standard.get(20, 28)], [[1, 1, 1, 255]; 2]);
+        assert!(panes("1,1,1,255:40x40:diagonal").is_err());
+        assert!(panes("1,1,1,255:40x40:standard:loose").is_err());
+        assert!(panes("1,1,1,255:4x4:standard").is_err());
     }
 
     struct Checker;
