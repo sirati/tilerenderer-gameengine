@@ -458,6 +458,14 @@ pub struct Snapper {
     /// When the element now snapped to was picked (for the log: how long
     /// the pointer takes to come to rest on it).
     picked: Option<f64>,
+    /// Whether the pointer has reached the element picked, and where it was
+    /// when it was picked (for the log).
+    reached: bool,
+    picked_from: Point,
+    /// Steps taken while snapping and the longest (for the log).
+    steps: u32,
+    longest_step: f64,
+    started: f64,
 }
 
 fn button_index(b: Button) -> usize {
@@ -517,6 +525,7 @@ impl Snapper {
     pub fn enter(&mut self, now: f64, at: Point, targets: &[Target], rates: Rates) {
         *self = Self { pressed: self.pressed, ..Self::default() };
         self.phase = Phase::Snapping;
+        self.started = now;
         self.spring = Spring::at(at);
         self.glide = Glide::at(at);
         self.last = now;
@@ -537,6 +546,10 @@ impl Snapper {
             return vec![];
         }
         let p = (self.spring.pos.0.round(), self.spring.pos.1.round());
+        let took = self.last - self.started;
+        if took > 0.0 {
+            log::debug!("snap: {} steps in {:.2} s ({:.0} a second), the longest {:.0} ms", self.steps, took, self.steps as f64 / took, self.longest_step * 1000.0);
+        }
         let had = self.hovered && self.spring.at_rest();
         self.phase = Phase::Parked(p);
         if had { vec![] } else { vec![Action::Move(p)] }
@@ -605,6 +618,8 @@ impl Snapper {
             return out;
         }
         let dt = (now - self.last).clamp(0.0, MAX_STEP);
+        self.steps += 1;
+        self.longest_step = self.longest_step.max(now - self.last);
         self.last = now;
         self.glide.step(dt);
         self.glide.clamp(window);
@@ -624,6 +639,14 @@ impl Snapper {
         }
         let was_at_rest = self.spring.at_rest();
         self.spring.step(dt, Spring::omega(rates.updates_per_second));
+        if let (Some(t0), false) = (self.picked, self.reached) {
+            // (Got there: no longer short of it, seen from where it came from.)
+            let (t, p, f) = (self.spring.target, self.spring.pos, self.picked_from);
+            if (t.0 - p.0) * (t.0 - f.0) + (t.1 - p.1) * (t.1 - f.1) <= 0.0 {
+                self.reached = true;
+                log::debug!("snap: reached {:?} {:.0} ms after it was picked", self.spring.target, (now - t0) * 1000.0);
+            }
+        }
         if self.spring.settle() {
             if let Some(t0) = self.picked.take().filter(|_| self.snapped.is_some()) {
                 log::debug!("snap: at rest on {:?} {:.0} ms after it was picked (update interval {:.0} ms)", self.spring.target, (now - t0) * 1000.0, 1000.0 / rates.updates_per_second);
@@ -641,6 +664,7 @@ impl Snapper {
         match self.scroll.step(dt) {
             0 => {}
             n => {
+                log::debug!("snap: the list scrolls a notch {}", if n > 0 { "up" } else { "down" });
                 out.push(Action::Wheel { delta: n * NOTCH, at: self.spring.pos });
                 self.scrolled = true;
             }
@@ -664,6 +688,8 @@ impl Snapper {
             self.spring.target = c;
             self.hovered = false;
             self.picked = Some(self.last);
+            self.reached = false;
+            self.picked_from = self.spring.pos;
         }
     }
 

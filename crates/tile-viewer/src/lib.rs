@@ -813,6 +813,7 @@ impl App {
         };
         // Views following something move without input: tell the driver.
         if let Some(views) = self.layout.take_views_change() {
+            log::debug!("viewer: own views now show {views:?}");
             self.display.send_input(Input::Views(views));
         }
         let views_moved = arranged.view_cameras != self.drawn_views;
@@ -1058,6 +1059,7 @@ impl ApplicationHandler for App {
             self.display.send_input(Input::Zooms(zooms));
         }
         if let Some(views) = self.layout.take_views_change() {
+            log::debug!("viewer: own views now show {views:?}");
             self.display.send_input(Input::Views(views));
         }
     }
