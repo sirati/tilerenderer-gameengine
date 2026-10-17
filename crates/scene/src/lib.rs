@@ -163,6 +163,10 @@ pub struct Scene {
     pub settings: Option<viewer_settings::Settings>,
     /// What the driver's interface shows that a renderer may arrange.
     pub interface: Interface,
+    /// What the user can point at and act on in the driver's interface
+    /// (buttons, list entries, lists), for pointer aids such as snapping
+    /// the pointer to buttons.
+    pub interactables: Vec<Interactable>,
 }
 
 /// Parts of the driver's interface a renderer may arrange (all in window
@@ -190,6 +194,34 @@ pub struct Interface {
     /// every view of the renderer's (e.g. the active unit's orders), while
     /// they are shown.
     pub reachable: Option<[i32; 4]>,
+}
+
+/// Something in the driver's interface the user can point at and act on,
+/// in the driver's window pixels (those of `Input` pointer events and of
+/// its interface's overlay).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Interactable {
+    /// x, y, width, height.
+    pub rect: [i32; 4],
+    pub kind: InteractableKind,
+    /// Chosen by the driver, the same while the element is there (e.g. the
+    /// address of a game's control object): a renderer may keep pointing at
+    /// the same element across updates.
+    pub id: u64,
+}
+
+/// What an [`Interactable`] is.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum InteractableKind {
+    /// Pressed with a click (also tabs, check boxes, a menu's entries).
+    #[default]
+    Button,
+    /// An entry of a list (selected with a click).
+    ListItem,
+    /// A list whose entries scroll: `scroll` is the rectangle (x, y, width,
+    /// height) they scroll in, `step` how many pixels they move for one
+    /// wheel notch (`Input::Wheel` with a delta of 120; 0: not known).
+    List { scroll: [i32; 4], step: i32 },
 }
 
 /// The pixels of one atlas sprite (row-major RGBA, its exact size).
@@ -230,6 +262,8 @@ pub enum Update {
     Settings(viewer_settings::Settings),
     /// See [`Scene::interface`].
     Interface(Interface),
+    /// See [`Scene::interactables`] (replaced).
+    Interactables(Vec<Interactable>),
 }
 
 impl Scene {
@@ -292,6 +326,7 @@ impl Scene {
             Update::Zooms(z) => self.zooms = z,
             Update::Settings(s) => self.settings = Some(s),
             Update::Interface(i) => self.interface = i,
+            Update::Interactables(i) => self.interactables = i,
         }
     }
 
@@ -355,6 +390,9 @@ impl Scene {
         }
         if self.interface != old.interface {
             out.push(Update::Interface(self.interface.clone()));
+        }
+        if self.interactables != old.interactables {
+            out.push(Update::Interactables(self.interactables.clone()));
         }
         out
     }

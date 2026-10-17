@@ -15,3 +15,6 @@ winit.workspace = true
 pollster.workspace = true
 log.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+toml = "0.9"

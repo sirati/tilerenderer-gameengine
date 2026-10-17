@@ -473,6 +473,40 @@ fn panes(spec: &str) -> Result<RgbaImage, String> {
     Ok(img)
 }
 
+/// `source = "pointer:R,G,B,A:WxH"`: a mouse pointer (an arrow head
+/// pointing up and left, a tail below it), outlined like `arrow:`, the
+/// outline as translucent as the colour; its tip at pixel (1, 1).
+fn pointer(spec: &str) -> Result<RgbaImage, String> {
+    let (color, (w, h)) = shape_spec(spec, "pointer")?;
+    let (iw, ih) = (w as f64 - 2.0, h as f64 - 2.0);
+    // The head's left edge is upright, its right edge comes down at 45°
+    // (for a pointer as wide as 2/3 of its height), its foot rises to the
+    // right; the tail leaves the foot down and to the right.
+    let head = (ih * 0.72).round();
+    let inside = |x: i32, y: i32| {
+        let (x, y) = (x as f64 - 1.0, y as f64 - 1.0);
+        if x < 0.0 || y < 0.0 || x >= iw || y >= ih {
+            return false;
+        }
+        let in_head = x <= y * iw / head && y <= head - x * head / (4.0 * iw);
+        let tail_from = head * 0.6;
+        let middle = iw * 0.3 + (y - tail_from) * 0.45;
+        let in_tail = y >= tail_from && (x - middle).abs() <= (iw * 0.14).max(1.0);
+        in_head || in_tail
+    };
+    let outline = [0, 0, 0, color[3]];
+    Ok(RgbaImage::from_fn(w, h, |x, y| {
+        let (x, y) = (x as i32, y as i32);
+        if inside(x, y) {
+            color
+        } else if [(-1, 0), (1, 0), (0, -1), (0, 1)].iter().any(|(dx, dy)| inside(x + dx, y + dy)) {
+            outline
+        } else {
+            [0; 4]
+        }
+    }))
+}
+
 fn shape_spec(spec: &str, kind: &str) -> Result<([u8; 4], (u32, u32)), String> {
     let err = || format!("{kind} image {spec:?}: expected R,G,B,A:WxH (at least 4x4)");
     let (rgba, size) = spec.split_once(':').ok_or_else(err)?;
@@ -682,8 +716,8 @@ impl Description {
             options.extend(self.blank_loader.clone());
             options.extend(image_blank);
         }
-        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 5] =
-            [("solid:", solid), ("line:", line), ("arrow:", arrow), ("crosshair:", crosshair), ("panes:", panes)];
+        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 6] =
+            [("solid:", solid), ("line:", line), ("arrow:", arrow), ("crosshair:", crosshair), ("panes:", panes), ("pointer:", pointer)];
         let generated = generators.iter().find_map(|(prefix, make)| img.source.strip_prefix(prefix).map(make));
         let image_error = |message: String| DescError::Image { name: name.to_owned(), message };
         Ok(match generated {
@@ -695,7 +729,7 @@ impl Description {
     /// The sizes of image `name`'s frames, without its pixels where the
     /// loader can tell them so (see [`ImageLoader::sizes`]).
     fn frame_sizes(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc) -> Result<Vec<(u32, u32)>, DescError> {
-        let generated = ["solid:", "line:", "arrow:", "crosshair:", "panes:"].iter().any(|p| img.source.starts_with(p));
+        let generated = ["solid:", "line:", "arrow:", "crosshair:", "panes:", "pointer:"].iter().any(|p| img.source.starts_with(p));
         if generated {
             return Ok(self.load_frames(loader, name, img, false)?.iter().map(|f| (f.width, f.height)).collect());
         }
@@ -1221,6 +1255,23 @@ mod tests {
         assert!(panes("1,1,1,255:40x40:diagonal").is_err());
         assert!(panes("1,1,1,255:40x40:standard:loose").is_err());
         assert!(panes("1,1,1,255:4x4:standard").is_err());
+    }
+
+    #[test]
+    fn pointers_have_their_tip_at_one_one_and_a_translucent_outline() {
+        let p = pointer("255,255,255,128:14x22").unwrap();
+        let white = [255, 255, 255, 128];
+        let edge = [0, 0, 0, 128];
+        // The tip, outlined above and to the left, nothing beyond.
+        assert_eq!(p.get(1, 1), white);
+        assert_eq!((p.get(0, 1), p.get(1, 0)), (edge, edge));
+        assert_eq!((p.get(0, 0), p.get(3, 1)), ([0; 4], [0; 4]));
+        // The head widens downwards, the tail reaches the bottom right of it.
+        let wide = |y: u32| (0..14).filter(|&x| p.get(x, y) == white).count();
+        assert!(wide(12) > wide(4) && wide(4) > wide(1));
+        let last = (0..14).filter(|&x| p.get(x, 20) == white).collect::<Vec<_>>();
+        assert!(!last.is_empty() && last[0] > 4, "{last:?}");
+        assert!(pointer("1,2,3,4:3x9").is_err());
     }
 
     struct Checker;
