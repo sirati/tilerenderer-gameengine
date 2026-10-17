@@ -61,6 +61,11 @@ pub trait ImageLoader {
     fn sizes(&self, source: &str, options: &toml::Table) -> Result<Vec<(u32, u32)>, String> {
         Ok(self.load(source, options)?.iter().map(|f| (f.width, f.height)).collect())
     }
+
+    /// The bytes of font file `source` (see [`Description::fonts`]).
+    fn font(&self, source: &str) -> Result<Vec<u8>, String> {
+        Err(format!("{source}: this loader has no fonts"))
+    }
 }
 
 /// The sprites of one sheet as compiled (named by the compile: the same
@@ -137,6 +142,23 @@ pub struct Description {
     pub sets: BTreeMap<String, SetDesc>,
     #[serde(default)]
     pub layers: Vec<LayerDesc>,
+    /// Font faces text is drawn with from outlines (`tile_render::OutlineGlyph`),
+    /// by name: `[fonts."Lucida Sans"] source = "LSANS.TTF"`, loaded with
+    /// [`ImageLoader::font`]. A face that does not load is left out (logged):
+    /// its text is then not drawn from outlines.
+    #[serde(default)]
+    pub fonts: BTreeMap<String, FontDesc>,
+}
+
+/// A font face (see [`Description::fonts`]).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FontDesc {
+    /// The font file, as the loader finds it.
+    pub source: String,
+    /// The face in a font collection.
+    #[serde(default)]
+    pub index: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -783,6 +805,16 @@ impl Description {
             set_blend.insert(id, blend);
         }
 
+        // Font faces (those that load).
+        let mut fonts = Vec::new();
+        for (name, font) in &self.fonts {
+            let face = loader.font(&font.source).and_then(|data| tile_render::gpu_text::Face::parse(&data, font.index).map_err(|e| e.to_string()));
+            match face {
+                Ok(face) => fonts.push((name.clone(), std::sync::Arc::new(face))),
+                Err(e) => log::warn!("font {name:?} ({}): {e}", font.source),
+            }
+        }
+
         // Layers and their value tables.
         let mut layers = Vec::new();
         let mut values = HashMap::new();
@@ -847,6 +879,7 @@ impl Description {
             values,
             set_ids,
             set_blend,
+            fonts,
         })
     }
 }
@@ -864,6 +897,9 @@ pub struct Compiled {
     values: HashMap<(String, String), u32>,
     set_ids: BTreeMap<String, SpriteSetId>,
     set_blend: HashMap<SpriteSetId, Blend>,
+    /// The font faces that loaded, by name, in the order of
+    /// `TileWorld::fonts` (see [`Compiled::font`]).
+    pub fonts: Vec<(String, std::sync::Arc<tile_render::gpu_text::Face>)>,
 }
 
 impl Compiled {
@@ -882,6 +918,7 @@ impl Compiled {
             values: self.values.clone(),
             set_ids: self.set_ids.clone(),
             set_blend: self.set_blend.clone(),
+            fonts: self.fonts.clone(),
         }
     }
 
@@ -897,6 +934,11 @@ impl Compiled {
         Some((id, self.set_blend.get(&id).copied().unwrap_or_default()))
     }
 
+    /// Font face `name`: its index (`OutlineGlyph::font`) and the face.
+    pub fn font(&self, name: &str) -> Option<(u32, &tile_render::gpu_text::Face)> {
+        self.fonts.iter().position(|(n, _)| n == name).map(|i| (i as u32, &*self.fonts[i].1))
+    }
+
     pub fn layer_index(&self, layer: &str) -> Option<usize> {
         self.layers.iter().position(|l| l.name == layer)
     }
@@ -906,6 +948,7 @@ impl Compiled {
         let grid = Grid { cols, rows, layout: self.layout, wrap_x, wrap_y, step: self.step };
         let mut world = tile_render::TileWorld::new(grid, self.sets.clone());
         world.color = self.color;
+        world.fonts = self.fonts.iter().map(|(_, f)| f.clone()).collect();
         for l in &self.layers {
             world.add_layer(l.clone());
         }
@@ -1034,6 +1077,45 @@ mod tests {
         fn load(&self, source: &str, _: &toml::Table) -> Result<Vec<RgbaImage>, String> {
             let seed = source.len() as u8;
             Ok(vec![RgbaImage::from_fn(40, 20, |x, y| [x as u8, y as u8, seed, 255])])
+        }
+    }
+
+    /// Fonts from the game's folder, where there is a Civ III installation.
+    struct Fonts(std::path::PathBuf);
+    impl ImageLoader for Fonts {
+        fn load(&self, source: &str, options: &toml::Table) -> Result<Vec<RgbaImage>, String> {
+            Checker.load(source, options)
+        }
+        fn font(&self, source: &str) -> Result<Vec<u8>, String> {
+            std::fs::read(self.0.join(source)).map_err(|e| e.to_string())
+        }
+    }
+
+    #[test]
+    fn fonts_that_load_are_kept_by_name() {
+        let d = Description::parse(
+            r#"
+            grid = { layout = "orthogonal", step = [64, 32] }
+            [fonts."Lucida Sans"]
+            source = "LSANS.TTF"
+            [fonts.missing]
+            source = "none.ttf"
+            "#,
+        )
+        .unwrap();
+        // A loader without fonts: none, and the rest compiles.
+        let c = d.compile(&Checker, 256).unwrap();
+        assert!(c.fonts.is_empty() && c.font("Lucida Sans").is_none());
+        let install = std::path::PathBuf::from(std::env::var("CIV3_INSTALL").unwrap_or_else(|_| "/mnt/datasets/winvm/civ3-src/Civilization III Complete".into()));
+        if !install.join("LSANS.TTF").is_file() {
+            return eprintln!("no Civ III installation, skipped");
+        }
+        for c in [d.compile(&Fonts(install.clone()), 256).unwrap(), d.compile_layout(&Fonts(install), 256).unwrap().without_pixels()] {
+            let (index, face) = c.font("Lucida Sans").expect("loaded");
+            assert_eq!(index, 0);
+            assert!(face.glyph('R').is_some());
+            assert!(c.font("missing").is_none());
+            assert_eq!(c.world(2, 2, false, false).fonts.len(), 1);
         }
     }
 
