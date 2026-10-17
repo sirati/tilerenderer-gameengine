@@ -410,7 +410,7 @@ fn interface_rects(compiled: &Compiled, scene: &Scene) -> Vec<[i32; 4]> {
 
 /// Writes run-time sprite pixels into the atlas; patches for sprites the
 /// description does not have (yet) wait for one that has.
-fn apply_patches<'p>(
+pub fn apply_patches<'p>(
     renderer: &mut TileRenderer,
     queue: &wgpu::Queue,
     compiled: &Compiled,
@@ -587,9 +587,8 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         presented: false,
         woken_idle: false,
         cursor_cameras: None,
-        next_frame: None,
+        frame_clock: FrameClock::default(),
         map_drawn: false,
-        frame_interval: DEFAULT_FRAME,
         interface: None,
         profile: profile::env_on("TILE_VIEWER_PROFILE").then(|| profile::Profile::new("viewer", Duration::from_secs(5))),
         received_seq: 0,
@@ -738,11 +737,8 @@ struct App {
     /// The cameras of the frame drawn last (for the latency: the motion
     /// moved them).
     cursor_cameras: Option<Vec<Camera>>,
-    /// When the next frame is due (the animation clock), without updates,
-    /// and how long a frame lasts at most (0: frames as fast as they are
-    /// drawn; see `configure_present`).
-    next_frame: Option<Instant>,
-    frame_interval: Duration,
+    /// Animation/retry timing and the optional maximum presentation rate.
+    frame_clock: FrameClock,
     /// Whether a scene with the world in a view was drawn yet.
     map_drawn: bool,
     /// What the scene's interface covers (`interface_rects`), for the scene
@@ -790,6 +786,179 @@ fn layout_captured_grab(window: &Window) -> bool {
 /// The longest time between frames (the animation clock) where the
 /// display's refresh rate is not known.
 const DEFAULT_FRAME: Duration = Duration::from_millis(16);
+
+/// The animation clock permits immediate input frames unless the user set
+/// a maximum rate. Only a presented frame starts the cap's next interval;
+/// unsuccessful draw attempts merely postpone the next animation retry.
+struct FrameClock {
+    interval: Duration,
+    capped: bool,
+    last_presented: Option<Instant>,
+    next_attempt: Option<Instant>,
+}
+
+impl Default for FrameClock {
+    fn default() -> Self {
+        Self { interval: DEFAULT_FRAME, capped: false, last_presented: None, next_attempt: None }
+    }
+}
+
+impl FrameClock {
+    fn configure(&mut self, interval: Duration, capped: bool) {
+        self.interval = interval;
+        self.capped = capped;
+        // Recompute from the last presentation, so changing or disabling a
+        // cap never retains the previous cap's deadline.
+        self.next_attempt = self.last_presented.map(|at| at + interval);
+    }
+
+    fn allowed(&self, now: Instant) -> bool {
+        !self.capped || self.last_presented.is_none_or(|at| now >= at + self.interval)
+    }
+
+    fn ready(&self, now: Instant, requested: bool) -> bool {
+        self.allowed(now) && (requested || self.next_attempt.is_none_or(|at| now >= at))
+    }
+
+    /// Accepts either a compositor redraw or the viewer's own request.
+    /// Rejected requests leave the presentation and retry clocks alone.
+    fn request(&mut self, now: Instant) -> bool {
+        if !self.allowed(now) {
+            return false;
+        }
+        self.next_attempt = Some(now + self.interval);
+        true
+    }
+
+    fn presented(&mut self, now: Instant) {
+        self.last_presented = Some(now);
+        self.next_attempt = Some(now + self.interval);
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.next_attempt.map(|retry| match (self.capped, self.last_presented) {
+            (true, Some(at)) => retry.max(at + self.interval),
+            _ => retry,
+        })
+    }
+
+    fn wake_at(&self, now: Instant) -> Option<Instant> {
+        if self.interval.is_zero() { None } else { Some(self.deadline().unwrap_or(now + self.interval)) }
+    }
+}
+
+#[cfg(test)]
+mod frame_clock_tests {
+    use super::{Duration, FrameClock, Instant};
+
+    #[test]
+    fn update_and_redraw_storms_obey_the_same_cap() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(4);
+        let mut clock = FrameClock::default();
+        clock.configure(interval, true);
+        let mut presentations = Vec::new();
+        for event in 0..=256 {
+            let now = start + Duration::from_micros(event * 125);
+            // Interleave driver updates and compositor/pointer redraws.
+            let draw = if event % 3 == 0 {
+                clock.ready(now, true) && clock.request(now)
+            } else {
+                clock.request(now)
+            };
+            if draw {
+                presentations.push(now);
+                clock.presented(now);
+            }
+        }
+        assert_eq!(presentations.len(), 9);
+        assert!(presentations.windows(2).all(|pair| pair[1] - pair[0] >= interval));
+    }
+
+    #[test]
+    fn early_redraws_do_not_move_the_deadline() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(10);
+        let mut clock = FrameClock::default();
+        clock.configure(interval, true);
+        clock.presented(start);
+        for millis in 1..10 {
+            let now = start + Duration::from_millis(millis);
+            assert!(!clock.ready(now, true));
+            assert!(!clock.request(now));
+            assert_eq!(clock.wake_at(now), Some(start + interval));
+        }
+        assert!(clock.ready(start + interval, false));
+        assert!(clock.request(start + interval));
+    }
+
+    #[test]
+    fn cap_starts_when_the_frame_is_presented() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(10);
+        let mut clock = FrameClock::default();
+        clock.configure(interval, true);
+        assert!(clock.request(start));
+        let presented = start + Duration::from_millis(3);
+        clock.presented(presented);
+        assert!(!clock.request(start + interval));
+        assert_eq!(clock.wake_at(start + interval), Some(presented + interval));
+        assert!(clock.request(presented + interval));
+    }
+
+    #[test]
+    fn unsuccessful_draws_only_delay_the_animation_retry() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(10);
+        let mut clock = FrameClock::default();
+        clock.configure(interval, true);
+        clock.presented(start);
+        let failed = start + interval;
+        assert!(clock.request(failed));
+        // No presentation followed this request. Avoid a timer spin while
+        // still accepting a new update/redraw before the retry timer.
+        assert_eq!(clock.wake_at(failed), Some(failed + interval));
+        let update = failed + Duration::from_millis(1);
+        assert!(!clock.ready(update, false));
+        assert!(clock.ready(update, true));
+        assert!(clock.request(update));
+        assert_eq!(clock.last_presented, Some(start));
+    }
+
+    #[test]
+    fn cap_changes_recompute_the_deadline_from_the_last_presentation() {
+        let start = Instant::now();
+        let mut clock = FrameClock::default();
+        clock.configure(Duration::from_millis(20), true);
+        clock.presented(start);
+        let now = start + Duration::from_millis(5);
+        clock.configure(Duration::from_millis(10), true);
+        assert_eq!(clock.wake_at(now), Some(start + Duration::from_millis(10)));
+        assert!(!clock.request(now));
+        clock.configure(Duration::from_millis(4), true);
+        assert!(clock.request(now));
+        clock.configure(Duration::from_millis(30), true);
+        assert_eq!(clock.wake_at(now), Some(start + Duration::from_millis(30)));
+        assert!(!clock.request(now));
+    }
+
+    #[test]
+    fn disabling_the_cap_restores_immediate_input_and_uncapped_polling() {
+        let start = Instant::now();
+        let mut clock = FrameClock::default();
+        clock.configure(Duration::from_secs(1), true);
+        clock.presented(start);
+        let now = start + Duration::from_millis(1);
+        clock.configure(Duration::from_millis(16), false);
+        assert!(!clock.ready(now, false));
+        assert!(clock.ready(now, true));
+        assert!(clock.request(now));
+        clock.configure(Duration::ZERO, false);
+        assert_eq!(clock.wake_at(now), None);
+        assert!(clock.ready(now, false));
+        assert!(clock.request(now));
+    }
+}
 
 /// The present mode for `asked` among the surface's `modes`, and how many
 /// frames may be in flight: with vsync one (the cursor drawn here lags as
@@ -843,15 +1012,16 @@ impl App {
         let max_fps = std::env::var("TILE_VIEWER_MAX_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(self.settings.display.max_fps);
         let Some(gpu) = &mut self.gpu else { return };
         let (mode, latency) = present_mode(asked, &gpu.present_modes);
-        // How long a frame lasts at most without updates (the viewer's own
-        // clock): as asked; else the display's refresh with vsync; else
-        // none, frames as fast as they are drawn.
+        // An explicit maximum limits every frame, including input and
+        // scene updates. Otherwise the display's refresh only paces the
+        // animation clock; input can still request a frame immediately.
         let refresh = gpu.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).filter(|&r| r > 0);
-        self.frame_interval = match (max_fps, mode) {
-            (n, _) if n > 0 => Duration::from_secs_f64(1.0 / n as f64),
+        let interval = match (max_fps, mode) {
+            (n, _) if n > 0 => Duration::from_nanos(1_000_000_000u64.div_ceil(u64::from(n))),
             (_, wgpu::PresentMode::Fifo | wgpu::PresentMode::AutoVsync) => refresh.map_or(DEFAULT_FRAME, |mhz| Duration::from_secs_f64(1000.0 / mhz as f64)),
             _ => Duration::ZERO,
         };
+        self.frame_clock.configure(interval, max_fps > 0);
         if (gpu.config.present_mode, gpu.config.desired_maximum_frame_latency) != (mode, latency) {
             gpu.config.present_mode = mode;
             gpu.config.desired_maximum_frame_latency = latency;
@@ -861,7 +1031,9 @@ impl App {
         log::info!(
             "viewer: present {mode:?} (asked {asked:?}; the surface has {:?}), {latency} frame(s) in flight, frames {}",
             gpu.present_modes,
-            if self.frame_interval.is_zero() { "as fast as they are drawn".to_owned() } else { format!("every {:.2} ms at most", self.frame_interval.as_secs_f64() * 1000.0) }
+            if interval.is_zero() { "as fast as they are drawn".to_owned() }
+            else if max_fps > 0 { format!("at most {max_fps} per second") }
+            else { format!("animation every {:.2} ms, input immediately", interval.as_secs_f64() * 1000.0) }
         );
     }
 
@@ -1021,7 +1193,8 @@ impl App {
         }
     }
 
-    /// The pointer moved: if the viewer draws the cursor, a frame at once.
+    /// The pointer moved: if the viewer draws the cursor, request a frame
+    /// immediately. An explicit maximum rate still applies to its draw.
     fn pointer_moved(&mut self) {
         self.pointer_since.get_or_insert_with(Instant::now);
         if self.pointer_hidden() || !self.drawn_cursor.is_empty() {
@@ -1230,6 +1403,11 @@ impl App {
     fn draw(&mut self) {
         // (Measuring: frames that take long.)
         let started = Instant::now();
+        // Compositor redraws and pointer requests must obey the same cap
+        // as scene updates. Receiving input continues while they wait.
+        if !self.frame_clock.request(started) {
+            return;
+        }
         if let Some(p) = &mut self.profile {
             p.round_start();
         }
@@ -1594,6 +1772,7 @@ impl App {
         }
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
+        self.frame_clock.presented(Instant::now());
         mark(&mut self.profile, "present", &mut t);
         if show_fps {
             self.fps.counter.presented(seconds);
@@ -1744,14 +1923,12 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Take what the driver sent (it wakes the loop when it sends), then
-        // redraw: at once for new updates, and on the animation clock's
-        // beat without them. The loop waits for events meanwhile, so the
-        // pointer's are taken (and drawn) the moment they come. Woken for
-        // nothing (some systems' message loops wake the event loop over and
-        // over, e.g. Wine's), it waits for the driver a little instead of
-        // spinning; the window's events wait at most that long.
-        let idle = std::mem::take(&mut self.woken_idle) && self.next_frame.is_some_and(|t| t > Instant::now());
+        // Receive updates and input immediately. Without an explicit cap,
+        // new updates also draw immediately; otherwise the event loop waits
+        // for the next allowed frame while continuing to receive events.
+        // Keep Wine's idle-wake workaround only for uncapped operation.
+        let idle = std::mem::take(&mut self.woken_idle) && !self.frame_clock.capped
+            && self.frame_clock.deadline().is_some_and(|t| t > Instant::now());
         let received = Instant::now();
         let changed = self.display.receive(if idle { IDLE_WAIT } else { Duration::ZERO });
         if let Some(p) = &mut self.profile {
@@ -1776,12 +1953,14 @@ impl ApplicationHandler for App {
         // (Snapping may have put the pointer somewhere, or let go of it.)
         self.apply_layout_requests(event_loop);
         let now = Instant::now();
-        let due = self.next_frame.is_none_or(|t| now >= t);
-        if due {
-            self.next_frame = Some(now + self.frame_interval);
+        let ready = self.frame_clock.ready(now, changed);
+        if ready {
+            // Pace retries even before the first scene arrives or while a
+            // compositor redraw waits. Neither counts as a presentation.
+            self.frame_clock.request(now);
         }
         if let Some(gpu) = &self.gpu {
-            if self.display.scene().seq != 0 && (changed || due) {
+            if self.display.scene().seq != 0 && ready {
                 // Without vsync a frame is drawn now: a redraw request waits
                 // for the compositor's next refresh (on Wayland), which
                 // would cap the frame rate at the display's.
@@ -1794,12 +1973,10 @@ impl ApplicationHandler for App {
                 }
             }
         }
-        // (Frames as fast as they are drawn: the loop does not wait.)
-        if self.frame_interval.is_zero() {
-            event_loop.set_control_flow(ControlFlow::Poll);
-        } else {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame.unwrap_or(now + self.frame_interval)));
-        }
+        event_loop.set_control_flow(match self.frame_clock.wake_at(Instant::now()) {
+            Some(at) => ControlFlow::WaitUntil(at),
+            None => ControlFlow::Poll,
+        });
     }
 }
 
