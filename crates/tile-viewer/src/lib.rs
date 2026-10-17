@@ -589,6 +589,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         cursor_cameras: None,
         next_frame: None,
         map_drawn: false,
+        frame_interval: DEFAULT_FRAME,
         interface: None,
         profile: profile::env_on("TILE_VIEWER_PROFILE").then(|| profile::Profile::new("viewer", Duration::from_secs(5))),
         received_seq: 0,
@@ -623,6 +624,8 @@ struct Gpu {
     /// The surface was configured anew since the last frame (drawn even if
     /// unchanged: the old picture may be gone).
     reconfigured: bool,
+    /// The present modes the surface has.
+    present_modes: Vec<wgpu::PresentMode>,
 }
 
 struct App {
@@ -735,8 +738,11 @@ struct App {
     /// The cameras of the frame drawn last (for the latency: the motion
     /// moved them).
     cursor_cameras: Option<Vec<Camera>>,
-    /// When the next frame is due (the animation clock), without updates.
+    /// When the next frame is due (the animation clock), without updates,
+    /// and how long a frame lasts at most (0: frames as fast as they are
+    /// drawn; see `configure_present`).
     next_frame: Option<Instant>,
+    frame_interval: Duration,
     /// Whether a scene with the world in a view was drawn yet.
     map_drawn: bool,
     /// What the scene's interface covers (`interface_rects`), for the scene
@@ -781,8 +787,22 @@ fn layout_captured_grab(window: &Window) -> bool {
     false
 }
 
-/// The longest time between frames (the animation clock).
-const FRAME: Duration = Duration::from_millis(16);
+/// The longest time between frames (the animation clock) where the
+/// display's refresh rate is not known.
+const DEFAULT_FRAME: Duration = Duration::from_millis(16);
+
+/// The present mode for `asked` among the surface's `modes`, and how many
+/// frames may be in flight: with vsync one (the cursor drawn here lags as
+/// little as it can), else two (the GPU never waits for the next frame).
+fn present_mode(asked: viewer_settings::Present, modes: &[wgpu::PresentMode]) -> (wgpu::PresentMode, u32) {
+    use viewer_settings::Present;
+    let has = |m| modes.contains(&m);
+    match asked {
+        Present::Immediate if has(wgpu::PresentMode::Immediate) => (wgpu::PresentMode::Immediate, 2),
+        Present::Immediate | Present::Mailbox if has(wgpu::PresentMode::Mailbox) => (wgpu::PresentMode::Mailbox, 2),
+        _ => (wgpu::PresentMode::AutoVsync, 1),
+    }
+}
 
 /// How long the event loop waits for the driver when it was woken for
 /// nothing (see `about_to_wait`).
@@ -810,6 +830,37 @@ impl App {
             self.fps = fps::Overlay::default();
         }
         self.settings = settings;
+        self.configure_present();
+    }
+
+    /// The present mode and frame rate the settings ask for
+    /// (`TILE_VIEWER_PRESENT`, `TILE_VIEWER_MAX_FPS` override them): the
+    /// surface configured anew if its mode changes.
+    fn configure_present(&mut self) {
+        let asked = std::env::var("TILE_VIEWER_PRESENT").ok().and_then(|v| viewer_settings::Present::parse(&v)).unwrap_or(self.settings.display.present);
+        let max_fps = std::env::var("TILE_VIEWER_MAX_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(self.settings.display.max_fps);
+        let Some(gpu) = &mut self.gpu else { return };
+        let (mode, latency) = present_mode(asked, &gpu.present_modes);
+        // How long a frame lasts at most without updates (the viewer's own
+        // clock): as asked; else the display's refresh with vsync; else
+        // none, frames as fast as they are drawn.
+        let refresh = gpu.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).filter(|&r| r > 0);
+        self.frame_interval = match (max_fps, mode) {
+            (n, _) if n > 0 => Duration::from_secs_f64(1.0 / n as f64),
+            (_, wgpu::PresentMode::Fifo | wgpu::PresentMode::AutoVsync) => refresh.map_or(DEFAULT_FRAME, |mhz| Duration::from_secs_f64(1000.0 / mhz as f64)),
+            _ => Duration::ZERO,
+        };
+        if (gpu.config.present_mode, gpu.config.desired_maximum_frame_latency) != (mode, latency) {
+            gpu.config.present_mode = mode;
+            gpu.config.desired_maximum_frame_latency = latency;
+            gpu.surface.configure(&gpu.device, &gpu.config);
+            gpu.reconfigured = true;
+        }
+        log::info!(
+            "viewer: present {mode:?} (asked {asked:?}; the surface has {:?}), {latency} frame(s) in flight, frames {}",
+            gpu.present_modes,
+            if self.frame_interval.is_zero() { "as fast as they are drawn".to_owned() } else { format!("every {:.2} ms at most", self.frame_interval.as_secs_f64() * 1000.0) }
+        );
     }
 
     /// Seconds since the viewer started (the snapping pointer's clock).
@@ -1049,8 +1100,10 @@ impl App {
             log::info!("viewer: software renderer, one frame in flight, unchanged frames skipped");
         }
         window.set_visible(true);
-        self.gpu = Some(Gpu { window, surface, device, queue, config, renderer, software, reconfigured: true });
+        let present_modes = surface.get_capabilities(&adapter).present_modes;
+        self.gpu = Some(Gpu { window, surface, device, queue, config, renderer, software, reconfigured: true, present_modes });
         self.update_plan();
+        self.configure_present();
         Ok(())
     }
 
@@ -1717,14 +1770,19 @@ impl ApplicationHandler for App {
         let now = Instant::now();
         let due = self.next_frame.is_none_or(|t| now >= t);
         if due {
-            self.next_frame = Some(now + FRAME);
+            self.next_frame = Some(now + self.frame_interval);
         }
         if let Some(gpu) = &self.gpu {
             if self.display.scene().seq != 0 && (changed || due) {
                 gpu.window.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame.unwrap_or(now + FRAME)));
+        // (Frames as fast as they are drawn: the loop does not wait.)
+        if self.frame_interval.is_zero() {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame.unwrap_or(now + self.frame_interval)));
+        }
     }
 }
 
