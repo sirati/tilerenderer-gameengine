@@ -244,12 +244,13 @@ pub struct Interface {
     /// "City", "Menu"); none: its usual screen over the world. A renderer
     /// may place a named screen in one of its own views.
     pub screen: Option<String>,
-    /// An interface-only view holding a copy of controls that belong with
-    /// whichever of the renderer's views the pointer is in (e.g. a game's
-    /// menu buttons in the top-left corner; the view's `origin` and
-    /// `viewport` are their rectangle). Its overlay duplicates what the
-    /// interface shows there: a renderer draws it only where it moved it
-    /// (and maps pointer input there back to where the driver put it).
+    /// An interface-only view holding controls that belong with whichever
+    /// of the renderer's views the pointer is in (e.g. a game's menu buttons
+    /// in the top-left corner, with the tooltip they show; the view's
+    /// `origin` and `viewport` are their rectangle). The other interface
+    /// views do not have them: a renderer draws this view where it places
+    /// it, where the driver put it if nowhere else (and maps pointer input
+    /// there back to where the driver put it).
     pub roaming: Option<u32>,
     /// An interface-only view holding the open popup (its `origin` and
     /// `viewport` are the popup's rectangle; the other interface views do

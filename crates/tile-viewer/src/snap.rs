@@ -925,7 +925,16 @@ impl SnapInput {
     /// the ghost, then the pointer over it.
     pub fn sprites(&self, compiled: &render_desc::Compiled, scene: &scene::Scene, frame: &crate::layout::Frame, layout: &Layout) -> Vec<tile_render::PlacedSprite> {
         let Some(pointer) = self.snapper.pointer() else { return vec![] };
-        let interface = scene.views.iter().zip(&frame.view_cameras).filter(|(v, _)| v.view.interface_only).filter_map(|(_, c)| *c).last();
+        // (The whole interface's camera, not one of a part drawn elsewhere,
+        // which shows only its rectangle.)
+        let parts = [scene.interface.roaming, scene.interface.popup, scene.interface.screen_view];
+        let interface = scene
+            .views
+            .iter()
+            .zip(&frame.view_cameras)
+            .filter(|(v, _)| v.view.interface_only && !parts.contains(&Some(v.id)))
+            .filter_map(|(_, c)| *c)
+            .last();
         let camera = interface.or_else(|| frame.cameras.iter().position(|c| c.origin == (0, 0) && c.zoom == (1, 1)).map(|c| c as u32)).unwrap_or(0);
         let ((ox, oy), (n, d)) = layout.screen_mapping();
         let to_screen = |(x, y): Point| (((x - ox as f64) * d as f64 / n.max(1) as f64).round() as i32, ((y - oy as f64) * d as f64 / n.max(1) as f64).round() as i32);

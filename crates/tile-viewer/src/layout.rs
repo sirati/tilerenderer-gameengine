@@ -1431,8 +1431,8 @@ impl Layout {
             if Some(m) == main {
                 self.shown.push((fit.hit, head));
             }
-            // (The roaming controls are in the picture already.)
-            for (i, camera) in base.iter().enumerate().filter(|&(i, _)| i != m && Some(i) != roaming) {
+            // (The roaming controls too, where the driver put them.)
+            for (i, camera) in base.iter().enumerate().filter(|&(i, _)| i != m) {
                 let stacked = Camera { stacked: true, hairline: true, zoomed_art: self.zoomed_art(zoom), ..*camera };
                 frame.view_cameras[i] = Some(push(&mut frame, stacked));
             }
@@ -1446,7 +1446,7 @@ impl Layout {
                 self.shown.push((Hit::Main, camera));
             }
         } else {
-            let roaming_shift = self.roaming_shift(main_rect, pane_rect);
+            let roaming_shift = self.roaming_shift(pane_rect);
             let popup_shift = popup.map(|i| self.popup_shift(rect_of(&base[i]), main_rect));
             let screen_shift = screen_part.map(|i| Some(self.screen_shift(rect_of(&base[i]))));
             for (i, (v, camera)) in scene.views.iter().zip(&base).enumerate() {
@@ -1464,8 +1464,7 @@ impl Layout {
                     frame.view_cameras[i] = Some(push(&mut frame, camera));
                     self.shown.push((Hit::Main, camera));
                 } else if let Some(shift) = shift {
-                    // The roaming controls only where they were moved to
-                    // (they are in the interface where the driver put them).
+                    // A part of the interface drawn on its own, where it goes.
                     let Some(d) = shift else { continue };
                     let r = rect_of(camera);
                     self.moved.push(([r[0] + d.0, r[1] + d.1, r[2], r[3]], d));
@@ -1598,14 +1597,15 @@ impl Layout {
         self.side.unwrap_or(Side::A)
     }
 
-    /// How far the driver's roaming controls move: to the same place in the
-    /// active pane as they have in the window (none: they stay).
-    fn roaming_shift(&self, main_rect: [i32; 4], pane_rect: Option<[i32; 4]>) -> Option<(i32, i32)> {
-        let rect = match (self.active_side(), pane_rect) {
-            (Side::B, Some(b)) if self.split.is_some() => b,
-            _ => main_rect,
-        };
-        Some((rect[0], rect[1])).filter(|&d| d != (0, 0))
+    /// How far the driver's roaming controls move: to the same place in B
+    /// as they have in the window while B is the active view; in A they are
+    /// where the driver put them (over a zoom strip too, which lies under
+    /// the interface). They show in the active view only.
+    fn roaming_shift(&self, pane_rect: Option<[i32; 4]>) -> Option<(i32, i32)> {
+        Some(match (self.active_side(), pane_rect) {
+            (Side::B, Some(b)) if self.split.is_some() => (b[0], b[1]),
+            _ => (0, 0),
+        })
     }
 
     /// How far the popup at `rect` moves: with the views' roles `UnitMouse`
@@ -3400,8 +3400,11 @@ mod tests {
         let s = with_parts(None);
         mv(&mut l, (100, 100));
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        // In A they are where the driver put them (in its interface).
-        assert_eq!(f.view_cameras[2], None);
+        // In A they are where the driver put them (the driver's interface
+        // has them no more: only the active view shows them).
+        let c = f.cameras[f.view_cameras[2].unwrap() as usize];
+        assert_eq!((c.origin, c.screen_shift), ((0, 0), (0, 0)));
+        assert_eq!(click(&mut l, (30, 20))[0], Input::MouseButton { button: Button::Left, down: true, x: 30, y: 20 });
         // In B: at B's top-left corner, drawn there; clicks there reach
         // them where the driver has them.
         mv(&mut l, (600, 300));
@@ -3415,10 +3418,12 @@ mod tests {
         assert_eq!(l.active_side(), Side::B);
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (404, 0));
-        // Below a zoom strip, in A too.
+        // With a zoom strip, over it where the driver put them (the strip
+        // lies under the interface).
         let mut l = arranged(&settings(|s| s.zoom = Zoom::TopStrip));
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (0, 154));
+        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (0, 0));
+        assert!(f.view_cameras[2].unwrap() as usize > f.cameras.iter().position(|c| c.zoom == (2, 1)).unwrap());
     }
 
     #[test]

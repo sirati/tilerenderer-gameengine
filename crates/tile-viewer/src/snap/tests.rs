@@ -683,6 +683,16 @@ fn pointers_are_drawn_in_the_interface_view_ghost_below() {
     assert_eq!(sprites[1].set, compiled.set(POINTER_SPRITE).unwrap().0);
     let (px, py) = l.pointer_in_window();
     assert_eq!((sprites[1].x, sprites[1].y), (px, py));
+    // A part of the interface drawn on its own over it (the corner's
+    // buttons, a popup): still in the whole interface's view, not the
+    // part's, which shows only its rectangle.
+    let mut s = s.clone();
+    let part = scene::ViewState { id: 256, view: scene::View { interface_only: true, origin: (0, 0), viewport: (150, 50), ..Default::default() }, overlay: vec![] };
+    s.views.push(part);
+    s.interface.roaming = Some(256);
+    let f = frame(&mut l, &s);
+    let sprites = snap.sprites(&compiled, &s, &f, &l);
+    assert!(sprites.iter().all(|p| p.view == f.view_cameras[1] && p.view.is_some()), "{sprites:?} {:?}", f.view_cameras);
 }
 
 struct NoFiles;
