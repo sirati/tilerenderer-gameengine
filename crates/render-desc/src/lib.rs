@@ -431,6 +431,10 @@ pub struct SheetDesc {
     /// art, in `color` (a ring around a ring); the sprite grows by `width` on
     /// every side, its anchor moves accordingly.
     pub outline: Option<OutlineDesc>,
+    /// Each cell resampled to this size, nearest pixel (e.g. a game's icon
+    /// fitted into a smaller picture); after `outline`. Colour images only
+    /// (`indexed = false`).
+    pub resize: Option<[u32; 2]>,
     /// See [`Description::parse`].
     pub variants: Option<Vec<i64>>,
     /// Cut every frame of the image (`frame` aside), one after the other:
@@ -796,6 +800,13 @@ fn outlined(w: u32, h: u32, color: [u8; 4], inside: impl Fn(i32, i32) -> bool) -
             [0; 4]
         }
     })
+}
+
+/// `image` resampled to `w × h`, nearest pixel (each pixel the source
+/// pixel under its middle).
+fn resize_nearest(image: &RgbaImage, (w, h): (u32, u32)) -> RgbaImage {
+    let (sw, sh) = (image.width as u64, image.height as u64);
+    RgbaImage::from_fn(w, h, |x, y| image.get(((2 * x as u64 + 1) * sw / (2 * w as u64)) as u32, ((2 * y as u64 + 1) * sh / (2 * h as u64)) as u32))
 }
 
 /// The band `width` pixels wide outside `sprite`'s art (its opaque pixels
@@ -1174,11 +1185,26 @@ impl Description {
         if matches!(all, Some(Frames::Indexed { .. })) && sheet.outline.is_some() {
             return Err(err("an indexed image cannot be outlined".into()));
         }
+        if matches!(all, Some(Frames::Indexed { .. })) && sheet.resize.is_some() {
+            return Err(err("an indexed image cannot be resized (indexed = false)".into()));
+        }
+        if sheet.resize.is_some_and(|[w, h]| w == 0 || h == 0) {
+            return Err(err("resized to nothing".into()));
+        }
         let grow = sheet.outline.as_ref().map_or(0, |o| o.width);
-        let (gw, gh) = (cw + 2 * grow, ch + 2 * grow);
-        let shape = |cell: RgbaImage| match &sheet.outline {
-            Some(o) => outline(&cell, o.width, o.color),
-            None => cell,
+        let (gw, gh) = match sheet.resize {
+            Some([w, h]) => (w, h),
+            None => (cw + 2 * grow, ch + 2 * grow),
+        };
+        let shape = |cell: RgbaImage| {
+            let cell = match &sheet.outline {
+                Some(o) => outline(&cell, o.width, o.color),
+                None => cell,
+            };
+            match sheet.resize {
+                Some([w, h]) => resize_nearest(&cell, (w, h)),
+                None => cell,
+            }
         };
         // A cell's pixels and what a view showing the world smaller samples
         // of it: its box (empty if it is all blank) or all of it.
@@ -2192,6 +2218,26 @@ mod tests {
         // Sources differ in length only by the padded value: "b03.pcx" vs "b12.pcx".
         let s = c.atlas.sprites[c.sprite_names.iter().position(|n| n == "B@3/0").unwrap()];
         assert_eq!(c.atlas.pages[s.page as usize].get(s.atlas_x, s.atlas_y)[2], 7);
+    }
+
+    #[test]
+    fn a_sheet_may_resize_its_cells_nearest_pixel() {
+        let text = "grid = { layout = \"orthogonal\", step = [1, 1] }\n\
+            [images.a]\nsource = \"a\"\n\
+            [sheets.icon]\nimage = \"a\"\norigin = [8, 2]\ncell = [8, 4]\ngrid = [1, 1]\nresize = [4, 3]\n\
+            [[layers]]\nname = \"l\"\nsets = [\"icon/0\"]\n";
+        let c = Description::parse(text).unwrap().compile(&Checker, 256).unwrap();
+        let s = c.atlas.sprites[c.sprite_names.iter().position(|n| n == "icon/0").unwrap()];
+        assert_eq!((s.width, s.height), (4, 3));
+        // (Checker's pixels hold their x and y.) Each the source pixel under
+        // its middle: columns 9, 11, 13, 15, rows 2, 4, 5 of the image.
+        let page = &c.atlas.pages[s.page as usize];
+        let got: Vec<(u8, u8)> = (0..3).flat_map(|y| (0..4).map(move |x| (x, y))).map(|(x, y)| page.get(s.atlas_x + x, s.atlas_y + y)).map(|p| (p[0], p[1])).collect();
+        let want: Vec<(u8, u8)> = [2, 4, 5].iter().flat_map(|&y| [9, 11, 13, 15].map(|x| (x, y))).collect();
+        assert_eq!(got, want);
+        // Not of indexed art.
+        let indexed = text.replace("source = \"a\"", "source = \"a.flc\"").replace("origin = [8, 2]", "origin = [0, 0]");
+        assert!(Description::parse(&indexed).unwrap().compile(&Indexed, 256).is_err());
     }
 
     #[test]

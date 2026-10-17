@@ -44,6 +44,7 @@
 //! size = [100, 60]
 //! labels = [{ text = "A", at = [25, 30], style = "icon" },
 //!           { text = "B", at = [75, 30], style = "icon" }]
+//! icons = [{ art = "knob", at = [75, 30] }]   # art centred on a point
 //!
 //! [panels.settings]
 //! size = [1024, 768]
@@ -228,6 +229,18 @@ pub struct ArtDesc {
     pub border: Option<[u8; 3]>,
     #[serde(default)]
     pub labels: Vec<LabelDesc>,
+    /// Other art drawn over it at its own size, centred on a point (e.g. an
+    /// icon in each pane of a picture).
+    #[serde(default)]
+    pub icons: Vec<IconDesc>,
+}
+
+/// Art drawn over other art (`ArtDesc::icons`), its middle at `at`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IconDesc {
+    pub art: String,
+    pub at: [i32; 2],
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -475,6 +488,8 @@ struct Art {
     tint: Option<[u8; 4]>,
     border: Option<[u8; 3]>,
     labels: Vec<Label>,
+    /// Other art drawn over it, centred on these points (`icons`).
+    icons: Vec<(String, (i32, i32))>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -669,7 +684,17 @@ impl Panels {
                 .iter()
                 .map(|l| Label { text: l.text.clone(), at: (l.at[0], l.at[1]), style: l.style.clone(), align: l.align, valign: l.valign })
                 .collect();
-            art.insert(name.clone(), Art { kind, size, slice: a.slice.map(|[l, r]| (l, r)), tint: a.tint, border: a.border, labels });
+            // (Icons are art of their own size, with no icons of theirs.)
+            for i in &a.icons {
+                match desc.art.get(&i.art) {
+                    None => return Err(invalid(what(), &format!("unknown icon art {:?}", i.art))),
+                    Some(icon) if !icon.icons.is_empty() => return Err(invalid(what(), &format!("icon art {:?} has icons itself", i.art))),
+                    Some(icon) if icon.size.is_none() && icon.rect.is_none() => return Err(invalid(what(), &format!("icon art {:?} has no size", i.art))),
+                    Some(_) => {}
+                }
+            }
+            let icons = a.icons.iter().map(|i| (i.art.clone(), (i.at[0], i.at[1]))).collect();
+            art.insert(name.clone(), Art { kind, size, slice: a.slice.map(|[l, r]| (l, r)), tint: a.tint, border: a.border, labels, icons });
         }
         let mut panels = BTreeMap::new();
         for (name, p) in &desc.panels {
@@ -1159,6 +1184,10 @@ impl Drawer<'_> {
             let text = self.values_text(&l.text, 2, false);
             self.text(&text, l.style.as_deref(), TextLook { enabled: true, selected: false, hover: false }, (x + l.at.0, y + l.at.1), l.align, l.valign);
         }
+        for (icon, (cx, cy)) in art.icons.clone() {
+            let Some((iw, ih)) = self.panels.art_named(&icon, self.state).and_then(|a| a.size) else { continue };
+            self.art(&icon, (x + cx - iw as i32 / 2, y + cy - ih as i32 / 2), None);
+        }
     }
 
     /// Text in a style with its point at `at`, aligned so.
@@ -1256,6 +1285,11 @@ mod tests {
         generated = "panes:1,1,1,255:20x10:vertical11"
         size = [20, 10]
         labels = [{ text = "A", at = [5, 5] }]
+        icons = [{ art = "dot", at = [15, 5] }]
+
+        [art.dot]
+        sprite = "Dot/0"
+        size = [4, 2]
 
         [panels.p]
         size = [400, 300]
@@ -1484,6 +1518,8 @@ mod tests {
         assert!(regions.contains(&([1, 1, 50, 20], (200, 100))));
         assert!(regions.contains(&([60, 1, 50, 20], (260, 100))));
         assert!(draws.iter().any(|d| matches!(d, Draw::Element(Element::Sprite { name, at: (225, 145), .. }) if name == "Panel@icon_a/0")));
+        // Its icon centred on its point (15, 5) of it.
+        assert!(draws.iter().any(|d| matches!(d, Draw::Element(Element::Sprite { name, at: (238, 149), .. }) if name == "Dot/0")));
         // The track: its left part and its right end, the knob at 1.0:
         // 110 · 0.2 = 22 in.
         assert!(regions.contains(&([0, 0, 117, 10], (210, 250))));
