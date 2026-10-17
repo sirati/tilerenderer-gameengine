@@ -791,7 +791,15 @@ impl Snapper {
         if self.flight.done(now) && !self.arrived {
             self.arrived = true;
             if let Some(s) = self.snapped {
-                log::debug!("snap: landed on {} at {:?} at {now:.3} s, {:.0} ms after it was picked (flight {:.0} ms)", s.id, self.flight.to, (now - self.picked) * 1000.0, self.flight.duration * 1000.0);
+                log::debug!(
+                    "snap: landed on {} at {:?} at {:.3} s, {:.0} ms after it was picked (flight {:.0} ms; seen by the step at {now:.3} s, {:.0} ms later)",
+                    s.id,
+                    self.flight.to,
+                    self.flight.end().max(self.picked),
+                    (self.flight.end() - self.picked).max(0.0) * 1000.0,
+                    self.flight.duration * 1000.0,
+                    (now - self.flight.end().max(self.picked)) * 1000.0
+                );
                 if !s.capture {
                     // At rest on the element: it shows its hover.
                     out.push(Action::Move(self.flight.to));
