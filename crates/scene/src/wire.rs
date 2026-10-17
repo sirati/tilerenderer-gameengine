@@ -713,6 +713,9 @@ pub struct Assets {
     /// An addition to the description of the generation before (see
     /// `render_desc::Growing`; `roots` as there), not a whole description.
     pub append: bool,
+    /// Index pages to make room for in the atlas (art expected soon, see
+    /// `tile_viewer::Assets::reserve`; 0: none).
+    pub reserve: u32,
 }
 
 pub fn encode_assets(a: &Assets) -> Vec<u8> {
@@ -728,6 +731,7 @@ pub fn encode_assets(a: &Assets) -> Vec<u8> {
     w.u32(a.generation as u32);
     w.u32((a.generation >> 32) as u32);
     w.bool(a.append);
+    w.u32(a.reserve);
     w.0
 }
 
@@ -746,7 +750,8 @@ pub fn decode_assets(bytes: &[u8]) -> Result<Assets, WireError> {
     let description = string(&mut r)?;
     let generation = r.u32()? as u64 | (r.u32()? as u64) << 32;
     let append = r.bool()?;
-    Ok(Assets { description, roots, generation, append })
+    let reserve = r.u32()?;
+    Ok(Assets { description, roots, generation, append, reserve })
 }
 
 #[cfg(test)]
@@ -839,7 +844,7 @@ mod tests {
             Input::Edge { x: 0, y: 0 },
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
-        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], generation: 7, append: true };
+        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], generation: 7, append: true, reserve: 300 };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
         assert_eq!(decode_updates(&[VERSION as u8, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[0xFE, 0, 0, 0]), Err(WireError::Version(0xFE)));
