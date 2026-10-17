@@ -30,7 +30,7 @@
 //! arrow at the point of interest, U puts the driver's whole screen
 //! (interface too) into the main pane of a split instead of over the window,
 //! arrow at the point of interest, T toggles sharp text in zoomed views (text
-//! rasterised at their zoom by the driver, or its pixels scaled), +/− and
+//! drawn at their zoom by the driver's zoomed art, or its pixels scaled), +/− and
 //! Ctrl+wheel zoom what is under
 //! the pointer, 0 resets its zoom, arrows pan it; a middle-button drag pans
 //! a view, Ctrl+Shift+left drag moves an inset (resizes it at its
