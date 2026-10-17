@@ -3,6 +3,7 @@
 //!
 //! Nothing here knows which game it is showing.
 
+mod constraints;
 pub mod cursor;
 pub mod fps;
 mod input;
@@ -548,6 +549,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         cursor_cameras: None,
         next_frame: None,
         map_drawn: false,
+        constraints: constraints::Constraints::default(),
     };
     // The arrangement to start with: the user's settings.
     app.set_settings(load_settings());
@@ -701,6 +703,8 @@ struct App {
     next_frame: Option<Instant>,
     /// Whether a scene with the world in a view was drawn yet.
     map_drawn: bool,
+    /// The system's pointer constraints (Wayland).
+    constraints: constraints::Constraints,
 }
 
 /// What happens to the system pointer once a frame went out after it was
@@ -784,7 +788,7 @@ impl App {
     /// Whether the viewer draws the cursor itself rather than the system:
     /// while the mouse is captured, or the pointer snaps to buttons.
     fn pointer_hidden(&self) -> bool {
-        (self.layout.captured() && !self.machine.edge()) || self.snap.snap_mode_active() || self.unlock_pending.is_some()
+        (self.layout.captured() && !self.machine.edge()) || self.snap.snap_mode_active() || self.unlock_pending.is_some() || self.constraints.moving()
     }
 
     /// The driver's cursor, as long as its scene refers to the art the
@@ -866,7 +870,9 @@ impl App {
         // (The layout's pixels are the driver's: in the window's.)
         if let (Some(p), Some(gpu)) = (warp, &self.gpu) {
             let (x, y) = self.plan.map_or(p, |plan| plan.to_window(p));
-            if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
+            if self.constraints.move_pointer(&gpu.window, (x, y)) {
+                log::debug!("viewer: moving the pointer to {x}, {y} (lock and hint)");
+            } else if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
                 log::debug!("viewer: moving the pointer to {x}, {y}: {e}");
                 // (The divider cannot hold back what it cannot move.)
                 self.layout.pointer_cannot_be_moved();
@@ -912,6 +918,9 @@ impl App {
             }
         }
         self.update_system_pointer(event_loop);
+        if let Some(gpu) = &self.gpu {
+            self.constraints.update(&gpu.window, &mut self.layout, self.plan.map(|p| p.present), self.pointer_inside);
+        }
     }
 
     /// Once a frame went out after the system pointer was moved (see
@@ -963,6 +972,7 @@ impl App {
         // it first shows, e.g. Wine's on Wayland at a default size, places
         // it for that size.)
         let window = Arc::new(event_loop.create_window(attrs.with_visible(false))?);
+        self.constraints.attach(&window);
         let instance = wgpu::Instance::new(tile_render::gpu::instance_descriptor());
         let surface = instance.create_surface(window.clone())?;
         let size = window.inner_size();
@@ -1119,8 +1129,10 @@ impl App {
 
     /// Captures (holds) or releases the mouse (the pointer is hidden and
     /// shown by `update_system_pointer`).
-    fn grab(&self, lock: bool) {
+    fn grab(&mut self, lock: bool) {
         let Some(gpu) = &self.gpu else { return };
+        // (Before winit's: the pointer takes one constraint at a time.)
+        self.constraints.winit_grab(lock);
         use winit::window::CursorGrabMode;
         if lock {
             // Locked where the system can, else kept inside the window.
@@ -1509,6 +1521,7 @@ impl ApplicationHandler for App {
                 self.update_system_pointer(event_loop);
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.constraints.pointer_moved((position.x, position.y));
                 // (In the layout's pixels, the driver's.)
                 self.system_pointer = self.plan.map_or((position.x as i32, position.y as i32), |p| p.to_screen((position.x, position.y)));
                 // At the world's edge the system pointer moves the world

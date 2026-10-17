@@ -10,6 +10,7 @@ members = [
     "crates/gdi-text",
     "crates/gpu-text",
     "crates/wine-unixlib",
+    "crates/wl-pointer",
     "crates/civ3r-native",
     "crates/tile-viewer",
     "crates/viewer-settings",

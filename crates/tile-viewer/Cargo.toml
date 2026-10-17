@@ -16,5 +16,8 @@ pollster.workspace = true
 log.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+wl-pointer = { path = "../wl-pointer" }
+
 [dev-dependencies]
 toml = "0.9"
