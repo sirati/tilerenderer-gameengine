@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Button, FreeSprite, Glyph, Input, LayerCells, Patch, Update, View, WorldShape};
+use crate::{Button, FreeSprite, Glyph, Input, Interactable, InteractableKind, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 20;
+pub const VERSION: u32 = 21;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -291,10 +291,34 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     w.u32(d);
                 }
             }
+            Update::Interactables(items) => {
+                w.u8(10);
+                w.u32(items.len() as u32);
+                for i in items {
+                    for v in i.rect {
+                        w.i32(v);
+                    }
+                    w.u32(i.id as u32);
+                    w.u32((i.id >> 32) as u32);
+                    let (tag, scroll, step) = match i.kind {
+                        InteractableKind::Button => (0, [0; 4], 0),
+                        InteractableKind::ListItem => (1, [0; 4], 0),
+                        InteractableKind::List { scroll, step } => (2, scroll, step),
+                    };
+                    w.u8(tag);
+                    for v in scroll {
+                        w.i32(v);
+                    }
+                    w.i32(step);
+                }
+            }
         }
     }
     w.0
 }
+
+/// Bytes of one encoded [`Interactable`].
+const INTERACTABLE_BYTES: usize = 16 + 8 + 1 + 16 + 4;
 
 /// Decodes a batch of updates.
 pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
@@ -357,6 +381,25 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
             9 => {
                 let n = r.len(8)?;
                 Update::Zooms((0..n).map(|_| Ok((r.u32()?, r.u32()?))).collect::<Result<_, WireError>>()?)
+            }
+            10 => {
+                let n = r.len(INTERACTABLE_BYTES)?;
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                    let id = r.u32()? as u64 | (r.u32()? as u64) << 32;
+                    let tag = r.u8()?;
+                    let scroll = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                    let step = r.i32()?;
+                    let kind = match tag {
+                        0 => InteractableKind::Button,
+                        1 => InteractableKind::ListItem,
+                        2 => InteractableKind::List { scroll, step },
+                        t => return Err(WireError::Tag(t)),
+                    };
+                    items.push(Interactable { rect, kind, id });
+                }
+                Update::Interactables(items)
             }
             t => return Err(WireError::Tag(t)),
         });
@@ -567,6 +610,11 @@ mod tests {
         s.focus = Some((-64, 96));
         s.assets = 3;
         s.zooms = vec![(3, 2)];
+        s.interactables = vec![
+            Interactable { rect: [10, 20, 100, 24], kind: InteractableKind::Button, id: 0x1_0000_0002 },
+            Interactable { rect: [5, 50, 200, 300], kind: InteractableKind::List { scroll: [5, 60, 190, 280], step: 20 }, id: 7 },
+            Interactable { rect: [5, 60, 190, 20], kind: InteractableKind::ListItem, id: 8 },
+        ];
         let mut updates = s.updates_since(&Scene::default());
         updates.push(Update::Cells(vec![(1, 0, 9)]));
         updates.push(Update::View { id: 2, view: None });
