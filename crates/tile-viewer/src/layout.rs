@@ -1130,6 +1130,7 @@ impl Layout {
         let edge = if side == Side::A { g0 } else { g1 - 1 };
         let along = if ta == fa { tb } else { fb + ((tb - fb) as i64 * (edge - fa) as i64 / (ta - fa) as i64) as i32 };
         let open = reachable
+            || self.interface_over_divider(if vertical { (edge, along) } else { (along, edge) })
             || match target {
                 // Into the gap: only where it is open.
                 None => in_span(tb),
@@ -1145,6 +1146,24 @@ impl Layout {
         // A wall: it stays at its side's last pixel and pushes against it.
         self.against = Some(side);
         if vertical { (held, to.1) } else { (to.0, held) }
+    }
+
+    /// Whether window pixel `p` of the divider lies under something of the
+    /// driver's reaching across the gap (its interface where it put it, a
+    /// popup or another part drawn elsewhere, its other world views): the
+    /// pointer is over that there, not over a view, and passes freely
+    /// (e.g. a screen floating over both views, or a popup).
+    fn interface_over_divider(&self, p: (i32, i32)) -> bool {
+        let (Some(((g0, g1), _)), Some(split)) = (self.gap(), self.split) else { return false };
+        if self.fit.is_some() {
+            return false;
+        }
+        let across = |r: &[i32; 4]| match split.axis {
+            Axis::Vertical => r[0] < g0 && r[0] + r[2] > g1,
+            Axis::Horizontal => r[1] < g0 && r[1] + r[3] > g1,
+        };
+        let moved = self.moved.iter().map(|(r, _)| r);
+        self.interface.iter().chain(&self.driver_rects).chain(moved).any(|r| across(r) && inside(*r, p))
     }
 
     /// The region a zoom box goes in: a vertical split's left or right
@@ -3075,6 +3094,40 @@ mod tests {
         l.pointer_gone();
         mv(&mut l, (700, 50));
         assert_eq!((l.pointer, l.side), ((700, 50), Some(Side::B)));
+    }
+
+    #[test]
+    fn the_pointer_crosses_the_divider_where_the_drivers_interface_lies_over_it() {
+        let mut l = split_1to1();
+        // A popup across the divider, low in the window (the divider's
+        // closed lower third), and a screen the driver put across it high up.
+        let mut s = with_parts(None);
+        let part = |id, origin, viewport| scene::ViewState { id, view: scene::View { interface_only: true, origin, viewport, ..Default::default() }, overlay: vec![] };
+        s.views.push(part(257, (300, 450), (450, 100)));
+        s.interface.popup = Some(257);
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![[200, 20, 400, 100]], BOUNDS);
+        // Over the popup: straight across, and clicks reach it there.
+        mv(&mut l, (350, 500));
+        mv(&mut l, (600, 500));
+        assert_eq!((l.pointer, l.side, l.take_warp()), ((600, 500), Some(Side::B), None));
+        assert_eq!(click(&mut l, (600, 500))[0], Input::MouseButton { button: Button::Left, down: true, x: 600, y: 500 });
+        // And back over the screen high up.
+        mv(&mut l, (500, 60));
+        mv(&mut l, (250, 60));
+        assert_eq!((l.pointer, l.side), ((250, 60), Some(Side::A)));
+        // Beside them the wall holds.
+        mv(&mut l, (250, 580));
+        mv(&mut l, (600, 580));
+        assert_eq!(l.pointer, (399, 580));
+        // Over a part only on one side: the wall too.
+        let mut l = split_1to1();
+        let mut s = with_parts(None);
+        s.views.push(part(257, (100, 450), (250, 100)));
+        s.interface.popup = Some(257);
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        mv(&mut l, (300, 500));
+        mv(&mut l, (600, 500));
+        assert_eq!(l.pointer, (399, 500));
     }
 
     #[test]
