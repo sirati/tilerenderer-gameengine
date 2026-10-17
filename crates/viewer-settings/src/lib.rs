@@ -203,8 +203,8 @@ impl Layout {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Input {
-    /// Button snapping (hold Alt): how often the snap target is recomputed
-    /// from the pointer's momentum, per second.
+    /// Button snapping (the Alt mode): how often the mouse's motion picks
+    /// the next element, per second (a move lasts 1.33 of these intervals).
     pub snap_updates_per_second: f32,
     /// How often the translucent target cursor follows, per second.
     pub snap_ghost_fps: f32,

@@ -184,11 +184,10 @@ pub trait SnapMode {
     fn snap_mode_active(&self) -> bool;
 }
 
-/// (Snapping is on while its pointer is out; a persistent snap mode
-/// answers here.)
+/// (The snap mode is on, or its pointer lands after it: `SnapInput::active`.)
 impl SnapMode for crate::snap::SnapInput {
     fn snap_mode_active(&self) -> bool {
-        self.snapper.pointer().is_some()
+        self.active()
     }
 }
 

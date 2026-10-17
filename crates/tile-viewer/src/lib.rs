@@ -395,6 +395,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         error: None,
         snap: snap::SnapInput::default(),
         fps: fps::Overlay::default(),
+        snap_grabbed: false,
         cursor_art: cursor::Art::default(),
         custom_cursors: std::collections::HashMap::new(),
         shown_pointer: None,
@@ -482,8 +483,10 @@ struct App {
     /// the driver sends (`scene::Update::Settings`; the driver keeps and saves
     /// them, e.g. edited on its preferences screen).
     settings: viewer_settings::Settings,
-    /// Button snapping (Alt while the mouse is captured).
+    /// Button snapping (a mode Alt turns on and off), and whether it holds
+    /// the mouse itself (the mouse not captured).
     snap: snap::SnapInput,
+    snap_grabbed: bool,
     /// The frame counter (`settings.display.show_fps`).
     fps: fps::Overlay,
     /// The cursor art kept for the system pointer, the system cursors made
@@ -684,6 +687,31 @@ impl App {
                 self.grab(false);
             }
         }
+        // Button snapping with the mouse not captured holds the mouse itself
+        // (its motion steers the snapping pointer, the system pointer stays
+        // hidden in the window); let go, the system pointer shows where the
+        // snapping pointer ended (moved there above).
+        let snap_grab = self.snap.snap_mode_active() && !self.layout.captured();
+        if snap_grab != self.snap_grabbed {
+            self.snap_grabbed = snap_grab;
+            if snap_grab {
+                if self.unlock_pending == Some(Unlock::Release) {
+                    self.unlock_pending = None;
+                }
+                self.update_system_pointer(event_loop);
+                self.grab(true);
+            } else if !self.layout.captured() && grab != Some(true) {
+                if warp.is_some() {
+                    self.unlock_pending = Some(Unlock::Release);
+                    self.presented = false;
+                    if let Some(gpu) = &self.gpu {
+                        gpu.window.request_redraw();
+                    }
+                } else {
+                    self.grab(false);
+                }
+            }
+        }
         self.update_system_pointer(event_loop);
     }
 
@@ -850,7 +878,6 @@ impl App {
                 }
                 let bounds = world_bounds(&self.compiled, scene);
                 self.layout.grid_step = self.compiled.step;
-                self.layout.set_snapping(self.snap.snapper.snapping());
                 let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
                 self.drawn_frame = Some(arranged.clone());
                 arranged
@@ -871,8 +898,6 @@ impl App {
         }
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
-        // The snapping pointer and its ghost (while snapping, the only cursor).
-        markers.extend(self.snap.sprites(&self.compiled, scene, &arranged, &self.layout));
         markers.extend(divider_sprites(&self.compiled, &arranged.divider));
         // The cursor where the viewer draws it, in a camera of its own on
         // top (only when there is one: the frame is as before otherwise).
@@ -920,7 +945,10 @@ impl App {
             }
             _ => Vec::new(),
         };
-        if !cursor_sprites.is_empty() {
+        // The snapping pointer and its ghost (while snapping, the only
+        // cursor), in the same camera on top, in window pixels.
+        let snap_sprites = if cameras.len() < tile_render::MAX_VIEWS { self.snap.sprites(&self.compiled, cameras.len() as u32) } else { Vec::new() };
+        if !cursor_sprites.is_empty() || !snap_sprites.is_empty() {
             cameras.push(cursor::overlay_camera(window));
         }
         // The frame counter over everything (the cursor too), by a camera of
@@ -935,6 +963,7 @@ impl App {
         }
         let cursor_moved = cursor_sprites != self.drawn_cursor;
         markers.extend_from_slice(&cursor_sprites);
+        markers.extend(snap_sprites);
         let world = self.world.as_mut().expect("built above");
         let own = world.free.len();
         world.free.extend_from_slice(&markers);
@@ -1160,7 +1189,8 @@ impl ApplicationHandler for App {
         for input in self.snap.tick(&mut self.layout, self.display.scene(), now, rates) {
             self.display.send_input(input);
         }
-        self.update_system_pointer(event_loop);
+        // (Snapping may have put the pointer somewhere, or let go of it.)
+        self.apply_layout_requests(event_loop);
         let now = Instant::now();
         let due = self.next_frame.is_none_or(|t| now >= t);
         if due {

@@ -1,33 +1,58 @@
-//! Button snapping: while the mouse is captured, holding Alt makes the
-//! pointer go from one thing of the driver's interface that can be clicked
-//! (`scene::Interactable`: buttons, list entries, lists) to the next rather
-//! than move freely.
+//! Button snapping: a mode in which the pointer goes from one thing of the
+//! driver's interface that can be clicked (`scene::Interactable`: buttons,
+//! list entries, lists) to the next rather than move freely.
 //!
-//! Three pointers take part:
+//! **The mode.** Alt pressed on its own turns it on, on any screen, the
+//! mouse captured or not; it stays on once Alt is let go. Alt again, Esc or
+//! Ctrl (which also lets go of a captured mouse) turn it off. Alt held
+//! with another key is a shortcut for the driver: the driver gets Alt and
+//! the key, and the mode does not come on. While the mode is on its pointer
+//! (and a translucent ghost) are the only cursor ([`SnapInput::active`],
+//! `crate::cursor::SnapMode`): the system pointer and the world cursor are
+//! not shown. The mouse's raw motion steers the pointer; the layout's
+//! divider, its walls and the window's edges (edge scrolling) do not apply
+//! to it: it reaches the interface anywhere in the window, in any view,
+//! the corner's buttons and popups drawn elsewhere included
+//! ([`Layout::moved_parts`]). Turned on again, it goes on from the element
+//! it last rested on (if that is still there), else from the one nearest
+//! the pointer.
 //!
-//! - A hidden one ([`Glide`]), moved by the mouse's raw motion, with
-//!   momentum and friction. It starts on the element snapped to.
-//! - The target: [`Settings::input`]'s `snap_updates_per_second` times a
-//!   second, where the hidden pointer would come to rest under friction is
-//!   worked out, and the element nearest to that point becomes the target.
-//!   A translucent ghost pointer shows at the element the next update would
-//!   pick, `snap_ghost_fps` times a second.
-//! - The visible pointer ([`Spring`]) flies to the target on a damped
-//!   spring (accelerating smoothly, overshooting a little and settling
-//!   back), keeping its speed when the target changes in flight. Only once
-//!   it rests on an element does the driver get the pointer there (the
-//!   element shows its hover), and the hidden pointer starts from there.
+//! **Where it goes.** On Alt it snaps at once to the element nearest the
+//! pointer. Then, at most [`Rates::updates_per_second`] times a second, the
+//! mouse's motion since the last update picks the next element: one lying
+//! within [`CONE`] (45°) of the motion's direction, seen from the element
+//! snapped to, the one most nearly along that direction (the angle weighs
+//! far more than the distance) at about the distance the mouse moved.
+//! Motion shorter than [`DEAD_ZONE`] picks nothing (jitter does not make it
+//! flip); without an element within the cone it stays. The first update
+//! after the mouse rested comes at once.
 //!
-//! In a list that scrolls, the pointer stays on its entry and the list
-//! scrolls instead ([`Scroller`]: wheel notches spread out in time), until
-//! an update lands outside the list. A click clicks the element snapped to.
-//! Releasing Alt (or pressing Ctrl, which lets go of the mouse) leaves the
-//! pointer where it is: clicks go there until the mouse moves again.
+//! **How it moves.** Every move is a flight ([`Flight`]) from where the
+//! pointer is to the element's middle, lasting exactly [`FLIGHT`] update
+//! intervals (1.33: 444 ms at 3 a second): a damped spring (accelerating
+//! smoothly, overshooting a little and settling back, as Apple's) eased
+//! onto the target at its end, so that it lands on it exactly then. A new
+//! target in flight keeps the pointer's velocity and steers it there, the
+//! flight timed anew. It lands also once the mode is turned off; it rests
+//! only on an element. Only at rest does the driver get the pointer there
+//! (the element shows its hover).
 //!
-//! The constants are tuned for the default of 3 updates a second; the
-//! spring's speed follows the configured rate.
+//! **Clicks** go to the element snapped to, never to the world. The view
+//! a click captures the mouse in (the one following the world cursor) is
+//! an element too ([`TargetKind::Capture`], from the layout, not the
+//! driver): clicking it ends the mode and captures the mouse (again).
 //!
-//! [`Settings::input`]: viewer_settings::Settings
+//! **Lists.** On an entry of a list that scrolls, motion up or down that
+//! stays inside the list scrolls it instead, smoothly ([`Scroller`]: wheel
+//! notches spread out in time), the pointer staying on its entry.
+//!
+//! **Leaving.** The pointer lands, then: with the mouse captured it stays
+//! where it is (clicks go there) until the mouse moves, which takes up the
+//! world cursor again; with the mouse free the system pointer shows there.
+//!
+//! [`Layout::moved_parts`]: crate::layout::Layout::moved_parts
+
+use std::f64::consts::PI;
 
 use scene::{Button, Input, Interactable, InteractableKind};
 
@@ -36,49 +61,46 @@ use crate::layout::Layout;
 /// A window position in pixels (fractional while moving).
 pub type Point = (f64, f64);
 
-/// The hidden pointer's friction, per second: once the mouse stops, its
-/// speed falls as `e^(−FRICTION·t)`, so it comes to rest `v / FRICTION`
-/// further on. 6/s: a glide's time constant (1/6 s) is half an update
-/// interval at 3 updates a second, so by the next update a throw has gone
-/// 86 % of its way; a flick of 1200 px/s throws the target 200 px ahead,
-/// a slow, careful move (60 px/s) only 10 px: precise when slow, far when
-/// fast.
-pub const FRICTION: f64 = 6.0;
+/// How long a flight lasts, in update intervals: 4/3 (1.33; 444 ms at 3
+/// updates a second). The next update comes before it lands, so a pointer
+/// kept moving is steered on rather than stopped.
+pub const FLIGHT: f64 = 4.0 / 3.0;
 
-/// How quickly the hidden pointer's speed follows the mouse's (time
-/// constant, seconds). 50 ms: a few mouse reports (125-1000 Hz), so one
-/// jittery report does not throw the target, short against the 333 ms
-/// update interval.
-pub const VELOCITY_SMOOTHING: f64 = 0.05;
+/// The flight's spring: its damping fraction (ζ, SwiftUI's
+/// `dampingFraction`), and when (a fraction of the flight) it first reaches
+/// its target from rest. From rest it overshoots by about
+/// `e^(−πζ/√(1−ζ²))`, 4.6 % at 0.7, a little less as it is eased in.
+pub const DAMPING: f64 = 0.7;
+pub const CROSSING: f64 = 0.5;
+
+/// From this fraction of the flight on the spring is eased onto the target
+/// (smoothstep), landing on it at the flight's end, still.
+pub const SETTLE_FROM: f64 = 0.6;
+
+/// The next element lies within this angle of the mouse's motion (radians).
+pub const CONE: f64 = PI / 4.0;
+
+/// Motion (pixels) an update needs to pick an element: less is jitter.
+pub const DEAD_ZONE: f64 = 12.0;
+
+/// Motion short of twice the dead zone is forgotten after the mouse rested
+/// this long (seconds): slow drift adds up, a nudge long ago does not (nor
+/// the rest of a nudge that picked at once).
+pub const IDLE_RESET: f64 = 0.25;
+
+/// How much an element off the motion's direction is held back: its
+/// distance term times `1 + ANGLE_WEIGHT · (angle / CONE)²` (17 at the
+/// cone's edge, 4.2 at 20°, 1.8 at 10°): one straight ahead wins over one
+/// 20° off unless that is several times nearer.
+pub const ANGLE_WEIGHT: f64 = 16.0;
+
+/// The distance term: how far an element is from the distance the mouse
+/// moved, plus this much of its distance (nearer ones first when equally
+/// far off).
+pub const DISTANCE_WEIGHT: f64 = 0.25;
 
 /// Window pixels per raw mouse count (as an unaccelerated system pointer).
 pub const MOTION_GAIN: f64 = 1.0;
-
-/// The visible pointer's damping fraction (ζ; SwiftUI's `dampingFraction`,
-/// Apple's springs are this model): from rest it overshoots by
-/// `e^(−πζ/√(1−ζ²))`, 2.8 % at 0.75 (9 px on a 300 px jump), and settles
-/// back without a second visible swing.
-pub const DAMPING: f64 = 0.75;
-
-/// When the visible pointer first reaches its target, starting from rest,
-/// in update intervals: 4/3 (444 ms at 3 updates a second). At the next
-/// update it is still moving at over 40 % of its top speed, so a new target
-/// steers it along rather than starting it again.
-pub const ARRIVAL: f64 = 4.0 / 3.0;
-
-/// The visible pointer is at rest within this distance of its target
-/// (pixels) and below [`REST_SPEED`] (pixels a second); it is then put on
-/// the target exactly.
-pub const REST_DISTANCE: f64 = 0.5;
-pub const REST_SPEED: f64 = 10.0;
-
-/// The longest step simulated at once (seconds): a stalled frame does not
-/// make the pointer jump.
-pub const MAX_STEP: f64 = 0.1;
-
-/// The spring's integration step (seconds), well below its period (0.7 s
-/// at 3 updates a second) for semi-implicit Euler to be accurate.
-const SUBSTEP: f64 = 1.0 / 480.0;
 
 /// Wheel notches for a list's scroll are spread out with this time
 /// constant (seconds): what an update asks for is 95 % sent by the next
@@ -95,14 +117,20 @@ pub const DEFAULT_SCROLL_STEP: f64 = 16.0;
 /// One notch, as `Input::Wheel` counts them.
 const NOTCH: i32 = 120;
 
-/// The sprite sets of the snapping pointer and its translucent ghost (the
-/// pointer's tip at the anchor). Without them, the world cursor's art is
-/// drawn and no ghost.
+/// The sprite sets of the snapping pointer and its half-transparent ghost
+/// (the pointer's tip at the anchor): the driver's arrow and its ghost if
+/// the description has them, else the viewer's own.
+pub const ARROW_SPRITE: &str = "Viewer@cursors/0";
+pub const ARROW_GHOST_SPRITE: &str = "Viewer@cursor_ghost/0";
 pub const POINTER_SPRITE: &str = "Viewer@pointer/0";
 pub const GHOST_SPRITE: &str = "Viewer@pointer_ghost/0";
 
+/// The id of the capture view's target (no driver's element has it).
+pub const CAPTURE_ID: u64 = u64::MAX;
+
 const VK_CONTROL: u32 = 0x11;
 const VK_MENU: u32 = 0x12;
+const VK_ESCAPE: u32 = 0x1B;
 
 /// Something to snap to, in window pixels.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -121,6 +149,9 @@ pub enum TargetKind {
     /// A list whose entries scroll in `scroll`, `step` pixels a notch;
     /// snapped to itself only if no entry of it is known.
     List { scroll: [f64; 4], step: f64, has_items: bool },
+    /// The view a click captures the mouse in (`rect`), snapped to at `at`
+    /// (where the world cursor is in it): a click there captures the mouse.
+    Capture { at: Point },
 }
 
 fn inside([x, y, w, h]: [f64; 4], (px, py): Point) -> bool {
@@ -128,7 +159,17 @@ fn inside([x, y, w, h]: [f64; 4], (px, py): Point) -> bool {
 }
 
 impl Target {
+    /// The capture view `rect` (window pixels), the world cursor at `at`.
+    pub fn capture(rect: [i32; 4], at: (i32, i32)) -> Self {
+        let [x, y, w, h] = rect;
+        Self { rect: [x as f64, y as f64, w as f64, h as f64], kind: TargetKind::Capture { at: (at.0 as f64, at.1 as f64) }, id: CAPTURE_ID }
+    }
+
+    /// Where the pointer goes on it.
     pub fn center(&self) -> Point {
+        if let TargetKind::Capture { at } = self.kind {
+            return at;
+        }
         let [x, y, w, h] = self.rect;
         // (Whole pixels: the driver gets them.)
         ((x + w / 2.0).floor(), (y + h / 2.0).floor())
@@ -146,12 +187,16 @@ impl Target {
         !matches!(self.kind, TargetKind::List { has_items: true, .. })
     }
 
+    fn is_capture(&self) -> bool {
+        matches!(self.kind, TargetKind::Capture { .. })
+    }
+
     /// The list it scrolls with (an entry's list, or a list itself).
     fn list(&self, index: usize) -> Option<usize> {
         match self.kind {
             TargetKind::ListItem { list } => list,
             TargetKind::List { .. } => Some(index),
-            TargetKind::Button => None,
+            TargetKind::Button | TargetKind::Capture { .. } => None,
         }
     }
 }
@@ -209,8 +254,8 @@ pub fn targets(items: &[Interactable], mapping: ((i32, i32), (u32, u32)), window
     out
 }
 
-/// The target to snap to from `p`: the nearest (by distance to its
-/// rectangle, then to its middle).
+/// The driver's element to snap to from `p`: the nearest (by distance to
+/// its rectangle, then to its middle). Not the capture view.
 pub fn nearest(targets: &[Target], p: Point) -> Option<usize> {
     let key = |t: &Target| {
         let c = t.center();
@@ -219,7 +264,7 @@ pub fn nearest(targets: &[Target], p: Point) -> Option<usize> {
     targets
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.snappable())
+        .filter(|(_, t)| t.snappable() && !t.is_capture())
         .min_by(|(_, a), (_, b)| {
             let (ka, kb) = (key(a), key(b));
             ka.0.total_cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
@@ -227,118 +272,117 @@ pub fn nearest(targets: &[Target], p: Point) -> Option<usize> {
         .map(|(k, _)| k)
 }
 
-/// The hidden pointer: follows the mouse one to one, keeps the mouse's
-/// speed, and glides on with friction once the mouse stops.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-pub struct Glide {
-    pub pos: Point,
-    /// Pixels a second.
-    pub vel: Point,
-    /// Motion since the last step.
-    moved: Point,
-}
-
-impl Glide {
-    pub fn at(pos: Point) -> Self {
-        Self { pos, ..Default::default() }
+/// The element the mouse's `moved` (pixels since the last update) points
+/// at from `from` (the element snapped to, `current`): within [`CONE`] of
+/// its direction, the angle weighing heavily, at about the distance moved.
+/// None for motion within the [`DEAD_ZONE`], or nothing within the cone.
+pub fn pick(targets: &[Target], from: Point, current: Option<u64>, moved: Point) -> Option<usize> {
+    let reach = moved.0.hypot(moved.1);
+    if reach < DEAD_ZONE {
+        return None;
     }
-
-    /// Raw mouse motion (counts).
-    pub fn push(&mut self, (dx, dy): Point) {
-        let d = (dx * MOTION_GAIN, dy * MOTION_GAIN);
-        self.pos = (self.pos.0 + d.0, self.pos.1 + d.1);
-        self.moved = (self.moved.0 + d.0, self.moved.1 + d.1);
-    }
-
-    /// `dt` seconds on: while the mouse moves, its speed is followed; once
-    /// it stops, the pointer glides.
-    pub fn step(&mut self, dt: f64) {
-        if dt <= 0.0 {
-            return;
-        }
-        let moved = std::mem::take(&mut self.moved);
-        if moved != (0.0, 0.0) {
-            let a = 1.0 - (-dt / VELOCITY_SMOOTHING).exp();
-            let u = (moved.0 / dt, moved.1 / dt);
-            self.vel = (self.vel.0 + (u.0 - self.vel.0) * a, self.vel.1 + (u.1 - self.vel.1) * a);
-        } else {
-            // Exactly: x(t) = x0 + v0 (1 − e^(−kt)) / k.
-            let decay = (-FRICTION * dt).exp();
-            let travel = (1.0 - decay) / FRICTION;
-            self.pos = (self.pos.0 + self.vel.0 * travel, self.pos.1 + self.vel.1 * travel);
-            self.vel = (self.vel.0 * decay, self.vel.1 * decay);
-        }
-    }
-
-    /// Where it comes to rest if the mouse stays still.
-    pub fn rest(&self) -> Point {
-        (self.pos.0 + self.vel.0 / FRICTION, self.pos.1 + self.vel.1 / FRICTION)
-    }
-
-    /// Kept in the window, stopped at its edges.
-    pub fn clamp(&mut self, (w, h): (u32, u32)) {
-        let one = |p: &mut f64, v: &mut f64, size: f64| {
-            let hi = (size - 1.0).max(0.0);
-            if *p < 0.0 || *p > hi {
-                *p = p.clamp(0.0, hi);
-                *v = 0.0;
+    let dir = (moved.0 / reach, moved.1 / reach);
+    targets
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.snappable() && Some(t.id) != current)
+        .filter_map(|(k, t)| {
+            let c = t.center();
+            let d = (c.0 - from.0, c.1 - from.1);
+            let dist = d.0.hypot(d.1);
+            if dist < 1.0 {
+                return None;
             }
-        };
-        one(&mut self.pos.0, &mut self.vel.0, w as f64);
-        one(&mut self.pos.1, &mut self.vel.1, h as f64);
-    }
+            let angle = ((d.0 * dir.0 + d.1 * dir.1) / dist).clamp(-1.0, 1.0).acos();
+            if angle > CONE + 1e-9 {
+                return None;
+            }
+            let off = (dist - reach).abs() + DISTANCE_WEIGHT * dist + 1.0;
+            Some((k, off * (1.0 + ANGLE_WEIGHT * (angle / CONE).powi(2))))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(k, _)| k)
 }
 
-/// The visible pointer: a damped spring pulling it to its target.
+/// The angle (degrees) between `moved` and the way from `from` to `to`.
+fn degrees(from: Point, to: Point, moved: Point) -> f64 {
+    let d = (to.0 - from.0, to.1 - from.1);
+    let n = d.0.hypot(d.1) * moved.0.hypot(moved.1);
+    if n == 0.0 { 0.0 } else { ((d.0 * moved.0 + d.1 * moved.1) / n).clamp(-1.0, 1.0).acos().to_degrees() }
+}
+
+/// The visible pointer's way to its target: from `from` at `vel` (pixels a
+/// second) at time `start`, landing on `to` exactly `duration` seconds
+/// later, still. A damped spring ([`DAMPING`], first reaching the target
+/// at [`CROSSING`] of the way from rest), eased onto the target from
+/// [`SETTLE_FROM`] on; the starting velocity carries on and dies out the
+/// same way.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
-pub struct Spring {
-    pub pos: Point,
+pub struct Flight {
+    pub from: Point,
     pub vel: Point,
-    pub target: Point,
+    pub to: Point,
+    pub start: f64,
+    pub duration: f64,
 }
 
-impl Spring {
-    pub fn at(pos: Point) -> Self {
-        Self { pos, vel: (0.0, 0.0), target: pos }
+/// The flight's shape at `u` (0..1 of its time): how much of the way from
+/// `from` is left (`F`), how much of the starting velocity's travel
+/// (`G`, in flight times), and their rates (per flight time).
+fn shape(u: f64) -> (f64, f64, f64, f64) {
+    let root = (1.0 - DAMPING * DAMPING).sqrt();
+    let omega = (PI - DAMPING.acos()) / (root * CROSSING);
+    let (a, wd) = (DAMPING * omega, omega * root);
+    let e = (-a * u).exp();
+    let (sin, cos) = (wd * u).sin_cos();
+    let s = e * (cos + a / wd * sin);
+    let s_rate = -e * omega * omega / wd * sin;
+    let q = e * sin / wd;
+    let q_rate = e * (cos - a / wd * sin);
+    let v = ((u - SETTLE_FROM) / (1.0 - SETTLE_FROM)).clamp(0.0, 1.0);
+    let m = 1.0 - v * v * (3.0 - 2.0 * v);
+    let m_rate = -6.0 * v * (1.0 - v) / (1.0 - SETTLE_FROM);
+    (s * m, s_rate * m + s * m_rate, q * m, q_rate * m + q * m_rate)
+}
+
+impl Flight {
+    /// At rest at `at`.
+    pub fn rest(at: Point) -> Self {
+        Self { from: at, vel: (0.0, 0.0), to: at, start: 0.0, duration: 0.0 }
     }
 
-    /// The natural frequency (rad/s) at which a spring with [`DAMPING`]
-    /// starting from rest first reaches its target after [`ARRIVAL`] update
-    /// intervals: the step response crosses 1 at `ω_d·t = π − acos ζ`.
-    pub fn omega(updates_per_second: f64) -> f64 {
-        let arrival = ARRIVAL / updates_per_second;
-        (std::f64::consts::PI - DAMPING.acos()) / ((1.0 - DAMPING * DAMPING).sqrt() * arrival)
+    /// When it lands.
+    pub fn end(&self) -> f64 {
+        self.start + self.duration
     }
 
-    /// `dt` seconds on at natural frequency `omega`.
-    pub fn step(&mut self, dt: f64, omega: f64) {
-        let n = (dt / SUBSTEP).ceil().max(1.0) as u32;
-        let h = dt / n as f64;
-        for _ in 0..n {
-            let accel = |x: f64, v: f64, t: f64| omega * omega * (t - x) - 2.0 * DAMPING * omega * v;
-            self.vel.0 += accel(self.pos.0, self.vel.0, self.target.0) * h;
-            self.vel.1 += accel(self.pos.1, self.vel.1, self.target.1) * h;
-            self.pos.0 += self.vel.0 * h;
-            self.pos.1 += self.vel.1 * h;
-        }
+    pub fn done(&self, now: f64) -> bool {
+        now >= self.end()
     }
 
-    /// Whether it is (as good as) still on its target; then it is put
-    /// there exactly.
-    pub fn settle(&mut self) -> bool {
-        let off = (self.target.0 - self.pos.0).hypot(self.target.1 - self.pos.1);
-        let speed = self.vel.0.hypot(self.vel.1);
-        if off < REST_DISTANCE && speed < REST_SPEED {
-            self.pos = self.target;
-            self.vel = (0.0, 0.0);
-            true
-        } else {
-            false
-        }
+    fn progress(&self, now: f64) -> Option<f64> {
+        (self.duration > 0.0 && now < self.end()).then(|| ((now - self.start) / self.duration).max(0.0))
     }
 
-    fn at_rest(&self) -> bool {
-        self.pos == self.target && self.vel == (0.0, 0.0)
+    pub fn position(&self, now: f64) -> Point {
+        let Some(u) = self.progress(now) else { return self.to };
+        let (f, _, g, _) = shape(u);
+        let d = self.duration;
+        (self.to.0 + (self.from.0 - self.to.0) * f + self.vel.0 * d * g, self.to.1 + (self.from.1 - self.to.1) * f + self.vel.1 * d * g)
+    }
+
+    /// Pixels a second.
+    pub fn velocity(&self, now: f64) -> Point {
+        let Some(u) = self.progress(now) else { return (0.0, 0.0) };
+        let (_, f_rate, _, g_rate) = shape(u);
+        let d = self.duration;
+        ((self.from.0 - self.to.0) * f_rate / d + self.vel.0 * g_rate, (self.from.1 - self.to.1) * f_rate / d + self.vel.1 * g_rate)
+    }
+
+    /// From where it is at `now`, at the speed it has, to `to` in
+    /// `duration` seconds.
+    pub fn retarget(&mut self, to: Point, now: f64, duration: f64) {
+        *self = Self { from: self.position(now), vel: self.velocity(now), to, start: now, duration };
     }
 }
 
@@ -394,6 +438,9 @@ pub enum Action {
     Move(Point),
     Button { button: Button, down: bool, at: Point },
     Wheel { delta: i32, at: Point },
+    /// The capture view was clicked: the mode ends, the mouse is captured
+    /// at this point.
+    Capture(Point),
 }
 
 /// The element snapped to.
@@ -405,14 +452,18 @@ struct Snapped {
     /// Whether it is a list's entry (the pointer stays while the list
     /// scrolls under it).
     entry: bool,
+    capture: bool,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 enum Phase {
     #[default]
     Off,
+    /// The mode is on.
     Snapping,
-    /// Left snapping: the pointer stays here until the mouse moves.
+    /// The mode was turned off in flight: the pointer lands.
+    Landing,
+    /// Landed after the mode: the pointer stays here until the mouse moves.
     Parked(Point),
 }
 
@@ -427,6 +478,11 @@ impl Rates {
     pub fn of(input: &viewer_settings::Input) -> Self {
         Self { updates_per_second: (input.snap_updates_per_second as f64).clamp(0.5, 60.0), ghost_fps: (input.snap_ghost_fps as f64).clamp(1.0, 240.0) }
     }
+
+    /// How long a flight lasts (seconds).
+    pub fn flight(&self) -> f64 {
+        FLIGHT / self.updates_per_second
+    }
 }
 
 impl Default for Rates {
@@ -440,32 +496,36 @@ impl Default for Rates {
 #[derive(Clone, Debug, Default)]
 pub struct Snapper {
     phase: Phase,
-    glide: Glide,
-    spring: Spring,
+    flight: Flight,
+    /// The visible pointer as of the last step.
+    pos: Point,
     snapped: Option<Snapped>,
     ghost: Option<Point>,
-    /// Whether the driver has the pointer where the visible one rests.
-    hovered: bool,
+    /// The flight landed and the driver has the pointer there (or a click
+    /// put it there).
+    arrived: bool,
+    /// Mouse motion since the last update (pixels), whether some came since
+    /// the last step, and how long none has come.
+    moved: Point,
+    moving: bool,
+    idle: f64,
     next_update: f64,
     next_ghost: f64,
     last: f64,
+    rates: Rates,
     scroll: Scroller,
     /// Notches were sent: once they are all out, the driver gets the
     /// pointer again (what is under it now shows its hover).
     scrolled: bool,
     /// Where each button's press went.
     pressed: [Option<Point>; 3],
-    /// When the element now snapped to was picked (for the log: how long
-    /// the pointer takes to come to rest on it).
-    picked: Option<f64>,
-    /// Whether the pointer has reached the element picked, and where it was
-    /// when it was picked (for the log).
-    reached: bool,
-    picked_from: Point,
-    /// Steps taken while snapping and the longest (for the log).
-    steps: u32,
-    longest_step: f64,
-    started: f64,
+    /// The driver's element the pointer last rested on (kept across modes:
+    /// the next one goes on from it).
+    rested: Option<u64>,
+    /// Where it parked, until [`Snapper::take_parked`].
+    parked: Option<Point>,
+    /// When the element now snapped to was picked (for the log).
+    picked: f64,
 }
 
 fn button_index(b: Button) -> usize {
@@ -488,14 +548,20 @@ enum Choice {
 }
 
 impl Snapper {
+    /// The mode is on.
     pub fn snapping(&self) -> bool {
         self.phase == Phase::Snapping
     }
 
-    /// The visible pointer, while snapping or left where snapping ended.
+    /// The snapping pointer is the pointer: the mode is on, or it lands.
+    pub fn holds_pointer(&self) -> bool {
+        matches!(self.phase, Phase::Snapping | Phase::Landing)
+    }
+
+    /// The visible pointer, while snapping, landing or parked.
     pub fn pointer(&self) -> Option<Point> {
         match self.phase {
-            Phase::Snapping => Some(self.spring.pos),
+            Phase::Snapping | Phase::Landing => Some(self.pos),
             Phase::Parked(p) => Some(p),
             Phase::Off => None,
         }
@@ -508,68 +574,112 @@ impl Snapper {
 
     /// The point snapped to (where the visible pointer is headed).
     pub fn target(&self) -> Option<Point> {
-        self.snapped.filter(|_| self.snapping()).map(|_| self.spring.target)
+        self.snapped.filter(|_| self.holds_pointer()).map(|_| self.flight.to)
     }
 
-    /// The hidden pointer.
-    pub fn glide(&self) -> &Glide {
-        &self.glide
+    /// The id of the element snapped to.
+    pub fn target_id(&self) -> Option<u64> {
+        self.snapped.filter(|_| self.holds_pointer()).map(|s| s.id)
     }
 
-    pub fn spring(&self) -> &Spring {
-        &self.spring
+    pub fn flight(&self) -> &Flight {
+        &self.flight
     }
 
-    /// Starts snapping at time `now` with the pointer at `at`: it snaps to
-    /// the element nearest to it at once.
+    /// The driver's element the pointer last rested on.
+    pub fn rested(&self) -> Option<u64> {
+        self.rested
+    }
+
+    /// Where the pointer parked (landed after the mode), once.
+    pub fn take_parked(&mut self) -> Option<Point> {
+        self.parked.take()
+    }
+
+    /// Turns the mode on at time `now`, the pointer at `at`: it goes on
+    /// from the element it last rested on if that is still there (from
+    /// there), else it flies to the one nearest `at` at once (the capture
+    /// view if there is no other).
     pub fn enter(&mut self, now: f64, at: Point, targets: &[Target], rates: Rates) {
-        *self = Self { pressed: self.pressed, ..Self::default() };
+        *self = Self { pressed: self.pressed, rested: self.rested, ..Self::default() };
         self.phase = Phase::Snapping;
-        self.started = now;
-        self.spring = Spring::at(at);
-        self.glide = Glide::at(at);
+        self.rates = rates;
         self.last = now;
-        if let Some(k) = nearest(targets, at) {
-            self.snap_to(targets, k);
-            // The hidden pointer starts on the element snapped to.
-            self.glide.pos = self.spring.target;
+        self.pos = at;
+        self.flight = Flight::rest(at);
+        let resume = self.rested.and_then(|id| targets.iter().position(|t| t.id == id && !t.is_capture() && t.snappable()));
+        if let Some(k) = resume {
+            self.pos = targets[k].center();
+            self.flight = Flight::rest(self.pos);
         }
-        self.ghost = Some(self.spring.target);
-        self.next_update = now + 1.0 / rates.updates_per_second;
+        let k = resume.or_else(|| nearest(targets, at)).or_else(|| targets.iter().position(Target::is_capture));
+        match k {
+            Some(k) => {
+                log::debug!("snap: on at {now:.3} s from {at:?}, {} {}", if resume.is_some() { "back on" } else { "nearest" }, targets[k].id);
+                self.snap_to(targets, k, now);
+            }
+            None => log::debug!("snap: on at {now:.3} s from {at:?}, nothing to snap to"),
+        }
+        self.ghost = Some(self.flight.to);
+        // (The first motion past the dead zone picks at once.)
+        self.next_update = now;
         self.next_ghost = now + 1.0 / rates.ghost_fps;
     }
 
-    /// Stops snapping, the pointer staying where it is: what the driver
-    /// gets (the pointer there, unless it has it already).
+    /// Turns the mode off: the pointer lands (on the capture view: the
+    /// world cursor is the pointer again at once). What the driver gets.
     pub fn leave(&mut self) -> Vec<Action> {
         if !self.snapping() {
             return vec![];
         }
-        let p = (self.spring.pos.0.round(), self.spring.pos.1.round());
-        let took = self.last - self.started;
-        if took > 0.0 {
-            log::debug!("snap: {} steps in {:.2} s ({:.0} a second), the longest {:.0} ms", self.steps, took, self.steps as f64 / took, self.longest_step * 1000.0);
+        self.ghost = None;
+        match self.snapped {
+            Some(s) if !s.capture => {
+                if self.flight.done(self.last) {
+                    let moved = !self.arrived;
+                    self.park();
+                    if moved {
+                        return vec![Action::Move(self.flight.to)];
+                    }
+                } else {
+                    self.phase = Phase::Landing;
+                }
+            }
+            _ => self.phase = Phase::Off,
         }
-        let had = self.hovered && self.spring.at_rest();
+        vec![]
+    }
+
+    fn park(&mut self) {
+        let p = self.flight.to;
         self.phase = Phase::Parked(p);
-        if had { vec![] } else { vec![Action::Move(p)] }
+        self.pos = p;
+        self.arrived = true;
+        self.parked = Some(p);
+        if let Some(s) = self.snapped.filter(|s| !s.capture) {
+            self.rested = Some(s.id);
+        }
+        log::debug!("snap: off, the pointer stays at {p:?}");
     }
 
     /// Nothing more to do (the mouse was let go, or moved after snapping).
     pub fn stop(&mut self) {
         self.phase = Phase::Off;
         self.ghost = None;
+        self.parked = None;
     }
 
-    /// Raw mouse motion: moves the hidden pointer while snapping (true);
-    /// a pointer left by snapping is taken up by the mouse again (false:
-    /// the motion is the mouse's as usual).
+    /// Raw mouse motion: steers the pointer while snapping (true; dropped
+    /// while it lands); a pointer left by snapping is taken up by the mouse
+    /// again (false: the motion is the mouse's as usual).
     pub fn motion(&mut self, d: Point) -> bool {
         match self.phase {
             Phase::Snapping => {
-                self.glide.push(d);
+                self.moved = (self.moved.0 + d.0 * MOTION_GAIN, self.moved.1 + d.1 * MOTION_GAIN);
+                self.moving = true;
                 true
             }
+            Phase::Landing => true,
             Phase::Parked(_) => {
                 self.phase = Phase::Off;
                 false
@@ -579,23 +689,33 @@ impl Snapper {
     }
 
     /// A button: while snapping it goes to the element snapped to (the
-    /// pointer put there), where snapping ended to that point; a release
-    /// goes where its press went. `None`: not the snapping pointer's.
+    /// pointer put there), where the pointer parked to that point; a
+    /// release goes where its press went. Nothing snapped to: nothing (never
+    /// the world). `None`: not the snapping pointer's.
     pub fn click(&mut self, button: Button, down: bool) -> Option<Vec<Action>> {
         let b = button_index(button);
         if !down {
             return self.pressed[b].take().map(|at| vec![Action::Button { button, down, at }]);
         }
         let at = match self.phase {
-            Phase::Snapping => {
-                let at = if self.snapped.is_some() { self.spring.target } else { (self.spring.pos.0.round(), self.spring.pos.1.round()) };
-                // On the element now, and the hidden pointer from there.
-                self.spring = Spring::at(at);
-                self.glide = Glide::at(at);
-                self.hovered = true;
-                self.ghost = Some(at);
-                at
-            }
+            Phase::Snapping | Phase::Landing => match self.snapped {
+                Some(s) if s.capture => return Some(vec![Action::Capture(self.flight.to)]),
+                Some(s) => {
+                    // On the element now.
+                    let at = self.flight.to;
+                    self.flight = Flight::rest(at);
+                    self.pos = at;
+                    self.arrived = true;
+                    self.rested = Some(s.id);
+                    if self.phase == Phase::Landing {
+                        self.park();
+                    } else {
+                        self.ghost = Some(at);
+                    }
+                    at
+                }
+                None => return Some(vec![]),
+            },
             Phase::Parked(p) => p,
             Phase::Off => return None,
         };
@@ -603,142 +723,147 @@ impl Snapper {
         Some(vec![Action::Move(at), Action::Button { button, down, at }])
     }
 
-    /// A wheel turn goes where the visible pointer is. `None`: not the
-    /// snapping pointer's.
+    /// A wheel turn goes to the element snapped to, or where the pointer
+    /// parked. `None`: not the snapping pointer's.
     pub fn wheel(&mut self, delta: i32) -> Option<Vec<Action>> {
-        let at = self.pointer()?;
-        Some(vec![Action::Wheel { delta, at: (at.0.round(), at.1.round()) }])
+        match self.phase {
+            Phase::Snapping | Phase::Landing => Some(match self.snapped {
+                Some(s) if !s.capture => vec![Action::Wheel { delta, at: self.flight.to }],
+                _ => vec![],
+            }),
+            Phase::Parked(p) => Some(vec![Action::Wheel { delta, at: p }]),
+            Phase::Off => None,
+        }
     }
 
-    /// Time `now` (in `window`, `targets` as they are now): the pointers
-    /// move on, updates and the ghost come when due, the list scrolls.
-    pub fn tick(&mut self, now: f64, targets: &[Target], window: (u32, u32), rates: Rates) -> Vec<Action> {
+    /// Time `now` (`targets` as they are now): the pointer moves on, an
+    /// update and the ghost come when due, the list scrolls.
+    pub fn tick(&mut self, now: f64, targets: &[Target], rates: Rates) -> Vec<Action> {
         let mut out = Vec::new();
-        if !self.snapping() {
+        if !self.holds_pointer() {
             return out;
         }
-        let dt = (now - self.last).clamp(0.0, MAX_STEP);
-        self.steps += 1;
-        self.longest_step = self.longest_step.max(now - self.last);
+        self.rates = rates;
+        let dt = (now - self.last).max(0.0);
         self.last = now;
-        self.glide.step(dt);
-        self.glide.clamp(window);
-        self.track(targets);
-        if now >= self.next_update {
-            self.update(targets);
-            let interval = 1.0 / rates.updates_per_second;
-            self.next_update = (self.next_update + interval).max(now);
-        }
-        if now >= self.next_ghost {
-            self.ghost = Some(match self.choose(targets) {
-                Choice::Snap(k) => targets[k].center(),
-                Choice::Scroll { .. } | Choice::Nothing => self.spring.target,
-            });
-            let interval = 1.0 / rates.ghost_fps;
-            self.next_ghost = (self.next_ghost + interval).max(now);
-        }
-        let was_at_rest = self.spring.at_rest();
-        self.spring.step(dt, Spring::omega(rates.updates_per_second));
-        if let (Some(t0), false) = (self.picked, self.reached) {
-            // (Got there: no longer short of it, seen from where it came from.)
-            let (t, p, f) = (self.spring.target, self.spring.pos, self.picked_from);
-            if (t.0 - p.0) * (t.0 - f.0) + (t.1 - p.1) * (t.1 - f.1) <= 0.0 {
-                self.reached = true;
-                log::debug!("snap: reached {:?} {:.0} ms after it was picked", self.spring.target, (now - t0) * 1000.0);
+        if std::mem::take(&mut self.moving) {
+            self.idle = 0.0;
+        } else {
+            self.idle += dt;
+            // (A move on, beyond a nudge, waits for the next update.)
+            if self.idle > IDLE_RESET && self.moved.0.hypot(self.moved.1) < 2.0 * DEAD_ZONE {
+                self.moved = (0.0, 0.0);
             }
         }
-        if self.spring.settle() {
-            if let Some(t0) = self.picked.take().filter(|_| self.snapped.is_some()) {
-                log::debug!("snap: at rest on {:?} {:.0} ms after it was picked (update interval {:.0} ms)", self.spring.target, (now - t0) * 1000.0, 1000.0 / rates.updates_per_second);
+        self.track(targets, now);
+        if self.snapping() {
+            let reach = self.moved.0.hypot(self.moved.1);
+            if now >= self.next_update && reach >= DEAD_ZONE {
+                self.update(targets, now);
+                self.moved = (0.0, 0.0);
+                self.next_update = now + 1.0 / rates.updates_per_second;
             }
-            if self.snapped.is_some() && !self.hovered {
-                // At rest on the element: it shows its hover, and the hidden
-                // pointer goes on from it.
-                out.push(Action::Move(self.spring.target));
-                self.hovered = true;
-                self.glide.pos = self.spring.target;
+            if now >= self.next_ghost {
+                self.ghost = Some(match self.choose(targets) {
+                    Choice::Snap(k) => targets[k].center(),
+                    Choice::Scroll { .. } | Choice::Nothing => self.flight.to,
+                });
+                self.next_ghost = (self.next_ghost + 1.0 / rates.ghost_fps).max(now);
             }
-        } else if was_at_rest {
-            self.hovered = false;
+        }
+        self.pos = self.flight.position(now);
+        if self.flight.done(now) && !self.arrived {
+            self.arrived = true;
+            if let Some(s) = self.snapped {
+                log::debug!("snap: landed on {} at {:?} at {now:.3} s, {:.0} ms after it was picked (flight {:.0} ms)", s.id, self.flight.to, (now - self.picked) * 1000.0, self.flight.duration * 1000.0);
+                if !s.capture {
+                    // At rest on the element: it shows its hover.
+                    out.push(Action::Move(self.flight.to));
+                    self.rested = Some(s.id);
+                }
+            }
+        }
+        if self.phase == Phase::Landing && self.flight.done(now) {
+            self.park();
         }
         match self.scroll.step(dt) {
             0 => {}
             n => {
                 log::debug!("snap: the list scrolls a notch {}", if n > 0 { "up" } else { "down" });
-                out.push(Action::Wheel { delta: n * NOTCH, at: self.spring.pos });
+                out.push(Action::Wheel { delta: n * NOTCH, at: self.flight.to });
                 self.scrolled = true;
             }
         }
         if self.scrolled && self.scroll.idle() {
             self.scrolled = false;
-            if self.spring.at_rest() {
-                out.push(Action::Move(self.spring.pos));
+            if self.flight.done(now) {
+                out.push(Action::Move(self.flight.to));
             }
         }
         out
     }
 
-    fn snap_to(&mut self, targets: &[Target], k: usize) {
+    /// Snaps to target `k`: the pointer flies there from where it is.
+    fn snap_to(&mut self, targets: &[Target], k: usize, now: f64) {
         let t = &targets[k];
         let list = t.list(k).map(|l| targets[l].id);
-        self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }) });
+        self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }), capture: t.is_capture() });
         let c = t.center();
-        if c != self.spring.target {
-            log::debug!("snap: at {:.3} s picked {:?} ({:?}) at {c:?}", self.last, t.id, t.kind);
-            self.spring.target = c;
-            self.hovered = false;
-            self.picked = Some(self.last);
-            self.reached = false;
-            self.picked_from = self.spring.pos;
+        self.picked = now;
+        if c != self.flight.to || !self.flight.done(now) || self.pos != c {
+            let duration = self.rates.flight();
+            self.flight.retarget(c, now, duration);
+            self.arrived = false;
+            log::debug!("snap: at {now:.3} s picked {} ({:?}) at {c:?} from {:?}, lands at {:.3} s", t.id, t.kind, self.pos, now + duration);
+        } else if !self.arrived {
+            // Already there and still.
+            self.flight = Flight::rest(c);
         }
     }
 
     /// What an update would do now.
     fn choose(&self, targets: &[Target]) -> Choice {
-        let landing = self.glide.rest();
-        // In a list that scrolls, landing inside it scrolls it.
+        let from = self.flight.to;
+        let m = self.moved;
+        // In a list that scrolls, motion up or down staying inside it
+        // scrolls it.
         let list = self.snapped.and_then(|s| s.list).and_then(|id| targets.iter().find(|t| t.id == id));
         if let Some(Target { rect, kind: TargetKind::List { step, .. }, .. }) = list {
-            if inside(*rect, landing) {
-                return Choice::Scroll { by: landing.1 - self.spring.target.1, step: *step };
+            if m.0.hypot(m.1) >= DEAD_ZONE && m.1.abs() >= m.0.abs() && inside(*rect, (from.0 + m.0, from.1 + m.1)) {
+                return Choice::Scroll { by: m.1, step: *step };
             }
         }
-        nearest(targets, landing).map_or(Choice::Nothing, Choice::Snap)
+        pick(targets, from, self.snapped.map(|s| s.id), m).map_or(Choice::Nothing, Choice::Snap)
     }
 
-    /// An update: snap to where the hidden pointer comes to rest.
-    fn update(&mut self, targets: &[Target]) {
+    /// An update: the motion picks the next element.
+    fn update(&mut self, targets: &[Target], now: f64) {
         match self.choose(targets) {
             Choice::Snap(k) => {
-                if self.snapped.map(|s| s.id) != Some(targets[k].id) {
-                    self.snap_to(targets, k);
-                }
+                log::debug!("snap: motion {:?} picks {} at {:.0}° off it", self.moved, targets[k].id, degrees(self.flight.to, targets[k].center(), self.moved));
+                self.snap_to(targets, k, now);
             }
             Choice::Scroll { by, step } => {
                 // Moving down the list shows what is further down: the wheel
                 // turned towards the user (negative).
                 self.scroll.add(-by / step.max(1.0));
-                // That way is used up: the hidden pointer stays level with
-                // the visible one.
-                self.glide.pos.1 = self.spring.target.1;
-                self.glide.vel.1 = 0.0;
             }
-            Choice::Nothing => {}
+            Choice::Nothing => log::debug!("snap: motion {:?}: nothing within {:.0}°, stays", self.moved, CONE.to_degrees()),
         }
     }
 
     /// Keeps the target on its element as the scene changes: an element
     /// that moved is followed; a list's entry stays where the pointer is
     /// (the entry there now, once the list scrolled).
-    fn track(&mut self, targets: &[Target]) {
+    fn track(&mut self, targets: &[Target], now: f64) {
         let Some(s) = self.snapped else { return };
-        let t = self.spring.target;
+        let t = self.flight.to;
         if s.entry {
             let still = targets.iter().any(|x| x.id == s.id && inside(x.rect, t));
             if !still {
                 let list = s.list.and_then(|id| targets.iter().position(|x| x.id == id));
-                let under = targets.iter().enumerate().find(|(_, x)| matches!(x.kind, TargetKind::ListItem { list: l } if l == list) && inside(x.rect, t));
-                if let Some((_, x)) = under {
+                let under = targets.iter().find(|x| matches!(x.kind, TargetKind::ListItem { list: l } if l == list) && inside(x.rect, t));
+                if let Some(x) = under {
                     self.snapped = Some(Snapped { id: x.id, ..s });
                 }
             }
@@ -747,24 +872,28 @@ impl Snapper {
         if let Some(x) = targets.iter().find(|x| x.id == s.id) {
             let c = x.center();
             if c != t {
-                self.spring.target = c;
-                self.hovered = false;
+                self.flight.retarget(c, now, self.rates.flight());
+                self.arrived = false;
             }
         }
     }
 }
 
-/// Button snapping in the viewer: Alt (while the mouse is captured)
-/// starts it, its release ends it; buttons and the wheel go to the
-/// snapping pointer; everything else goes on to the layout.
+/// Button snapping in the viewer: Alt turns the mode on and off; buttons
+/// and the wheel go to the snapping pointer; everything else goes on to
+/// the layout.
 #[derive(Debug, Default)]
 pub struct SnapInput {
     pub snapper: Snapper,
     ctrl: bool,
-    /// Alt's press was taken for snapping (its release ends it).
+    /// Alt is held (its press repeats).
     alt: bool,
-    /// Alt's press went to the driver after all (another key with it).
+    /// This Alt press turned the mode on (another key with it undoes that).
+    alt_entered: bool,
+    /// Alt's press went to the driver (another key with it, or Ctrl held).
     alt_sent: bool,
+    /// Esc's press turned the mode off (its release is not the driver's).
+    esc: bool,
     /// Whether the system pointer is to be hidden, when that changes.
     hide_pointer: Option<bool>,
 }
@@ -786,19 +915,23 @@ fn to_input(action: Action, layout: &Layout) -> Option<Input> {
             let (x, y) = layout.route_window(whole(at))?;
             Input::Wheel { delta, x, y }
         }
+        Action::Capture(_) => return None,
     })
 }
 
-fn to_inputs(actions: Vec<Action>, layout: &Layout) -> Vec<Input> {
-    actions.into_iter().filter_map(|a| to_input(a, layout)).collect()
-}
-
 impl SnapInput {
-    /// The targets in `scene` as `layout` shows them.
+    /// The snap mode is on (its pointer is the only cursor; it is the
+    /// pointer while it lands too).
+    pub fn active(&self) -> bool {
+        self.snapper.holds_pointer()
+    }
+
+    /// The targets in `scene` as `layout` shows them, and the view a click
+    /// captures the mouse in.
     fn targets(scene: &scene::Scene, layout: &Layout) -> Vec<Target> {
         let mut out = targets(&scene.interactables, layout.screen_mapping(), layout.window());
-        // What lies in a part of the interface drawn elsewhere (a popup moved
-        // into a view, a screen moved below the zoom strip) is there.
+        // What lies in a part of the interface drawn elsewhere (the corner's
+        // buttons, a popup moved into a view) is there.
         for t in &mut out {
             let c = t.center();
             let moved = layout.moved_parts().iter().find(|([x, y, w, h], (dx, dy))| {
@@ -814,79 +947,152 @@ impl SnapInput {
                 }
             }
         }
+        if let Some((rect, at)) = layout.capture_view() {
+            out.push(Target::capture(rect, at));
+        }
         out
+    }
+
+    /// The actions as the driver gets them; a click on the capture view
+    /// ends the mode and captures the mouse.
+    fn perform(&mut self, actions: Vec<Action>, layout: &mut Layout) -> Vec<Input> {
+        let mut out = Vec::new();
+        for a in actions {
+            match a {
+                Action::Capture(p) => {
+                    self.snapper.stop();
+                    let p = (p.0.round() as i32, p.1.round() as i32);
+                    if !layout.captured() {
+                        layout.capture_at(p);
+                    }
+                    log::debug!("snap: the capture view clicked: off, the mouse captured at {p:?}");
+                }
+                a => out.extend(to_input(a, layout)),
+            }
+        }
+        out.extend(self.sync(layout));
+        out
+    }
+
+    /// The layout told whether the snapping pointer is the pointer, the
+    /// system pointer hidden as long as it is; where it parked, the pointer
+    /// is (with the mouse free the system pointer shows there).
+    fn sync(&mut self, layout: &mut Layout) -> Vec<Input> {
+        if let Some(p) = self.snapper.take_parked() {
+            layout.place_pointer((p.0.round() as i32, p.1.round() as i32));
+            if !layout.captured() {
+                self.snapper.stop();
+            }
+        }
+        // (Parked with the mouse no longer captured: the system pointer.)
+        if !layout.captured() && !self.active() && self.snapper.pointer().is_some() {
+            self.snapper.stop();
+        }
+        let on = self.active();
+        if on == layout.snapping() {
+            return vec![];
+        }
+        self.hide_pointer = Some(on);
+        layout.set_snapping(on)
+    }
+
+    /// Turns the mode on.
+    fn enter(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
+        let at = self.snapper.pointer().unwrap_or_else(|| {
+            let (x, y) = layout.pointer_in_window();
+            (x as f64, y as f64)
+        });
+        self.snapper.enter(now, at, &Self::targets(scene, layout), rates);
+        log::debug!("viewer: button snapping on (the mouse {})", if layout.captured() { "captured" } else { "free" });
+        self.sync(layout)
+    }
+
+    /// Turns the mode off (the pointer lands).
+    fn leave(&mut self, layout: &mut Layout) -> Vec<Input> {
+        if !self.snapper.snapping() {
+            return vec![];
+        }
+        let actions = self.snapper.leave();
+        log::debug!("viewer: button snapping off");
+        self.perform(actions, layout)
     }
 
     /// A window input at time `now`: what goes to the driver.
     pub fn route(&mut self, input: Input, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
         match input {
-            Input::Key { vk: VK_MENU, down: true, .. } if self.snapper.snapping() => vec![],
-            Input::Key { vk: VK_MENU, down: true, .. } if layout.captured() && !self.ctrl => {
-                let at = match self.snapper.pointer() {
-                    Some(p) => p,
-                    None => {
-                        let (x, y) = layout.pointer_in_window();
-                        (x as f64, y as f64)
-                    }
-                };
-                self.snapper.enter(now, at, &Self::targets(scene, layout), rates);
+            // (Held, it repeats.)
+            Input::Key { vk: VK_MENU, down: true, .. } if self.alt => vec![],
+            Input::Key { vk: VK_MENU, down: true, .. } => {
                 self.alt = true;
-                self.hide_pointer = Some(true);
-                log::debug!("viewer: button snapping from {at:?}");
-                vec![]
-            }
-            Input::Key { vk: VK_MENU, down: false, .. } if self.alt => {
-                self.alt = false;
-                let mut out = self.leave_inputs(layout);
-                if std::mem::take(&mut self.alt_sent) {
-                    out.extend(layout.route(input));
+                self.alt_entered = false;
+                self.alt_sent = false;
+                if self.snapper.snapping() {
+                    return self.leave(layout);
                 }
-                out
+                if self.ctrl {
+                    log::debug!("viewer: Alt with Ctrl held: the driver's");
+                    self.alt_sent = true;
+                    return layout.route(input);
+                }
+                self.alt_entered = true;
+                self.enter(layout, scene, now, rates)
+            }
+            Input::Key { vk: VK_MENU, down: false, .. } => {
+                self.alt = false;
+                if std::mem::take(&mut self.alt_sent) { layout.route(input) } else { vec![] }
+            }
+            Input::Key { vk: VK_ESCAPE, down: true, .. } if self.snapper.snapping() => {
+                self.esc = true;
+                self.leave(layout)
+            }
+            Input::Key { vk: VK_ESCAPE, down: false, .. } if self.esc => {
+                self.esc = false;
+                vec![]
             }
             Input::Key { vk: VK_CONTROL, down, .. } => {
                 self.ctrl = down;
-                // Ctrl lets go of the mouse: snapping ends first, the
-                // pointer staying where it is.
-                let mut out = if down { self.leave_inputs(layout) } else { vec![] };
+                // Ctrl lets go of the mouse: the mode ends first.
+                let mut out = if down { self.leave(layout) } else { vec![] };
                 out.extend(layout.route(input));
                 out
             }
-            // Another key with Alt held: the driver gets Alt first.
+            // Another key with Alt held: a shortcut. The driver gets Alt
+            // first; the mode this Alt turned on is off again.
             Input::Key { down: true, .. } if self.alt && !self.alt_sent => {
                 self.alt_sent = true;
-                let mut out = layout.route(Input::Key { vk: VK_MENU, down: true, text: None });
+                let mut out = Vec::new();
+                if std::mem::take(&mut self.alt_entered) && self.snapper.snapping() {
+                    self.snapper.stop();
+                    log::debug!("viewer: Alt with a key: a shortcut, no button snapping");
+                    out.extend(self.sync(layout));
+                }
+                out.extend(layout.route(Input::Key { vk: VK_MENU, down: true, text: None }));
                 out.extend(layout.route(input));
                 out
             }
+            // (The system pointer's own motion: not while the snapping
+            // pointer is the pointer.)
+            Input::MouseMove { .. } if self.active() => vec![],
             Input::MouseButton { button, down, x, y } => match self.snapper.click(button, down) {
-                Some(actions) => to_inputs(actions, layout),
+                Some(actions) => self.perform(actions, layout),
                 None => layout.route(Input::MouseButton { button, down, x, y }),
             },
             Input::Wheel { delta, .. } if !self.ctrl => match self.snapper.wheel(delta) {
-                Some(actions) => to_inputs(actions, layout),
+                Some(actions) => self.perform(actions, layout),
                 None => layout.route(input),
             },
+            // Keys while the snapping pointer is the pointer: the interface's
+            // (never the world's, whatever the world cursor is over).
+            Input::Key { .. } if self.active() => layout
+                .route(input)
+                .into_iter()
+                .map(|i| match i {
+                    Input::WorldKey { vk, down, text, .. } => Input::Key { vk, down, text },
+                    i => i,
+                })
+                .collect(),
             other => layout.route(other),
         }
-    }
-
-    /// Ends snapping, the pointer staying where it is.
-    fn leave(&mut self, layout: &mut Layout) -> Vec<Action> {
-        if !self.snapper.snapping() {
-            return vec![];
-        }
-        let actions = self.snapper.leave();
-        if let Some((x, y)) = self.snapper.pointer() {
-            layout.place_pointer((x as i32, y as i32));
-            log::debug!("viewer: button snapping ends at ({x}, {y})");
-        }
-        self.hide_pointer = Some(false);
-        actions
-    }
-
-    fn leave_inputs(&mut self, layout: &mut Layout) -> Vec<Input> {
-        let actions = self.leave(layout);
-        to_inputs(actions, layout)
     }
 
     /// Raw mouse motion: `None` if it is the layout's (as without
@@ -895,24 +1101,17 @@ impl SnapInput {
         self.snapper.motion(d).then(Vec::new)
     }
 
-    /// Time `now`: the pointers move on; what goes to the driver.
+    /// Time `now`: the pointer moves on; what goes to the driver.
     pub fn tick(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
-        // Without the mouse captured there is nothing to snap.
-        if !layout.captured() && self.snapper.pointer().is_some() {
-            let out = self.leave_inputs(layout);
-            self.snapper.stop();
-            return out;
-        }
-        let actions = self.snapper.tick(now, &Self::targets(scene, layout), layout.window(), rates);
-        to_inputs(actions, layout)
+        let actions = self.snapper.tick(now, &Self::targets(scene, layout), rates);
+        self.perform(actions, layout)
     }
 
-    /// The window lost the keyboard: no key is held any more.
+    /// The window lost the keyboard: no key is held any more, the mode ends.
     pub fn focus_lost(&mut self, layout: &mut Layout) -> Vec<Input> {
-        let out = self.leave_inputs(layout);
         self.snapper.stop();
-        (self.ctrl, self.alt, self.alt_sent) = (false, false, false);
-        out
+        (self.ctrl, self.alt, self.alt_entered, self.alt_sent, self.esc) = (false, false, false, false, false);
+        self.sync(layout)
     }
 
     /// Whether to hide the system pointer, when that changes.
@@ -920,31 +1119,18 @@ impl SnapInput {
         self.hide_pointer.take()
     }
 
-    /// The pointers as sprites on top of everything, in the camera of the
-    /// driver's topmost interface (drawn in the driver's screen pixels):
-    /// the ghost, then the pointer over it.
-    pub fn sprites(&self, compiled: &render_desc::Compiled, scene: &scene::Scene, frame: &crate::layout::Frame, layout: &Layout) -> Vec<tile_render::PlacedSprite> {
+    /// The pointers as sprites in camera `overlay` (over the whole window
+    /// at 1:1, on top of every view: window pixels): the ghost, then the
+    /// pointer over it; the driver's arrow if the description has it.
+    pub fn sprites(&self, compiled: &render_desc::Compiled, overlay: u32) -> Vec<tile_render::PlacedSprite> {
         let Some(pointer) = self.snapper.pointer() else { return vec![] };
-        // (The whole interface's camera, not one of a part drawn elsewhere,
-        // which shows only its rectangle.)
-        let parts = [scene.interface.roaming, scene.interface.popup, scene.interface.screen_view];
-        let interface = scene
-            .views
-            .iter()
-            .zip(&frame.view_cameras)
-            .filter(|(v, _)| v.view.interface_only && !parts.contains(&Some(v.id)))
-            .filter_map(|(_, c)| *c)
-            .last();
-        let camera = interface.or_else(|| frame.cameras.iter().position(|c| c.origin == (0, 0) && c.zoom == (1, 1)).map(|c| c as u32)).unwrap_or(0);
-        let ((ox, oy), (n, d)) = layout.screen_mapping();
-        let to_screen = |(x, y): Point| (((x - ox as f64) * d as f64 / n.max(1) as f64).round() as i32, ((y - oy as f64) * d as f64 / n.max(1) as f64).round() as i32);
-        let place = |name: &str, p: Point| {
-            let (set, _) = compiled.set(name)?;
-            let (x, y) = to_screen(p);
-            Some(tile_render::PlacedSprite { screen: true, view: Some(camera), ..tile_render::PlacedSprite::new(set, x, y) })
+        let set = |names: &[&str]| names.iter().find_map(|n| compiled.set(n).map(|(s, _)| s));
+        let place = |set: Option<tile_render::SpriteSetId>, (x, y): Point| {
+            Some(tile_render::PlacedSprite { screen: true, view: Some(overlay), ..tile_render::PlacedSprite::new(set?, x.round() as i32, y.round() as i32) })
         };
-        let solid = place(POINTER_SPRITE, pointer).or_else(|| place(crate::CURSOR_SPRITE, pointer));
-        let ghost = self.snapper.ghost().and_then(|g| place(GHOST_SPRITE, g));
+        let solid = place(set(&[ARROW_SPRITE, POINTER_SPRITE, crate::CURSOR_SPRITE]), pointer);
+        // (Under the pointer it would not be seen.)
+        let ghost = self.snapper.ghost().filter(|g| (g.0 - pointer.0).hypot(g.1 - pointer.1) >= 2.0).and_then(|g| place(set(&[ARROW_GHOST_SPRITE, GHOST_SPRITE]), g));
         ghost.into_iter().chain(solid).collect()
     }
 }
