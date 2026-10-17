@@ -538,6 +538,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         frames_presented: 0,
         frame_log: frame_times().then(fps::FrameLog::default),
         beside_drawn: None,
+        staged: None,
         unlock_pending: None,
         machine: cursor::Machine::default(),
         system_pointer: (0, 0),
@@ -677,6 +678,8 @@ struct App {
     /// last drawn beside a screen (`scene::Beside`, for the log).
     frame_log: Option<fps::FrameLog>,
     beside_drawn: Option<(scene::WorldShape, Option<[i32; 4]>)>,
+    /// New art on its way to the GPU (see `ATLAS_PART`).
+    staged: Option<Staged>,
     /// What happens to the system pointer after the next frame (see
     /// `unlock_after_frame`).
     unlock_pending: Option<Unlock>,
@@ -729,6 +732,19 @@ const FRAME: Duration = Duration::from_millis(16);
 /// How long the event loop waits for the driver when it was woken for
 /// nothing (see `about_to_wait`).
 const IDLE_WAIT: Duration = Duration::from_millis(1);
+/// About how many bytes of new art go up to the GPU a frame (at least a
+/// page; a colour page of 2048² is 16 MiB).
+const ATLAS_PART: u64 = 16 << 20;
+
+/// New art being uploaded (`TileRenderer::stage_atlas`), and since when, in
+/// how many frames.
+struct Staged {
+    version: u64,
+    atlas: tile_render::StagedAtlas,
+    compiled: Arc<Compiled>,
+    since: Instant,
+    frames: u32,
+}
 
 /// Whether frame times are logged (`TILE_VIEWER_FRAME_TIMES`, see `fps::FrameLog`).
 fn frame_times() -> bool {
@@ -1145,31 +1161,49 @@ impl App {
             }
         }
         let (version, whole) = self.assets.whole();
-        // A new whole description is taken together with a scene that
-        // refers to it (sprite ids change with every compile), or when none
-        // came for a while; growths of the one drawn at once (they keep
-        // what was there).
+        // A new whole description goes up to the GPU a part a frame
+        // (`ATLAS_PART`), frames drawn with the art before meanwhile (nothing
+        // waits for the GPU); a newer one replaces it on the way.
+        if let Some(c) = whole.as_ref().filter(|_| version != self.whole_version && self.staged.as_ref().is_none_or(|s| s.version != version)) {
+            self.staged = Some(Staged { version, atlas: gpu.renderer.stage_atlas(&gpu.device, &c.atlas), compiled: c.clone(), since: Instant::now(), frames: 0 });
+        }
+        drop(whole);
+        let uploaded = match &mut self.staged {
+            Some(s) if s.version == version => {
+                s.frames += 1;
+                gpu.renderer.upload_staged(&gpu.queue, &mut s.atlas, &s.compiled.atlas, ATLAS_PART)
+            }
+            _ => false,
+        };
+        // It is taken, once all of it is there, together with a scene that
+        // refers to it (sprite ids change with every compile: taken before,
+        // the scenes drawn till then would show other sprites); growths of
+        // the one drawn at once (they keep what was there).
         let refers_to = self.display.scene().assets;
         let drawable = |from: u64, to: u64| refers_to == 0 || (from..=to).contains(&refers_to);
         let waits = self.art_waiting.get_or_insert_with(std::time::Instant::now).elapsed();
         let gave_up = waits > Duration::from_secs(3);
-        let new_assets = version != self.whole_version && (refers_to == 0 || refers_to >= version || gave_up);
-        if new_assets {
+        let new_assets = version != self.whole_version && uploaded && (refers_to == 0 || refers_to >= version);
+        if let Some(s) = new_assets.then(|| self.staged.take()).flatten() {
             let started = std::time::Instant::now();
-            if let Some(compiled) = whole {
-                gpu.renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
-                // (Set ids change with every compile.)
-                self.cursor_art = cursor::Art::of(&compiled);
-                self.custom_cursors.clear();
-                self.cursor_builds.forget();
-                self.shown_pointer = None;
-                log::info!("viewer: new assets ({} sprites, uploaded in {} ms)", compiled.sprite_names.len(), started.elapsed().as_millis());
-                // The pixels are on the GPU now: keep only the rest.
-                self.compiled = compiled.without_pixels();
-            }
-            self.assets.uploaded(version);
-            self.whole_version = version;
-            self.assets_version = version;
+            gpu.renderer.adopt_atlas(&gpu.device, s.atlas, &s.compiled.atlas);
+            // (Set ids change with every compile.)
+            self.cursor_art = cursor::Art::of(&s.compiled);
+            self.custom_cursors.clear();
+            self.cursor_builds.forget();
+            self.shown_pointer = None;
+            log::info!(
+                "viewer: new assets ({} sprites, uploaded over {} ms in {} frames, taken in {} ms)",
+                s.compiled.sprite_names.len(),
+                s.since.elapsed().as_millis(),
+                s.frames,
+                started.elapsed().as_millis()
+            );
+            // The pixels are on the GPU now: keep only the rest.
+            self.compiled = s.compiled.without_pixels();
+            self.assets.uploaded(s.version);
+            self.whole_version = s.version;
+            self.assets_version = s.version;
         }
         if let Some((pages, index_pages)) = self.assets.take_reserve() {
             let started = std::time::Instant::now();
