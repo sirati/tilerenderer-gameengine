@@ -75,6 +75,16 @@ impl Constraints {
         false
     }
 
+    /// A lock-and-hint move has not finished yet. Keep the pointer hidden
+    /// until the compositor has released that lock or the move times out.
+    pub fn moving(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(c) = &self.wayland {
+            return c.is_moving();
+        }
+        false
+    }
+
     /// The system pointer moved to window point `at` (physical pixels).
     pub fn pointer_moved(&mut self, at: (f64, f64)) {
         self.pointer = at;
@@ -119,15 +129,17 @@ impl Constraints {
 }
 
 /// Canvas rectangle `r` (the layout's pixels) in the window (physical
-/// pixels): the window pixels wholly inside it.
+/// pixels): the window pixels wholly inside it, at least one per nonempty
+/// span so a thin divider still holds the pointer.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn in_window(present: Option<Present>, [x, y, w, h]: [i32; 4]) -> [i32; 4] {
     let Some(p) = present else { return [x, y, w, h] };
     let (n, d) = (p.zoom.0.max(1) as i64, p.zoom.1.max(1) as i64);
     let span = |v: i32, len: i32, at: i32| {
         let a = -(-(v as i64 * n)).div_euclid(d);
-        let b = ((v + len) as i64 * n).div_euclid(d);
-        (at + a as i32, (b - a).max(0) as i32)
+        let b = ((v as i64 + len as i64) * n).div_euclid(d);
+        // A divider thinner than a window pixel must still block motion.
+        (at + a as i32, if len > 0 { (b - a).max(1) as i32 } else { 0 })
     };
     let ((x, w), (y, h)) = (span(x, w, p.at.0), span(y, h, p.at.1));
     [x, y, w, h]
@@ -152,5 +164,10 @@ mod tests {
         // 721.5..724.5, window pixels 722 and 723.
         let p = Present { canvas: (1280, 720), zoom: (3, 2), at: (0, 0), target: (1920, 1080) };
         assert_eq!(in_window(Some(p), [481, 1, 2, 3]), [722, 2, 2, 4]);
+        // A canvas scaled below one window pixel per divider width still
+        // has a physical wall. Negative origins round towards the inside.
+        let p = Present { zoom: (1, 8), at: (0, 0), ..p };
+        assert_eq!(in_window(Some(p), [481, -9, 2, 17]), [61, -1, 1, 2]);
+        assert_eq!(in_window(Some(p), [481, 0, 0, 3]), [61, 0, 0, 1]);
     }
 }

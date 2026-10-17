@@ -788,7 +788,7 @@ impl App {
     /// Whether the viewer draws the cursor itself rather than the system:
     /// while the mouse is captured, or the pointer snaps to buttons.
     fn pointer_hidden(&self) -> bool {
-        (self.layout.captured() && !self.machine.edge()) || self.snap.snap_mode_active() || self.unlock_pending.is_some()
+        (self.layout.captured() && !self.machine.edge()) || self.snap.snap_mode_active() || self.unlock_pending.is_some() || self.constraints.moving()
     }
 
     /// The driver's cursor, as long as its scene refers to the art the

@@ -1066,7 +1066,7 @@ impl Layout {
     }
 
     /// The divider's walls as of the last frame, for the system to keep the
-    /// pointer out of ([`Walls::Confined`]): window rectangles; none where
+    /// pointer out of ([`Walls::Confined`]): canvas rectangles; none where
     /// the divider holds nothing back (no split, the mouse captured, the
     /// divider dragged, a screen beside its world, button snapping). They
     /// are the gap's closed stretches less where the driver's interface
@@ -4339,6 +4339,11 @@ mod tests {
     fn the_walls_the_system_holds_the_pointer_out_of_are_the_gaps_closed_stretches() {
         let mut l = split_1to1();
         assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 200], [400, 400, 4, 200]]));
+        // Always reachable unit controls open a gap with the same margin
+        // as pointer routing, even when only part overlaps the divider.
+        l.reachable = Some([398, 100, 20, 30]);
+        assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 96], [400, 134, 4, 66], [400, 400, 4, 200]]));
+        l.reachable = None;
         let h = arranged(&settings(|s| s.split = S::Horizontal1To1));
         assert_eq!(h.pointer_walls(), Some(vec![[0, 300, 266, 4], [534, 300, 266, 4]]));
         // None where the divider holds nothing back.
@@ -4390,6 +4395,33 @@ mod tests {
         l.set_walls(Walls::Confined);
         l.place_pointer((250, 250));
         assert_eq!(l.take_warp(), Some((250, 250)));
+    }
+
+    #[test]
+    fn a_stationary_confined_pointer_keeps_scrolling_both_sides() {
+        let mut l = split_1to1();
+        l.set_walls(Walls::Confined);
+        mv(&mut l, (100, 100));
+        mv(&mut l, (399, 100));
+        for _ in 0..2 {
+            l.advance(std::time::Duration::from_millis(100));
+            frame(&mut l, vec![]);
+            assert_eq!(l.against, Some(Side::A));
+            assert_eq!(l.driver_edge(l.pointer), (1, 0));
+            assert_eq!(l.take_warp(), None);
+        }
+        mv(&mut l, (300, 300));
+        mv(&mut l, (600, 300));
+        mv(&mut l, (600, 500));
+        mv(&mut l, (404, 500));
+        let center = l.split.unwrap().view.center;
+        for i in 1..=2 {
+            l.advance(std::time::Duration::from_millis(100));
+            frame(&mut l, vec![]);
+            assert_eq!(l.against, Some(Side::B));
+            assert_eq!(l.split.unwrap().view.center, (center.0 - 60 * i, center.1));
+            assert_eq!(l.take_warp(), None);
+        }
     }
 
     #[test]
