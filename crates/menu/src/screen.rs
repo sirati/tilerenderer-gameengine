@@ -66,6 +66,36 @@ pub enum Element {
 
 
 impl Element {
+    /// Whether the current compiled art can draw this visible element.
+    /// Empty or fully clipped elements need no art. A requested palette
+    /// must exist rather than silently falling back to the sprite's own.
+    pub fn ready(&self, compiled: &Compiled) -> bool {
+        if self.is_empty() { return true; }
+        let (name, clip, bounds) = match self {
+            Element::Image { region, at, clip } | Element::OpacityImage { region, at, clip, .. } =>
+                (region_sprite(region), clip, Some((at.0, at.1, region.rect[2], region.rect[3]))),
+            Element::Fill { rect, rgb, alpha, clip } => {
+                if *alpha == 0 { return true; }
+                (fill_sprite([rgb[0], rgb[1], rgb[2], *alpha], (rect[2] as u32, rect[3] as u32)), clip, Some((rect[0], rect[1], rect[2], rect[3])))
+            }
+            Element::Dynamic { name, size, rect, at, clip } => {
+                if size.0 == 0 || size.1 == 0 { return true; }
+                (dynamic_sprite(name, *size), clip, Some((at.0, at.1, rect[2], rect[3])))
+            }
+            Element::Sprite { name, clip, palette, .. } => {
+                if clip[0] >= clip[2] || clip[1] >= clip[3] { return true; }
+                if !palette.is_empty() && compiled.palette(palette).is_none() { return false; }
+                (name.clone(), clip, None)
+            }
+        };
+        if clip[0] >= clip[2] || clip[1] >= clip[3] { return true; }
+        if let Some((x, y, w, h)) = bounds {
+            if i64::from(x) >= i64::from(clip[2]) || i64::from(y) >= i64::from(clip[3])
+                || i64::from(x) + i64::from(w) <= i64::from(clip[0]) || i64::from(y) + i64::from(h) <= i64::from(clip[1]) { return true; }
+        }
+        compiled.set(&name).and_then(|(set, _)| compiled.sets.frame(set, 0)).and_then(|id| compiled.atlas.sprites.get(id.0 as usize)).is_some()
+    }
+
     /// Whether it covers no pixels (nothing to draw or describe).
     pub fn is_empty(&self) -> bool {
         match self {
@@ -334,6 +364,56 @@ mod tests {
         fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> {
             Ok(vec![tile_render::RgbaImage::from_fn(64, 64, |x, y| [x as u8, y as u8, 0, 255])])
         }
+        fn palette(&self, _: &str, _: &toml::Table) -> Result<Vec<[u8; 4]>, String> {
+            Ok(vec![[1, 2, 3, 255]; 256])
+        }
+    }
+
+    #[test]
+    fn readiness_requires_each_element_and_its_requested_palette() {
+        let region = Region { source: "panel.pcx".into(), rect: [0, 0, 8, 6], keyed: true, mask: None, palette: None };
+        let elements = vec![
+            Element::Image { region: region.clone(), at: (1, 2), clip: [0, 0, 80, 60] },
+            Element::OpacityImage { region: region.clone(), at: (1, 2), clip: [0, 0, 80, 60], opacity: 128 },
+            Element::Fill { rect: [2, 3, 4, 5], rgb: [1, 2, 3], alpha: 255, clip: [0, 0, 80, 60] },
+            Element::Dynamic { name: "minimap".into(), size: (8, 6), rect: [0, 0, 8, 6], at: (1, 2), clip: [0, 0, 80, 60] },
+            Element::Sprite { name: region_sprite(&region), at: (1, 2), clip: [0, 0, 80, 60], scale_den: 0, palette: String::new() },
+        ];
+        let compile = |art: &ScreenArt, extra: &str| {
+            let text = format!("[grid]\nlayout = \"orthogonal\"\nstep = [1, 1]\n{}\n{extra}", art.description("", "", |_, _| String::new()));
+            render_desc::Description::parse(&text).unwrap().compile(&Plain, 256).unwrap()
+        };
+        let empty = compile(&ScreenArt::default(), "");
+        assert!(elements.iter().all(|element| !element.ready(&empty)));
+        let mut art = ScreenArt::default();
+        art.add(&elements);
+        let compiled = compile(&art, "[palettes.loaded]\nsource = \"palette\"\n[sets.empty]\nframes = []\n");
+        assert!(elements.iter().all(|element| element.ready(&compiled)));
+        assert!(elements.iter().all(|element| element.ready(&compiled.without_pixels())));
+        let mut sprite = elements[4].clone();
+        if let Element::Sprite { palette, .. } = &mut sprite { *palette = "missing".into(); }
+        assert!(!sprite.ready(&compiled), "a named palette must not silently fall back to row zero");
+        if let Element::Sprite { palette, .. } = &mut sprite { *palette = "loaded".into(); }
+        assert!(sprite.ready(&compiled));
+        if let Element::Sprite { name, palette, .. } = &mut sprite { *name = "empty".into(); palette.clear(); }
+        assert!(!sprite.ready(&compiled), "an empty named animation has no drawable frame");
+    }
+
+    #[test]
+    fn invisible_elements_do_not_wait_for_art() {
+        let empty = render_desc::Description::parse("[grid]\nlayout = \"orthogonal\"\nstep = [1, 1]\n").unwrap().compile(&Plain, 256).unwrap();
+        let region = Region { source: "missing.pcx".into(), rect: [0, 0, 8, 6], keyed: true, mask: None, palette: None };
+        let elements = [
+            Element::Image { region: Region { rect: [0, 0, 0, 6], ..region.clone() }, at: (0, 0), clip: [0, 0, 80, 60] },
+            Element::Image { region: region.clone(), at: (100, 0), clip: [0, 0, 80, 60] },
+            Element::OpacityImage { region: region.clone(), at: (0, 0), clip: [0, 0, 80, 60], opacity: 0 },
+            Element::Fill { rect: [0, 0, 8, 6], rgb: [1, 2, 3], alpha: 0, clip: [0, 0, 80, 60] },
+            Element::Dynamic { name: "missing".into(), size: (8, 6), rect: [0, 0, 0, 6], at: (0, 0), clip: [0, 0, 80, 60] },
+            Element::Sprite { name: "missing".into(), at: (0, 0), clip: [5, 5, 5, 8], scale_den: 0, palette: "missing".into() },
+        ];
+        assert!(elements.iter().all(|element| element.ready(&empty)));
+        let visible = Element::Image { region, at: (i32::MAX - 2, 0), clip: [i32::MAX - 3, 0, i32::MAX, 10] };
+        assert!(!visible.ready(&empty), "visibility arithmetic must not overflow at screen coordinate limits");
     }
 
     #[test]
