@@ -46,9 +46,11 @@
 //! stays inside the list scrolls it instead, smoothly ([`Scroller`]: wheel
 //! notches spread out in time), the pointer staying on its entry.
 //!
-//! **Leaving.** The pointer lands, then: with the mouse captured it stays
-//! where it is (clicks go there) until the mouse moves, which takes up the
-//! world cursor again; with the mouse free the system pointer shows there.
+//! **Leaving.** The pointer lands, and the usual rules take over where it
+//! is: on an element of the driver's the system pointer shows there (a
+//! captured mouse is let go there); on the capture view the world cursor
+//! goes on. Should the element snapped to go (a screen opened over it), the
+//! pointer goes on to the one nearest it.
 //!
 //! [`Layout::moved_parts`]: crate::layout::Layout::moved_parts
 
@@ -883,23 +885,37 @@ impl Snapper {
         let Some(s) = self.snapped else { return };
         let t = self.flight.to;
         if s.entry {
-            let still = targets.iter().any(|x| x.id == s.id && inside(x.rect, t));
-            if !still {
-                let list = s.list.and_then(|id| targets.iter().position(|x| x.id == id));
-                let under = targets.iter().find(|x| matches!(x.kind, TargetKind::ListItem { list: l } if l == list) && inside(x.rect, t));
-                if let Some(x) = under {
-                    self.snapped = Some(Snapped { id: x.id, ..s });
-                }
+            if targets.iter().any(|x| x.id == s.id && inside(x.rect, t)) {
+                return;
+            }
+            let list = s.list.and_then(|id| targets.iter().position(|x| x.id == id));
+            let under = targets.iter().find(|x| matches!(x.kind, TargetKind::ListItem { list: l } if l == list) && inside(x.rect, t));
+            match under {
+                Some(x) => self.snapped = Some(Snapped { id: x.id, ..s }),
+                None => self.gone(targets, s.id, now),
             }
             return;
         }
-        if let Some(x) = targets.iter().find(|x| x.id == s.id) {
-            let c = x.center();
-            if c != t {
-                self.flight.retarget(c, now, self.rates.flight());
-                self.arrived = false;
+        match targets.iter().find(|x| x.id == s.id) {
+            Some(x) => {
+                let c = x.center();
+                if c != t {
+                    self.flight.retarget(c, now, self.rates.flight());
+                    self.arrived = false;
+                }
             }
+            None => self.gone(targets, s.id, now),
         }
+    }
+
+    /// The element snapped to is gone (a screen opened over it, or closed):
+    /// on to the one nearest the pointer (the capture view if there is no
+    /// other), so that it never rests where nothing is.
+    fn gone(&mut self, targets: &[Target], id: u64, now: f64) {
+        let Some(k) = nearest(targets, self.pos).or_else(|| targets.iter().position(Target::is_capture)) else { return };
+        log::debug!("snap: {id} is gone: on to the nearest, {}", targets[k].id);
+        self.moved = (0.0, 0.0);
+        self.snap_to(targets, k, now);
     }
 }
 
@@ -1002,14 +1018,16 @@ impl SnapInput {
     /// system pointer hidden as long as it is; where it parked, the pointer
     /// is (with the mouse free the system pointer shows there).
     fn sync(&mut self, layout: &mut Layout) -> Vec<Input> {
+        // Landed on an element after the mode: the pointer is there, under
+        // the usual rules (the system pointer, the mouse let go if it was
+        // captured).
         if let Some(p) = self.snapper.take_parked() {
-            layout.place_pointer((p.0.round() as i32, p.1.round() as i32));
-            if !layout.captured() {
-                self.snapper.stop();
+            let p = (p.0.round() as i32, p.1.round() as i32);
+            if layout.captured() {
+                layout.let_go_at(p);
+            } else {
+                layout.place_pointer(p);
             }
-        }
-        // (Parked with the mouse no longer captured: the system pointer.)
-        if !layout.captured() && !self.active() && self.snapper.pointer().is_some() {
             self.snapper.stop();
         }
         let on = self.active();
@@ -1032,12 +1050,12 @@ impl SnapInput {
     }
 
     /// Turns the mode off (the pointer lands).
-    fn leave(&mut self, layout: &mut Layout) -> Vec<Input> {
+    fn leave(&mut self, layout: &mut Layout, why: &str) -> Vec<Input> {
         if !self.snapper.snapping() {
             return vec![];
         }
         let actions = self.snapper.leave();
-        log::debug!("viewer: button snapping off");
+        log::debug!("viewer: button snapping off ({why})");
         self.perform(actions, layout)
     }
 
@@ -1052,7 +1070,7 @@ impl SnapInput {
                 self.alt_entered = false;
                 self.alt_sent = false;
                 if self.snapper.snapping() {
-                    return self.leave(layout);
+                    return self.leave(layout, "Alt");
                 }
                 if self.ctrl {
                     log::debug!("viewer: Alt with Ctrl held: the driver's");
@@ -1075,7 +1093,7 @@ impl SnapInput {
             }
             Input::Key { vk: VK_ESCAPE, down: true, .. } if self.snapper.snapping() => {
                 self.esc = true;
-                self.leave(layout)
+                self.leave(layout, "Esc")
             }
             Input::Key { vk: VK_ESCAPE, down: false, .. } if self.esc => {
                 self.esc = false;
@@ -1084,7 +1102,7 @@ impl SnapInput {
             Input::Key { vk: VK_CONTROL, down, .. } => {
                 self.ctrl = down;
                 // Ctrl lets go of the mouse: the mode ends first.
-                let mut out = if down { self.leave(layout) } else { vec![] };
+                let mut out = if down { self.leave(layout, "Ctrl") } else { vec![] };
                 out.extend(layout.route(input));
                 out
             }

@@ -2327,6 +2327,13 @@ impl Layout {
         })
     }
 
+    /// Lets go of a captured mouse, the system pointer showing at window
+    /// pixel `p` (button snapping ended there, on the interface).
+    pub fn let_go_at(&mut self, p: (i32, i32)) {
+        self.release("button snapping ended on the interface");
+        self.place_pointer(p);
+    }
+
     /// Captures the mouse at window pixel `p` as a click there would (the
     /// snapping pointer's click on [`Layout::capture_view`]); whether it did.
     pub fn capture_at(&mut self, p: (i32, i32)) -> bool {

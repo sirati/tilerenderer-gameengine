@@ -416,6 +416,30 @@ fn the_target_follows_its_element_when_it_moves() {
 }
 
 #[test]
+fn when_its_element_goes_the_pointer_goes_on_to_the_nearest() {
+    // (A screen opened over the buttons: other targets now.)
+    let t = row();
+    let mut s = Snapper::default();
+    s.enter(0.0, (120.0, 110.0), &t, Rates::default());
+    run(&mut s, &t, 0.0, 0.5, (0.0, 0.0), |_| false);
+    let screen = targets(&[at(7, 500, 600), at(8, 900, 700)], IDENTITY, WINDOW);
+    let actions = run(&mut s, &screen, 0.5, 1.5, (0.0, 0.0), |_| false);
+    assert_eq!(s.target(), Some((500.0, 600.0)));
+    assert_eq!(moves(&actions).iter().map(|m| m.1).collect::<Vec<_>>(), [(500.0, 600.0)]);
+    // An entry gone with nothing of its list under it: the same.
+    let l = with_list();
+    let mut s = Snapper::default();
+    s.enter(0.0, (600.0, 150.0), &l, Rates::default());
+    run(&mut s, &screen, 0.0, 1.0, (0.0, 0.0), |_| false);
+    assert_eq!(s.target(), Some((500.0, 600.0)));
+    // Nothing at all for a moment (the scene in between): it stays.
+    let mut s = Snapper::default();
+    s.enter(0.0, (120.0, 110.0), &t, Rates::default());
+    run(&mut s, &[], 0.0, 0.5, (0.0, 0.0), |_| false);
+    assert_eq!(s.target(), Some((120.0, 110.0)));
+}
+
+#[test]
 fn targets_map_into_the_window() {
     let items = [button(1, [10, 20, 30, 40]), button(2, [2000, 20, 30, 40]), button(3, [5, 5, 0, 10])];
     let t = targets(&items, IDENTITY, WINDOW);
@@ -665,18 +689,20 @@ fn alt_turns_the_mode_on_and_alt_again_off() {
     assert!(snap.active());
     let out = ticks(&mut snap, &mut l, &s, 0.1, 1.0);
     assert_eq!(out, [Input::MouseMove { x: 330, y: 535 }]);
-    // Alt again: off, the pointer staying on B (the driver has it there).
+    // Alt again: off. It ended on B: the mouse is let go there (the usual
+    // rules: the system pointer on B, the driver has it there already).
     assert!(snap.route(key(ALT, true), &mut l, &s, 1.0, Rates::default()).is_empty());
     assert!(snap.route(key(ALT, false), &mut l, &s, 1.1, Rates::default()).is_empty());
     assert!(!snap.active() && !l.snapping());
     assert_eq!(snap.take_hide_pointer(), Some(false));
-    assert_eq!(snap.snapper.pointer(), Some((330.0, 535.0)));
-    // A click there goes to B; the mouse moving gives it back to the world
-    // cursor.
-    let out = click(&mut snap, &mut l, &s, 1.2);
-    assert_eq!(out[1], Input::MouseButton { button: Button::Left, down: true, x: 330, y: 535 });
-    assert_eq!(snap.motion((1.0, 0.0)), None);
     assert_eq!(snap.snapper.pointer(), None);
+    assert!(!l.captured());
+    assert_eq!((l.take_grab(), l.take_warp(), l.pointer_in_window()), (Some(false), Some((330, 535)), (330, 535)));
+    // A click there goes to B, as any click of the free mouse.
+    let down = snap.route(Input::MouseButton { button: Button::Left, down: true, x: 330, y: 535 }, &mut l, &s, 1.2, Rates::default());
+    assert_eq!(down, [Input::MouseButton { button: Button::Left, down: true, x: 330, y: 535 }]);
+    snap.route(Input::MouseButton { button: Button::Left, down: false, x: 330, y: 535 }, &mut l, &s, 1.25, Rates::default());
+    assert_eq!(snap.motion((1.0, 0.0)), None);
     // On a third time.
     snap.route(key(ALT, true), &mut l, &s, 2.0, Rates::default());
     assert!(snap.active());
