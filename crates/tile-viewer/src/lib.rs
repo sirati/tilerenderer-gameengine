@@ -111,6 +111,11 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
                 world.set_phase(id, cell as u32 % s.cols, cell as u32 / s.cols, p);
             }
         }
+        if let (Some(offsets), true) = (&layer.offsets, compiled.layers[i].per_cell_offset) {
+            for (cell, &o) in offsets.iter().enumerate().take(cells as usize).filter(|(_, o)| **o != (0, 0)) {
+                world.set_offset(id, cell as u32 % s.cols, cell as u32 / s.cols, o);
+            }
+        }
     }
     // The camera showing scene view `id`, if one does.
     let camera_of = |id: u32| scene.views.iter().zip(view_cameras).find(|(v, _)| v.id == id).and_then(|(_, c)| *c);

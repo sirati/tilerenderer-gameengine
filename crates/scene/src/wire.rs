@@ -5,7 +5,7 @@
 use crate::{Button, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, Patch, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 23;
+pub const VERSION: u32 = 24;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -30,6 +30,9 @@ impl Writer {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn i32(&mut self, v: i32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn i16(&mut self, v: i16) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn bool(&mut self, v: bool) {
@@ -58,6 +61,9 @@ impl<'a> Reader<'a> {
     }
     fn i32(&mut self) -> Result<i32, WireError> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn i16(&mut self) -> Result<i16, WireError> {
+        Ok(i16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
     fn bool(&mut self) -> Result<bool, WireError> {
         Ok(self.u8()? != 0)
@@ -229,6 +235,14 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                         w.u32(p.len() as u32);
                         w.0.extend_from_slice(p);
                     }
+                    w.bool(l.offsets.is_some());
+                    if let Some(o) = &l.offsets {
+                        w.u32(o.len() as u32);
+                        for &(x, y) in o {
+                            w.i16(x);
+                            w.i16(y);
+                        }
+                    }
                 }
             }
             Update::Cells(cells) => {
@@ -238,6 +252,25 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     w.u32(l);
                     w.u32(i);
                     w.u32(v);
+                }
+            }
+            Update::Phases(phases) => {
+                w.u8(13);
+                w.u32(phases.len() as u32);
+                for &(l, i, p) in phases {
+                    w.u32(l);
+                    w.u32(i);
+                    w.u8(p);
+                }
+            }
+            Update::Offsets(offsets) => {
+                w.u8(14);
+                w.u32(offsets.len() as u32);
+                for &(l, i, (x, y)) in offsets {
+                    w.u32(l);
+                    w.u32(i);
+                    w.i16(x);
+                    w.i16(y);
                 }
             }
             Update::Sprites(sprites) => {
@@ -368,7 +401,13 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     } else {
                         None
                     };
-                    layers.push(LayerCells { values, phases });
+                    let offsets = if r.bool()? {
+                        let k = r.len(4)?;
+                        Some((0..k).map(|_| Ok((r.i16()?, r.i16()?))).collect::<Result<_, WireError>>()?)
+                    } else {
+                        None
+                    };
+                    layers.push(LayerCells { values, phases, offsets });
                 }
                 Update::World { shape, layers }
             }
@@ -443,6 +482,14 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     items.push(Interactable { rect, kind, id });
                 }
                 Update::Interactables(items)
+            }
+            13 => {
+                let n = r.len(9)?;
+                Update::Phases((0..n).map(|_| Ok((r.u32()?, r.u32()?, r.u8()?))).collect::<Result<_, WireError>>()?)
+            }
+            14 => {
+                let n = r.len(12)?;
+                Update::Offsets((0..n).map(|_| Ok((r.u32()?, r.u32()?, (r.i16()?, r.i16()?)))).collect::<Result<_, WireError>>()?)
             }
             t => return Err(WireError::Tag(t)),
         });
@@ -645,6 +692,7 @@ mod tests {
         s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false, downscale: 2 };
         s.set(1, 2, 1, 0xABCDEF);
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
+        s.layers[1].offsets = Some(vec![(0, 0), (-300, 7), (0, 0), (5, -1), (0, 0), (0, 0)]);
         s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, tint: 0x123456, zoom_art: 2, zoom: (3, 2), zoom_offset: (-4, 7), clip: None, not_in_view: Some(3), glyph: None });
         s.sprites.push(FreeSprite { x: 7, y: 30, zoom_art: 2, tint: 0xFFFF00, glyph: Some(Glyph { font: 1, ch: 'é', em64: 640, advance: 6, bold: true, italic: false, key: Some([255, 0, 255]), bar: None }), ..Default::default() });
         s.sprites.push(FreeSprite { x: 13, y: 30, zoom_art: 2, glyph: Some(Glyph { font: 0, ch: ' ', em64: 768, advance: 4, bold: false, italic: true, key: None, bar: Some((1, 2)) }), ..Default::default() });
@@ -668,6 +716,8 @@ mod tests {
         let mut updates = s.updates_since(&Scene::default());
         assert!(updates.iter().any(|u| matches!(u, Update::Settings(_))));
         updates.push(Update::Cells(vec![(1, 0, 9)]));
+        updates.push(Update::Phases(vec![(0, 5, 200)]));
+        updates.push(Update::Offsets(vec![(1, 2, (-1, 32767))]));
         updates.push(Update::View { id: 2, view: None });
         updates.push(Update::Interface(Interface { screen: None, roaming: None, popup: Some(7), reachable: None }));
         assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
@@ -676,6 +726,8 @@ mod tests {
             got.apply(u);
         }
         assert_eq!(got.layers[1].values[0], 9);
+        assert_eq!(got.layers[0].phases.as_ref().unwrap()[5], 200);
+        assert_eq!(got.layers[1].offsets.as_ref().unwrap()[1..3], [(-300, 7), (-1, 32767)]);
         assert_eq!(got.settings, s.settings);
         // Settings that are no TOML of settings: an error, not a panic.
         let mut bad = Writer::default();

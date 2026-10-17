@@ -56,6 +56,10 @@ pub struct LayerCells {
     pub values: Vec<u32>,
     /// Per-cell animation phase, if the layer has one.
     pub phases: Option<Vec<u8>>,
+    /// Per-cell pixel offset (x, y), if the layer has one: the cell's sprite
+    /// is drawn that far from its place (world pixels, see
+    /// `tile_render::TileWorld::set_offset`).
+    pub offsets: Option<Vec<(i16, i16)>>,
 }
 
 /// A sprite not tied to a cell (units, effects, UI).
@@ -242,6 +246,10 @@ pub enum Update {
     World { shape: WorldShape, layers: Vec<LayerCells> },
     /// Some cells changed: (layer, cell index, value).
     Cells(Vec<(u32, u32, u32)>),
+    /// Some cells' phases changed: (layer, cell index, phase).
+    Phases(Vec<(u32, u32, u8)>),
+    /// Some cells' offsets changed: (layer, cell index, offset).
+    Offsets(Vec<(u32, u32, (i16, i16))>),
     /// The world-space sprites (replaced).
     Sprites(Vec<FreeSprite>),
     /// View `id` added or changed (its overlay kept), or removed (`None`).
@@ -269,7 +277,42 @@ pub enum Update {
 impl Scene {
     pub fn empty(shape: WorldShape, layer_count: usize) -> Self {
         let n = (shape.cols * shape.rows) as usize;
-        Scene { shape, layers: vec![LayerCells { values: vec![0; n], phases: None }; layer_count], ..Default::default() }
+        Scene { shape, layers: vec![LayerCells { values: vec![0; n], phases: None, offsets: None }; layer_count], ..Default::default() }
+    }
+
+    /// An empty scene whose layers carry per-cell phases and offsets as
+    /// `layers` says (one `(phases, offsets)` per layer).
+    pub fn empty_with(shape: WorldShape, layers: impl IntoIterator<Item = (bool, bool)>) -> Self {
+        let n = (shape.cols * shape.rows) as usize;
+        let layers = layers
+            .into_iter()
+            .map(|(phases, offsets)| LayerCells { values: vec![0; n], phases: phases.then(|| vec![0; n]), offsets: offsets.then(|| vec![(0, 0); n]) })
+            .collect();
+        Scene { shape, layers, ..Default::default() }
+    }
+
+    /// Sets a cell's phase (on a layer with phases; others ignore it).
+    pub fn set_phase(&mut self, layer: usize, col: u32, row: u32, phase: u8) {
+        let i = (row * self.shape.cols + col) as usize;
+        if let Some(p) = self.layers[layer].phases.as_mut().and_then(|p| p.get_mut(i)) {
+            *p = phase;
+        }
+    }
+
+    /// Sets a cell's offset (on a layer with offsets; others ignore it).
+    pub fn set_offset(&mut self, layer: usize, col: u32, row: u32, offset: (i16, i16)) {
+        let i = (row * self.shape.cols + col) as usize;
+        if let Some(o) = self.layers[layer].offsets.as_mut().and_then(|o| o.get_mut(i)) {
+            *o = offset;
+        }
+    }
+
+    /// Bytes the cells take (values, phases, offsets), for diagnostics.
+    pub fn cell_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| l.values.len() * 4 + l.phases.as_ref().map_or(0, Vec::len) + l.offsets.as_ref().map_or(0, |o| o.len() * 4))
+            .sum()
     }
 
     pub fn set(&mut self, layer: usize, col: u32, row: u32, value: u32) {
@@ -308,6 +351,20 @@ impl Scene {
                     }
                 }
             }
+            Update::Phases(changes) => {
+                for (layer, cell, phase) in changes {
+                    if let Some(p) = self.layers.get_mut(layer as usize).and_then(|l| l.phases.as_mut()).and_then(|p| p.get_mut(cell as usize)) {
+                        *p = phase;
+                    }
+                }
+            }
+            Update::Offsets(changes) => {
+                for (layer, cell, offset) in changes {
+                    if let Some(o) = self.layers.get_mut(layer as usize).and_then(|l| l.offsets.as_mut()).and_then(|o| o.get_mut(cell as usize)) {
+                        *o = offset;
+                    }
+                }
+            }
             Update::Sprites(sprites) => self.sprites = sprites,
             Update::View { id, view: Some(view) } => self.view_mut(id).view = view,
             Update::View { id, view: None } => self.views.retain(|v| v.id != id),
@@ -336,20 +393,35 @@ impl Scene {
         let mut out = Vec::new();
         let same_layout = self.shape == old.shape
             && self.layers.len() == old.layers.len()
-            && self.layers.iter().zip(&old.layers).all(|(a, b)| a.values.len() == b.values.len() && a.phases == b.phases);
+            && self.layers.iter().zip(&old.layers).all(|(a, b)| {
+                let len = |v: &Option<Vec<_>>| v.as_ref().map(Vec::len);
+                a.values.len() == b.values.len() && len(&a.phases) == len(&b.phases) && a.offsets.as_ref().map(Vec::len) == b.offsets.as_ref().map(Vec::len)
+            });
         if !same_layout {
             out.push(Update::World { shape: self.shape, layers: self.layers.clone() });
         } else {
-            let mut cells = Vec::new();
+            let (mut cells, mut phases, mut offsets) = (Vec::new(), Vec::new(), Vec::new());
             for (l, (new, old)) in self.layers.iter().zip(&old.layers).enumerate() {
                 for (i, (a, b)) in new.values.iter().zip(&old.values).enumerate() {
                     if a != b {
                         cells.push((l as u32, i as u32, *a));
                     }
                 }
+                if let (Some(new), Some(old)) = (&new.phases, &old.phases) {
+                    phases.extend(new.iter().zip(old).enumerate().filter(|(_, (a, b))| a != b).map(|(i, (a, _))| (l as u32, i as u32, *a)));
+                }
+                if let (Some(new), Some(old)) = (&new.offsets, &old.offsets) {
+                    offsets.extend(new.iter().zip(old).enumerate().filter(|(_, (a, b))| a != b).map(|(i, (a, _))| (l as u32, i as u32, *a)));
+                }
             }
             if !cells.is_empty() {
                 out.push(Update::Cells(cells));
+            }
+            if !phases.is_empty() {
+                out.push(Update::Phases(phases));
+            }
+            if !offsets.is_empty() {
+                out.push(Update::Offsets(offsets));
             }
         }
         if self.sprites != old.sprites {
@@ -596,6 +668,18 @@ mod tests {
             driver
         });
         let driver = t.join().unwrap();
+        // Phases and offsets travel as changes, not as a new world.
+        let shape = WorldShape { cols: 2, rows: 1, ..Default::default() };
+        let old = Scene::empty_with(shape, [(true, true), (false, false)]);
+        let mut new = old.clone();
+        new.set_phase(0, 1, 0, 3);
+        new.set_offset(0, 0, 0, (-5, 2));
+        new.set_offset(1, 0, 0, (9, 9));
+        assert_eq!(new.updates_since(&old), vec![Update::Phases(vec![(0, 1, 3)]), Update::Offsets(vec![(0, 0, (-5, 2))])]);
+        let mut applied = old.clone();
+        new.updates_since(&old).into_iter().for_each(|u| applied.apply(u));
+        assert_eq!(applied, new);
+        assert_eq!(new.cell_bytes(), 2 * 4 + 2 + 2 * 4 + 2 * 4);
         assert!(display.receive(Duration::from_secs(5)));
         assert_eq!(display.scene().layers[0].values, vec![0, 0, 0, 42]);
         assert_eq!(display.scene().views.iter().map(|v| v.id).collect::<Vec<_>>(), vec![0, 3]);
