@@ -1990,14 +1990,28 @@ impl Growing {
         }
         let sprite = |name: &str| sprites.get(name).copied().or_else(|| compiled.sprite(name));
         let mut sets = Vec::new();
-        for (name, set) in desc.sets.iter().filter(|(n, _)| !compiled.set_ids.contains_key(*n)) {
+        for (name, set) in &desc.sets {
             let blend = blend_of(set.blend).ok_or_else(|| DescError::Unknown { kind: "blend of set", name: name.clone() })?;
             let frames = set.frames.iter().map(|f| sprite(f).ok_or(DescError::Unknown { kind: "sprite", name: f.clone() })).collect::<Result<Vec<_>, _>>()?;
+            // A set there already stays as it is, unless it has other frames
+            // now (more of an animation made): then it is replaced.
+            if let Some(&id) = compiled.set_ids.get(name) {
+                let had: Vec<SpriteId> = (0..).map_while(|i| compiled.sets.frame(id, i)).collect();
+                if had == frames {
+                    continue;
+                }
+            }
             sets.push((name.clone(), frames, blend));
         }
         // The new sets on the layers whose patterns match them.
-        let new_sets: Vec<String> =
-            sprites.keys().filter(|n| !compiled.set_ids.contains_key(*n)).chain(sets.iter().map(|(n, _, _)| n)).cloned().collect::<BTreeSet<_>>().into_iter().collect();
+        let new_sets: Vec<String> = sprites
+            .keys()
+            .chain(sets.iter().map(|(n, _, _)| n))
+            .filter(|n| !compiled.set_ids.contains_key(*n))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let mut layer_values = Vec::new();
         for (i, patterns) in self.patterns.iter().enumerate() {
             let Some(layer) = compiled.layers.get(i) else { continue };
@@ -2069,7 +2083,16 @@ impl Compiled {
         }
         for (name, frames, blend) in &growth.sets {
             let id = self.sets.add(frames);
-            self.set_ids.insert(name.clone(), id);
+            // (A set replaced: the layer values that drew it draw the new one.)
+            if let Some(old) = self.set_ids.insert(name.clone(), id) {
+                for layer in &mut self.layers {
+                    if let Some(&v) = self.values.get(&(layer.name.clone(), name.clone())) {
+                        if layer.lut.get(v as usize) == Some(&old) {
+                            layer.lut[v as usize] = id;
+                        }
+                    }
+                }
+            }
             self.set_blend.insert(id, *blend);
         }
         for (i, names) in &growth.layer_values {
@@ -2752,8 +2775,6 @@ mod tests {
         cell = [3, 2]
         grid = [2, 1]
         group = "Part"
-        [sets."Anim@one"]
-        frames = ["s/0"]
         [sets."Anim@two"]
         frames = ["U@two/0", "U@one/9"]
         "#;
@@ -2811,8 +2832,7 @@ mod tests {
         assert_eq!(grown.value("l", "U@one/0"), Some(6));
         assert_eq!(grown.value("m", "Anim@one"), Some(1));
         assert_eq!(grown.value("m", "Anim@two"), Some(2));
-        // Art there already is kept (the set too), a sheet made again adds nothing.
-        assert_eq!(frame_names(&grown, "Anim@one"), ["U@one/0", "U@one/3", "s/2"]);
+        // Art there already is kept, a sheet made again adds nothing.
         assert_eq!(grown.sprite_names.iter().filter(|n| n.starts_with("U@one/")).count(), 10);
         // The same pixels as one compile of everything.
         let whole = Description::parse(&format!("{BASE}{WHOLE}")).unwrap().compile(&Checker, 64).unwrap();
@@ -2831,6 +2851,17 @@ mod tests {
         let sizes = |c: &Compiled| c.atlas.sprites.iter().map(|s| (s.width, s.height, s.anchor_x, s.anchor_y)).collect::<Vec<_>>();
         assert_eq!(sizes(&tables), sizes(&grown));
         assert_eq!(tables.value("m", "Anim@two"), grown.value("m", "Anim@two"));
+        // A set given again with other frames is replaced: its layer value
+        // draws the new one.
+        let value = grown.value("m", "Anim@one");
+        let g = growing.grow(&grown, "[sets.\"Anim@one\"]\nframes = [\"s/0\", \"U@one/1\"]\n", &Checker).unwrap();
+        grown.apply(&g);
+        assert_eq!(frame_names(&grown, "Anim@one"), ["s/0", "U@one/1"]);
+        assert_eq!(grown.value("m", "Anim@one"), value);
+        let layer = grown.layers.iter().find(|l| l.name == "m").unwrap();
+        assert_eq!(layer.lut[value.unwrap() as usize], grown.set("Anim@one").unwrap().0);
+        // The same frames again: nothing.
+        assert!(growing.grow(&grown, "[sets.\"Anim@one\"]\nframes = [\"s/0\", \"U@one/1\"]\n", &Checker).unwrap().is_empty());
         // A failed addition adds nothing; the next one numbers on.
         let n = grown.atlas.sprites.len();
         let bad = "[images.x]\nsource = \"x\"\n[sheets.x]\nimage = \"x\"\ncell = [2, 2]\ngroup = \"X\"\n[sets.\"Anim@bad\"]\nframes = [\"nothing\"]\n";
