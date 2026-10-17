@@ -616,6 +616,17 @@ pub struct Layout {
     /// interface on its own, `crate::scaling`): its views filling its
     /// screen are as large as that.
     pub driver_screen: Option<(u32, u32)>,
+    /// Exploring the world beside the driver's screen ([`Explore`]); the
+    /// world beside it in the last frame; the last left press on it (when,
+    /// where: for double-clicks).
+    explore: Option<Explore>,
+    beside_of: Option<(scene::WorldShape, Option<[i32; 4]>)>,
+    beside_press: Option<(f64, (i32, i32))>,
+    /// How many times smaller the driver's view showed the world beside
+    /// the screen in the last frame.
+    beside_view_downscale: u32,
+    /// Keys whose press exploring kept from the driver (their release too).
+    kept_keys: Vec<u32>,
 }
 
 impl Default for Layout {
@@ -688,12 +699,42 @@ impl Default for Layout {
             world_scale: (1, 1),
             interface_shown: None,
             driver_screen: None,
+            explore: None,
+            beside_of: None,
+            beside_press: None,
+            beside_view_downscale: 1,
+            kept_keys: Vec::new(),
         }
     }
 }
 
 const VK_SHIFT: u32 = 0x10;
 const VK_CONTROL: u32 = 0x11;
+const VK_ESCAPE: u32 = 0x1B;
+
+/// Exploring the world beside the driver's screen (`scene::Beside`) up
+/// close: a double-click on it shows it [`EXPLORE_ZOOM`] times bigger
+/// (by nearest pixel, of the world as the driver shows it) around the
+/// point clicked, the mouse captured: the view follows the world cursor,
+/// and nothing reaches the driver. Ctrl on its own lets the mouse go (a
+/// click on the world captures it again); a double-click or Esc goes back
+/// to the world fitted beside the screen, as does another world beside it
+/// (e.g. another scenario picked) or the screen closing.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct Explore {
+    /// The world explored: the scene's world and the part the driver
+    /// asked to fit (`scene::Beside::world`).
+    of: (scene::WorldShape, Option<[i32; 4]>),
+    /// The world pixel in the middle (in the pixels of the driver's view).
+    center: (i32, i32),
+}
+
+/// The zoom ([`ZOOMS`] index) a world beside a screen is explored at: 2.
+const EXPLORE_ZOOM: usize = 6;
+/// Two presses at most this far apart in time (seconds) and space (window
+/// pixels) are a double-click.
+const DOUBLE_CLICK_SECONDS: f64 = 0.5;
+const DOUBLE_CLICK_PIXELS: i32 = 6;
 
 /// Whether rectangles (x, y, w, h) share a pixel.
 fn overlap(a: [i32; 4], b: [i32; 4]) -> bool {
@@ -1496,6 +1537,7 @@ impl Layout {
 
     fn follows_pointer(&self) -> bool {
         self.main_view.follow == Follow::Pointer
+            || self.explore.is_some()
             || self.split.is_some_and(|s| s.view.follow == Follow::Pointer)
             || self.insets.iter().any(|i| i.view.follow == Follow::Pointer)
     }
@@ -1520,6 +1562,8 @@ impl Layout {
             return self.frame_beside(scene, overhang, beside, bounds);
         }
         self.beside = None;
+        self.beside_of = None;
+        self.leave_explore("the screen beside its world closed");
         let dt = std::mem::take(&mut self.step).min(MAX_STEP);
         // (The driver's views filling its screen: as large as that.)
         let base = crate::scene_cameras(scene, self.driver_screen(), overhang);
@@ -1885,7 +1929,13 @@ impl Layout {
     /// the viewer's own views: the arrangement is the driver's.
     fn frame_beside(&mut self, scene: &Scene, overhang: (u32, u32, u32, u32), beside: scene::Beside, bounds: Option<WorldBounds>) -> Frame {
         let base = crate::scene_cameras(scene, self.window, overhang);
-        self.step = 0.0;
+        self.clock += std::mem::take(&mut self.step).min(MAX_STEP);
+        // Another world beside the screen: back to it fitted.
+        let of = (scene.shape, beside.world);
+        self.beside_of = Some(of);
+        if self.explore.is_some_and(|e| e.of != of) {
+            self.leave_explore("another world beside the screen");
+        }
         self.main = None;
         self.fit = None;
         self.shown.clear();
@@ -1901,17 +1951,24 @@ impl Layout {
         self.moved = vec![([0, 0, self.window.0 as i32, self.window.1 as i32], shift)];
         self.beside = Some(world);
         let mut frame = Frame { view_cameras: vec![None; scene.views.len()], ..Default::default() };
-        // The world: the driver's first world view, all of it, fitted.
+        // The world: the driver's first world view, all of it (or the part
+        // asked for) fitted, or explored up close.
         let main = scene.views.iter().position(|v| !v.view.interface_only);
         if let (Some(m), Some(b)) = (main, bounds.filter(|_| world[2] > 0 && world[3] > 0)) {
-            // (What the driver names of it, at the scale its view shows it.)
-            let shown = base[m].downscale.max(1) as i32;
-            let area = beside.world.map_or_else(|| whole_world(b, self.grid_step, shown as u32), |[x, y, w, h]| [x / shown, y / shown, w / shown, h / shown]);
-            let mut camera = fit_world(&base[m], area, world, self.grid_step);
+            self.beside_view_downscale = base[m].downscale.max(1);
+            let camera = match self.explore {
+                Some(e) => self.explore_camera(&base[m], e, world, overhang, b),
+                None => {
+                    // (What the driver names of it, at the scale its view shows it.)
+                    let shown = base[m].downscale.max(1) as i32;
+                    let area = beside.world.map_or_else(|| whole_world(b, self.grid_step, shown as u32), |[x, y, w, h]| [x / shown, y / shown, w / shown, h / shown]);
+                    fit_world(&base[m], area, world, self.grid_step)
+                }
+            };
             // (Text comes as drawn at 1:1 and is shown at the view's zoom: drawn
             // from outlines at the zoom, world text does not show in a view of
             // a world shown smaller.)
-            camera.zoomed_art = false;
+            let camera = Camera { zoomed_art: false, ..camera };
             frame.cameras.push(camera);
             frame.view_cameras[m] = Some(frame.cameras.len() as u32 - 1);
             self.shown.push((Hit::Beside, camera));
@@ -1921,7 +1978,8 @@ impl Layout {
         // world), moved (screen sprites are in window pixels, moved by the
         // shift; the view's rectangle clips them).
         let [sx, sy, sw, sh] = beside.screen;
-        for (i, (_, c)) in scene.views.iter().zip(&base).enumerate().filter(|(_, (v, _))| v.view.interface_only) {
+        let hint = scene.interface.capture_hint.and_then(|id| scene.views.iter().position(|v| v.id == id && v.view.interface_only));
+        for (i, (_, c)) in scene.views.iter().zip(&base).enumerate().filter(|(i, (v, _))| v.view.interface_only && Some(*i) != hint) {
             let (x0, y0) = (c.origin.0.max(sx), c.origin.1.max(sy));
             let (x1, y1) = ((c.origin.0 + c.viewport.0 as i32).min(sx + sw), (c.origin.1 + c.viewport.1 as i32).min(sy + sh));
             if x1 <= x0 || y1 <= y0 {
@@ -1931,7 +1989,59 @@ impl Layout {
             frame.cameras.push(Camera { origin, viewport: ((x1 - x0) as u32, (y1 - y0) as u32), screen_shift: shift, ..*c });
             frame.view_cameras[i] = Some(frame.cameras.len() as u32 - 1);
         }
+        // Exploring with the mouse captured: the world cursor, and the hint
+        // how to let it go at the world's top-left (where the driver put it
+        // for its window's top-left), unless snapping.
+        if self.explore.is_some() && self.locked {
+            frame.markers.push(Marker::Cursor(self.cursor));
+            if let Some(i) = hint.filter(|_| !self.snapping) {
+                let shift = (world[0], world[1]);
+                let c = base[i];
+                frame.cameras.push(Camera { origin: (c.origin.0 + shift.0, c.origin.1 + shift.1), screen_shift: shift, ..c });
+                frame.view_cameras[i] = Some(frame.cameras.len() as u32 - 1);
+            }
+        }
         frame
+    }
+
+    /// The camera exploring the world beside the screen (`Explore`): the
+    /// world as the driver's view `base` shows it, zoomed [`EXPLORE_ZOOM`]
+    /// around the world cursor while the mouse is captured (else where it
+    /// was), not past an edge of a world that does not wrap (`bounds`).
+    fn explore_camera(&mut self, base: &Camera, e: Explore, rect: [i32; 4], overhang: (u32, u32, u32, u32), bounds: WorldBounds) -> Camera {
+        let center = if self.locked { self.cursor } else { e.center };
+        if let Some(e) = &mut self.explore {
+            e.center = center;
+        }
+        let c = FreeView::new(center, EXPLORE_ZOOM, Follow::Pointer).camera(rect, overhang, Some(bounds), self.world_scale);
+        Camera { x: c.x, y: c.y, zoom: c.zoom, viewport: c.viewport, origin: c.origin, cull: None, screen_shift: (0, 0), downscale: base.downscale.max(1), ..*base }
+    }
+
+    /// Explores the world beside the screen around window pixel `p` (on
+    /// it), the mouse captured there.
+    fn start_explore(&mut self, p: (i32, i32)) {
+        let (Some(of), Some((_, c))) = (self.beside_of, self.shown.iter().find(|(h, _)| *h == Hit::Beside).copied()) else { return };
+        // (The fitted view may show the world smaller than the driver's
+        // view does: in that view's pixels.)
+        let (q, n) = (world_at(&c, p), (c.downscale / self.beside_view_downscale.max(1)).max(1) as i32);
+        let center = (q.0 * n, q.1 * n);
+        self.explore = Some(Explore { of, center });
+        self.cursor = center;
+        self.motion_rest = (0.0, 0.0);
+        self.locked = true;
+        self.grab = Some(true);
+        self.against = None;
+        log::info!("viewer: exploring the world beside the screen at {center:?}, zoomed {:?} (Ctrl on its own lets the mouse go; a double-click or Esc goes back)", ZOOMS[EXPLORE_ZOOM]);
+    }
+
+    /// Back to the world fitted beside the screen (the mouse let go).
+    fn leave_explore(&mut self, why: &str) {
+        if self.explore.take().is_some() {
+            if self.locked {
+                self.release(why);
+            }
+            log::info!("viewer: the world beside the screen fitted again ({why})");
+        }
     }
 
     /// The side whose controls are shown: the one the pointer is in (the
@@ -2217,7 +2327,7 @@ impl Layout {
             Hit::Magnifier if self.magnifier.is_some_and(|m| self.magnifier_geometry(&m).1.is_none()) => self.hit_below_magnifier(p),
             h => h,
         };
-        (matches!(hit, Hit::Main | Hit::Pane | Hit::Inset(_)) && self.follow_of(hit) == Some(Follow::Pointer)).then_some(hit)
+        (matches!(hit, Hit::Main | Hit::Pane | Hit::Inset(_) | Hit::Beside) && self.follow_of(hit) == Some(Follow::Pointer)).then_some(hit)
     }
 
     /// The world pixel under window pixel `p`, if a world view shows one.
@@ -2538,6 +2648,7 @@ impl Layout {
 
     fn follow_of(&self, hit: Hit) -> Option<Follow> {
         match hit {
+            Hit::Beside if self.explore.is_some() => Some(Follow::Pointer),
             Hit::Main => Some(self.main_view.follow),
             Hit::Pane => self.split.map(|s| s.view.follow),
             Hit::Inset(k) => self.insets.get(k).map(|i| i.view.follow),
@@ -2577,6 +2688,19 @@ impl Layout {
                 vec![input]
             }
             Input::Key { vk, down, .. } if self.ctrl && self.shift && self.command(vk, down) => vec![],
+            // Exploring the world beside the screen: Esc goes back to it
+            // fitted; with the mouse captured no key reaches the driver.
+            // (A key whose press it kept: its release too.)
+            Input::Key { vk, down, .. } if (down && self.explore.is_some() && (vk == VK_ESCAPE || self.locked)) || (!down && self.kept_keys.contains(&vk)) => {
+                self.kept_keys.retain(|&k| k != vk);
+                if down {
+                    self.kept_keys.push(vk);
+                    if vk == VK_ESCAPE {
+                        self.leave_explore("Esc");
+                    }
+                }
+                vec![]
+            }
             Input::Key { vk, down, text } => vec![self.key(vk, down, text)],
             Input::MouseMove { x, y } => {
                 if self.locked {
@@ -2648,6 +2772,10 @@ impl Layout {
             let q = self.route_point(p).unwrap_or_else(|_| self.clamp_to_main(p));
             return vec![Input::MouseButton { button, down, x: q.0, y: q.1 }];
         }
+        // The world beside the driver's screen: its own gestures.
+        if let Some(out) = self.beside_button(button, p) {
+            return out;
+        }
         let hit = if self.locked { Hit::Interface } else { self.hit(p) };
         // Viewer gestures.
         match (button, hit) {
@@ -2697,6 +2825,41 @@ impl Layout {
             }
             Err(None) => vec![],
         }
+    }
+
+    /// A press on the world beside the driver's screen (or anywhere while it
+    /// is explored with the mouse captured): a double-click explores it, or
+    /// goes back to it fitted; exploring with the mouse free, a click
+    /// captures it again. None of it reaches the driver (`Some`: what does,
+    /// nothing); `None`: not such a press.
+    fn beside_button(&mut self, button: Button, p: (i32, i32)) -> Option<Vec<Input>> {
+        self.beside?;
+        let on_world = if self.locked { self.explore.is_some() } else { self.hit(p) == Hit::Beside };
+        if !on_world {
+            self.beside_press = None;
+            return None;
+        }
+        if button != Button::Left {
+            return Some(vec![]);
+        }
+        // (Where it is made: the world cursor while the mouse is captured.)
+        let at = if self.locked { self.cursor_on_window().unwrap_or(p) } else { p };
+        let near = |(t, q): (f64, (i32, i32))| {
+            self.clock - t <= DOUBLE_CLICK_SECONDS && (q.0 - at.0).abs() <= DOUBLE_CLICK_PIXELS && (q.1 - at.1).abs() <= DOUBLE_CLICK_PIXELS
+        };
+        if self.beside_press.take().is_some_and(near) {
+            if self.explore.is_some() {
+                self.leave_explore("a double-click");
+            } else {
+                self.start_explore(p);
+            }
+        } else {
+            self.beside_press = Some((self.clock, at));
+            if self.explore.is_some() && !self.locked {
+                self.capture(Hit::Beside, p);
+            }
+        }
+        Some(vec![])
     }
 
     /// A key that is not the viewer's: `Input::WorldKey` while the pointer
@@ -3159,6 +3322,137 @@ mod tests {
             // Filling the rectangle one way.
             assert!(sw as i32 <= (size.0 + 64) / n + 2 || sh as i32 <= size.1 / n + 2, "{size:?}: {c:?}");
         }
+    }
+
+    /// A dialog left of its world, which the driver shows 4 times smaller,
+    /// the part (`Beside::world`) around (8000, 4000) at full size fitted;
+    /// a hint how to let the mouse go (view 259, at the window's top-left).
+    fn beside_scene(cols: u32) -> Scene {
+        let mut s = scene();
+        s.shape.cols = cols;
+        s.views[0].view.downscale = 4;
+        s.views.push(ViewState { id: 259, view: View { interface_only: true, origin: (8, 8), viewport: (133, 38), ..Default::default() }, overlay: vec![] });
+        s.interface.capture_hint = Some(259);
+        s.interface.beside = Some(scene::Beside { screen: [448, 156, 1024, 768], edge: scene::Edge::Left, world: Some([6000, 3000, 4000, 2000]) });
+        s
+    }
+
+    fn beside_frame(l: &mut Layout, s: &Scene) -> Frame {
+        // (The bounds at the scale the driver's view shows the world.)
+        l.frame(s, (1920, 1080), (0, 0, 0, 0), vec![[448, 156, 1024, 768]], Some(WorldBounds { size: (4000, 2000), wrap: (true, false) }))
+    }
+
+    /// Frames over a second (one frame takes at most `MAX_STEP`).
+    fn wait(l: &mut Layout, s: &Scene) {
+        for _ in 0..10 {
+            l.advance(std::time::Duration::from_millis(100));
+            beside_frame(l, s);
+        }
+    }
+
+    fn centre(c: &Camera) -> (i32, i32) {
+        let (sw, sh) = c.source_size();
+        (c.x + sw as i32 / 2, c.y + sh as i32 / 2)
+    }
+
+    #[test]
+    fn the_part_of_the_world_asked_for_fits_beside_the_screen() {
+        let mut l = Layout::default();
+        let f = beside_frame(&mut l, &beside_scene(62));
+        let c = f.cameras[0];
+        assert_eq!((c.origin, c.viewport), ((1028, 0), (892, 1080)));
+        // 4000 × 2000 world pixels from (6000, 3000), 1000 × 500 in the
+        // driver's view: as the driver shows it, a little zoomed out, around
+        // (8000, 4000) (2000, 1000 there).
+        assert_eq!(c.downscale, 4);
+        assert!(c.zoom.0 < c.zoom.1);
+        let (x, y) = centre(&c);
+        assert!((x - 2000).abs() <= 2 && (y - 1000).abs() <= 2, "{c:?}");
+    }
+
+    #[test]
+    fn a_double_click_explores_the_world_beside_the_screen_up_close() {
+        let mut l = Layout::default();
+        let s = beside_scene(62);
+        let fitted = beside_frame(&mut l, &s).cameras[0];
+        // The point double-clicked, in the pixels of the driver's view.
+        let q = world_at(&fitted, (1500, 300));
+        let n = fitted.downscale as i32 / 4;
+        let at = (q.0 * n, q.1 * n);
+        assert!(click(&mut l, (1500, 300)).is_empty());
+        assert!(!l.captured());
+        assert!(click(&mut l, (1500, 300)).is_empty());
+        assert!(l.captured());
+        // Twice as big as the driver shows it, by nearest pixel, around it;
+        // the world cursor there, the hint at the world's top-left.
+        let f = beside_frame(&mut l, &s);
+        let c = f.cameras[0];
+        assert_eq!((c.zoom, c.downscale, c.origin, c.viewport), ((2, 1), 4, (1028, 0), (892, 1080)));
+        assert_eq!(centre(&c), at);
+        assert_eq!(f.markers, [Marker::Cursor(at)]);
+        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (1028 + 8, 8));
+        // Nothing reaches the driver: clicks, keys, the wheel, motion.
+        assert!(click(&mut l, (100, 400)).is_empty());
+        assert!(key(&mut l, 0x41, true).is_empty() && key(&mut l, 0x41, false).is_empty());
+        assert!(l.route(Input::Wheel { delta: 1, x: 300, y: 400 }).is_empty());
+        assert!(l.motion((20.0, 0.0)).is_empty());
+        let f = beside_frame(&mut l, &s);
+        assert_eq!(centre(&f.cameras[0]), (at.0 + 10, at.1));
+        // Ctrl on its own lets the mouse go: still explored, no hint; the
+        // dialog takes clicks again.
+        key(&mut l, VK_CONTROL, true);
+        key(&mut l, VK_CONTROL, false);
+        assert!(!l.captured());
+        let f = beside_frame(&mut l, &s);
+        assert_eq!((f.cameras[0].zoom, centre(&f.cameras[0])), ((2, 1), (at.0 + 10, at.1)));
+        assert!(f.markers.is_empty() && f.view_cameras[2].is_none());
+        assert_eq!(click(&mut l, (100, 400))[0], Input::MouseButton { button: Button::Left, down: true, x: 548, y: 400 });
+        // A click on the world captures the mouse again, the view put.
+        wait(&mut l, &s);
+        assert!(click(&mut l, (1500, 300)).is_empty());
+        assert!(l.captured());
+        assert_eq!(centre(&beside_frame(&mut l, &s).cameras[0]), (at.0 + 10, at.1));
+        // Esc goes back to the world fitted (and does not reach the driver).
+        assert!(key(&mut l, VK_ESCAPE, true).is_empty() && key(&mut l, VK_ESCAPE, false).is_empty());
+        assert!(!l.captured());
+        assert_eq!(beside_frame(&mut l, &s).cameras[0], fitted);
+        // So does a double-click while exploring.
+        click(&mut l, (1500, 300));
+        click(&mut l, (1500, 300));
+        assert!(l.captured());
+        wait(&mut l, &s);
+        click(&mut l, (1500, 300));
+        click(&mut l, (1500, 300));
+        assert!(!l.captured());
+        assert_eq!(beside_frame(&mut l, &s).cameras[0], fitted);
+        // Slow clicks are no double-click.
+        click(&mut l, (1500, 300));
+        wait(&mut l, &s);
+        click(&mut l, (1500, 300));
+        assert!(!l.captured());
+    }
+
+    #[test]
+    fn another_world_beside_the_screen_is_shown_fitted() {
+        let mut l = Layout::default();
+        let s = beside_scene(62);
+        beside_frame(&mut l, &s);
+        click(&mut l, (1500, 300));
+        click(&mut l, (1500, 300));
+        assert!(l.captured());
+        // Another scenario picked: its world, fitted, the mouse let go.
+        let other = beside_scene(80);
+        let f = beside_frame(&mut l, &other);
+        assert!(!l.captured());
+        assert_ne!(f.cameras[0].zoom, (2, 1));
+        assert!(f.markers.is_empty());
+        // The screen closing ends it too.
+        beside_frame(&mut l, &other);
+        click(&mut l, (1500, 300));
+        click(&mut l, (1500, 300));
+        assert!(l.captured());
+        frame(&mut l, vec![]);
+        assert!(!l.captured());
     }
 
     /// A split whose pane (right half) shows world (5000, 2000) around its
