@@ -163,6 +163,7 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
                 zoomed_art: false,
                 stacked: false,
                 hairline: false,
+                downscale: 1,
             }
         })
         .collect()
