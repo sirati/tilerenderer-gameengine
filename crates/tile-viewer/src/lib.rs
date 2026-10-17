@@ -8,6 +8,7 @@ pub mod cursor;
 pub mod fps;
 mod input;
 pub mod layout;
+pub mod looks;
 pub mod scaling;
 pub mod snap;
 
@@ -188,7 +189,50 @@ pub fn scene_world_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[
     }
     // The camera showing scene view `id`, if one does.
     let camera_of = |id: u32| scene.views.iter().zip(view_cameras).find(|(v, _)| v.id == id).and_then(|(_, c)| *c);
-    let placed = |s: &scene::FreeSprite, view: Option<u32>| tile_render::PlacedSprite {
+    world.free = scene.sprites.iter().map(|s| placed_sprite(compiled, s, None, s.not_in_view.and_then(camera_of))).collect();
+    for (i, (v, camera)) in scene.views.iter().zip(view_cameras).enumerate() {
+        match overlay_cameras.iter().find(|(view, _)| *view == i) {
+            Some((_, cameras)) => world.free.extend(v.overlay.iter().zip(cameras).map(|(s, c)| placed_sprite(compiled, s, Some(*c), None))),
+            None => {
+                if let Some(c) = camera {
+                    world.free.extend(v.overlay.iter().map(|s| placed_sprite(compiled, s, Some(*c), None)));
+                }
+            }
+        }
+    }
+    world
+}
+
+/// Where [`scene_world_for`] puts each drawn view's overlay among the
+/// world's free sprites: (view id, first index, how many, camera).
+pub fn overlay_spans(scene: &Scene, view_cameras: &[Option<u32>]) -> Vec<looks::Span> {
+    overlay_spans_arranged(scene, view_cameras, &[])
+}
+
+/// [`overlay_spans`] with each scaled panel's sprite cameras retained.
+pub fn overlay_spans_arranged(scene: &Scene, view_cameras: &[Option<u32>], overlay_cameras: &[(usize, Vec<u32>)]) -> Vec<looks::Span> {
+    let mut at = scene.sprites.len();
+    let mut out = Vec::new();
+    for (i, (v, camera)) in scene.views.iter().zip(view_cameras).enumerate() {
+        let cameras = match overlay_cameras.iter().find(|(view, _)| *view == i) {
+            Some((_, cameras)) => cameras.iter().copied().take(v.overlay.len()).collect(),
+            None => match camera {
+                Some(c) => vec![*c; v.overlay.len()],
+                None => continue,
+            },
+        };
+        let len = cameras.len();
+        out.push(looks::Span { view: v.id, start: at, len, cameras });
+        at += len;
+    }
+    out
+}
+
+/// A scene's sprite as the renderer places it: in every view, or only in
+/// the one drawn by camera `view` (an overlay's); `not_in`: drawn in every
+/// view but the one of that camera.
+pub fn placed_sprite(compiled: &Compiled, s: &scene::FreeSprite, view: Option<u32>, not_in: Option<u32>) -> tile_render::PlacedSprite {
+    tile_render::PlacedSprite {
         set: tile_render::SpriteSetId::from_raw(s.set),
         x: s.x,
         y: s.y,
@@ -198,8 +242,8 @@ pub fn scene_world_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[
         ticks_per_frame: s.ticks_per_frame.max(1),
         blend: tile_render::Blend::from_scale_den(s.scale_den, s.tint),
         clip: s.clip,
-        view: view.or_else(|| s.not_in_view.and_then(camera_of)),
-        except_view: view.is_none() && s.not_in_view.and_then(camera_of).is_some(),
+        view: view.or(not_in),
+        except_view: view.is_none() && not_in.is_some(),
         zoom_art: match s.zoom_art {
             1 => tile_render::ZoomArt::Low,
             2 => tile_render::ZoomArt::Zoomed { zoom: (u32::from(s.zoom.0), u32::from(s.zoom.1)), offset: s.zoom_offset },
@@ -207,19 +251,7 @@ pub fn scene_world_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[
         },
         text: s.glyph.and_then(|g| outline_glyph(compiled, &g, s.tint)),
         palette: s.palette,
-    };
-    world.free = scene.sprites.iter().map(|s| placed(s, None)).collect();
-    for (i, (v, camera)) in scene.views.iter().zip(view_cameras).enumerate() {
-        match overlay_cameras.iter().find(|(view, _)| *view == i) {
-            Some((_, cameras)) => world.free.extend(v.overlay.iter().zip(cameras).map(|(s, c)| placed(s, Some(*c)))),
-            None => {
-                if let Some(c) = camera {
-                    world.free.extend(v.overlay.iter().map(|s| placed(s, Some(*c))));
-                }
-            }
-        }
     }
-    world
 }
 
 /// A scene's glyph (in `tint`, 0xRRGGBB) as the renderer draws it from its
@@ -550,6 +582,11 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         next_frame: None,
         map_drawn: false,
         constraints: constraints::Constraints::default(),
+        feedback: looks::Feedback::from_env(),
+        drawn_looks: Vec::new(),
+        base_free: Vec::new(),
+        spans: Vec::new(),
+        look_scene: looks::LookScene::default(),
     };
     // The arrangement to start with: the user's settings.
     app.set_settings(load_settings());
@@ -705,6 +742,16 @@ struct App {
     map_drawn: bool,
     /// The system's pointer constraints (Wayland).
     constraints: constraints::Constraints,
+    /// The interaction looks drawn here (hover, pressed, selected), and
+    /// those the last frame drew.
+    feedback: looks::Feedback,
+    drawn_looks: Vec<(u64, scene::LookState)>,
+    /// The world's free sprites as built (no looks drawn), where the
+    /// views' overlays lie among them, and the interactables and looks of
+    /// the scene it was built from.
+    base_free: Vec<tile_render::PlacedSprite>,
+    spans: Vec<looks::Span>,
+    look_scene: looks::LookScene,
 }
 
 /// What happens to the system pointer once a frame went out after it was
@@ -778,6 +825,18 @@ impl App {
             self.fps = fps::Overlay::default();
         }
         self.settings = settings;
+    }
+
+    /// Input for the driver: also what the interaction looks follow (a
+    /// frame is drawn at once when they may change).
+    fn send(&mut self, input: Input) {
+        let now = self.now();
+        if self.feedback.sent(&input, &self.look_scene, now) {
+            if let Some(gpu) = &self.gpu {
+                gpu.window.request_redraw();
+            }
+        }
+        self.display.send_input(input);
     }
 
     /// Seconds since the viewer started (the snapping pointer's clock).
@@ -1332,9 +1391,27 @@ impl App {
         let views_moved = arranged.view_cameras != self.drawn_views || self.drawn_overlay != self.built_overlay;
         let rebuilt = new_assets || ((scene.seq != self.drawn_seq || views_moved) && matches) || self.world.is_none();
         if rebuilt {
-            self.world = Some(scene_world_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay));
+            let world = scene_world_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay);
+            self.base_free = world.free.clone();
+            self.spans = overlay_spans_arranged(scene, &arranged.view_cameras, &self.drawn_overlay);
+            self.look_scene = looks::LookScene::of(scene);
+            self.world = Some(world);
             self.built_overlay = self.drawn_overlay.clone();
         }
+        // The interaction looks drawn here, in the world as built (from the
+        // scene it was built from, also while a newer one waits for its
+        // art).
+        let now = self.started.elapsed().as_secs_f64();
+        let replacements = self.feedback.replacements(&self.look_scene, now);
+        let looks_changed = rebuilt || self.feedback.drawn() != &self.drawn_looks[..];
+        if looks_changed {
+            if let Some(world) = self.world.as_mut() {
+                let compiled = &self.compiled;
+                world.free = looks::splice(&self.base_free, &self.spans, &replacements, |s, camera| placed_sprite(compiled, s, Some(camera), None));
+            }
+        }
+        self.drawn_looks = self.feedback.drawn().to_vec();
+        drop(replacements);
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
         markers.extend(divider_sprites(&self.compiled, &arranged.divider));
@@ -1421,7 +1498,7 @@ impl App {
         } else if rebuilt {
             gpu.renderer.update_world(&gpu.device, &gpu.queue, world);
         }
-        let markers_moved = markers != self.drawn_markers;
+        let markers_moved = markers != self.drawn_markers || looks_changed;
         if !new_assets && !rebuilt && markers_moved {
             gpu.renderer.update_free(&gpu.device, &gpu.queue, world);
         }
@@ -1491,6 +1568,7 @@ impl App {
         }
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
+        self.feedback.presented(self.started.elapsed().as_secs_f64());
         if show_fps {
             self.fps.counter.presented(seconds);
         }
@@ -1583,7 +1661,7 @@ impl ApplicationHandler for App {
         }
         if let WindowEvent::Focused(false) = event {
             for input in self.snap.focus_lost(&mut self.layout) {
-                self.display.send_input(input);
+                self.send(input);
             }
             self.layout.released();
             self.grab(false);
@@ -1592,14 +1670,23 @@ impl ApplicationHandler for App {
         // window is no longer the one the user works in).
         if matches!(event, WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. }) {
             for input in self.layout.pointer_gone() {
-                self.display.send_input(input);
+                self.send(input);
             }
+            self.feedback.pointer_gone(self.started.elapsed().as_secs_f64());
         }
         let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
         for input in self.input.translate(&event) {
             // (Through button snapping, which passes on what is not its.)
-            for input in self.snap.route(input, &mut self.layout, self.display.scene(), now, rates) {
-                self.display.send_input(input);
+            let routed = self.snap.route(input.clone(), &mut self.layout, self.display.scene(), now, rates);
+            // The pointer moved where the driver does not get it, a release
+            // the driver does not get: no longer over its interactables.
+            match input {
+                Input::MouseMove { .. } if !self.layout.captured() && !routed.iter().any(|i| matches!(i, Input::MouseMove { .. })) => self.feedback.pointer_gone(now),
+                Input::MouseButton { button: scene::Button::Left, down: false, .. } if !routed.iter().any(|i| matches!(i, Input::MouseButton { button: scene::Button::Left, down: false, .. })) => self.feedback.released(now),
+                _ => {}
+            }
+            for input in routed {
+                self.send(input);
             }
         }
         // (After a redraw too: what the pointer is over may have changed.)
@@ -1628,7 +1715,7 @@ impl ApplicationHandler for App {
             let delta = (delta.0 / s, delta.1 / s);
             let inputs = self.snap.motion(delta).unwrap_or_else(|| if edge { vec![] } else { self.layout.motion(delta) });
             for input in inputs {
-                self.display.send_input(input);
+                self.send(input);
             }
             if self.pointer_hidden() {
                 self.pointer_moved();
@@ -1661,7 +1748,7 @@ impl ApplicationHandler for App {
         }
         let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
         for input in self.snap.tick(&mut self.layout, self.display.scene(), now, rates) {
-            self.display.send_input(input);
+            self.send(input);
         }
         // (Snapping may have put the pointer somewhere, or let go of it.)
         self.apply_layout_requests(event_loop);

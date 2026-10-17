@@ -336,6 +336,38 @@ impl Menus {
         out
     }
 
+    /// The buttons of `menu` as [`Menus::sprites`] draws them now and in
+    /// their other states (normal, hover, pressed), for a renderer to draw
+    /// those itself at once (`scene::Looks`); ids as
+    /// [`Menus::interactables`] gives them.
+    pub fn looks(&self, menu: &Menu, state: &MenuState, viewport: (u32, u32), after_pass: u32) -> Vec<ButtonLooks> {
+        use scene::{LookState, PointerState};
+        menu.items
+            .iter()
+            .filter_map(|item| {
+                let Item::Button { id, .. } = item else { return None };
+                let one = Menu { items: vec![item.clone()], ..menu.clone() };
+                let in_state = |pointer: PointerState| {
+                    let over = (pointer != PointerState::Normal).then(|| id.clone());
+                    let pressed = (pointer == PointerState::Pressed).then(|| id.clone());
+                    self.sprites(&one, &MenuState { hover: over, pressed }, viewport, after_pass)
+                };
+                let pointer = match (state.hover.as_deref() == Some(id.as_str()), state.pressed.as_deref() == Some(id.as_str())) {
+                    (true, true) => PointerState::Pressed,
+                    (true, false) => PointerState::Hover,
+                    _ => PointerState::Normal,
+                };
+                let shown = LookState { pointer, selected: false };
+                let states = [PointerState::Normal, PointerState::Hover, PointerState::Pressed]
+                    .into_iter()
+                    .filter(|&p| p != pointer)
+                    .map(|p| (LookState { pointer: p, selected: false }, in_state(p)))
+                    .collect();
+                Some(ButtonLooks { id: id_hash(&menu.name, id), shown, sprites: self.sprites(&one, state, viewport, after_pass), states })
+            })
+            .collect()
+    }
+
     /// The button of `menu` under viewport position (x, y).
     pub fn hit<'m>(&self, menu: &'m Menu, viewport: (u32, u32), x: i32, y: i32) -> Option<&'m str> {
         let (ox, oy) = menu.anchor.place(menu.size, viewport);
@@ -398,6 +430,16 @@ fn id_hash(menu: &str, id: &str) -> u64 {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
     h | 1 << 63
+}
+
+/// A menu's button as drawn now and in its other states (see
+/// [`Menus::looks`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ButtonLooks {
+    pub id: u64,
+    pub shown: scene::LookState,
+    pub sprites: Vec<FreeSprite>,
+    pub states: Vec<(scene::LookState, Vec<FreeSprite>)>,
 }
 
 /// Pointer state of an open menu.
@@ -503,5 +545,17 @@ mod tests {
         assert_eq!(menus.interactables(m, (640, 480))[0].id, items[0].id);
         assert_ne!(id_hash("m", "ok"), id_hash("m", "cancel"));
         assert_ne!(id_hash("a", "bc"), id_hash("ab", "c"));
+        // Its looks: as drawn now (a part of the menu's sprites) and the
+        // other states.
+        let state = MenuState { hover: Some("ok".into()), pressed: None };
+        let looks = menus.looks(m, &state, (300, 150), u32::MAX);
+        assert_eq!(looks.len(), 1);
+        assert_eq!(looks[0].id, items[0].id);
+        assert_eq!(looks[0].shown.pointer, scene::PointerState::Hover);
+        let all = menus.sprites(m, &state, (300, 150), u32::MAX);
+        assert!(all.windows(looks[0].sprites.len()).any(|w| w == &looks[0].sprites[..]));
+        let normal = &looks[0].states.iter().find(|(l, _)| l.pointer == scene::PointerState::Normal).unwrap().1;
+        let all_normal = menus.sprites(m, &MenuState::default(), (300, 150), u32::MAX);
+        assert!(all_normal.windows(normal.len()).any(|w| w == &normal[..]));
     }
 }
