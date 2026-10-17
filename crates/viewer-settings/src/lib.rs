@@ -5,11 +5,16 @@
 //!
 //! Game-agnostic: screens are named by the driver (`ScreenKind` holds
 //! strings), not by any one game.
+//!
+//! [`controls`]: the settings as named controls (choices, switches,
+//! numbers with their ranges), as a preferences screen shows and sets them.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+pub mod controls;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
@@ -230,12 +235,19 @@ impl Settings {
         }
     }
 
+    /// Writes the settings to `path` (its folder made if missing), whole or
+    /// not at all: into a file beside it, then moved over it, so that a
+    /// reader never sees half a file.
     pub fn save(&self, path: &Path) -> Result<(), SettingsError> {
         let text = toml::to_string_pretty(self)?;
-        if let Some(dir) = path.parent() {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(|e| SettingsError::Io(dir.into(), e))?;
         }
-        std::fs::write(path, text).map_err(|e| SettingsError::Io(path.into(), e))
+        let mut temp = path.as_os_str().to_owned();
+        temp.push(".new");
+        let temp = PathBuf::from(temp);
+        std::fs::write(&temp, text).map_err(|e| SettingsError::Io(temp.clone(), e))?;
+        std::fs::rename(&temp, path).map_err(|e| SettingsError::Io(path.into(), e))
     }
 }
 
@@ -255,6 +267,24 @@ mod tests {
         let partial: Settings = toml::from_str("[layout]\nsmooth_world_movement = true\n").unwrap();
         assert!(partial.layout.smooth_world_movement);
         assert_eq!(partial.resolution, Resolution::default());
+    }
+
+    #[test]
+    fn saved_settings_load_back_and_a_missing_file_gives_defaults() {
+        let dir = std::env::temp_dir().join(format!("viewer-settings-test-{}", std::process::id()));
+        let path = dir.join("sub").join("settings.toml");
+        assert_eq!(Settings::load(&path).unwrap(), Settings::default());
+        let mut s = Settings::default();
+        s.layout.roles = Roles::UnitMouse;
+        s.input.snap_updates_per_second = 5.0;
+        s.save(&path).unwrap();
+        s.layout.zoom = Zoom::Mouse131;
+        s.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), s);
+        assert!(!dir.join("sub").join("settings.toml.new").exists());
+        std::fs::write(&path, "[layout]\nsplit = 7\n").unwrap();
+        assert!(matches!(Settings::load(&path), Err(SettingsError::Parse(..))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
