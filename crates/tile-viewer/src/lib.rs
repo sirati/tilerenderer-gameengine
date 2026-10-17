@@ -1012,7 +1012,7 @@ impl App {
     fn reconcile_system_pointer(&mut self) {
         if self.pointer_inside && self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus()) && !self.layout.captured() && !self.snap.snap_mode_active() {
             for input in self.layout.system_pointer_placed(self.system_pointer) {
-                self.display.send_input(input);
+                self.send(input);
             }
         }
     }
