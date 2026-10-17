@@ -293,7 +293,7 @@ pub struct Interface {
 /// the part of the screen that matters (`screen`, x, y, w, h in the
 /// driver's window pixels, e.g. a dialog) goes to one edge of the window,
 /// its interface moved with it (pointer input mapped back), and the
-/// world, all of it, fitted into the rest (shown as small as it takes,
+/// world (all of it, or the part `world` names) fitted into the rest (shown as small as it takes,
 /// see `View::downscale`). The world is not the driver's view then: pointer
 /// input on it does not reach the driver.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -301,6 +301,11 @@ pub struct Beside {
     pub screen: [i32; 4],
     /// The window edge the screen goes to.
     pub edge: Edge,
+    /// The part of the world to fit into the rest (x, y, w, h in world
+    /// pixels as the driver's views show it at full size, e.g. what a
+    /// preview has revealed; it may reach past the edge of a world that
+    /// wraps): all of the world if none.
+    pub world: Option<[i32; 4]>,
 }
 
 /// An edge of the window.
@@ -650,11 +655,11 @@ pub enum Input {
     /// in such a view, sent instead of `Key`: a driver may act on the world
     /// there, or take it as the `Key` it would have been.
     WorldKey { vk: u32, down: bool, text: Option<char>, x: i32, y: i32 },
-    /// The pointer rests at the edge of the renderer's window over the
-    /// driver's main view, which shows the driver's view unmoved (each
-    /// window pixel the driver's own): it is at the driver's screen edge as
-    /// much as at the window's, and a driver may scroll the way it does when
-    /// its own pointer is there. Per axis: 0 if the pointer is not within
+    /// The pointer rests at the edge of the renderer's window over a view
+    /// that follows the driver's main view (unmoved, each window pixel the
+    /// driver's own, or zoomed about its middle): it is at the driver's
+    /// screen edge as much as at the window's, and a driver may scroll the
+    /// way it does when its own pointer is there (that view follows). Per axis: 0 if the pointer is not within
     /// [`EDGE_ZONE`] pixels of that axis's edges, else how far from the edge
     /// it is plus one, negative for the left (top) edge, positive for the
     /// right (bottom) one; `(0, 0)` once it is at no edge (or left the window

@@ -32,6 +32,10 @@
 //! sets = ["xtgc/*"]              # sets drawable on this layer; `*` expands
 //! ```
 
+mod cancel;
+
+pub use cancel::{CANCELLED, StopWhen};
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::Deserialize;

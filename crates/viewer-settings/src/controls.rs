@@ -8,7 +8,7 @@
 //! Choices are named like the enum variants they stand for (`"Vertical2To1"`,
 //! `"LeftOrBottom"`); the pixel scale by its number (`"1"` .. `"6"`).
 
-use crate::{Layout, Place, Resolution, Roles, Settings, Split, Zoom};
+use crate::{Layout, MapMovement, Place, Resolution, Roles, Settings, Split, Zoom};
 
 /// A control's value.
 #[derive(Clone, Debug, PartialEq)]
@@ -58,7 +58,7 @@ pub const SCREENS_PREFIX: &str = "layout.screens.";
 
 /// Every key [`Settings::control`] answers (besides one screen place per
 /// screen of [`Layout::SCREENS`], and the derived `"layout.orientation"`).
-pub const KEYS: [&str; 13] = [
+pub const KEYS: [&str; 14] = [
     "resolution.pixel_scale",
     "resolution.menu_scale",
     "resolution.frame_scale",
@@ -71,6 +71,7 @@ pub const KEYS: [&str; 13] = [
     "layout.roles",
     "input.snap_updates_per_second",
     "input.snap_ghost_fps",
+    "input.map_movement",
     "display.show_fps",
 ];
 
@@ -127,6 +128,10 @@ impl Named for Roles {
     const ALL: &'static [(Self, &'static str)] = &[(Roles::Free, "Free"), (Roles::UnitMouse, "UnitMouse")];
 }
 
+impl Named for MapMovement {
+    const ALL: &'static [(Self, &'static str)] = &[(MapMovement::EdgeScroll, "EdgeScroll"), (MapMovement::Drag, "Drag")];
+}
+
 fn choice<T: Named>(v: T) -> Option<ControlValue> {
     Some(ControlValue::Choice(v.name().to_owned()))
 }
@@ -178,6 +183,7 @@ impl Settings {
             "layout.orientation" => Some(ControlValue::Choice(if horizontal(l) { "horizontal" } else { "vertical" }.into())),
             "input.snap_updates_per_second" => Some(ControlValue::Number(i.snap_updates_per_second)),
             "input.snap_ghost_fps" => Some(ControlValue::Number(i.snap_ghost_fps)),
+            "input.map_movement" => choice(i.map_movement),
             "display.show_fps" => Some(ControlValue::On(self.display.show_fps)),
             _ => {
                 let kind = key.strip_prefix(SCREENS_PREFIX)?;
@@ -236,6 +242,7 @@ impl Settings {
                 "layout.roles" => set_choice(&mut l.roles, value),
                 "input.snap_updates_per_second" => set_number(&mut i.snap_updates_per_second, key, value),
                 "input.snap_ghost_fps" => set_number(&mut i.snap_ghost_fps, key, value),
+                "input.map_movement" => set_choice(&mut i.map_movement, value),
                 "display.show_fps" => match value {
                     ControlValue::On(on) => {
                         d.show_fps = *on;
@@ -288,6 +295,7 @@ mod tests {
             ("layout.roles", ControlValue::Choice("UnitMouse".into())),
             ("input.snap_updates_per_second", ControlValue::Number(7.0)),
             ("display.show_fps", ControlValue::On(true)),
+            ("input.map_movement", ControlValue::Choice("Drag".into())),
             ("layout.screens.City", ControlValue::Choice("LeftOrBottom".into())),
         ] {
             assert!(s.set_control(key, &value), "{key}");
@@ -301,6 +309,7 @@ mod tests {
         assert_eq!(s.layout.zoom, Zoom::TopStrip);
         assert_eq!(s.layout.roles, Roles::UnitMouse);
         assert!(s.display.show_fps);
+        assert_eq!(s.input.map_movement, MapMovement::Drag);
         assert_eq!(s.layout.screens["City"], ScreenPlace { vertical: Place::LeftOrBottom, horizontal: Place::Floating });
         // Setting the same again changes nothing.
         assert!(!s.set_control("layout.split", &ControlValue::Choice("Vertical2To1".into())));
@@ -316,6 +325,9 @@ mod tests {
         assert!(!s.set_control("nonsense", &ControlValue::On(true)));
         assert!(!s.set_control("display.show_fps", &ControlValue::Number(1.0)));
         assert!(!s.set_control("display.show_fps", &ControlValue::On(false)));
+        assert!(!s.set_control("input.map_movement", &ControlValue::Choice("Wobble".into())));
+        assert!(!s.set_control("input.map_movement", &ControlValue::On(true)));
+        assert!(!s.set_control("input.map_movement", &ControlValue::Choice("EdgeScroll".into())));
         assert!(!s.set_control("layout.screens.F9", &ControlValue::Choice("Floating".into())));
         assert_eq!(s, Settings::default());
         assert!(s.set_control("layout.zoom_strip", &ControlValue::Number(0.9)));
