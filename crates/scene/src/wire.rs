@@ -5,7 +5,7 @@
 use crate::{Beside, Button, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, Patch, SystemCursor, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 27;
+pub const VERSION: u32 = 28;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -710,6 +710,9 @@ pub struct Assets {
     pub roots: Vec<String>,
     /// Its generation, as scenes refer to it (`Scene::assets`).
     pub generation: u64,
+    /// An addition to the description of the generation before (see
+    /// `render_desc::Growing`; `roots` as there), not a whole description.
+    pub append: bool,
 }
 
 pub fn encode_assets(a: &Assets) -> Vec<u8> {
@@ -724,6 +727,7 @@ pub fn encode_assets(a: &Assets) -> Vec<u8> {
     w.0.extend_from_slice(a.description.as_bytes());
     w.u32(a.generation as u32);
     w.u32((a.generation >> 32) as u32);
+    w.bool(a.append);
     w.0
 }
 
@@ -741,7 +745,8 @@ pub fn decode_assets(bytes: &[u8]) -> Result<Assets, WireError> {
     let roots = (0..n).map(|_| string(&mut r)).collect::<Result<_, _>>()?;
     let description = string(&mut r)?;
     let generation = r.u32()? as u64 | (r.u32()? as u64) << 32;
-    Ok(Assets { description, roots, generation })
+    let append = r.bool()?;
+    Ok(Assets { description, roots, generation, append })
 }
 
 #[cfg(test)]
@@ -834,7 +839,7 @@ mod tests {
             Input::Edge { x: 0, y: 0 },
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
-        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], generation: 7 };
+        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], generation: 7, append: true };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
         assert_eq!(decode_updates(&[VERSION as u8, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[0xFE, 0, 0, 0]), Err(WireError::Version(0xFE)));
