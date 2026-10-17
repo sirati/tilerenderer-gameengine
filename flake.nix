@@ -17,6 +17,8 @@
         nativeBuildInputs = with pkgs; [
           rustup
           pkg-config
+          python3
+          ripgrep
           gcc
           mingw64.stdenv.cc
           mingw32.stdenv.cc
