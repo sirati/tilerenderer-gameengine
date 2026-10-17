@@ -510,7 +510,62 @@ pub enum BlendDesc {
 }
 
 /// Sources made without the loader (full colour).
-const GENERATED: [&str; 7] = ["solid:", "line:", "arrow:", "crosshair:", "panes:", "pointer:", "rects:"];
+const GENERATED: [&str; 8] = ["solid:", "line:", "arrow:", "crosshair:", "panes:", "pointer:", "rects:", "glyphs:"];
+
+/// The characters of a [`glyphs`] image, one cell each, in this order.
+pub const GLYPHS: &str = " 0123456789.%fpsmki";
+
+/// The rows of each of [`GLYPHS`] in 5 × 7 pixels (bit 4 the left column).
+const GLYPH_ROWS: [[u8; 7]; 19] = [
+    [0; 7],
+    [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+    [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+    [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+    [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110],
+    [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+    [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+    [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+    [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+    [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+    [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+    [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
+    [0b11000, 0b11001, 0b00010, 0b00100, 0b01000, 0b10011, 0b00011],
+    [0b00110, 0b01001, 0b01000, 0b11100, 0b01000, 0b01000, 0b01000],
+    [0b00000, 0b00000, 0b11110, 0b10001, 0b11110, 0b10000, 0b10000],
+    [0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110],
+    [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10001, 0b10001],
+    [0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010],
+    [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
+];
+
+/// The cell of each glyph of a [`glyphs`] image at scale `n`: a 5 × 7 glyph
+/// with a column to its right and a row above and below it, every pixel
+/// `n × n`.
+pub fn glyph_cell(n: u32) -> (u32, u32) {
+    (6 * n, 9 * n)
+}
+
+/// `source = "glyphs:R,G,B,A:R,G,B,A:N"`: the characters of [`GLYPHS`] side
+/// by side, each in a cell of [`glyph_cell`]`(N)` (1..=8), drawn in the
+/// first colour on the second (cells side by side make a box behind a
+/// line of text): small text such as a counter, sharp at any size.
+fn glyphs(spec: &str) -> Result<RgbaImage, String> {
+    let err = || format!("glyphs image {spec:?}: expected R,G,B,A:R,G,B,A:N (N 1..=8)");
+    let parts: Vec<&str> = spec.split(':').collect();
+    let [fg, bg, n] = parts[..] else { return Err(err()) };
+    let color = |s: &str| -> Result<[u8; 4], String> {
+        let c: Vec<u8> = s.split(',').map(|v| v.trim().parse().map_err(|_| err())).collect::<Result<_, _>>()?;
+        <[u8; 4]>::try_from(c).map_err(|_| err())
+    };
+    let (fg, bg) = (color(fg)?, color(bg)?);
+    let n: u32 = n.trim().parse().ok().filter(|n| (1..=8).contains(n)).ok_or_else(err)?;
+    let (cw, ch) = glyph_cell(n);
+    Ok(RgbaImage::from_fn(cw * GLYPH_ROWS.len() as u32, ch, |x, y| {
+        let (glyph, gx, gy) = ((x / cw) as usize, (x % cw) / n, (y / n) as i32 - 1);
+        let on = gx < 5 && (0..7).contains(&gy) && GLYPH_ROWS[glyph][gy as usize] >> (4 - gx) & 1 == 1;
+        if on { fg } else { bg }
+    }))
+}
 
 /// `source = "solid:R,G,B,A:WxH"`: a single-colour image, made without the
 /// loader (bars, lines).
@@ -971,8 +1026,16 @@ impl Description {
     /// boxes makes them (`blank_loader`, then the image's own `blank`).
     fn load_frames(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc, blank: bool) -> Result<Vec<RgbaImage>, DescError> {
         let options = self.image_options(img, blank);
-        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 7] =
-            [("solid:", solid), ("line:", line), ("arrow:", arrow), ("crosshair:", crosshair), ("panes:", panes), ("pointer:", pointer), ("rects:", rects)];
+        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 8] = [
+            ("solid:", solid),
+            ("line:", line),
+            ("arrow:", arrow),
+            ("crosshair:", crosshair),
+            ("panes:", panes),
+            ("pointer:", pointer),
+            ("rects:", rects),
+            ("glyphs:", glyphs),
+        ];
         let generated = generators.iter().find_map(|(prefix, make)| img.source.strip_prefix(prefix).map(make));
         let image_error = |message: String| DescError::Image { name: name.to_owned(), message };
         Ok(match generated {
@@ -1737,6 +1800,24 @@ mod tests {
         let last = (0..14).filter(|&x| p.get(x, 20) == white).collect::<Vec<_>>();
         assert!(!last.is_empty() && last[0] > 4, "{last:?}");
         assert!(pointer("1,2,3,4:3x9").is_err());
+    }
+
+    #[test]
+    fn glyphs_are_cells_of_text_on_their_background() {
+        let (fg, bg) = ([255, 255, 255, 255], [0, 0, 0, 160]);
+        let img = glyphs("255,255,255,255:0,0,0,160:2").unwrap();
+        assert_eq!(glyph_cell(2), (12, 18));
+        assert_eq!((img.width, img.height), (12 * GLYPHS.chars().count() as u32, 18));
+        // The space is all background; "1" has its stem in the middle column
+        // (glyph column 2, pixels 4..6), a row clear above it.
+        let one = 12 * GLYPHS.find('1').unwrap() as u32;
+        assert!((0..12).all(|x| (0..18).all(|y| img.get(x, y) == bg)));
+        assert_eq!((img.get(one + 4, 2), img.get(one + 5, 15), img.get(one + 4, 1)), (fg, fg, bg));
+        // The column right of the glyph stays clear.
+        assert!((0..18).all(|y| img.get(one + 10, y) == bg && img.get(one + 11, y) == bg));
+        assert!(glyphs("1,2,3,4:5,6,7,8:0").is_err());
+        assert!(glyphs("1,2,3,4:5,6,7,8").is_err());
+        assert_eq!(GLYPHS.chars().count(), GLYPH_ROWS.len());
     }
 
     #[test]
