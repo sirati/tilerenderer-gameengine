@@ -5,6 +5,7 @@
 
 mod input;
 pub mod layout;
+pub mod snap;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -331,6 +332,8 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         art_waiting: None,
         drawn_frame: None,
         error: None,
+        settings: load_settings(),
+        snap: snap::SnapInput::default(),
     };
     // The arrangement to start with (see `layout::Layout::configure`).
     if let Ok(spec) = std::env::var("TILE_VIEWER_LAYOUT") {
@@ -387,9 +390,36 @@ struct App {
     /// art).
     drawn_frame: Option<layout::Frame>,
     error: Option<ViewerError>,
+    /// The user's settings (`viewer_settings`).
+    settings: viewer_settings::Settings,
+    /// Button snapping (Alt while the mouse is captured).
+    snap: snap::SnapInput,
+}
+
+/// The settings at their usual place (defaults if there are none or they
+/// do not read).
+fn load_settings() -> viewer_settings::Settings {
+    let path = viewer_settings::Settings::default_path();
+    viewer_settings::Settings::load(&path).unwrap_or_else(|e| {
+        log::warn!("viewer settings: {e}");
+        viewer_settings::Settings::default()
+    })
 }
 
 impl App {
+    /// Seconds since the viewer started (the snapping pointer's clock).
+    fn now(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+
+    /// Shows or hides the system pointer as button snapping wants it
+    /// (hidden while the mouse is captured anyway).
+    fn snap_pointer(&mut self) {
+        if let (Some(hide), Some(gpu)) = (self.snap.take_hide_pointer(), &self.gpu) {
+            gpu.window.set_cursor_visible(!hide && !self.layout.captured());
+        }
+    }
+
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<(), ViewerError> {
         let mut attrs = Window::default_attributes()
             .with_title(self.config.title.clone())
@@ -522,7 +552,8 @@ impl App {
             self.world = Some(scene_world_for(&self.compiled, scene, &arranged.view_cameras));
         }
         // The viewer's markers on top of the world, for this frame only.
-        let markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
+        let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
+        markers.extend(self.snap.sprites(&self.compiled, scene, &arranged, &self.layout));
         let world = self.world.as_mut().expect("built above");
         let own = world.free.len();
         world.free.extend_from_slice(&markers);
@@ -607,6 +638,9 @@ impl ApplicationHandler for App {
             _ => {}
         }
         if let WindowEvent::Focused(false) = event {
+            for input in self.snap.focus_lost(&mut self.layout) {
+                self.display.send_input(input);
+            }
             self.layout.released();
             self.grab(false);
         }
@@ -617,14 +651,17 @@ impl ApplicationHandler for App {
                 self.display.send_input(input);
             }
         }
+        let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
         for input in self.input.translate(&event) {
-            for input in self.layout.route(input) {
+            // (Through button snapping, which passes on what is not its.)
+            for input in self.snap.route(input, &mut self.layout, self.display.scene(), now, rates) {
                 self.display.send_input(input);
             }
         }
         if let Some(lock) = self.layout.take_grab() {
             self.grab(lock);
         }
+        self.snap_pointer();
         if let Some(zooms) = self.layout.take_zooms_change() {
             self.display.send_input(Input::Zooms(zooms));
         }
@@ -635,8 +672,10 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
         // While the mouse is captured its motion moves the world cursor.
+        // (While snapping, it moves the snapping pointer's hidden pointer.)
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            for input in self.layout.motion(delta) {
+            let inputs = self.snap.motion(delta).unwrap_or_else(|| self.layout.motion(delta));
+            for input in inputs {
                 self.display.send_input(input);
             }
         }
@@ -646,6 +685,11 @@ impl ApplicationHandler for App {
         // Take what the driver sent (waiting a frame's time for it), then
         // redraw: the animation clock moves on even without updates.
         self.display.receive(Duration::from_millis(16));
+        let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
+        for input in self.snap.tick(&mut self.layout, self.display.scene(), now, rates) {
+            self.display.send_input(input);
+        }
+        self.snap_pointer();
         if let Some(gpu) = &self.gpu {
             if self.display.scene().seq != 0 {
                 gpu.window.request_redraw();

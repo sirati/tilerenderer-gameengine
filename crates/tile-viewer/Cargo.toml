@@ -9,8 +9,12 @@ version.workspace = true
 tile-render.workspace = true
 render-desc = { path = "../render-desc" }
 scene = { path = "../scene" }
+viewer-settings = { path = "../viewer-settings" }
 wgpu.workspace = true
 winit.workspace = true
 pollster.workspace = true
 log.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+toml = "0.9"

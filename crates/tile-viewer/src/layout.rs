@@ -946,6 +946,60 @@ impl Layout {
         }
     }
 
+    /// Whether the mouse is captured (its motion moves the world cursor).
+    pub fn captured(&self) -> bool {
+        self.locked
+    }
+
+    /// The window size of the last frame.
+    pub fn window(&self) -> (u32, u32) {
+        self.window
+    }
+
+    /// How the driver's screen (its window pixels, those of its interface)
+    /// lies in the window, as of the last frame: driver pixel `s` is at
+    /// window pixel `origin + s · zoom.0 / zoom.1` (1:1 at the window's
+    /// corner unless it is fitted into a pane).
+    pub fn screen_mapping(&self) -> ((i32, i32), (u32, u32)) {
+        self.fit.unwrap_or(((0, 0), (1, 1)))
+    }
+
+    /// Where the pointer shows in the window: the world cursor in the view
+    /// following it while the mouse is captured (else in the driver's main
+    /// view), the pointer otherwise.
+    pub fn pointer_in_window(&self) -> (i32, i32) {
+        if !self.locked {
+            return self.pointer;
+        }
+        let following = self.shown.iter().find(|(h, _)| self.follow_of(*h) == Some(Follow::Pointer));
+        let camera = following.or_else(|| self.shown.iter().find(|(h, _)| *h == Hit::Main)).map(|(_, c)| c);
+        camera.map_or(self.pointer, |c| {
+            let (n, d) = (c.zoom.0.max(1) as i32, c.zoom.1.max(1) as i32);
+            (c.origin.0 + (self.cursor.0 - c.x) * n / d, c.origin.1 + (self.cursor.1 - c.y) * n / d)
+        })
+    }
+
+    /// The pointer was put at window pixel `p` by other means than the
+    /// mouse (e.g. the snapping pointer, `crate::snap`): it is there now,
+    /// and while the mouse is captured, over a view following the world
+    /// cursor, so is the world cursor.
+    pub fn place_pointer(&mut self, p: (i32, i32)) {
+        self.pointer = p;
+        if self.locked && self.hit_follow(p) == Some(Follow::Pointer) {
+            if let Some(w) = self.world_under(p) {
+                self.cursor = w;
+            }
+        }
+    }
+
+    /// Where a pointer event at window pixel `p` goes in the driver's
+    /// window, as if the mouse were not captured (the snapping pointer
+    /// points at the driver's interface while it is): `None` if it does
+    /// not reach the driver's window.
+    pub fn route_window(&self, p: (i32, i32)) -> Option<(i32, i32)> {
+        self.route_free(p).ok()
+    }
+
     /// Where a pointer event goes in the driver's window: `Ok(q)`, or
     /// `Err(world pixel)` if the driver does not show it, `Err(None)` if
     /// nothing.
@@ -953,6 +1007,11 @@ impl Layout {
         if self.locked {
             return self.route_world(self.cursor);
         }
+        self.route_free(p)
+    }
+
+    /// [`Layout::route_point`] for the pointer at `p` (not the world cursor).
+    fn route_free(&self, p: (i32, i32)) -> Result<(i32, i32), Option<(i32, i32)>> {
         match self.hit(p) {
             Hit::Interface => Ok(p),
             Hit::Divider => Err(None),
@@ -971,7 +1030,7 @@ impl Layout {
                         let q = self.magnified(&m, rect, source, p);
                         let mut without = self.clone();
                         without.magnifier = None;
-                        without.route_point(q)
+                        without.route_free(q)
                     }
                     None => {
                         let zoom = ZOOMS[m.zoom];
