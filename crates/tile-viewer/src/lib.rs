@@ -8,6 +8,7 @@ pub mod fps;
 mod input;
 pub mod layout;
 pub mod scaling;
+pub mod profile;
 pub mod snap;
 
 use std::sync::Arc;
@@ -419,9 +420,7 @@ pub fn render_arranged(
     size: (u32, u32),
     config: &ViewerConfig,
 ) -> RgbaImage {
-    let mut layout = layout::Layout::default();
-    layout.grid_step = compiled.step;
-    let frame = layout.frame(scene, size, config.overhang, interface_rects(compiled, scene), Some(world_bounds(compiled, scene)));
+    let frame = arranged_frame(compiled, scene, size, config);
     let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world_for(compiled, scene, &frame.view_cameras));
@@ -465,6 +464,14 @@ async fn show_with(
         Some(e) => Err((adapter, e.to_string())),
         None => Ok((adapter, device, queue, config)),
     }
+}
+
+/// How a freshly opened viewer arranges `scene` in a window of `size` (the
+/// user's settings left at their defaults).
+pub fn arranged_frame(compiled: &Compiled, scene: &Scene, size: (u32, u32), config: &ViewerConfig) -> layout::Frame {
+    let mut layout = layout::Layout::default();
+    layout.grid_step = compiled.step;
+    layout.frame(scene, size, config.overhang, interface_rects(compiled, scene), Some(world_bounds(compiled, scene)))
 }
 
 /// Opens the window and runs until it is closed, drawing what `display`
@@ -545,6 +552,8 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         cursor_cameras: None,
         next_frame: None,
         map_drawn: false,
+        profile: profile::env_on("TILE_VIEWER_PROFILE").then(|| profile::Profile::new("viewer", Duration::from_secs(5))),
+        received_seq: 0,
     };
     // The arrangement to start with: the user's settings.
     app.set_settings(load_settings());
@@ -692,6 +701,20 @@ struct App {
     next_frame: Option<Instant>,
     /// Whether a scene with the world in a view was drawn yet.
     map_drawn: bool,
+    /// Where the time goes (`TILE_VIEWER_PROFILE=1`), logged every 5 s.
+    profile: Option<profile::Profile>,
+    /// The scene version last received (scenes counted for the profile).
+    received_seq: u64,
+}
+
+/// Adds the time since `t` to span `name` of the profile, if one is kept,
+/// and restarts `t`.
+fn mark(profile: &mut Option<profile::Profile>, name: &str, t: &mut Instant) {
+    let now = Instant::now();
+    if let Some(p) = profile {
+        p.add(name, now - *t);
+    }
+    *t = now;
 }
 
 /// What happens to the system pointer once a frame went out after it was
@@ -970,6 +993,10 @@ impl App {
         let (adapter, device, queue, config) = shown;
         log::info!("viewer adapter: {:?}", adapter.get_info());
         let mut renderer = TileRenderer::new(&device, config.format);
+        if self.profile.is_some() {
+            let timed = renderer.enable_timing(&device, &queue);
+            log::info!("viewer: profiling (TILE_VIEWER_PROFILE), GPU time per pass: {}", if timed { "yes" } else { "no timestamp queries" });
+        }
         if let Some(whole) = self.upload.take() {
             renderer.set_atlas(&device, &queue, &whole.atlas);
             self.cursor_art = cursor::Art::of(&whole);
@@ -1106,16 +1133,26 @@ impl App {
 
     fn draw(&mut self) {
         // (Measuring: frames that take long.)
-        let began = std::time::Instant::now();
-        self.draw_frame();
-        let took = began.elapsed();
+        let started = Instant::now();
+        if let Some(p) = &mut self.profile {
+            p.round_start();
+        }
+        self.draw_frame(started);
+        let took = started.elapsed();
         if took >= Duration::from_millis(40) && self.map_drawn {
             log::info!("viewer: a frame took {} ms", took.as_millis());
         }
+        if let Some(p) = &mut self.profile {
+            p.add("draw (all)", took);
+            p.round_end();
+            if let Some(report) = p.report() {
+                log::info!("{report}");
+            }
+        }
     }
 
-    fn draw_frame(&mut self) {
-        let started = Instant::now();
+    fn draw_frame(&mut self, started: Instant) {
+        let mut t = started;
         self.update_plan();
         let Some(plan) = self.plan else { return };
         let Some(gpu) = &mut self.gpu else { return };
@@ -1159,6 +1196,7 @@ impl App {
             self.assets.uploaded(version);
             self.whole_version = version;
             self.assets_version = version;
+            mark(&mut self.profile, "new assets", &mut t);
         }
         if let Some((pages, index_pages)) = self.assets.take_reserve() {
             let started = std::time::Instant::now();
@@ -1228,6 +1266,7 @@ impl App {
                 arranged
             }
         };
+        mark(&mut self.profile, "layout", &mut t);
         // Views following something move without input: tell the driver.
         if let Some((x, y, w, h)) = self.layout.take_main_view_change() {
             self.display.send_input(Input::MainView { x, y, w, h });
@@ -1241,6 +1280,7 @@ impl App {
         if rebuilt {
             self.world = Some(scene_world_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay));
             self.built_overlay = self.drawn_overlay.clone();
+            mark(&mut self.profile, "world build", &mut t);
         }
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
@@ -1311,9 +1351,14 @@ impl App {
         let cursor_moved = cursor_sprites != self.drawn_cursor;
         markers.extend_from_slice(&cursor_sprites);
         markers.extend(snap_sprites);
+        mark(&mut self.profile, "markers+cursor", &mut t);
         let world = self.world.as_mut().expect("built above");
         let own = world.free.len();
         world.free.extend_from_slice(&markers);
+        if let Some(p) = &mut self.profile {
+            p.count("free sprites", world.free.len());
+            p.count("cameras", cameras.len());
+        }
         if new_assets {
             gpu.renderer.set_world(&gpu.device, world);
         } else if rebuilt {
@@ -1324,11 +1369,13 @@ impl App {
             gpu.renderer.update_free(&gpu.device, &gpu.queue, world);
         }
         world.free.truncate(own);
+        mark(&mut self.profile, if new_assets || rebuilt { "upload world" } else { "upload free" }, &mut t);
         self.drawn_markers = markers;
         self.drawn_cursor = cursor_sprites;
         self.drawn_views = arranged.view_cameras.clone();
         if new_assets || (scene.seq != self.drawn_seq && matches) {
             apply_patches(&gpu.renderer, &gpu.queue, &self.compiled, self.patches.values());
+            mark(&mut self.profile, "patches", &mut t);
         }
         if matches {
             self.drawn_seq = scene.seq;
@@ -1354,6 +1401,7 @@ impl App {
         }
         self.drawn_tick = scene.tick;
         self.drawn_window = window;
+        mark(&mut self.profile, "misc", &mut t);
         let frame = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -1365,12 +1413,32 @@ impl App {
                 return;
             }
         };
+        mark(&mut self.profile, "acquire", &mut t);
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         let target = &frame.texture;
         let copies = &arranged.copies;
         gpu.reconfigured = false;
         gpu.renderer.render_presented(&gpu.device, &gpu.queue, &mut encoder, target, &cameras, copies, scene.tick, self.config.clear, plan.present);
+        if let Some(timer) = gpu.renderer.timer() {
+            timer.finish(&mut encoder);
+        }
+        mark(&mut self.profile, "encode", &mut t);
         gpu.queue.submit([encoder.finish()]);
+        mark(&mut self.profile, "submit", &mut t);
+        if let Some(timer) = gpu.renderer.timer() {
+            timer.submitted();
+            let frames = timer.collect(&gpu.device);
+            if let Some(p) = &mut self.profile {
+                for f in frames {
+                    p.add_ms("gpu frame span", f.span);
+                    p.add_ms("gpu passes sum", f.passes.iter().map(|(_, ms)| ms).sum());
+                    p.count("gpu passes", f.passes.len());
+                    for (label, ms) in f.passes {
+                        p.add_ms(&format!("gpu {label}"), ms);
+                    }
+                }
+            }
+        }
         if let (Some(since), true) = (since, log_latency()) {
             let done = self.latency.done.clone();
             gpu.queue.on_submitted_work_done(move || done.lock().unwrap_or_else(|e| e.into_inner()).push(since.elapsed().as_secs_f64() * 1000.0));
@@ -1383,6 +1451,7 @@ impl App {
         }
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
+        mark(&mut self.profile, "present", &mut t);
         if show_fps {
             self.fps.counter.presented(seconds);
         }
@@ -1540,7 +1609,17 @@ impl ApplicationHandler for App {
         // over, e.g. Wine's), it waits for the driver a little instead of
         // spinning; the window's events wait at most that long.
         let idle = std::mem::take(&mut self.woken_idle) && self.next_frame.is_some_and(|t| t > Instant::now());
+        let received = Instant::now();
         let changed = self.display.receive(if idle { IDLE_WAIT } else { Duration::ZERO });
+        if let Some(p) = &mut self.profile {
+            // (Waiting for nothing, when idle, is not the work of receiving.)
+            if changed {
+                p.add("receive (outside draw)", received.elapsed());
+            }
+            let seq = self.display.scene().seq;
+            p.event("scenes", seq.saturating_sub(self.received_seq));
+            self.received_seq = seq;
+        }
         if let Some(settings) = self.display.take_settings() {
             if settings != self.settings {
                 log::info!("viewer: new settings from the driver");
