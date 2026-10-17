@@ -399,7 +399,9 @@ pub enum Input {
     /// [`EDGE_ZONE`] pixels of that axis's edges, else how far from the edge
     /// it is plus one, negative for the left (top) edge, positive for the
     /// right (bottom) one; `(0, 0)` once it is at no edge (or left the window
-    /// or such a view). Sent when it changes.
+    /// or such a view). Sent when it changes. A renderer that divides its
+    /// window may also send it while the pointer pushes against a divider
+    /// from such a view (its edge there, at the outermost pixel).
     Edge { x: i32, y: i32 },
 }
 

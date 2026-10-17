@@ -239,10 +239,12 @@ fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u3
 }
 
 /// The window rectangles (x, y, w, h) the scene's interface-only views
-/// cover: their sprites' first frames, clipped.
+/// cover: their sprites' first frames, clipped (not the parts the layout
+/// may draw elsewhere, `scene::Interface`, which it knows itself).
 fn interface_rects(compiled: &Compiled, scene: &Scene) -> Vec<[i32; 4]> {
     let mut out = Vec::new();
-    for v in scene.views.iter().filter(|v| v.view.interface_only) {
+    let parts = [scene.interface.roaming, scene.interface.popup];
+    for v in scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id))) {
         for s in &v.overlay {
             let Some(id) = compiled.sets.frame(tile_render::SpriteSetId::from_raw(s.set), 0) else { continue };
             let Some(sprite) = compiled.atlas.sprites.get(id.0 as usize) else { continue };
@@ -330,14 +332,17 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         started: std::time::Instant::now(),
         art_waiting: None,
         drawn_frame: None,
+        drawn_at: None,
+        settings: viewer_settings::Settings::default(),
         error: None,
     };
-    // The arrangement to start with (see `layout::Layout::configure`).
-    if let Ok(spec) = std::env::var("TILE_VIEWER_LAYOUT") {
-        if let Err(e) = app.layout.configure(&spec) {
-            log::warn!("TILE_VIEWER_LAYOUT: {e}");
-        }
-    }
+    // The arrangement to start with: the user's settings.
+    let path = viewer_settings::Settings::default_path();
+    let settings = viewer_settings::Settings::load(&path).unwrap_or_else(|e| {
+        log::warn!("viewer settings: {e}; using the defaults");
+        viewer_settings::Settings::default()
+    });
+    app.set_settings(settings);
     event_loop.run_app(&mut app)?;
     app.error.map_or(Ok(()), Err)
 }
@@ -386,10 +391,49 @@ struct App {
     /// The arrangement drawn last (drawn again while a scene waits for its
     /// art).
     drawn_frame: Option<layout::Frame>,
+    /// When the last frame was drawn (the layout's smooth movement).
+    drawn_at: Option<std::time::Instant>,
+    /// The user's settings (`viewer_settings`).
+    settings: viewer_settings::Settings,
     error: Option<ViewerError>,
 }
 
 impl App {
+    /// Takes the user's settings: the layout is arranged as they say, then
+    /// `TILE_VIEWER_LAYOUT` (a spec, `layout::Layout::configure`) on top,
+    /// for testing.
+    fn set_settings(&mut self, settings: viewer_settings::Settings) {
+        self.layout.apply_settings(&settings.layout);
+        if let Ok(spec) = std::env::var("TILE_VIEWER_LAYOUT") {
+            if let Err(e) = self.layout.configure(&spec) {
+                log::warn!("TILE_VIEWER_LAYOUT: {e}");
+            }
+        }
+        self.settings = settings;
+    }
+
+    /// What the layout asks of the window: the mouse captured or let go,
+    /// the system pointer moved back (held at the divider), another pointer
+    /// shape.
+    fn apply_layout_requests(&mut self) {
+        if let Some(lock) = self.layout.take_grab() {
+            self.grab(lock);
+        }
+        let Some(gpu) = &self.gpu else { return };
+        if let Some((x, y)) = self.layout.take_warp() {
+            if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
+                log::debug!("viewer: moving the pointer back to the divider: {e}");
+            }
+        }
+        if let Some(icon) = self.layout.take_pointer_icon() {
+            gpu.window.set_cursor(match icon {
+                layout::PointerIcon::Default => winit::window::CursorIcon::Default,
+                // A click captures the mouse there.
+                layout::PointerIcon::Capture => winit::window::CursorIcon::Crosshair,
+            });
+        }
+    }
+
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<(), ViewerError> {
         let mut attrs = Window::default_attributes()
             .with_title(self.config.title.clone())
@@ -506,6 +550,10 @@ impl App {
         let arranged = match &self.drawn_frame {
             Some(frame) if !matches && self.world.is_some() && window == self.drawn_window => frame.clone(),
             _ => {
+                let now = std::time::Instant::now();
+                if let Some(at) = self.drawn_at.replace(now) {
+                    self.layout.advance(now - at);
+                }
                 let bounds = world_bounds(&self.compiled, scene);
                 let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
                 self.drawn_frame = Some(arranged.clone());
@@ -622,9 +670,8 @@ impl ApplicationHandler for App {
                 self.display.send_input(input);
             }
         }
-        if let Some(lock) = self.layout.take_grab() {
-            self.grab(lock);
-        }
+        // (After a redraw too: what the pointer is over may have changed.)
+        self.apply_layout_requests();
         if let Some(zooms) = self.layout.take_zooms_change() {
             self.display.send_input(Input::Zooms(zooms));
         }
