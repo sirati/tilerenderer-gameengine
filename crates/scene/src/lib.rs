@@ -84,6 +84,7 @@ pub struct FreeSprite {
     pub scale_den: u32,
     /// The colour of ClearType-like text (`scale_den` = the renderer's
     /// `SCALE_SUBPIXEL`), 0xRRGGBB.
+    /// With ordinary alpha blending: the high byte is inverse opacity.
     pub tint: u32,
     /// 0 any zoom; 1 the 1:1 twin of sprites made for zooms, left out in
     /// views at a zoom the scene has art for ([`Scene::zooms`]); 2 made for
