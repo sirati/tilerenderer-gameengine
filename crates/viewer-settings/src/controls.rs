@@ -57,7 +57,7 @@ pub const SCREENS_PREFIX: &str = "layout.screens.";
 
 /// Every key [`Settings::control`] answers (besides one screen place per
 /// screen of [`Layout::SCREENS`], and the derived `"layout.orientation"`).
-pub const KEYS: [&str; 12] = [
+pub const KEYS: [&str; 13] = [
     "resolution.pixel_scale",
     "resolution.menu_scale",
     "resolution.frame_scale",
@@ -70,6 +70,7 @@ pub const KEYS: [&str; 12] = [
     "layout.roles",
     "input.snap_updates_per_second",
     "input.snap_ghost_fps",
+    "display.show_fps",
 ];
 
 /// The range of number control `key`, if it is one.
@@ -175,6 +176,7 @@ impl Settings {
             "layout.orientation" => Some(ControlValue::Choice(if horizontal(l) { "horizontal" } else { "vertical" }.into())),
             "input.snap_updates_per_second" => Some(ControlValue::Number(i.snap_updates_per_second)),
             "input.snap_ghost_fps" => Some(ControlValue::Number(i.snap_ghost_fps)),
+            "display.show_fps" => Some(ControlValue::On(self.display.show_fps)),
             _ => {
                 let kind = key.strip_prefix(SCREENS_PREFIX)?;
                 Layout::SCREENS.contains(&kind).then(|| choice(l.place_of(kind))).flatten()
@@ -199,7 +201,7 @@ impl Settings {
     pub fn set_control(&mut self, key: &str, value: &ControlValue) -> bool {
         let before = self.clone();
         let ok = {
-            let (r, l, i) = (&mut self.resolution, &mut self.layout, &mut self.input);
+            let (r, l, i, d) = (&mut self.resolution, &mut self.layout, &mut self.input, &mut self.display);
             match key {
                 "resolution.pixel_scale" => match value {
                     ControlValue::Choice(n) => match n.parse::<u32>() {
@@ -228,6 +230,13 @@ impl Settings {
                 "layout.roles" => set_choice(&mut l.roles, value),
                 "input.snap_updates_per_second" => set_number(&mut i.snap_updates_per_second, key, value),
                 "input.snap_ghost_fps" => set_number(&mut i.snap_ghost_fps, key, value),
+                "display.show_fps" => match value {
+                    ControlValue::On(on) => {
+                        d.show_fps = *on;
+                        true
+                    }
+                    _ => false,
+                },
                 _ => match key.strip_prefix(SCREENS_PREFIX).filter(|k| Layout::SCREENS.contains(k)) {
                     Some(kind) => {
                         let horizontal = horizontal(l);
@@ -272,6 +281,7 @@ mod tests {
             ("layout.smooth_world_movement", ControlValue::On(true)),
             ("layout.roles", ControlValue::Choice("UnitMouse".into())),
             ("input.snap_updates_per_second", ControlValue::Number(7.0)),
+            ("display.show_fps", ControlValue::On(true)),
             ("layout.screens.City", ControlValue::Choice("LeftOrBottom".into())),
         ] {
             assert!(s.set_control(key, &value), "{key}");
@@ -281,6 +291,7 @@ mod tests {
         assert_eq!(s.layout.split, Split::Vertical2To1);
         assert_eq!(s.layout.zoom, Zoom::TopStrip);
         assert_eq!(s.layout.roles, Roles::UnitMouse);
+        assert!(s.display.show_fps);
         assert_eq!(s.layout.screens["City"], ScreenPlace { vertical: Place::LeftOrBottom, horizontal: Place::Floating });
         // Setting the same again changes nothing.
         assert!(!s.set_control("layout.split", &ControlValue::Choice("Vertical2To1".into())));
@@ -294,6 +305,8 @@ mod tests {
         assert!(!s.set_control("resolution.pixel_scale", &ControlValue::Choice("7".into())));
         assert!(!s.set_control("resolution.pixel_scale", &ControlValue::Choice("0".into())));
         assert!(!s.set_control("nonsense", &ControlValue::On(true)));
+        assert!(!s.set_control("display.show_fps", &ControlValue::Number(1.0)));
+        assert!(!s.set_control("display.show_fps", &ControlValue::On(false)));
         assert!(!s.set_control("layout.screens.F9", &ControlValue::Choice("Floating".into())));
         assert_eq!(s, Settings::default());
         assert!(s.set_control("layout.zoom_strip", &ControlValue::Number(0.9)));

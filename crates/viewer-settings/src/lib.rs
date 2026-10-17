@@ -33,6 +33,7 @@ pub struct Settings {
     pub resolution: Resolution,
     pub layout: Layout,
     pub input: Input,
+    pub display: Display,
 }
 
 /// The "Resolution" tab.
@@ -210,6 +211,16 @@ impl Default for Input {
     }
 }
 
+/// What the viewer shows besides the picture (on the "Resolution" tab).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Display {
+    /// A frame counter in the window's top-right corner: frames per second,
+    /// the frame time, and with a software renderer the share of frames it
+    /// skipped (unchanged).
+    pub show_fps: bool,
+}
+
 impl Settings {
     /// Where settings are kept: `$CIV3R_SETTINGS`, else
     /// `$XDG_CONFIG_HOME/civ3r/settings.toml`, else `~/.config/civ3r/settings.toml`
@@ -267,6 +278,22 @@ mod tests {
         let partial: Settings = toml::from_str("[layout]\nsmooth_world_movement = true\n").unwrap();
         assert!(partial.layout.smooth_world_movement);
         assert_eq!(partial.resolution, Resolution::default());
+        assert!(!partial.display.show_fps);
+    }
+
+    #[test]
+    fn the_frame_counter_is_off_by_default_and_older_files_still_load() {
+        assert!(!Settings::default().display.show_fps);
+        // A file from before the setting existed.
+        let old: Settings = toml::from_str("[resolution]\npixel_scale = 2\n\n[layout]\nsplit = \"Vertical1To1\"\n").unwrap();
+        assert_eq!(old.display, Display::default());
+        assert_eq!((old.resolution.pixel_scale, old.layout.split), (2, Split::Vertical1To1));
+        let on: Settings = toml::from_str("[display]\nshow_fps = true\n").unwrap();
+        assert!(on.display.show_fps);
+        assert_eq!(on.layout, Layout::default());
+        let text = toml::to_string_pretty(&on).unwrap();
+        assert!(text.contains("[display]") && text.contains("show_fps = true"), "{text}");
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), on);
     }
 
     #[test]
