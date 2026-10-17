@@ -1553,11 +1553,17 @@ impl App {
         let target = &frame.texture;
         let copies = &arranged.copies;
         gpu.reconfigured = false;
-        gpu.renderer.render_presented(&gpu.device, &gpu.queue, &mut encoder, target, &cameras, copies, scene.tick, self.config.clear, plan.present);
+        // (The cursor's and the counter's cameras come after the layout's:
+        // they draw over a picture that is not drawn again unless it changed.)
+        let overlay_from = arranged.cameras.len();
+        gpu.renderer.render_layered(&gpu.device, &gpu.queue, &mut encoder, target, &cameras, overlay_from, copies, scene.tick, self.config.clear, plan.present);
         if let Some(timer) = gpu.renderer.timer() {
             timer.finish(&mut encoder);
         }
         mark(&mut self.profile, "encode", &mut t);
+        if let Some(p) = &mut self.profile {
+            p.event(if gpu.renderer.reused() { "frames drawn on the last picture" } else { "frames drawn whole" }, 1);
+        }
         gpu.queue.submit([encoder.finish()]);
         mark(&mut self.profile, "submit", &mut t);
         if let Some(timer) = gpu.renderer.timer() {
@@ -1774,7 +1780,16 @@ impl ApplicationHandler for App {
         }
         if let Some(gpu) = &self.gpu {
             if self.display.scene().seq != 0 && (changed || due) {
-                gpu.window.request_redraw();
+                // Without vsync a frame is drawn now: a redraw request waits
+                // for the compositor's next refresh (on Wayland), which
+                // would cap the frame rate at the display's.
+                if matches!(gpu.config.present_mode, wgpu::PresentMode::Mailbox | wgpu::PresentMode::Immediate) {
+                    self.draw();
+                    self.unlock_after_frame();
+                    self.update_system_pointer(event_loop);
+                } else {
+                    gpu.window.request_redraw();
+                }
             }
         }
         // (Frames as fast as they are drawn: the loop does not wait.)
