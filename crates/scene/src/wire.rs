@@ -345,9 +345,11 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     w.bool(view.is_some());
                     w.u32(view.unwrap_or_default());
                 }
-                w.bool(i.reachable.is_some());
-                for v in i.reachable.unwrap_or_default() {
-                    w.i32(v);
+                for rect in [i.reachable, i.focus_control] {
+                    w.bool(rect.is_some());
+                    for v in rect.unwrap_or_default() {
+                        w.i32(v);
+                    }
                 }
             }
             Update::Interactables(items) => {
@@ -472,9 +474,13 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     Ok(some.then_some(id))
                 };
                 let (roaming, popup, screen_view) = (view()?, view()?, view()?);
-                let some = r.bool()?;
-                let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-                Update::Interface(Interface { screen: named.then_some(screen), roaming, popup, screen_view, reachable: some.then_some(rect) })
+                let mut rect = || -> Result<Option<[i32; 4]>, WireError> {
+                    let some = r.bool()?;
+                    let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                    Ok(some.then_some(rect))
+                };
+                let (reachable, focus_control) = (rect()?, rect()?);
+                Update::Interface(Interface { screen: named.then_some(screen), roaming, popup, screen_view, reachable, focus_control })
             }
             12 => {
                 let n = r.len(INTERACTABLE_BYTES)?;
@@ -736,7 +742,7 @@ mod tests {
         settings.layout.screens.insert("Spy".into(), viewer_settings::ScreenPlace { vertical: viewer_settings::Place::RightOrTop, horizontal: viewer_settings::Place::LeftOrBottom });
         settings.input.snap_updates_per_second = 4.5;
         s.settings = Some(settings);
-        s.interface = Interface { screen: Some("F4".into()), roaming: Some(256), popup: None, screen_view: Some(258), reachable: Some([-1, 2, 300, 40]) };
+        s.interface = Interface { screen: Some("F4".into()), roaming: Some(256), popup: None, screen_view: Some(258), reachable: Some([-1, 2, 300, 40]), focus_control: Some([5, 6, 7, 8]) };
         s.interactables = vec![
             Interactable { rect: [10, 20, 100, 24], kind: InteractableKind::Button, id: 0x1_0000_0002 },
             Interactable { rect: [5, 50, 200, 300], kind: InteractableKind::List { scroll: [5, 60, 190, 280], step: 20 }, id: 7 },
@@ -748,7 +754,7 @@ mod tests {
         updates.push(Update::Phases(vec![(0, 5, 200)]));
         updates.push(Update::Offsets(vec![(1, 2, (-1, 32767))]));
         updates.push(Update::View { id: 2, view: None });
-        updates.push(Update::Interface(Interface { screen: None, roaming: None, popup: Some(7), screen_view: None, reachable: None }));
+        updates.push(Update::Interface(Interface { screen: None, roaming: None, popup: Some(7), screen_view: None, reachable: None, focus_control: None }));
         updates.push(Update::Cursor(Cursor::Sprite(42)));
         updates.push(Update::Cursor(Cursor::System(SystemCursor::ResizeNesw)));
         updates.push(Update::Cursor(Cursor::Default));

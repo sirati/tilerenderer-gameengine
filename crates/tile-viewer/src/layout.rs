@@ -499,8 +499,11 @@ pub struct Layout {
     /// How far the open popup moves, when it opened at a click.
     popup_anchor: Option<(i32, i32)>,
     /// The world cursor to capture the mouse at again once the popup that
-    /// let it go closes.
+    /// let it go closes; the screen likewise.
     recapture: Option<(i32, i32)>,
+    recapture_screen: Option<(i32, i32)>,
+    /// The pointer goes to the screen just opened (this frame).
+    pointer_to_screen: bool,
     moved: Vec<([i32; 4], (i32, i32))>,
     /// Whether the last frame showed the magnifier (it may be left out, or
     /// be under a screen fitted into a pane).
@@ -603,6 +606,8 @@ impl Default for Layout {
             last_press: None,
             popup_anchor: None,
             recapture: None,
+            recapture_screen: None,
+            pointer_to_screen: false,
             moved: Vec::new(),
             magnifier_shown: true,
             world_shown: true,
@@ -1353,6 +1358,26 @@ impl Layout {
                 Some(name) => log::info!("viewer: screen {name} open, placed {}", self.fit_target(Some(name)).map_or("over the window", |h| if h == Hit::Main { "in A" } else { "in B" })),
                 None => log::info!("viewer: screen {} closed", self.screen.as_deref().unwrap_or_default()),
             }
+            // A screen opening lets go of a captured mouse, the pointer on
+            // its main control (below, once it is placed); captured again
+            // when it closes.
+            match (&parts.screen, &self.screen) {
+                (Some(_), None) if self.locked => {
+                    self.recapture_screen = Some(self.cursor);
+                    self.release_here("a screen opened");
+                    self.pointer_to_screen = true;
+                }
+                (None, Some(_)) => {
+                    if let Some(cursor) = self.recapture_screen.take().filter(|_| self.follows_pointer() && !self.locked) {
+                        self.cursor = cursor;
+                        self.locked = true;
+                        self.grab = Some(true);
+                        self.against = None;
+                        log::info!("viewer: mouse captured again (the screen closed)");
+                    }
+                }
+                _ => {}
+            }
         }
         self.clock += dt;
         if popup.is_some() != self.popup_shown {
@@ -1616,6 +1641,16 @@ impl Layout {
                 }
             }
         }
+        // The pointer on the screen that just opened: its main control (as
+        // the driver names it), else its middle, where the screen shows.
+        if std::mem::take(&mut self.pointer_to_screen) {
+            let screen = screen_part.map(|i| rect_of(&base[i])).unwrap_or([0, 0, window.0 as i32, window.1 as i32]);
+            let [x, y, w, h] = parts.focus_control.unwrap_or(screen);
+            let p = self.driver_to_window((x + w / 2, y + h / 2));
+            (self.pointer, self.raw_pointer, self.warp) = (p, p, Some(p));
+            self.side = self.side_of(p);
+            log::info!("viewer: the pointer on the screen's {} at {p:?}", if parts.focus_control.is_some() { "main control" } else { "middle" });
+        }
         if self.follows_pointer() {
             frame.markers.push(Marker::Cursor(self.cursor));
         }
@@ -1664,6 +1699,20 @@ impl Layout {
         if self.locked {
             self.recapture = Some(self.cursor);
             self.release_here("a popup is open");
+        }
+    }
+
+    /// Where driver window pixel `p` shows in the window (as of this frame):
+    /// in the screen fitted into a pane, in a part drawn elsewhere, or where
+    /// the driver has it.
+    fn driver_to_window(&self, (x, y): (i32, i32)) -> (i32, i32) {
+        if let Some(Fit { origin: (ox, oy), zoom: (n, d), .. }) = self.fit {
+            let (n, d) = (n as i32, d.max(1) as i32);
+            return (ox + x * n / d, oy + y * n / d);
+        }
+        match self.moved.iter().find(|(r, d)| inside([r[0] - d.0, r[1] - d.1, r[2], r[3]], (x, y))) {
+            Some((_, (dx, dy))) => (x + dx, y + dy),
+            None => (x, y),
         }
     }
 
@@ -3594,6 +3643,43 @@ mod tests {
         l.frame(&with_parts(None), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert!(l.captured());
         assert_eq!((l.take_grab(), l.cursor), (Some(true), cursor));
+    }
+
+    #[test]
+    fn a_screen_opening_lets_the_mouse_go_with_the_pointer_on_its_main_control() {
+        let unit_mouse = settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse));
+        let mut l = arranged(&unit_mouse);
+        mv(&mut l, (600, 300));
+        frame(&mut l, vec![]);
+        click(&mut l, (600, 300));
+        assert!(l.captured());
+        let cursor = l.cursor;
+        let _ = l.take_grab();
+        // The city screen over the window, its production box at 500, 400.
+        let mut s = with_screen("City");
+        s.interface.focus_control = Some([480, 380, 40, 40]);
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(!l.captured());
+        assert_eq!((l.take_grab(), l.take_warp(), l.pointer), (Some(false), Some((500, 400)), (500, 400)));
+        // Fitted into A (the settings place it there): where it shows.
+        let mut l2 = arranged(&unit_mouse);
+        l2.screen_places.insert("City".into(), ScreenPlace { vertical: Place::LeftOrBottom, horizontal: Place::Floating });
+        mv(&mut l2, (600, 300));
+        frame(&mut l2, vec![]);
+        click(&mut l2, (600, 300));
+        l2.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        // (A is 400 wide: the 800x600 screen at 1/2.)
+        assert_eq!(l2.take_warp(), Some((250, 200)));
+        // Closed: captured again at the world cursor it had.
+        l.frame(&scene(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(l.captured());
+        assert_eq!((l.take_grab(), l.cursor), (Some(true), BOUNDS.unwrap().clamp_point(cursor)));
+        // A screen opening with the mouse free leaves the pointer alone.
+        let mut l = arranged(&unit_mouse);
+        mv(&mut l, (100, 100));
+        frame(&mut l, vec![]);
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!((l.take_warp(), l.pointer), (None, (100, 100)));
     }
 
     // ---- Mouse capture ----------------------------------------------------
