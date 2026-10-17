@@ -282,6 +282,9 @@ pub struct Layout {
     shown: Vec<(Hit, Camera)>,
     interface: Vec<[i32; 4]>,
     bounds: Option<WorldBounds>,
+    /// The pointer's place at the window's edge as last told to the driver
+    /// (`Input::Edge`).
+    edge: (i32, i32),
 }
 
 impl Default for Layout {
@@ -314,6 +317,7 @@ impl Default for Layout {
             shown: Vec::new(),
             interface: Vec::new(),
             bounds: None,
+            edge: (0, 0),
         }
     }
 }
@@ -481,6 +485,55 @@ impl Layout {
     /// The mouse was let go (e.g. the window lost focus).
     pub fn released(&mut self) {
         self.locked = false;
+    }
+
+    /// The pointer left the window, or the window lost the focus: it is at
+    /// no edge any more (what goes to the driver).
+    pub fn pointer_gone(&mut self) -> Vec<Input> {
+        self.edge_change((0, 0))
+    }
+
+    /// `Input::Edge` for the pointer now at `edge`, if that changed.
+    fn edge_change(&mut self, edge: (i32, i32)) -> Vec<Input> {
+        if edge == self.edge {
+            return vec![];
+        }
+        self.edge = edge;
+        vec![Input::Edge { x: edge.0, y: edge.1 }]
+    }
+
+    /// Where pointer `p` is at the window's edge (see `Input::Edge`): only
+    /// over the driver's main view shown unmoved, at zoom 1 where the driver
+    /// shows it (a window pixel is the driver's), so that the window's edge
+    /// is the driver's screen edge; not while the mouse is captured or
+    /// dragging, nor with the driver's screen fitted into a pane.
+    fn edge_at(&self, p: (i32, i32)) -> (i32, i32) {
+        let (main_rect, _) = self.panes();
+        let unmoved = self.main.is_some_and(|m| {
+            self.shown.iter().any(|(h, c)| *h == Hit::Main && c.zoom == (1, 1) && (c.x, c.y, c.origin) == (m.x, m.y, m.origin) && c.screen_shift == (0, 0))
+        });
+        let over_main = match self.hit(p) {
+            Hit::Main => true,
+            // The driver's interface where the main view is.
+            Hit::Interface => inside(main_rect, p),
+            _ => false,
+        };
+        if !unmoved || !over_main || self.locked || self.drag.is_some() || self.fit.is_some() {
+            return (0, 0);
+        }
+        let at = |v: i32, size: u32| {
+            let far = size as i32 - 1 - v;
+            if v < 0 || far < 0 {
+                0
+            } else if v < scene::EDGE_ZONE {
+                -(v + 1)
+            } else if far < scene::EDGE_ZONE {
+                far + 1
+            } else {
+                0
+            }
+        };
+        (at(p.0, self.window.0), at(p.1, self.window.1))
     }
 
     /// The main pane's rectangle, and the second pane's if split.
@@ -859,12 +912,16 @@ impl Layout {
                 self.pointer = (x, y);
                 if let Some(drag) = self.drag {
                     self.dragged(drag, (x, y));
-                    return vec![];
+                    return self.edge_change((0, 0));
                 }
-                match self.route_point((x, y)) {
+                let mut out = match self.route_point((x, y)) {
                     Ok((x, y)) => vec![Input::MouseMove { x, y }],
                     Err(_) => vec![],
-                }
+                };
+                // (After the move: a driver takes the edge for where the
+                // pointer is.)
+                out.extend(self.edge_change(self.edge_at((x, y))));
+                out
             }
             Input::MouseButton { button, down, x, y } => self.button(button, down, (x, y)),
             Input::Wheel { delta, x, y } => {
@@ -1374,6 +1431,38 @@ mod tests {
         assert_eq!(out, [Input::WorldButton { button: Button::Right, down: true, x: pane.x + 96, y: pane.y + 200 }]);
         // The fitted screen still takes its clicks.
         assert!(matches!(click(&mut l, (100, 100))[0], Input::MouseButton { .. }));
+    }
+
+    #[test]
+    fn the_pointer_at_the_window_edge_is_at_the_drivers_edge_only_unmoved() {
+        let mut l = Layout::default();
+        frame(&mut l, vec![[0, 560, 800, 40]]);
+        // The middle: no edge; the right edge, its outermost pixel and 3 in.
+        assert_eq!(l.route(Input::MouseMove { x: 400, y: 300 }), vec![Input::MouseMove { x: 400, y: 300 }]);
+        assert_eq!(l.route(Input::MouseMove { x: 799, y: 300 }), vec![Input::MouseMove { x: 799, y: 300 }, Input::Edge { x: 1, y: 0 }]);
+        assert_eq!(l.route(Input::MouseMove { x: 796, y: 300 }), vec![Input::MouseMove { x: 796, y: 300 }, Input::Edge { x: 4, y: 0 }]);
+        // Unchanged: not sent again; a corner, over the driver's interface.
+        assert_eq!(l.route(Input::MouseMove { x: 796, y: 300 }), vec![Input::MouseMove { x: 796, y: 300 }]);
+        assert_eq!(l.route(Input::MouseMove { x: 0, y: 599 }), vec![Input::MouseMove { x: 0, y: 599 }, Input::Edge { x: -1, y: 1 }]);
+        assert_eq!(l.pointer_gone(), vec![Input::Edge { x: 0, y: 0 }]);
+        assert_eq!(l.pointer_gone(), vec![]);
+        // Zoomed in, the window's edge is not the driver's.
+        l.route(Input::MouseMove { x: 799, y: 300 });
+        l.main_view.zoom = ONE + 2;
+        frame(&mut l, vec![]);
+        assert_eq!(l.route(Input::MouseMove { x: 798, y: 300 }).last(), Some(&Input::Edge { x: 0, y: 0 }));
+        // Split: the main pane's outer edges are the driver's, the divider is
+        // not, the second pane is a view of the viewer's own.
+        l.main_view.zoom = ONE;
+        l.split = Some(Split { axis: Axis::Vertical, fraction: 0.5, view: FreeView::new((0, 0), ONE, Follow::Free) });
+        frame(&mut l, vec![]);
+        assert_eq!(l.route(Input::MouseMove { x: 2, y: 300 }).last(), Some(&Input::Edge { x: -3, y: 0 }));
+        assert_eq!(l.route(Input::MouseMove { x: 390, y: 300 }).last(), Some(&Input::Edge { x: 0, y: 0 }));
+        assert!(!l.route(Input::MouseMove { x: 799, y: 300 }).iter().any(|i| matches!(i, Input::Edge { .. })));
+        // The driver's screen fitted into the pane: none.
+        l.ui_in_pane = true;
+        frame(&mut l, vec![]);
+        assert!(!l.route(Input::MouseMove { x: 0, y: 300 }).iter().any(|i| matches!(i, Input::Edge { x, .. } if *x != 0)));
     }
 
     #[test]

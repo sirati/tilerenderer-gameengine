@@ -559,6 +559,13 @@ impl ApplicationHandler for App {
             self.layout.released();
             self.grab(false);
         }
+        // The pointer is at no edge of the window once it left (or the
+        // window is no longer the one the user works in).
+        if matches!(event, WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. }) {
+            for input in self.layout.pointer_gone() {
+                self.display.send_input(input);
+            }
+        }
         for input in self.input.translate(&event) {
             for input in self.layout.route(input) {
                 self.display.send_input(input);
