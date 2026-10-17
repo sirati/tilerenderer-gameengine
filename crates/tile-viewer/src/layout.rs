@@ -906,6 +906,9 @@ impl Layout {
     /// Where the window is to move the system pointer (the divider held it
     /// back), if it is to.
     pub fn take_warp(&mut self) -> Option<(i32, i32)> {
+        if self.snapping {
+            return None;
+        }
         self.warp.take()
     }
 
@@ -1033,12 +1036,6 @@ impl Layout {
     }
 
     /// The mouse was let go (e.g. the window lost focus).
-    /// Whether button snapping is on (`crate::snap`): it points at the
-    /// interface, so the corner's buttons show to be snapped to.
-    pub fn set_snapping(&mut self, on: bool) {
-        self.snapping = on;
-    }
-
     pub fn released(&mut self) {
         if self.locked {
             self.release("the window lost the mouse");
@@ -1130,7 +1127,7 @@ impl Layout {
             _ => false,
         };
         let pushed = self.against == Some(Side::A);
-        if !self.main_unmoved() || !(over_main || pushed) || self.locked || self.drag.is_some() {
+        if !self.main_unmoved() || !(over_main || pushed) || self.locked || self.snapping || self.drag.is_some() {
             return (0, 0);
         }
         let at = |v: i32, size: u32| {
@@ -2300,12 +2297,59 @@ impl Layout {
         })
     }
 
+    /// Button snapping (`crate::snap`) holds the pointer (`on`) or gives it
+    /// back: while it holds it, it points at the interface (the corner's
+    /// buttons show to be snapped to), no divider or window edge acts on the
+    /// pointer and the system pointer is not moved (a warp asked for waits);
+    /// what the driver gets (the pointer at no edge any more).
+    pub fn set_snapping(&mut self, on: bool) -> Vec<Input> {
+        self.snapping = on;
+        self.against = None;
+        if on { self.edge_change((0, 0)) } else { vec![] }
+    }
+
+    pub fn snapping(&self) -> bool {
+        self.snapping
+    }
+
+    /// The view a click captures the mouse in (as of the last frame): its
+    /// window rectangle and the point to click (where the world cursor is
+    /// in it, else its middle), if a click there does capture it (not under
+    /// the driver's interface).
+    pub fn capture_view(&self) -> Option<([i32; 4], (i32, i32))> {
+        self.shown.iter().filter(|(h, _)| matches!(h, Hit::Main | Hit::Pane | Hit::Inset(_))).find_map(|(h, c)| {
+            if self.follow_of(*h) != Some(Follow::Pointer) {
+                return None;
+            }
+            let rect = [c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32];
+            let at = self.cursor_on_window().filter(|&p| inside(rect, p)).unwrap_or((rect[0] + rect[2] / 2, rect[1] + rect[3] / 2));
+            (self.capture_hit(at) == Some(*h)).then_some((rect, at))
+        })
+    }
+
+    /// Captures the mouse at window pixel `p` as a click there would (the
+    /// snapping pointer's click on [`Layout::capture_view`]); whether it did.
+    pub fn capture_at(&mut self, p: (i32, i32)) -> bool {
+        let Some(hit) = self.capture_hit(p).filter(|_| !self.locked) else { return false };
+        self.pointer = p;
+        self.raw_pointer = p;
+        self.capture(hit, p);
+        true
+    }
+
     /// The pointer was put at window pixel `p` by other means than the
-    /// mouse (e.g. the snapping pointer, `crate::snap`): it is there now,
-    /// and while the mouse is captured, over a view following the world
-    /// cursor, so is the world cursor.
+    /// mouse (e.g. the snapping pointer, `crate::snap`): it is there now
+    /// (the system pointer moved there while the mouse is free), and while
+    /// the mouse is captured, over a view following the world cursor, so is
+    /// the world cursor.
     pub fn place_pointer(&mut self, p: (i32, i32)) {
         self.pointer = p;
+        if !self.locked {
+            // (The system pointer shows there.)
+            self.raw_pointer = p;
+            self.warp = Some(p);
+            self.side = self.side_of(p);
+        }
         if self.locked && self.hit_follow(p) == Some(Follow::Pointer) {
             if let Some(w) = self.world_under(p) {
                 self.cursor = w;
