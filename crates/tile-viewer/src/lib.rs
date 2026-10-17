@@ -165,6 +165,13 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
 /// several cameras: per such view (its index), each overlay sprite's camera
 /// (`scaling::Arranged::overlay_cameras`).
 pub fn scene_world_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[Option<u32>], overlay_cameras: &[(usize, Vec<u32>)]) -> TileWorld {
+    let mut world = scene_cells(compiled, scene);
+    world.free = scene_free_arranged(compiled, scene, view_cameras, overlay_cameras);
+    world
+}
+
+/// The scene's cells as the renderer's world (no free sprites).
+pub fn scene_cells(compiled: &Compiled, scene: &Scene) -> TileWorld {
     let s = scene.shape;
     let mut world = compiled.world(s.cols.max(1), s.rows.max(1), s.wrap_x, s.wrap_y);
     let cells = s.cols * s.rows;
@@ -186,6 +193,36 @@ pub fn scene_world_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[
             }
         }
     }
+    world
+}
+
+/// Writes the scene's `cells` (layer, cell index: value, phase, offset)
+/// into `world`, made from an earlier version of it of the same shape
+/// (`scene_cells`).
+pub fn scene_cells_changed(compiled: &Compiled, scene: &Scene, world: &mut TileWorld, cells: &[(u32, u32)]) {
+    let s = scene.shape;
+    let n = s.cols * s.rows;
+    for &(layer, cell) in cells {
+        let (Some(l), Some(spec)) = (scene.layers.get(layer as usize), compiled.layers.get(layer as usize)) else { continue };
+        if cell >= n || cell as usize >= l.values.len() {
+            continue;
+        }
+        let (id, col, row) = (tile_render::LayerId(layer as usize), cell % s.cols, cell / s.cols);
+        world.set(id, col, row, l.values[cell as usize]);
+        if let (Some(p), true) = (&l.phases, spec.per_cell_phase) {
+            world.set_phase(id, col, row, p.get(cell as usize).copied().unwrap_or(0));
+        }
+        if let (Some(o), true) = (&l.offsets, spec.per_cell_offset) {
+            world.set_offset(id, col, row, o.get(cell as usize).copied().unwrap_or((0, 0)));
+        }
+    }
+}
+
+/// The renderer's free sprites of `scene`: the world's sprites (in every
+/// view) and each view's overlay, scene view `i`'s drawn by camera
+/// `view_cameras[i]` (none: not drawn), or for the views
+/// `overlay_cameras` lists, each sprite by the camera it gives.
+pub fn scene_free_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[Option<u32>], overlay_cameras: &[(usize, Vec<u32>)]) -> Vec<tile_render::PlacedSprite> {
     // The camera showing scene view `id`, if one does.
     let camera_of = |id: u32| scene.views.iter().zip(view_cameras).find(|(v, _)| v.id == id).and_then(|(_, c)| *c);
     let placed = |s: &scene::FreeSprite, view: Option<u32>| tile_render::PlacedSprite {
@@ -208,18 +245,18 @@ pub fn scene_world_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[
         text: s.glyph.and_then(|g| outline_glyph(compiled, &g, s.tint)),
         palette: s.palette,
     };
-    world.free = scene.sprites.iter().map(|s| placed(s, None)).collect();
+    let mut free: Vec<_> = scene.sprites.iter().map(|s| placed(s, None)).collect();
     for (i, (v, camera)) in scene.views.iter().zip(view_cameras).enumerate() {
         match overlay_cameras.iter().find(|(view, _)| *view == i) {
-            Some((_, cameras)) => world.free.extend(v.overlay.iter().zip(cameras).map(|(s, c)| placed(s, Some(*c)))),
+            Some((_, cameras)) => free.extend(v.overlay.iter().zip(cameras).map(|(s, c)| placed(s, Some(*c)))),
             None => {
                 if let Some(c) = camera {
-                    world.free.extend(v.overlay.iter().map(|s| placed(s, Some(*c))));
+                    free.extend(v.overlay.iter().map(|s| placed(s, Some(*c))));
                 }
             }
         }
     }
-    world
+    free
 }
 
 /// A scene's glyph (in `tint`, 0xRRGGBB) as the renderer draws it from its
@@ -552,6 +589,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         cursor_cameras: None,
         next_frame: None,
         map_drawn: false,
+        interface: None,
         profile: profile::env_on("TILE_VIEWER_PROFILE").then(|| profile::Profile::new("viewer", Duration::from_secs(5))),
         received_seq: 0,
     };
@@ -701,6 +739,9 @@ struct App {
     next_frame: Option<Instant>,
     /// Whether a scene with the world in a view was drawn yet.
     map_drawn: bool,
+    /// What the scene's interface covers (`interface_rects`), for the scene
+    /// version and art it was found for.
+    interface: Option<((u64, u64), Vec<[i32; 4]>)>,
     /// Where the time goes (`TILE_VIEWER_PROFILE=1`), logged every 5 s.
     profile: Option<profile::Profile>,
     /// The scene version last received (scenes counted for the profile).
@@ -1234,8 +1275,7 @@ impl App {
         for p in self.display.take_patches() {
             self.patches.insert(p.sprite.clone(), p);
         }
-        let scene = self.display.scene();
-        if scene.seq == 0 {
+        if self.display.scene().seq == 0 {
             return;
         }
         // The picture (the viewer arranges and draws in its pixels; the
@@ -1245,7 +1285,12 @@ impl App {
         // is drawn meanwhile as it was, its world in its arrangement (the
         // waiting scene's views may differ, e.g. a screen opened with a view
         // of its own).
-        let matches = scene.assets == 0 || (self.whole_version..=self.assets_version).contains(&scene.assets) || gave_up;
+        let assets = self.display.scene().assets;
+        let matches = assets == 0 || (self.whole_version..=self.assets_version).contains(&assets) || gave_up;
+        // What changed since the renderer's world was made of the scene
+        // (taken when it is made of it: not while the scene waits).
+        let changes = if matches || new_assets || self.world.is_none() { self.display.take_changes().0 } else { scene::Changes::default() };
+        let scene = self.display.scene();
         let arranged = match &self.drawn_frame {
             Some(frame) if !matches && self.world.is_some() && window == self.drawn_window => frame.clone(),
             _ => {
@@ -1256,7 +1301,13 @@ impl App {
                 let bounds = world_bounds(&self.compiled, scene);
                 self.layout.grid_step = self.compiled.step;
                 self.layout.driver_screen = Some(plan.screen);
-                let mut arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
+                // (What the interface covers changes with the scene only.)
+                let key = (scene.seq, self.assets_version);
+                if self.interface.as_ref().is_none_or(|(k, _)| *k != key) {
+                    self.interface = Some((key, interface_rects(&self.compiled, scene)));
+                }
+                let rects = self.interface.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
+                let mut arranged = self.layout.frame(scene, window, self.config.overhang, rects, Some(bounds));
                 let compiled = &self.compiled;
                 let shown = scaling::arrange(&plan, scene, &mut arranged, |s| sprite_rect(compiled, s));
                 self.layout.interface_shown = shown.shown;
@@ -1275,12 +1326,33 @@ impl App {
             log::debug!("viewer: own views now show {views:?}");
             self.display.send_input(Input::Views(views));
         }
-        let views_moved = arranged.view_cameras != self.drawn_views || self.drawn_overlay != self.built_overlay;
-        let rebuilt = new_assets || ((scene.seq != self.drawn_seq || views_moved) && matches) || self.world.is_none();
-        if rebuilt {
-            self.world = Some(scene_world_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay));
-            self.built_overlay = self.drawn_overlay.clone();
-            mark(&mut self.profile, "world build", &mut t);
+        // The world made anew (new art, a new world) or only what changed
+        // of it: cells, free sprites (also when the views drawing the
+        // scene's overlays move).
+        let views_moved = (arranged.view_cameras != self.drawn_views || self.drawn_overlay != self.built_overlay) && matches;
+        let full = new_assets || changes.world || self.world.is_none();
+        let cells_changed = !full && !changes.cells.is_empty();
+        let free_changed = !full && (changes.sprites || changes.views || views_moved);
+        match self.world.as_mut() {
+            Some(world) if !full => {
+                if cells_changed {
+                    scene_cells_changed(&self.compiled, scene, world, &changes.cells);
+                    mark(&mut self.profile, "cells changed", &mut t);
+                }
+                if free_changed {
+                    world.free = scene_free_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay);
+                    self.built_overlay = self.drawn_overlay.clone();
+                    mark(&mut self.profile, "free sprites build", &mut t);
+                }
+            }
+            _ => {
+                self.world = Some(scene_world_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay));
+                self.built_overlay = self.drawn_overlay.clone();
+                mark(&mut self.profile, "world build", &mut t);
+            }
+        }
+        if let Some(p) = &mut self.profile {
+            p.count("cells changed", changes.cells.len());
         }
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
@@ -1353,23 +1425,33 @@ impl App {
         markers.extend(snap_sprites);
         mark(&mut self.profile, "markers+cursor", &mut t);
         let world = self.world.as_mut().expect("built above");
-        let own = world.free.len();
-        world.free.extend_from_slice(&markers);
         if let Some(p) = &mut self.profile {
             p.count("free sprites", world.free.len());
+            p.count("markers", markers.len());
             p.count("cameras", cameras.len());
         }
+        let dirty = world.take_dirty();
         if new_assets {
             gpu.renderer.set_world(&gpu.device, world);
-        } else if rebuilt {
-            gpu.renderer.update_world(&gpu.device, &gpu.queue, world);
-        }
-        let markers_moved = markers != self.drawn_markers;
-        if !new_assets && !rebuilt && markers_moved {
+        } else if full {
+            gpu.renderer.update_cells(&gpu.device, &gpu.queue, world, &tile_render::Dirty::All);
             gpu.renderer.update_free(&gpu.device, &gpu.queue, world);
+        } else {
+            if cells_changed {
+                gpu.renderer.update_cells(&gpu.device, &gpu.queue, world, &dirty);
+            }
+            if free_changed {
+                gpu.renderer.update_free(&gpu.device, &gpu.queue, world);
+            }
         }
-        world.free.truncate(own);
-        mark(&mut self.profile, if new_assets || rebuilt { "upload world" } else { "upload free" }, &mut t);
+        mark(&mut self.profile, "upload world", &mut t);
+        // The viewer's markers (cursor, counter, ...) change more often
+        // than the world: uploaded on their own.
+        let markers_moved = markers != self.drawn_markers;
+        if markers_moved {
+            gpu.renderer.set_markers(&gpu.device, &gpu.queue, &markers);
+            mark(&mut self.profile, "upload markers", &mut t);
+        }
         self.drawn_markers = markers;
         self.drawn_cursor = cursor_sprites;
         self.drawn_views = arranged.view_cameras.clone();
@@ -1386,7 +1468,7 @@ impl App {
             log::info!("viewer: first map drawn (scene {})", scene.seq);
         }
         // A software renderer draws a frame only when it differs from the last.
-        let unchanged = !new_assets && !rebuilt && !markers_moved && scene.tick == self.drawn_tick && window == self.drawn_window && !gpu.reconfigured;
+        let unchanged = !full && !cells_changed && !free_changed && !markers_moved && scene.tick == self.drawn_tick && window == self.drawn_window && !gpu.reconfigured;
         // The pointer's motion is drawn (or there was nothing to draw): the
         // cursor moved, or the views following it.
         let views_followed = self.drawn_frame.as_ref().map(|f| &f.cameras) != self.cursor_cameras.as_ref();
