@@ -33,8 +33,18 @@
 //! drawn at their zoom by the driver's zoomed art, or its pixels scaled), +/− and
 //! Ctrl+wheel zoom what is under
 //! the pointer, 0 resets its zoom, arrows pan it; a middle-button drag pans
-//! a view, Ctrl+Shift+left drag moves an inset (resizes it at its
-//! bottom-right corner), a left drag on the divider moves it.
+//! a view (sliding on when let go), Ctrl+Shift+left drag moves an inset
+//! (resizes it at its bottom-right corner), a left drag on the divider moves
+//! it.
+//!
+//! # Moving the map
+//!
+//! While the mouse is free, every view scrolls with the pointer at the
+//! window's edges and corners it reaches (the driver's own view by the
+//! driver, `Input::Edge`; the viewer's views by the viewer, faster nearer
+//! the edge), or, with `viewer_settings::MapMovement::Drag`, a left drag
+//! past a few pixels grabs the map instead (a shorter press is a click), it
+//! following the pointer 1:1 and sliding on with momentum. See `pan`.
 //!
 //! [`Layout::configure`] sets it up from a spec such as
 //! `split=vertical,main=focus,pane=pointer,pane_zoom=2`.
@@ -76,8 +86,8 @@
 //! driver's always reachable controls are (`Interface::reachable`, e.g. the
 //! unit's orders): the pointer pushed against it stays in its view (the
 //! window is asked to move the system pointer back, [`Layout::take_warp`])
-//! and scrolls that view instead (`Input::Edge` for the driver's view shown
-//! unmoved, else the viewer pans it). Through the gaps it moves freely. The
+//! and scrolls that view instead (`Input::Edge` for the driver's view, else
+//! the viewer pans it; with edge scrolling on). Through the gaps it moves freely. The
 //! driver's roaming controls (`Interface::roaming`, a game's corner menu
 //! buttons) are drawn in the view the pointer is in. While the mouse is
 //! captured the whole divider is a wall. Ctrl pressed and released on its
@@ -88,6 +98,10 @@
 use std::collections::BTreeMap;
 
 use scene::{Button, Input, Scene};
+
+#[path = "pan.rs"]
+mod pan;
+pub use pan::{DRAG_THRESHOLD, Momentum, Tracker};
 use tile_render::{Camera, ScreenCopy};
 use viewer_settings::{Place, Roles, ScreenPlace};
 
@@ -108,7 +122,8 @@ const UNPLACED: (i32, i32) = (i32::MIN, i32::MIN);
 /// its view about for a moment, about 3 s at 60 frames a second).
 pub const SETTLE_FRAMES: u32 = 180;
 /// How fast the viewer scrolls a view the pointer pushes against the
-/// divider, in screen pixels per second.
+/// divider, or rests at the window's outermost pixel by, in screen pixels
+/// per second (slower further in, `pan`).
 pub const EDGE_PAN_SPEED: f64 = 600.0;
 /// The longest frame step smooth movement takes (a stalled frame does not
 /// make a view jump).
@@ -462,7 +477,6 @@ struct Fit {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Drag {
-    Pan { hit: Hit, from: (i32, i32), center: (i32, i32) },
     MoveInset { index: usize, from: (i32, i32), rect: [i32; 4], resize: bool },
     Divider,
 }
@@ -616,6 +630,8 @@ pub struct Layout {
     /// interface on its own, `crate::scaling`): its views filling its
     /// screen are as large as that.
     pub driver_screen: Option<(u32, u32)>,
+    /// Edge scrolling and dragging the map (`pan`).
+    pan: pan::Pan,
 }
 
 impl Default for Layout {
@@ -688,6 +704,7 @@ impl Default for Layout {
             world_scale: (1, 1),
             interface_shown: None,
             driver_screen: None,
+            pan: pan::Pan::default(),
         }
     }
 }
@@ -1125,6 +1142,7 @@ impl Layout {
     pub fn pointer_gone(&mut self) -> Vec<Input> {
         self.side = None;
         self.against = None;
+        self.pan_pointer_gone();
         self.edge_change((0, 0))
     }
 
@@ -1140,48 +1158,9 @@ impl Layout {
     /// Whether the main pane shows the driver's main view unmoved (or
     /// gliding back to it): following it at zoom 1, each window pixel the
     /// driver's own (perhaps cropped), its screen not fitted into a pane.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn main_unmoved(&self) -> bool {
         self.main.is_some() && self.main_view.follow == Follow::Driver && self.main_view.zoom == ONE && self.fit.is_none() && self.shown.iter().any(|(h, _)| *h == Hit::Main)
-    }
-
-    /// Where pointer `p` is at the window's edge (see `Input::Edge`): only
-    /// over the driver's main view shown unmoved, at zoom 1 where the driver
-    /// shows it (a window pixel is the driver's), so that the window's edge
-    /// is the driver's screen edge; not while the mouse is captured or
-    /// dragging, nor with the driver's screen fitted into a pane. Pushed
-    /// against the divider from the main pane: at that edge.
-    fn edge_at(&self, p: (i32, i32)) -> (i32, i32) {
-        let (main_rect, _) = self.panes();
-        let over_main = match self.hit(p) {
-            Hit::Main => true,
-            // The driver's interface where the main view is.
-            Hit::Interface | Hit::Moved(_) => inside(main_rect, p),
-            _ => false,
-        };
-        let pushed = self.against == Some(Side::A);
-        if !self.main_unmoved() || !(over_main || pushed) || self.locked || self.snapping || self.drag.is_some() {
-            return (0, 0);
-        }
-        let at = |v: i32, size: u32| {
-            let far = size as i32 - 1 - v;
-            if v < 0 || far < 0 {
-                0
-            } else if v < scene::EDGE_ZONE {
-                -(v + 1)
-            } else if far < scene::EDGE_ZONE {
-                far + 1
-            } else {
-                0
-            }
-        };
-        let edge = (at(p.0, self.window.0), at(p.1, self.window.1));
-        // The main pane is left of (above) the divider: its right (bottom)
-        // edge, at the outermost pixel.
-        match self.split.map(|s| s.axis) {
-            Some(Axis::Vertical) if pushed => (1, edge.1),
-            Some(Axis::Horizontal) if pushed => (edge.0, 1),
-            _ => edge,
-        }
     }
 
     /// The zoom strip's rectangle, if the magnifier is one, and the region
@@ -1579,9 +1558,10 @@ impl Layout {
         }
         let (main_rect, pane_rect) = self.panes();
         let fit_target = self.fit_target(self.screen.as_deref());
-        // Pushed against the divider: the view on that side scrolls (the
-        // driver's own view shown unmoved scrolls itself, `Input::Edge`).
-        self.edge_pan(dt, fit_target);
+        // At the window's edge or pushed against the divider: the view
+        // there scrolls (the driver's own view scrolls itself,
+        // `Input::Edge`); a view let go slides on (`pan`).
+        self.pan_frame(dt, fit_target);
         if let Some(b) = bounds {
             self.cursor = b.clamp_point(self.cursor);
         }
@@ -2052,38 +2032,6 @@ impl Layout {
             }
         }
         out
-    }
-
-    /// Scrolls the view the pointer pushes against the divider with (unless
-    /// the driver scrolls it, `Input::Edge`, or it shows a fitted screen):
-    /// by [`EDGE_PAN_SPEED`] towards the divider.
-    fn edge_pan(&mut self, dt: f64, fitted: Option<Hit>) {
-        let (Some(side), Some(split)) = (self.against, self.split) else { return };
-        if self.locked || dt <= 0.0 || fitted == Some(side.hit()) || (side == Side::A && self.main_unmoved()) {
-            return;
-        }
-        let zoom = self.shown.iter().find(|(h, _)| *h == side.hit()).map_or((1, 1), |(_, c)| c.zoom);
-        let step = (EDGE_PAN_SPEED * dt * zoom.1 as f64 / zoom.0.max(1) as f64).round().max(1.0) as i32;
-        // Towards the divider: right (down) from the main pane, left (up)
-        // from the second.
-        let along = if side == Side::A { step } else { -step };
-        let d = if split.axis == Axis::Vertical { (along, 0) } else { (0, along) };
-        let focus = self.focus;
-        let view = match side {
-            Side::A => &mut self.main_view,
-            Side::B => &mut self.split.as_mut().expect("split").view,
-        };
-        match view.follow {
-            // The world cursor's view keeps it in its middle: it moves.
-            Follow::Pointer => self.cursor = (self.cursor.0 + d.0, self.cursor.1 + d.1),
-            // (Zoomed, the driver's view does not scroll at the viewer's
-            // edges either.)
-            Follow::Driver if view.zoom != ONE => {}
-            _ => {
-                let to = (view.center.0 + d.0, view.center.1 + d.1);
-                view.moved_by_hand(to, focus);
-            }
-        }
     }
 
     /// The driver's main view as the main pane shows it: following the
@@ -2572,6 +2520,10 @@ impl Layout {
                 if self.locked {
                     return vec![];
                 }
+                // (A view grabbed follows it.)
+                if let Some(out) = self.pan_motion((x, y)) {
+                    return out;
+                }
                 let from = self.pointer;
                 self.raw_pointer = (x, y);
                 // The divider may hold it back (the system pointer is moved
@@ -2592,7 +2544,7 @@ impl Layout {
                 };
                 // (After the move: a driver takes the edge for where the
                 // pointer is.)
-                out.extend(self.edge_change(self.edge_at((x, y))));
+                out.extend(self.edge_change(self.driver_edge((x, y))));
                 out
             }
             Input::MouseButton { button, down, x, y } => {
@@ -2621,6 +2573,10 @@ impl Layout {
     }
 
     fn button(&mut self, button: Button, down: bool, p: (i32, i32)) -> Vec<Input> {
+        // Grabbing a view, or a press that may become a drag (`pan`).
+        if let Some(out) = self.pan_button(button, down, p) {
+            return out;
+        }
         let b = button_index(button);
         if !down {
             self.drag = None;
@@ -2641,15 +2597,6 @@ impl Layout {
         let hit = if self.locked { Hit::Interface } else { self.hit(p) };
         // Viewer gestures.
         match (button, hit) {
-            (Button::Middle, Hit::Main | Hit::Pane | Hit::Inset(_)) => {
-                if let Some(center) = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| {
-                    let (sw, sh) = c.source_size();
-                    (c.x + sw as i32 / 2, c.y + sh as i32 / 2)
-                }) {
-                    self.drag = Some(Drag::Pan { hit, from: p, center });
-                }
-                return vec![];
-            }
             (Button::Left, Hit::Divider) => {
                 self.drag = Some(Drag::Divider);
                 return vec![];
@@ -2745,16 +2692,6 @@ impl Layout {
 
     fn dragged(&mut self, drag: Drag, p: (i32, i32)) {
         match drag {
-            Drag::Pan { hit, from, center } => {
-                let zoom = self.shown.iter().find(|(h, _)| *h == hit).map_or((1, 1), |(_, c)| c.zoom);
-                let (n, d) = (zoom.0 as i32, zoom.1 as i32);
-                let focus = self.focus;
-                if let Some(view) = self.free_view(hit) {
-                    // Moved by hand: it follows nothing now (the focus of
-                    // interest again once it moves).
-                    view.moved_by_hand((center.0 - (p.0 - from.0) * d / n, center.1 - (p.1 - from.1) * d / n), focus);
-                }
-            }
             Drag::MoveInset { index, from, rect, resize } => {
                 let (dx, dy) = (p.0 - from.0, p.1 - from.1);
                 if let Some(inset) = self.insets.get_mut(index) {
@@ -3217,7 +3154,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pointer_at_the_window_edge_is_at_the_drivers_edge_only_unmoved() {
+    fn the_pointer_at_the_window_edge_is_at_the_drivers_edge_where_it_scrolls_the_main_pane() {
         let mut l = Layout::default();
         frame(&mut l, vec![[0, 560, 800, 40]]);
         // The middle: no edge; the right edge, its outermost pixel and 3 in.
@@ -3229,11 +3166,12 @@ mod tests {
         assert_eq!(l.route(Input::MouseMove { x: 0, y: 599 }), vec![Input::MouseMove { x: 0, y: 599 }, Input::Edge { x: -1, y: 1 }]);
         assert_eq!(l.pointer_gone(), vec![Input::Edge { x: 0, y: 0 }]);
         assert_eq!(l.pointer_gone(), vec![]);
-        // Zoomed in, the window's edge is not the driver's.
+        // Zoomed in, the main pane still follows the driver's view, which
+        // the driver scrolls (at the pointer's distance from the edge).
         l.route(Input::MouseMove { x: 799, y: 300 });
         l.main_view.zoom = ONE + 2;
         frame(&mut l, vec![]);
-        assert_eq!(l.route(Input::MouseMove { x: 798, y: 300 }).last(), Some(&Input::Edge { x: 0, y: 0 }));
+        assert_eq!(l.route(Input::MouseMove { x: 798, y: 300 }).last(), Some(&Input::Edge { x: 2, y: 0 }));
         // Split: the main pane's outer edges are the driver's, the divider is
         // not, the second pane is a view of the viewer's own.
         l.main_view.zoom = ONE;

@@ -237,6 +237,20 @@ impl Layout {
     }
 }
 
+/// How the mouse moves the map while it is free (not captured).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MapMovement {
+    /// The pointer resting at a window edge or corner (or pushed against
+    /// the divider) scrolls the view it is in, faster nearer the edge.
+    #[default]
+    EdgeScroll,
+    /// Civilization IV style: the left button held on the map and dragged
+    /// past a few pixels grabs it, the map following the pointer 1:1 and
+    /// sliding on with momentum when let go (a shorter click is a click);
+    /// no edge scrolling.
+    Drag,
+}
+
 /// Pointer behaviour.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -246,11 +260,13 @@ pub struct Input {
     pub snap_updates_per_second: f32,
     /// How often the translucent target cursor follows, per second.
     pub snap_ghost_fps: f32,
+    /// Edge scrolling, or grabbing the map and dragging it.
+    pub map_movement: MapMovement,
 }
 
 impl Default for Input {
     fn default() -> Self {
-        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0 }
+        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, map_movement: MapMovement::EdgeScroll }
     }
 }
 
@@ -337,6 +353,21 @@ mod tests {
         let text = toml::to_string_pretty(&on).unwrap();
         assert!(text.contains("[display]") && text.contains("show_fps = true"), "{text}");
         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), on);
+    }
+
+    #[test]
+    fn map_movement_is_edge_scrolling_by_default_and_older_files_still_load() {
+        assert_eq!(Settings::default().input.map_movement, MapMovement::EdgeScroll);
+        // A file from before the setting existed (its input section too).
+        let old: Settings = toml::from_str("[input]\nsnap_updates_per_second = 5.0\n").unwrap();
+        assert_eq!((old.input.map_movement, old.input.snap_updates_per_second), (MapMovement::EdgeScroll, 5.0));
+        let drag: Settings = toml::from_str("[input]\nmap_movement = \"Drag\"\n").unwrap();
+        assert_eq!(drag.input.map_movement, MapMovement::Drag);
+        assert_eq!(drag.input.snap_ghost_fps, Input::default().snap_ghost_fps);
+        let text = toml::to_string_pretty(&drag).unwrap();
+        assert!(text.contains("map_movement = \"Drag\""), "{text}");
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), drag);
+        assert!(toml::from_str::<Settings>("[input]\nmap_movement = \"Wobble\"\n").is_err());
     }
 
     #[test]
