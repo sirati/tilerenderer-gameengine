@@ -526,6 +526,23 @@ fn moving_up_the_list_scrolls_it_up() {
 }
 
 #[test]
+fn from_the_first_entry_shown_moving_up_scrolls_and_a_long_move_leaves() {
+    // A header button just above the list.
+    let mut items = vec![list(10, [500, 100, 200, 300], 0), at(5, 600, 80)];
+    items.extend((0..15).map(|k| item(100 + k, [500, 100 + 20 * k as i32, 200, 20])));
+    let t = targets(&items, IDENTITY, WINDOW);
+    let mut s = Snapper::default();
+    s.enter(0.0, (600.0, 110.0), &t, Rates::default());
+    let actions = run(&mut s, &t, 0.0, 1.0, (0.0, -5.0), |t| t < 0.03);
+    assert!(actions.iter().any(|(_, a)| matches!(a, Action::Wheel { delta: 120, .. })), "{actions:?}");
+    assert_eq!(s.target(), Some((600.0, 110.0)));
+    // A long move up in one go: the header.
+    s.motion((0.0, -60.0));
+    run(&mut s, &t, 1.0, 1.1, (0.0, 0.0), |_| false);
+    assert_eq!(s.target(), Some((600.0, 80.0)));
+}
+
+#[test]
 fn moving_sideways_out_of_the_list_leaves_it() {
     let t = with_list();
     let mut s = Snapper::default();

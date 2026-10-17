@@ -851,11 +851,14 @@ impl Snapper {
     fn choose(&self, targets: &[Target]) -> Choice {
         let from = self.flight.to;
         let m = self.moved;
-        // In a list that scrolls, motion up or down staying inside it
+        // In a list that scrolls, motion up or down staying inside it (or
+        // within a step past its edge: from its first or last entry shown)
         // scrolls it.
         let list = self.snapped.and_then(|s| s.list).and_then(|id| targets.iter().find(|t| t.id == id));
         if let Some(Target { rect, kind: TargetKind::List { step, .. }, .. }) = list {
-            if m.0.hypot(m.1) >= DEAD_ZONE && m.1.abs() >= m.0.abs() && inside(*rect, (from.0 + m.0, from.1 + m.1)) {
+            let [x, y, w, h] = *rect;
+            let reach = [x, y - step, w, h + 2.0 * step];
+            if m.0.hypot(m.1) >= DEAD_ZONE && m.1.abs() >= m.0.abs() && inside(reach, (from.0 + m.0, from.1 + m.1)) {
                 return Choice::Scroll { by: m.1, step: *step };
             }
         }
