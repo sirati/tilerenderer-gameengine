@@ -133,12 +133,17 @@ struct Sliced {
 /// the atlas, whatever their colours (e.g. a unit's body and its shadow).
 type TexelKey = (String, usize, [u32; 4]);
 
+/// The indices of every indexed sprite sliced, by where they come from:
+/// sprites of the same pixels (a unit's body, its shadow, an army's banner
+/// art) hold one copy, across compiles too (see `SheetCache`).
+type SharedTexels = HashMap<TexelKey, std::sync::Arc<IndexImage>>;
+
 /// A sprite's pixels as sliced.
 enum Cut {
     Rgba(RgbaImage),
     /// Palette indices, the colours of its own palette row (entry `i` of
     /// `row` for index `i`) and where the indices come from.
-    Indexed { image: IndexImage, row: std::sync::Arc<Vec<u32>>, key: TexelKey },
+    Indexed { image: std::sync::Arc<IndexImage>, row: std::sync::Arc<Vec<u32>>, key: TexelKey },
 }
 
 struct SlicedSprite {
@@ -1001,7 +1006,16 @@ impl Description {
     /// sizes only), from the frames of its image (`frames` loads an image's
     /// frames, `blank` them as the load that finds boxes makes them, `sizes`
     /// gives their sizes).
-    fn slice(&self, name: &str, sheet: &SheetDesc, pixels: bool, frames: &mut dyn FnMut(&str, bool) -> Result<Frames, DescError>, sizes: &mut dyn FnMut(&str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, DescError>) -> Result<Sliced, DescError> {
+    #[allow(clippy::too_many_arguments)]
+    fn slice(
+        &self,
+        name: &str,
+        sheet: &SheetDesc,
+        pixels: bool,
+        frames: &mut dyn FnMut(&str, bool) -> Result<Frames, DescError>,
+        sizes: &mut dyn FnMut(&str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, DescError>,
+        shared: &mut SharedTexels,
+    ) -> Result<Sliced, DescError> {
         let all = if pixels { Some(frames(&sheet.image, false)?) } else { None };
         // The images again as the sprite format sees them, for the sheets
         // that sample from their boxes (the boxes are found once, here).
@@ -1012,7 +1026,7 @@ impl Description {
         let mut out = Sliced { sprites: Vec::new(), cells: 0 };
         for k in 0..count {
             let frame = if sheet.all_frames { k } else { sheet.frame };
-            let one = self.slice_frame(name, sheet, frame, all.as_ref(), all_blank.as_ref(), sizes)?;
+            let one = self.slice_frame(name, sheet, frame, all.as_ref(), all_blank.as_ref(), sizes, shared)?;
             out.sprites.extend(one.sprites.into_iter().map(|s| SlicedSprite { index: s.index + out.cells, ..s }));
             out.cells += one.cells;
         }
@@ -1021,6 +1035,7 @@ impl Description {
 
     /// [`Description::slice`] for frame `frame` of the image (`all`,
     /// `all_blank`: its frames, if made).
+    #[allow(clippy::too_many_arguments)]
     fn slice_frame(
         &self,
         name: &str,
@@ -1029,6 +1044,7 @@ impl Description {
         all: Option<&Frames>,
         all_blank: Option<&Frames>,
         sizes: &mut dyn FnMut(&str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, DescError>,
+        shared: &mut SharedTexels,
     ) -> Result<Sliced, DescError> {
         let err = |message: String| DescError::Sheet { sheet: name.to_owned(), message };
         let no_frame = || err(format!("image has no frame {frame}"));
@@ -1073,14 +1089,14 @@ impl Description {
         let source = self.images.get(&sheet.image).map_or("", |i| i.source.as_str());
         // A cell's pixels and what a view showing the world smaller samples
         // of it: its box (empty if it is all blank) or all of it.
-        let cut = |x: u32, y: u32| -> (Option<Cut>, [u32; 4]) {
+        let mut cut = |x: u32, y: u32| -> (Option<Cut>, [u32; 4]) {
             let image = all.map(|f| match f {
                 Frames::Rgba(frames) => Cut::Rgba(shape(frames[frame].crop(x, y, cw, ch))),
-                Frames::Indexed { frames, rows } => Cut::Indexed {
-                    image: frames[frame].pixels.crop(x, y, cw, ch),
-                    row: rows[frame].clone(),
-                    key: (source.to_owned(), frame, [x, y, cw, ch]),
-                },
+                Frames::Indexed { frames, rows } => {
+                    let key = (source.to_owned(), frame, [x, y, cw, ch]);
+                    let image = shared.entry(key.clone()).or_insert_with(|| std::sync::Arc::new(frames[frame].pixels.crop(x, y, cw, ch))).clone();
+                    Cut::Indexed { image, row: rows[frame].clone(), key }
+                }
             });
             let sample_box = match all_blank {
                 Some(Frames::Rgba(blank)) => opaque_box(&shape(blank[frame].crop(x, y, cw, ch))).unwrap_or_default(),
@@ -1190,6 +1206,18 @@ impl Description {
         let globals = format!("{:?}|{:?}", self.loader, self.blank_loader);
         let mut kept: HashMap<String, std::sync::Arc<Sliced>> = HashMap::new();
         let mut placer = Placer::new(page_size, pixels);
+        // The indices of the sheets kept from earlier compiles, for new sheets
+        // of the same pixels to share.
+        let mut shared: SharedTexels = HashMap::new();
+        for sliced in cache.as_ref().and_then(|c| c.sheets.as_ref()).into_iter().flat_map(|s| s.values()) {
+            for s in &sliced.sprites {
+                for cut in [s.image.as_ref(), s.scaled.as_ref().and_then(|c| c.0.as_ref())].into_iter().flatten() {
+                    if let Cut::Indexed { image, key, .. } = cut {
+                        shared.entry(key.clone()).or_insert_with(|| image.clone());
+                    }
+                }
+            }
+        }
         // Sprites with a twin for views showing the world smaller
         // (`scaled_origin`): which, and where their twin's cell is.
         let mut twins: Vec<(SpriteId, std::sync::Arc<Sliced>, usize, u32, u32)> = Vec::new();
@@ -1203,12 +1231,12 @@ impl Description {
                     let key = self.sheet_key(sheet, &globals);
                     let sliced = match cache.sheets.as_ref().and_then(|c| c.get(&key)) {
                         Some(s) => s.clone(),
-                        None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes)?),
+                        None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared)?),
                     };
                     kept.insert(key, sliced.clone());
                     sliced
                 }
-                None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes)?),
+                None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared)?),
             };
             let scaling = match sheet.scaling {
                 SheetScaling::Scale => tile_render_shared::SHRINK,
@@ -1704,6 +1732,98 @@ mod tests {
             let seed = source.len() as u8;
             Ok(vec![RgbaImage::from_fn(40, 20, |x, y| [x as u8, y as u8, seed, 255])])
         }
+    }
+
+    /// Indexed images: frame `f` of "a.flc" is 8×4 indices `x + 10·f` (to
+    /// 63), its colours grey ramps, index 0 clear, `shadow = true` making
+    /// all but 9 clear; "pal" palettes are red ramps.
+    struct Indexed;
+    impl ImageLoader for Indexed {
+        fn load(&self, source: &str, _: &toml::Table) -> Result<Vec<RgbaImage>, String> {
+            Ok(vec![RgbaImage::from_fn(8, 4, |x, y| [x as u8, y as u8, source.len() as u8, 255])])
+        }
+        fn indexed(&self, source: &str, options: &toml::Table) -> Result<Option<Vec<IndexedFrame>>, String> {
+            if source != "a.flc" {
+                return Ok(None);
+            }
+            let shadow = options.get("shadow").and_then(toml::Value::as_bool).unwrap_or(false);
+            let palette: Vec<[u8; 4]> = (0..256u32).map(|i| if i == 0 || (shadow && i != 9) { [0; 4] } else { [i as u8, i as u8, i as u8, 255] }).collect();
+            Ok(Some((0..3u32).map(|f| IndexedFrame { pixels: IndexImage::from_fn(8, 4, |x, _| (x + 10 * f) as u8), palette: palette.clone() }).collect()))
+        }
+        fn palette(&self, source: &str, _: &toml::Table) -> Result<Vec<[u8; 4]>, String> {
+            let k = source.len() as u32;
+            Ok((0..256u32).map(|i| [(i * k) as u8, 0, 0, 255]).collect())
+        }
+    }
+
+    #[test]
+    fn indexed_images_share_their_pixels_and_pick_named_palettes() {
+        let text = r#"
+            grid = { layout = "orthogonal", step = [8, 4] }
+            [palettes.civ]
+            source = "pal{v}"
+            variants = [1, 22]
+            [palettes.army]
+            base = "civ@1"
+            copy = [["civ@22", 2, 5, 2]]
+            [images.body]
+            source = "a.flc"
+            remap = [2, 6]
+            [images.shadow]
+            source = "a.flc"
+            shadow = true
+            [images.plain]
+            source = "b.pcx"
+            [images.colours]
+            source = "a.flc"
+            indexed = false
+            [sheets.body]
+            image = "body"
+            all_frames = true
+            cell = [8, 4]
+            [sheets.shadow]
+            image = "shadow"
+            all_frames = true
+            cell = [8, 4]
+            [sheets.plain]
+            image = "plain"
+            cell = [8, 4]
+            [sheets.colours]
+            image = "colours"
+            cell = [8, 4]
+            [[layers]]
+            name = "units"
+            sets = ["body/*"]
+            palettes = true
+        "#;
+        let c = Description::parse(text).unwrap().compile(&Indexed, 64).unwrap();
+        let sprite = |n: &str| c.atlas.sprites[c.sprite(n).unwrap().0 as usize];
+        // Every frame, indexed; the shadow on the body's pixels, its own row.
+        let (body, shadow) = (sprite("body/2"), sprite("shadow/2"));
+        assert_eq!((body.page, body.atlas_x, body.atlas_y), (shadow.page, shadow.atlas_x, shadow.atlas_y));
+        assert!(body.palette != 0 && shadow.palette != 0 && body.palette != shadow.palette);
+        assert_eq!((body.remap, shadow.remap), (tile_render_shared::remap_range(2, 6), 0));
+        // Frames of one palette share its row; the colour images are not indexed.
+        assert_eq!(sprite("body/0").palette, body.palette);
+        assert_eq!((sprite("plain/0").palette, sprite("colours/0").palette), (0, 0));
+        assert_eq!((c.atlas.index_pages.len(), c.atlas.pages.len()), (1, 1));
+        // Named rows after the own ones (row 0 clear, body, shadow).
+        assert_eq!(c.atlas.named_palettes, 3);
+        let row = |name: &str| c.palette(name).unwrap();
+        assert_eq!((row("army"), row("civ@1"), row("civ@22")), (1, 2, 3));
+        let entry = |r: u32, i: u32| c.atlas.palettes[((c.atlas.named_palettes + r - 1) * tile_render_shared::PALETTE_SIZE + i) as usize].to_le_bytes();
+        // (civ@1: 4 · i, from "pal1"; civ@22: 5 · i, from "pal22"; the army
+        // row civ@1's with entries 2, 3 of civ@22 at 5, 6.)
+        assert_eq!((entry(2, 3), entry(3, 3), entry(1, 5), entry(1, 7)), ([12, 0, 0, 255], [15, 0, 0, 255], [10, 0, 0, 255], [28, 0, 0, 255]));
+        // Drawn: the body's frame 2 (indices 20..27) through civ@22 where remapped (none are: 2..6).
+        let tile = tile_render_shared::indexed_color(22, body.palette, body.remap, row("civ@22"), c.atlas.named_palettes, &c.atlas.palettes);
+        assert_eq!(tile, [22, 22, 22, 255]);
+        let remapped = tile_render_shared::indexed_color(3, body.palette, body.remap, row("civ@22"), c.atlas.named_palettes, &c.atlas.palettes);
+        assert_eq!(remapped, [15, 0, 0, 255]);
+        // A layer value picks a named palette in its upper bits.
+        let v = c.value_in("units", "body/1", row("civ@22")).unwrap();
+        assert_eq!(v & 3, c.value("units", "body/1").unwrap());
+        assert_eq!(c.layers[0].value_in(c.value("units", "body/1").unwrap(), 3), Some(v));
     }
 
     /// Fonts from the game's folder, where there is a Civ III installation.
