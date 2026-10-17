@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Button, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, Patch, Update, View, WorldShape};
+use crate::{Button, Cursor, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, Patch, SystemCursor, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 24;
+pub const VERSION: u32 = 25;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -371,6 +371,16 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     w.i32(step);
                 }
             }
+            Update::Cursor(c) => {
+                w.u8(15);
+                let (tag, value) = match *c {
+                    Cursor::Default => (0, 0),
+                    Cursor::Sprite(set) => (1, set),
+                    Cursor::System(s) => (2, SystemCursor::ALL.iter().position(|&k| k == s).unwrap_or(0) as u32),
+                };
+                w.u8(tag);
+                w.u32(value);
+            }
         }
     }
     w.0
@@ -492,6 +502,16 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
             14 => {
                 let n = r.len(12)?;
                 Update::Offsets((0..n).map(|_| Ok((r.u32()?, r.u32()?, (r.i16()?, r.i16()?)))).collect::<Result<_, WireError>>()?)
+            }
+            15 => {
+                let tag = r.u8()?;
+                let value = r.u32()?;
+                Update::Cursor(match tag {
+                    0 => Cursor::Default,
+                    1 => Cursor::Sprite(value),
+                    2 => Cursor::System(*SystemCursor::ALL.get(value as usize).ok_or(WireError::Tag(tag))?),
+                    t => return Err(WireError::Tag(t)),
+                })
             }
             t => return Err(WireError::Tag(t)),
         });
@@ -722,6 +742,9 @@ mod tests {
         updates.push(Update::Offsets(vec![(1, 2, (-1, 32767))]));
         updates.push(Update::View { id: 2, view: None });
         updates.push(Update::Interface(Interface { screen: None, roaming: None, popup: Some(7), reachable: None }));
+        updates.push(Update::Cursor(Cursor::Sprite(42)));
+        updates.push(Update::Cursor(Cursor::System(SystemCursor::ResizeNesw)));
+        updates.push(Update::Cursor(Cursor::Default));
         assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
         let mut got = Scene::default();
         for u in decode_updates(&encode_updates(&updates)).unwrap() {

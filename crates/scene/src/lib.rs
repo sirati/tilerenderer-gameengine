@@ -174,6 +174,65 @@ pub struct Scene {
     /// (buttons, list entries, lists), for pointer aids such as snapping
     /// the pointer to buttons.
     pub interactables: Vec<Interactable>,
+    /// The mouse pointer the driver's interface shows now (e.g. a game's
+    /// targeting cursor while the player picks a target).
+    pub cursor: Cursor,
+}
+
+/// A mouse pointer.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Cursor {
+    /// Whatever the renderer shows by default.
+    #[default]
+    Default,
+    /// The first frame of this sprite set (the raw id, as
+    /// [`FreeSprite::set`]), its anchor at the hot spot. A renderer shows it
+    /// as the system's pointer where it can (it needs the set's pixels: see
+    /// the renderer for which sets it keeps them of), and draws it itself
+    /// where it shows the pointer on its own.
+    Sprite(u32),
+    /// One of the system's standard pointers.
+    System(SystemCursor),
+}
+
+/// The standard pointers of a system.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum SystemCursor {
+    #[default]
+    Arrow,
+    /// Busy: the program takes no input.
+    Wait,
+    /// Busy in the background: input is still taken.
+    Progress,
+    Crosshair,
+    Text,
+    Hand,
+    NotAllowed,
+    Move,
+    /// Resizing: up and down, left and right, along the diagonal from the
+    /// top left, along the one from the top right.
+    ResizeNs,
+    ResizeEw,
+    ResizeNwse,
+    ResizeNesw,
+}
+
+impl SystemCursor {
+    /// All of them, in the order of their wire tags.
+    pub const ALL: [SystemCursor; 12] = [
+        SystemCursor::Arrow,
+        SystemCursor::Wait,
+        SystemCursor::Progress,
+        SystemCursor::Crosshair,
+        SystemCursor::Text,
+        SystemCursor::Hand,
+        SystemCursor::NotAllowed,
+        SystemCursor::Move,
+        SystemCursor::ResizeNs,
+        SystemCursor::ResizeEw,
+        SystemCursor::ResizeNwse,
+        SystemCursor::ResizeNesw,
+    ];
 }
 
 /// Parts of the driver's interface a renderer may arrange (all in window
@@ -275,6 +334,8 @@ pub enum Update {
     Interface(Interface),
     /// See [`Scene::interactables`] (replaced).
     Interactables(Vec<Interactable>),
+    /// See [`Scene::cursor`].
+    Cursor(Cursor),
 }
 
 impl Scene {
@@ -387,6 +448,7 @@ impl Scene {
             Update::Settings(s) => self.settings = Some(s),
             Update::Interface(i) => self.interface = i,
             Update::Interactables(i) => self.interactables = i,
+            Update::Cursor(c) => self.cursor = c,
         }
     }
 
@@ -469,6 +531,9 @@ impl Scene {
         if self.interactables != old.interactables {
             out.push(Update::Interactables(self.interactables.clone()));
         }
+        if self.cursor != old.cursor {
+            out.push(Update::Cursor(self.cursor));
+        }
         out
     }
 }
@@ -539,9 +604,10 @@ pub fn connect() -> (Driver, Display) {
     let (updates_tx, updates_rx) = mpsc::channel();
     let (input_tx, input_rx) = mpsc::channel();
     let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wake = Waker::default();
     (
-        Driver { updates: updates_tx, input: input_rx, in_flight: in_flight.clone() },
-        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None },
+        Driver { updates: updates_tx, input: input_rx, in_flight: in_flight.clone(), wake: wake.clone() },
+        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake },
     )
 }
 
@@ -551,12 +617,26 @@ pub type Updater = mpsc::Sender<Vec<Update>>;
 /// driver).
 pub type InputSender = mpsc::Sender<Input>;
 
+/// What the driver's end calls after each batch it sends (see
+/// [`Display::set_wake`]).
+#[derive(Clone, Default)]
+struct Waker(std::sync::Arc<std::sync::Mutex<Option<Box<dyn Fn() + Send>>>>);
+
+impl Waker {
+    fn wake(&self) {
+        if let Some(f) = &*self.0.lock().unwrap_or_else(|e| e.into_inner()) {
+            f();
+        }
+    }
+}
+
 /// The driver's end: sends updates, takes input.
 pub struct Driver {
     updates: Updater,
     input: mpsc::Receiver<Input>,
     /// Batches sent but not yet taken by the renderer.
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    wake: Waker,
 }
 
 impl Driver {
@@ -567,7 +647,9 @@ impl Driver {
             return true;
         }
         self.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.updates.send(batch).is_ok()
+        let sent = self.updates.send(batch).is_ok();
+        self.wake.wake();
+        sent
     }
 
     /// Whether the renderer has not taken everything sent yet: a driver may
@@ -596,9 +678,18 @@ pub struct Display {
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Settings received and not taken yet (see [`Display::take_settings`]).
     new_settings: Option<viewer_settings::Settings>,
+    wake: Waker,
 }
 
 impl Display {
+    /// Has `wake` called whenever the driver has sent a batch (through
+    /// [`Driver::send`]; not through other [`Updater`]s), on the driver's
+    /// thread: a renderer that waits for its window's events rather than
+    /// for updates ([`Display::receive`]) learns of them at once.
+    pub fn set_wake(&self, wake: impl Fn() + Send + 'static) {
+        *self.wake.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(wake));
+    }
+
     /// Applies every batch received so far, waiting up to `timeout` for the
     /// first if none is there; whether anything changed.
     pub fn receive(&mut self, timeout: Duration) -> bool {
@@ -693,6 +784,26 @@ mod tests {
         other.send(Input::Quit).unwrap();
         assert_eq!(driver.take_input().len(), 2);
         assert!(driver.take_input().is_empty());
+    }
+
+    #[test]
+    fn the_driver_wakes_the_renderer_and_the_cursor_travels() {
+        let (driver, mut display) = connect();
+        let woken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = woken.clone();
+        display.set_wake(move || {
+            w.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut s = Scene::default();
+        // Nothing to send: no wake.
+        driver.send(s.updates_since(&Scene::default()));
+        assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), 0);
+        s.cursor = Cursor::Sprite(7);
+        assert_eq!(s.updates_since(&Scene::default()), vec![Update::Cursor(Cursor::Sprite(7))]);
+        driver.send(s.updates_since(&Scene::default()));
+        assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(display.receive(Duration::ZERO));
+        assert_eq!(display.scene().cursor, Cursor::Sprite(7));
     }
 
     #[test]
