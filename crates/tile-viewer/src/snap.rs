@@ -516,6 +516,8 @@ pub struct Snapper {
     last: f64,
     rates: Rates,
     scroll: Scroller,
+    /// Notches moved in the list not sent yet (less than half of one).
+    scroll_rest: f64,
     /// Notches were sent: once they are all out, the driver gets the
     /// pointer again (what is under it now shows its hover).
     scrolled: bool,
@@ -836,6 +838,7 @@ impl Snapper {
         self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }), capture: t.is_capture() });
         let c = t.center();
         self.picked = now;
+        self.scroll_rest = 0.0;
         if c != self.flight.to || !self.flight.done(now) || self.pos != c {
             let duration = self.rates.flight();
             self.flight.retarget(c, now, duration);
@@ -875,7 +878,14 @@ impl Snapper {
             Choice::Scroll { by, step } => {
                 // Moving down the list shows what is further down: the wheel
                 // turned towards the user (negative).
-                self.scroll.add(-by / step.max(1.0));
+                // (In whole notches, the rest kept for the next: short moves
+                // add up.)
+                self.scroll_rest += -by / step.max(1.0);
+                if self.scroll_rest.abs() >= 0.5 {
+                    let whole = self.scroll_rest.round();
+                    self.scroll_rest -= whole;
+                    self.scroll.add(whole);
+                }
             }
             Choice::Nothing => log::debug!("snap: motion {:?}: nothing within {:.0}°, stays", self.moved, CONE.to_degrees()),
         }

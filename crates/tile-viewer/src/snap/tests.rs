@@ -526,6 +526,25 @@ fn moving_up_the_list_scrolls_it_up() {
 }
 
 #[test]
+fn short_moves_down_a_list_add_up_to_notches() {
+    // Entries 42 high (a notch each); nudges of 24 px, half a second apart.
+    let mut items = vec![list(10, [500, 100, 200, 252], 0)];
+    items.extend((0..6).map(|k| item(100 + k, [500, 100 + 42 * k as i32, 200, 42])));
+    let t = targets(&items, IDENTITY, WINDOW);
+    let mut s = Snapper::default();
+    s.enter(0.0, (600.0, 163.0), &t, Rates::default());
+    let mut actions = Vec::new();
+    for k in 0..4 {
+        let t0 = 0.5 * k as f64;
+        actions.extend(run(&mut s, &t, t0, t0 + 0.5, (0.0, 8.0), |t| t < t0 + 3.0 * TICK + 1e-9));
+    }
+    actions.extend(run(&mut s, &t, 2.0, 3.0, (0.0, 0.0), |_| false));
+    let notches = actions.iter().filter(|(_, a)| matches!(a, Action::Wheel { delta: -120, .. })).count();
+    assert!(notches >= 2, "{actions:?}");
+    assert_eq!(s.target(), Some((600.0, 163.0)));
+}
+
+#[test]
 fn from_the_first_entry_shown_moving_up_scrolls_and_a_long_move_leaves() {
     // A header button just above the list.
     let mut items = vec![list(10, [500, 100, 200, 300], 0), at(5, 600, 80)];
