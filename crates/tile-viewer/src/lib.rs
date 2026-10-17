@@ -793,13 +793,15 @@ const DEFAULT_FRAME: Duration = Duration::from_millis(16);
 
 /// The present mode for `asked` among the surface's `modes`, and how many
 /// frames may be in flight: with vsync one (the cursor drawn here lags as
-/// little as it can), else two (the GPU never waits for the next frame).
+/// little as it can), else three (the GPU never waits for the next frame,
+/// and a compositor holding a shown and a waiting picture leaves one to
+/// draw into).
 fn present_mode(asked: viewer_settings::Present, modes: &[wgpu::PresentMode]) -> (wgpu::PresentMode, u32) {
     use viewer_settings::Present;
     let has = |m| modes.contains(&m);
     match asked {
-        Present::Immediate if has(wgpu::PresentMode::Immediate) => (wgpu::PresentMode::Immediate, 2),
-        Present::Immediate | Present::Mailbox if has(wgpu::PresentMode::Mailbox) => (wgpu::PresentMode::Mailbox, 2),
+        Present::Immediate if has(wgpu::PresentMode::Immediate) => (wgpu::PresentMode::Immediate, 3),
+        Present::Immediate | Present::Mailbox if has(wgpu::PresentMode::Mailbox) => (wgpu::PresentMode::Mailbox, 3),
         _ => (wgpu::PresentMode::AutoVsync, 1),
     }
 }
