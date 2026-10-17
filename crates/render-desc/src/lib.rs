@@ -67,6 +67,15 @@ pub trait ImageLoader {
         Err(format!("{source}: this loader has no fonts"))
     }
 
+    /// What `source` (loaded with `options`) stands for right now, e.g. the
+    /// files it and the files its options name resolve to among search
+    /// folders that change: sheets (and indexed sprites' indices) are kept
+    /// from one compile for the next ([`SheetCache`]) only while it is the
+    /// same. By default the source itself.
+    fn identity(&self, source: &str, _options: &toml::Table) -> String {
+        source.to_owned()
+    }
+
     /// The frames of `source` as palette indices, each with the colour every
     /// index is drawn in (see [`IndexedFrame`]), where the loader can tell
     /// the image so with these options: its pixels are a palette's indices
@@ -996,10 +1005,11 @@ impl Description {
     /// `self.blank_loader` (`globals`, the same for all sheets): its image
     /// and how it is cut, not what the sheet, its image or its sprites are
     /// called (names are given in the order things were added, and move as
-    /// art is added). For [`SheetCache`].
-    fn sheet_key(&self, sheet: &SheetDesc, globals: &str) -> String {
+    /// art is added). For [`SheetCache`]. `identity`: what the image stands for
+    /// now (see [`ImageLoader::identity`]).
+    fn sheet_key(&self, sheet: &SheetDesc, globals: &str, identity: &str) -> String {
         let shape = SheetDesc { image: String::new(), group: None, first_index: 0, index_stride: 1, ..sheet.clone() };
-        format!("{shape:?}|{:?}|{globals}", self.images.get(&sheet.image))
+        format!("{shape:?}|{:?}|{identity}|{globals}", self.images.get(&sheet.image))
     }
 
     /// The sprites of sheet `name` (`pixels`: with their pixels, else their
@@ -1015,6 +1025,7 @@ impl Description {
         frames: &mut dyn FnMut(&str, bool) -> Result<Frames, DescError>,
         sizes: &mut dyn FnMut(&str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, DescError>,
         shared: &mut SharedTexels,
+        source_id: &str,
     ) -> Result<Sliced, DescError> {
         let all = if pixels { Some(frames(&sheet.image, false)?) } else { None };
         // The images again as the sprite format sees them, for the sheets
@@ -1026,7 +1037,7 @@ impl Description {
         let mut out = Sliced { sprites: Vec::new(), cells: 0 };
         for k in 0..count {
             let frame = if sheet.all_frames { k } else { sheet.frame };
-            let one = self.slice_frame(name, sheet, frame, all.as_ref(), all_blank.as_ref(), sizes, shared)?;
+            let one = self.slice_frame(name, sheet, frame, all.as_ref(), all_blank.as_ref(), sizes, shared, source_id)?;
             out.sprites.extend(one.sprites.into_iter().map(|s| SlicedSprite { index: s.index + out.cells, ..s }));
             out.cells += one.cells;
         }
@@ -1045,6 +1056,7 @@ impl Description {
         all_blank: Option<&Frames>,
         sizes: &mut dyn FnMut(&str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, DescError>,
         shared: &mut SharedTexels,
+        source: &str,
     ) -> Result<Sliced, DescError> {
         let err = |message: String| DescError::Sheet { sheet: name.to_owned(), message };
         let no_frame = || err(format!("image has no frame {frame}"));
@@ -1086,7 +1098,6 @@ impl Description {
             Some(o) => outline(&cell, o.width, o.color),
             None => cell,
         };
-        let source = self.images.get(&sheet.image).map_or("", |i| i.source.as_str());
         // A cell's pixels and what a view showing the world smaller samples
         // of it: its box (empty if it is all blank) or all of it.
         let mut cut = |x: u32, y: u32| -> (Option<Cut>, [u32; 4]) {
@@ -1203,6 +1214,22 @@ impl Description {
             measured.insert(name.to_owned(), s.clone());
             Ok(s)
         };
+        // What each image stands for now: with its options (the sheet's
+        // key), and its source alone (its indices).
+        let mut identities: HashMap<(String, bool), String> = HashMap::new();
+        let mut identity = |name: &str, with_options: bool| -> String {
+            identities
+                .entry((name.to_owned(), with_options))
+                .or_insert_with(|| match self.images.get(name) {
+                    Some(img) if !GENERATED.iter().any(|p| img.source.starts_with(p)) => {
+                        let options = if with_options { self.image_options(img, false) } else { toml::Table::new() };
+                        loader.identity(&img.source, &options)
+                    }
+                    Some(img) => img.source.clone(),
+                    None => String::new(),
+                })
+                .clone()
+        };
         let globals = format!("{:?}|{:?}", self.loader, self.blank_loader);
         let mut kept: HashMap<String, std::sync::Arc<Sliced>> = HashMap::new();
         let mut placer = Placer::new(page_size, pixels);
@@ -1228,15 +1255,15 @@ impl Description {
         for (sheet_name, sheet) in &self.sheets {
             let sliced = match cache.as_deref_mut() {
                 Some(cache) => {
-                    let key = self.sheet_key(sheet, &globals);
+                    let key = self.sheet_key(sheet, &globals, &identity(&sheet.image, true));
                     let sliced = match cache.sheets.as_ref().and_then(|c| c.get(&key)) {
                         Some(s) => s.clone(),
-                        None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared)?),
+                        None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared, &identity(&sheet.image, false))?),
                     };
                     kept.insert(key, sliced.clone());
                     sliced
                 }
-                None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared)?),
+                None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared, &identity(&sheet.image, false))?),
             };
             let scaling = match sheet.scaling {
                 SheetScaling::Scale => tile_render_shared::SHRINK,
