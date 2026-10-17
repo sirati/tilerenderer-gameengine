@@ -1051,6 +1051,13 @@ impl SnapInput {
                     self.alt_sent = true;
                     return layout.route(input);
                 }
+                // (Nothing of the driver's to snap to, e.g. before its first
+                // screen: Alt is the driver's.)
+                if !Self::targets(scene, layout).iter().any(|t| !t.is_capture()) {
+                    log::debug!("snap: nothing to snap to: Alt is the driver's");
+                    self.alt_sent = true;
+                    return layout.route(input);
+                }
                 self.alt_entered = true;
                 self.enter(layout, scene, now, rates)
             }

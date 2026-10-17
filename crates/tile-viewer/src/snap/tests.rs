@@ -683,6 +683,17 @@ fn alt_turns_the_mode_on_and_alt_again_off() {
 }
 
 #[test]
+fn with_nothing_of_the_driver_s_to_snap_to_alt_is_the_driver_s() {
+    let (mut l, mut s) = captured();
+    s.interactables.clear();
+    let mut snap = SnapInput::default();
+    // (Only the capture view.)
+    assert_eq!(snap.route(key(ALT, true), &mut l, &s, 0.0, Rates::default()).len(), 1);
+    assert!(!snap.active() && !l.snapping());
+    assert_eq!(snap.route(key(ALT, false), &mut l, &s, 0.1, Rates::default()).len(), 1);
+}
+
+#[test]
 fn esc_and_ctrl_turn_the_mode_off() {
     let (mut l, s) = captured();
     let mut snap = SnapInput::default();
