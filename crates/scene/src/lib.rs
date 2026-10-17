@@ -570,6 +570,12 @@ pub enum Input {
     /// views of its own besides the driver's main view (a split pane,
     /// insets): a driver may mark them (e.g. on a minimap).
     Views([(i32, i32, i32, i32); 4]),
+    /// The world rectangle (x, y, w, h) the renderer shows of the driver's
+    /// main view where that is not all of it, as the driver has it (a split
+    /// or a zoom strip crops it, a zoom shows less or more, it follows
+    /// something else); w 0: all of it. A driver may mark that rather than
+    /// its own view (e.g. on a minimap).
+    MainView { x: i32, y: i32, w: i32, h: i32 },
     /// The renderer shows the world at these zooms (`(num, den)` reduced;
     /// `(0, 0)`: unused): a driver may make art for them (e.g. text at that
     /// size, `FreeSprite::zoom_art` 2) and list them in `Scene::zooms`.

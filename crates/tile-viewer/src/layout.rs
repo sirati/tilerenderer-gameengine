@@ -530,6 +530,8 @@ pub struct Layout {
     /// The world rectangles of the viewer's own views as last told to the
     /// driver.
     reported_views: [(i32, i32, i32, i32); 4],
+    /// The main pane's world rectangle as last told to the driver.
+    reported_main: (i32, i32, i32, i32),
     /// Zooms the scene has zoomed art (text) for, from the last frame ((0, 0):
     /// every zoom).
     art_zooms: Vec<(u32, u32)>,
@@ -578,6 +580,7 @@ impl Default for Layout {
             reported_zooms: [(0, 0); 8],
             art_zooms: Vec::new(),
             reported_views: [(0, 0, 0, 0); 4],
+            reported_main: (0, 0, 0, 0),
             sharp_text: true,
             ui_in_pane: false,
             fit: None,
@@ -841,6 +844,24 @@ impl Layout {
         (zooms != self.reported_zooms).then(|| {
             self.reported_zooms = zooms;
             zooms
+        })
+    }
+
+    /// The world rectangle the main pane shows of the driver's main view
+    /// where that is not all of it (as of the last frame; `Input::MainView`,
+    /// w 0: all of it), when it changed since last asked.
+    pub fn take_main_view_change(&mut self) -> Option<(i32, i32, i32, i32)> {
+        let whole = self.fit.is_some() || (self.split.is_none() && self.strip().is_none() && self.main_unmoved());
+        let rect = match self.shown.iter().find(|(h, _)| *h == Hit::Main) {
+            Some((_, c)) if !whole => {
+                let (w, h) = c.source_size();
+                (c.x, c.y, w as i32, h as i32)
+            }
+            _ => (0, 0, 0, 0),
+        };
+        (rect != self.reported_main).then(|| {
+            self.reported_main = rect;
+            rect
         })
     }
 
@@ -2969,6 +2990,22 @@ mod tests {
 
     fn rect(c: &Camera) -> [i32; 4] {
         [c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32]
+    }
+
+    #[test]
+    fn what_a_shows_of_the_drivers_view_is_reported_where_it_is_not_all_of_it() {
+        // One view, the driver's unmoved: all of it.
+        let mut l = arranged(&Settings::default());
+        assert_eq!(l.take_main_view_change(), None);
+        // A split: A's half (the driver's view is at 1000, 500, 800x600).
+        let mut l = arranged(&settings(|s| s.split = S::Vertical1To1));
+        assert_eq!(l.take_main_view_change(), Some((1000, 500, 400, 600)));
+        assert_eq!(l.take_main_view_change(), None);
+        // Zoomed in 2/1 in one view: half as much each way, about its middle.
+        let mut l = arranged(&Settings::default());
+        l.main_view.zoom = ONE + 2;
+        frame(&mut l, vec![]);
+        assert_eq!(l.take_main_view_change(), Some((1200, 650, 400, 300)));
     }
 
     #[test]

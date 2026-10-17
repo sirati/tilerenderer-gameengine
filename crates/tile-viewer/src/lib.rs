@@ -814,6 +814,9 @@ impl App {
             }
         };
         // Views following something move without input: tell the driver.
+        if let Some((x, y, w, h)) = self.layout.take_main_view_change() {
+            self.display.send_input(Input::MainView { x, y, w, h });
+        }
         if let Some(views) = self.layout.take_views_change() {
             log::debug!("viewer: own views now show {views:?}");
             self.display.send_input(Input::Views(views));
@@ -1059,6 +1062,9 @@ impl ApplicationHandler for App {
         self.apply_layout_requests(event_loop);
         if let Some(zooms) = self.layout.take_zooms_change() {
             self.display.send_input(Input::Zooms(zooms));
+        }
+        if let Some((x, y, w, h)) = self.layout.take_main_view_change() {
+            self.display.send_input(Input::MainView { x, y, w, h });
         }
         if let Some(views) = self.layout.take_views_change() {
             log::debug!("viewer: own views now show {views:?}");

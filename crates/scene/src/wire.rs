@@ -601,6 +601,12 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
+            Input::MainView { x, y, w: ww, h } => {
+                w.u8(12);
+                for v in [x, y, ww, h] {
+                    w.i32(v);
+                }
+            }
         }
     }
     w.0
@@ -639,6 +645,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
             5 => Input::Quit,
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
             11 => Input::Edge { x: r.i32()?, y: r.i32()? },
+            12 => Input::MainView { x: r.i32()?, y: r.i32()?, w: r.i32()?, h: r.i32()? },
             8 => {
                 let mut views = [(0, 0, 0, 0); 4];
                 for v in &mut views {
@@ -774,6 +781,7 @@ mod tests {
             Input::Look { x: -5, y: 7000 },
             Input::Zooms([(3, 2), (2, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]),
             Input::Views([(10, -20, 300, 200), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]),
+            Input::MainView { x: 5, y: -6, w: 700, h: 400 },
             Input::WorldButton { button: Button::Right, down: true, x: -64, y: 4096 },
             Input::WorldButton { button: Button::Middle, down: false, x: 0, y: 0 },
             Input::WorldKey { vk: 0x66, down: true, text: Some('6'), x: 130, y: -2 },
