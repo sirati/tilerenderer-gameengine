@@ -23,7 +23,9 @@
 //! Controls (Ctrl+Shift with a key, so they do not collide with a game's):
 //! S cycles the split (off, side by side, stacked), I adds an inset at the
 //! pointer, X removes the inset under it, F cycles what the view under the
-//! pointer follows, Space releases (or takes) the mouse, M cycles the
+//! pointer follows, Space releases the mouse (over a view following the world
+//! cursor while free: takes it, as a click there does; each change is
+//! logged), M cycles the
 //! magnifier (off, everything on screen, the world only), A toggles the
 //! arrow at the point of interest, U puts the driver's whole screen
 //! (interface too) into the main pane of a split instead of over the window,
@@ -501,7 +503,29 @@ impl Layout {
 
     /// The mouse was let go (e.g. the window lost focus).
     pub fn released(&mut self) {
-        self.locked = false;
+        if self.locked {
+            self.release("the window lost the mouse");
+        }
+    }
+
+    /// Captures the mouse at window pixel `p` of `hit` (a view following
+    /// the world cursor): the world cursor starts there.
+    fn capture(&mut self, hit: Hit, p: (i32, i32)) {
+        if let Some((_, camera)) = self.shown.iter().find(|(h, _)| *h == hit) {
+            self.cursor = world_at(camera, p);
+        }
+        self.locked = true;
+        self.grab = Some(true);
+        log::info!("viewer: mouse captured, it moves the world cursor at {:?} (Ctrl+Shift+Space releases it)", self.cursor);
+    }
+
+    /// Releases the mouse (never captures it).
+    fn release(&mut self, why: &str) {
+        let was = std::mem::replace(&mut self.locked, false);
+        self.grab = Some(false);
+        if was {
+            log::info!("viewer: mouse released ({why})");
+        }
     }
 
     /// The main pane's rectangle, and the second pane's if split.
@@ -1025,11 +1049,7 @@ impl Layout {
             // Clicking into a view that follows the world cursor captures
             // the mouse there.
             (Button::Left, Hit::Main | Hit::Pane | Hit::Inset(_)) if self.follow_of(hit) == Some(Follow::Pointer) => {
-                if let Some((_, camera)) = self.shown.iter().find(|(h, _)| *h == hit) {
-                    self.cursor = world_at(camera, p);
-                }
-                self.locked = true;
-                self.grab = Some(true);
+                self.capture(hit, p);
                 return vec![];
             }
             _ => {}
@@ -1195,12 +1215,15 @@ impl Layout {
                     v.follow = v.follow.next();
                 }
             }
-            // Space: release (or take) the mouse.
+            // Space: release the mouse; or take it, over a view following
+            // the world cursor (as a click into it does).
             0x20 => {
-                let lock = !self.locked && self.follows_pointer();
-                if lock != self.locked {
-                    self.locked = lock;
-                    self.grab = Some(lock);
+                if self.locked {
+                    self.release("Ctrl+Shift+Space");
+                } else if self.hit_follow(p) == Some(Follow::Pointer) {
+                    self.capture(hit, p);
+                } else {
+                    log::info!("viewer: mouse stays free (no view under the pointer follows the world cursor)");
                 }
             }
             // A: the arrow at the point of interest.
@@ -1649,4 +1672,29 @@ mod tests {
         assert_eq!(l.split.unwrap().view.center, moved);
     }
 
+    #[test]
+    fn ctrl_shift_space_releases_and_never_captures_by_accident() {
+        // Free, over a view that does not follow the world cursor: nothing.
+        let mut l = Layout::default();
+        l.configure("split=vertical,pane=pointer").unwrap();
+        frame(&mut l, vec![]);
+        l.route(Input::MouseMove { x: 100, y: 300 });
+        ctrl_shift(&mut l, 0x20);
+        assert!(!l.locked);
+        assert_eq!(l.take_grab(), None);
+        assert_eq!(click(&mut l, (100, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 100, y: 300 });
+        // Over the pane following it: taken; again: released.
+        l.route(Input::MouseMove { x: 600, y: 300 });
+        ctrl_shift(&mut l, 0x20);
+        assert!(l.locked);
+        assert_eq!(l.take_grab(), Some(true));
+        ctrl_shift(&mut l, 0x20);
+        assert!(!l.locked);
+        assert_eq!(l.take_grab(), Some(false));
+        // Captured by a click, the window losing the mouse releases it.
+        click(&mut l, (600, 300));
+        assert!(l.locked);
+        l.released();
+        assert!(!l.locked);
+    }
 }
