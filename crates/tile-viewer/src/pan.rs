@@ -934,6 +934,35 @@ mod tests {
     }
 
     #[test]
+    fn world_scaling_keeps_dragging_and_edge_scrolling_in_window_pixels() {
+        for scale in [(2, 1), (3, 2), (1, 2)] {
+            let mut l = split(MapMovement::Drag, Roles::Free);
+            l.world_scale = scale;
+            frame(&mut l);
+            let start = b(&l);
+            left(&mut l, true, (600, 300));
+            mv(&mut l, (450, 225));
+            let world_per_pixel = scale.1 as f64 / scale.0 as f64;
+            let dragged = ((150.0 * world_per_pixel).round() as i32, (75.0 * world_per_pixel).round() as i32);
+            assert_eq!(b(&l), (start.0 + dragged.0, start.1 + dragged.1), "{scale:?}");
+            left(&mut l, false, (450, 225));
+
+            let mut l = split(MapMovement::EdgeScroll, Roles::Free);
+            l.world_scale = scale;
+            frame(&mut l);
+            let start = b(&l);
+            mv(&mut l, (799, 300));
+            tick(&mut l, 100);
+            assert_eq!(b(&l), (start.0 + (60.0 * world_per_pixel).round() as i32, start.1), "{scale:?}");
+            // The driver receives edge distances in window pixels even
+            // when its world is shown at a different scale. Cross the
+            // divider through its open middle before entering A's corner.
+            mv(&mut l, (100, 300));
+            assert_eq!(edges(&mv(&mut l, (3, 0))), [(-4, -1)], "{scale:?}");
+        }
+    }
+
+    #[test]
     fn dragging_the_drivers_view_has_the_driver_look_where_it_comes_to_rest() {
         let mut l = Layout::default();
         l.set_map_movement(MapMovement::Drag);
