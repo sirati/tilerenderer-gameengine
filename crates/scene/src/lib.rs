@@ -99,6 +99,9 @@ pub struct FreeSprite {
     /// (`zoom_art` 2, `zoom` (0, 0)), its pen at the sprite's position on
     /// the baseline.
     pub glyph: Option<Glyph>,
+    /// The named palette its indexed sprites are drawn with (an index into
+    /// the render description's palettes; 0: none).
+    pub palette: u32,
 }
 
 /// A glyph drawn from a font's outline (see [`FreeSprite::glyph`]).

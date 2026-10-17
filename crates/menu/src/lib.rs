@@ -300,6 +300,7 @@ impl Menus {
                 clip: None,
                 not_in_view: None,
                 glyph: None,
+                palette: 0,
             });
         };
         let text = |font: &Font, s: &str, (x, y): (i32, i32), put: &mut dyn FnMut(Art, (i32, i32))| {

@@ -56,8 +56,10 @@ pub enum Element {
     Dynamic { name: String, size: (u32, u32), rect: [i32; 4], at: (i32, i32), clip: [i32; 4] },
     /// A sprite of the description by name, its top-left at `at` (art the
     /// description has anyway, e.g. animation frames). `scale_den`: 0 for
-    /// an ordinary sprite, else a scale blend ([`FreeSprite::scale_den`]).
-    Sprite { name: String, at: (i32, i32), clip: [i32; 4], scale_den: u32 },
+    /// an ordinary sprite, else a scale blend ([`FreeSprite::scale_den`]);
+    /// `palette`: the named palette its indexed art's remapped indices are
+    /// drawn with (empty: none).
+    Sprite { name: String, at: (i32, i32), clip: [i32; 4], scale_den: u32, palette: String },
 }
 
 
@@ -177,10 +179,13 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
         .filter_map(|e| {
             // Sprites are placed by their anchor; elements give their top-left.
             let anchor = |name: &str| {
-                let id = compiled.sprite_names.iter().position(|n| n == name)?;
-                compiled.atlas.sprites.get(id).map(|s| (s.anchor_x, s.anchor_y))
+                let id = compiled.sprite(name)?;
+                compiled.atlas.sprites.get(id.0 as usize).map(|s| (s.anchor_x, s.anchor_y))
             };
-            let scale_den = if let Element::Sprite { scale_den, .. } = e { *scale_den } else { 0 };
+            let (scale_den, palette) = match e {
+                Element::Sprite { scale_den, palette, .. } => (*scale_den, if palette.is_empty() { 0 } else { compiled.palette(palette).unwrap_or(0) }),
+                _ => (0, 0),
+            };
             let (name, (x, y), clip) = match e {
                 Element::Sprite { name, at: (x, y), clip, .. } => {
                     let (ax, ay) = anchor(name).unwrap_or((0, 0));
@@ -215,6 +220,7 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
                 clip: Some(clip),
                 not_in_view: None,
                 glyph: None,
+                palette: palette,
             })
         })
         .collect()

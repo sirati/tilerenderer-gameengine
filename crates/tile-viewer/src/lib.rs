@@ -137,6 +137,7 @@ pub fn scene_world_for(compiled: &Compiled, scene: &Scene, view_cameras: &[Optio
             _ => tile_render::ZoomArt::Any,
         },
         text: s.glyph.and_then(|g| outline_glyph(compiled, &g, s.tint)),
+        palette: s.palette,
     };
     world.free = scene.sprites.iter().map(|s| placed(s, None)).collect();
     for (v, camera) in scene.views.iter().zip(view_cameras) {
@@ -276,7 +277,7 @@ fn apply_patches<'p>(
     patches: impl IntoIterator<Item = &'p scene::Patch>,
 ) {
     for p in patches {
-        let Some(id) = compiled.sprite_names.iter().position(|n| *n == p.sprite) else { continue };
+        let Some(id) = compiled.sprite(&p.sprite) else { continue };
         if p.rgba.len() != (p.width * p.height * 4) as usize {
             continue;
         }
@@ -284,7 +285,7 @@ fn apply_patches<'p>(
             let i = ((y * p.width + x) * 4) as usize;
             [p.rgba[i], p.rgba[i + 1], p.rgba[i + 2], p.rgba[i + 3]]
         });
-        if !renderer.patch_sprite(queue, tile_render::SpriteId(id as u32), &image) {
+        if !renderer.patch_sprite(queue, id, &image) {
             log::debug!("viewer: patch for sprite {} does not fit", p.sprite);
         }
     }

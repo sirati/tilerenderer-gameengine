@@ -1144,7 +1144,7 @@ impl Drawer<'_> {
                     }
                 }
             }
-            ArtKind::Sprite(name) => self.out.push(Draw::Element(Element::Sprite { name: name.clone(), at: (x, y), clip, scale_den: 0 })),
+            ArtKind::Sprite(name) => self.out.push(Draw::Element(Element::Sprite { name: name.clone(), at: (x, y), clip, scale_den: 0, palette: String::new() })),
             ArtKind::Fill { rgb, alpha } => self.element(Element::Fill { rect: [x, y, w, h], rgb: *rgb, alpha: *alpha, clip }),
         }
         if let Some([r, g, b, a]) = art.tint {
