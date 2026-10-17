@@ -361,7 +361,9 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         latency: cursor::Latency::default(),
         latency_logged: Instant::now(),
         frames_presented: 0,
-        release_pending: false,
+        unlock_pending: None,
+        machine: cursor::Machine::default(),
+        system_pointer: (0, 0),
         cursor: scene::Cursor::Default,
         presented: false,
         woken_idle: false,
@@ -454,9 +456,13 @@ struct App {
     latency: cursor::Latency,
     latency_logged: Instant,
     frames_presented: u32,
-    /// The mouse is let go after the next frame (see
-    /// `release_after_frame`).
-    release_pending: bool,
+    /// What happens to the system pointer after the next frame (see
+    /// `unlock_after_frame`).
+    unlock_pending: Option<Unlock>,
+    /// The cursor's state (`cursor::Machine`), and where the system pointer
+    /// is (window pixels, as the window last reported it or put it).
+    machine: cursor::Machine,
+    system_pointer: (i32, i32),
     /// The driver's cursor (see `driver_cursor`).
     cursor: scene::Cursor,
     /// A frame was presented since `release_after_frame` last looked.
@@ -469,6 +475,29 @@ struct App {
     cursor_cameras: Option<Vec<Camera>>,
     /// When the next frame is due (the animation clock), without updates.
     next_frame: Option<Instant>,
+}
+
+/// What happens to the system pointer once a frame went out after it was
+/// moved (on Wayland a captured pointer is moved by a hint the window's
+/// next frame applies when it is let go).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Unlock {
+    /// The mouse is let go.
+    Release,
+    /// It shows at the world cursor, kept inside the window, moving it
+    /// (`cursor::Machine::edge`).
+    Edge,
+}
+
+/// Captures the mouse again (locked where the system can, else kept in the
+/// window); whether it was locked.
+fn layout_captured_grab(window: &Window) -> bool {
+    use winit::window::CursorGrabMode;
+    if window.set_cursor_grab(CursorGrabMode::Locked).is_ok() {
+        return true;
+    }
+    let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+    false
 }
 
 /// The longest time between frames (the animation clock).
@@ -506,7 +535,7 @@ impl App {
     /// Whether the viewer draws the cursor itself rather than the system:
     /// while the mouse is captured, or the pointer snaps to buttons.
     fn pointer_hidden(&self) -> bool {
-        self.layout.captured() || self.snap.snapper.pointer().is_some() || self.release_pending
+        (self.layout.captured() && !self.machine.edge()) || self.snap.snapper.pointer().is_some() || self.unlock_pending.is_some()
     }
 
     /// The driver's cursor, as long as its scene refers to the art the
@@ -592,26 +621,35 @@ impl App {
         if grab == Some(false) {
             if warp.is_some() {
                 // (On Wayland the place is applied with the window's next
-                // frame: the mouse is let go after it, `release_after_frame`.)
-                self.release_pending = true;
+                // frame: the mouse is let go after it, `unlock_after_frame`.)
+                self.unlock_pending = Some(Unlock::Release);
                 self.presented = false;
                 if let Some(gpu) = &self.gpu {
                     gpu.window.request_redraw();
                 }
             } else {
-                self.release_pending = false;
+                self.unlock_pending = None;
                 self.grab(false);
             }
         }
         self.update_system_pointer(event_loop);
     }
 
-    /// Lets go of the mouse once a frame went out after the pointer was
-    /// moved (see `apply_layout_requests`); the pointer shows then.
-    fn release_after_frame(&mut self) {
-        if std::mem::take(&mut self.presented) && std::mem::take(&mut self.release_pending) {
-            self.grab(false);
-            self.shown_pointer = None;
+    /// Once a frame went out after the system pointer was moved (see
+    /// `Unlock`): lets go of the mouse, or keeps the pointer inside the
+    /// window only (the edge mode); the pointer shows then.
+    fn unlock_after_frame(&mut self) {
+        if !std::mem::take(&mut self.presented) {
+            return;
+        }
+        match self.unlock_pending.take() {
+            Some(Unlock::Release) => self.grab(false),
+            Some(Unlock::Edge) => {
+                if let Some(gpu) = &self.gpu {
+                    let _ = gpu.window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
+                }
+            }
+            None => {}
         }
     }
 
@@ -780,7 +818,38 @@ impl App {
         markers.extend(self.snap.sprites(&self.compiled, scene, &arranged, &self.layout).into_iter().filter(|s| !solid.contains(&s.set)));
         // The cursor where the viewer draws it, in a camera of its own on
         // top (only when there is one: the frame is as before otherwise).
-        let marks = Self::cursor_marks_of(&self.layout, &self.snap, self.pointer_inside, &arranged);
+        let captured = self.layout.captured();
+        let facts = cursor::Facts {
+            captured,
+            snap: self.snap.snapper.pointer().map(|(x, y)| (x.round() as i32, y.round() as i32)),
+            unlocking: self.unlock_pending.is_some(),
+            world_cursor: arranged.markers.iter().filter_map(|m| if let layout::Marker::Cursor(p) = m { Some(*p) } else { None }).collect(),
+            cursor_view: self.layout.world_cursor_view(),
+            pointer: if captured { self.system_pointer } else { self.layout.pointer_in_window() },
+            pointer_inside: self.pointer_inside,
+            pointer_world: self.layout.pointer_world(),
+            now: self.started.elapsed().as_secs_f64(),
+        };
+        let plan = self.machine.step(&facts);
+        let marks = plan.marks;
+        if let Some(q) = plan.enter_edge {
+            // The view following the world cursor is held at the world's
+            // edge: the system pointer goes where the drawn cursor is and
+            // shows there once this frame is out (`unlock_after_frame`).
+            if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(q.0, q.1)) {
+                log::debug!("viewer: moving the pointer to the world cursor: {e}");
+            }
+            self.system_pointer = q;
+            self.unlock_pending = Some(Unlock::Edge);
+            self.presented = false;
+            log::info!("viewer: world cursor at the world's edge: the system pointer shows it at {q:?}");
+        }
+        if plan.leave_edge {
+            // Centred again: captured and hidden (at once; this frame
+            // draws the cursor where the pointer is).
+            let locked = layout_captured_grab(&gpu.window);
+            log::info!("viewer: world cursor centred again: drawn, the system pointer captured (locked: {locked})");
+        }
         let mut cameras = arranged.cameras.clone();
         if scene.assets == 0 || scene.assets == self.assets_version {
             self.cursor = scene.cursor;
@@ -828,7 +897,7 @@ impl App {
         self.cursor_cameras = self.drawn_frame.as_ref().map(|f| f.cameras.clone());
         let since = self.pointer_since.take().filter(|_| cursor_moved || views_followed);
         // (Not while the mouse waits to be let go after a frame.)
-        if gpu.software && unchanged && !self.release_pending {
+        if gpu.software && unchanged && self.unlock_pending.is_none() {
             return;
         }
         self.drawn_tick = scene.tick;
@@ -886,21 +955,6 @@ impl App {
         }
     }
 
-    /// Where the viewer draws the cursor this frame (see `cursor`).
-    fn cursor_marks_of(layout: &layout::Layout, snap: &snap::SnapInput, pointer_inside: bool, frame: &layout::Frame) -> cursor::Marks {
-        if let Some((x, y)) = snap.snapper.pointer() {
-            return cursor::Marks { world: vec![], window: vec![(x.round() as i32, y.round() as i32)], system: None };
-        }
-        // Captured: the world cursor. Free: the world pixel under the
-        // system pointer, in the other views showing it (the world cursor
-        // waiting in the view a click captures in is not the pointer).
-        if layout.captured() {
-            let world = frame.markers.iter().filter_map(|m| if let layout::Marker::Cursor(p) = m { Some(*p) } else { None }).collect();
-            return cursor::Marks { world, window: vec![], system: None };
-        }
-        let world = layout.pointer_world().filter(|_| pointer_inside).into_iter().collect();
-        cursor::Marks { world, window: vec![], system: Some(layout.pointer_in_window()) }
-    }
 }
 
 impl ApplicationHandler for App {
@@ -935,9 +989,20 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.draw();
-                self.release_after_frame();
+                self.unlock_after_frame();
+                self.update_system_pointer(event_loop);
             }
-            WindowEvent::CursorMoved { .. } => self.pointer_moved(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.system_pointer = (position.x as i32, position.y as i32);
+                // At the world's edge the system pointer moves the world
+                // cursor (`cursor::Machine::edge`).
+                if self.machine.edge() && self.unlock_pending.is_none() {
+                    for input in self.layout.pointer_to(self.system_pointer) {
+                        self.display.send_input(input);
+                    }
+                }
+                self.pointer_moved();
+            }
             WindowEvent::CursorEntered { .. } => self.pointer_inside = true,
             WindowEvent::CursorLeft { .. } => self.pointer_inside = false,
             _ => {}
@@ -978,7 +1043,9 @@ impl ApplicationHandler for App {
         // While the mouse is captured its motion moves the world cursor.
         // (While snapping, it moves the snapping pointer's hidden pointer.)
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            let inputs = self.snap.motion(delta).unwrap_or_else(|| self.layout.motion(delta));
+            // (At the world's edge the system pointer moves it instead.)
+            let edge = self.machine.edge() && self.unlock_pending.is_none();
+            let inputs = self.snap.motion(delta).unwrap_or_else(|| if edge { vec![] } else { self.layout.motion(delta) });
             for input in inputs {
                 self.display.send_input(input);
             }

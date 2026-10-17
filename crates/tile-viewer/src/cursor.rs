@@ -11,6 +11,13 @@
 //!   system pointer is hidden and the viewer draws the cursor itself at its
 //!   logical place: the world cursor in every view that shows it, the
 //!   snapping pointer where it flies.
+//! - But while the view following the world cursor is held at the edge of
+//!   a world that does not wrap (the cursor off its middle), the system
+//!   pointer shows at the world cursor and moves it, kept inside the
+//!   window; once the view can centre the cursor again, the pointer is
+//!   captured and hidden again ([`Machine`]: the system pointer is put
+//!   where the drawn cursor was and shows only after the frame that
+//!   applies that, so it never jumps).
 //! - While the mouse is free, every other view showing the world pixel
 //!   under the pointer (the other pane, insets, a zoom box) shows it too,
 //!   drawn by the viewer; not where the system draws it.
@@ -169,6 +176,117 @@ pub fn sprite_set(compiled: &Compiled, cursor: scene::Cursor) -> Option<SpriteSe
     .or_else(|| FALLBACK_SPRITES.iter().find_map(|n| compiled.set(n).map(|(s, _)| s)))
 }
 
+/// What decides how the cursor shows, as of a frame.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Facts {
+    /// The mouse is captured (its motion moves the world cursor).
+    pub captured: bool,
+    /// The snapping pointer (window pixels), while it snaps.
+    pub snap: Option<(i32, i32)>,
+    /// The system pointer waits for a frame to be let go of (or to be
+    /// shown at the world cursor): it is still hidden.
+    pub unlocking: bool,
+    /// The layout's world cursor markers (world pixels as its markers).
+    pub world_cursor: Vec<(i32, i32)>,
+    /// The view following the world cursor: its rectangle, where the world
+    /// cursor is in it, whether it is held at the world's edge
+    /// (`Layout::world_cursor_view`).
+    pub cursor_view: Option<([i32; 4], (i32, i32), bool)>,
+    /// The system pointer (window pixels), whether it is in the window,
+    /// and the world pixel under it (while free).
+    pub pointer: (i32, i32),
+    pub pointer_inside: bool,
+    pub pointer_world: Option<(i32, i32)>,
+    /// Seconds (any clock).
+    pub now: f64,
+}
+
+/// How the cursor shows this frame, and what changes for the system
+/// pointer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Plan {
+    /// The system pointer is hidden.
+    pub hidden: bool,
+    pub marks: Marks,
+    /// The view following the world cursor is held at the world's edge:
+    /// the system pointer is to show at the world cursor (this window
+    /// pixel) instead of the drawn cursor, and to move it from now on.
+    pub enter_edge: Option<(i32, i32)>,
+    /// The view can centre the world cursor again: the system pointer is
+    /// to be captured and hidden again, the cursor drawn.
+    pub leave_edge: bool,
+}
+
+/// The cursor's states: free (the system pointer), captured (hidden, the
+/// world cursor drawn in the middle of the view following it and wherever
+/// else the world shows it), captured at the world's edge (the system
+/// pointer at the world cursor, moving it, which then moves freely in its
+/// view: drawn only in the other views), snapping (the snapping pointer
+/// drawn). At any moment the cursor shows once per place: where the
+/// system pointer shows, nothing is drawn; the world cursor is drawn only
+/// while the mouse is captured.
+#[derive(Clone, Debug, Default)]
+pub struct Machine {
+    edge: bool,
+    /// No edge mode before this time (the pointer left the view while in
+    /// it).
+    edge_after: f64,
+}
+
+/// How long the edge mode waits to start again after the pointer left the
+/// view following the world cursor (seconds).
+const EDGE_PAUSE: f64 = 0.3;
+
+impl Machine {
+    /// Whether the system pointer shows at the world cursor and moves it
+    /// (the view following it held at the world's edge).
+    pub fn edge(&self) -> bool {
+        self.edge
+    }
+
+    /// Takes the facts of a frame: how the cursor shows.
+    pub fn step(&mut self, f: &Facts) -> Plan {
+        let mut plan = Plan::default();
+        let active = f.captured && f.snap.is_none();
+        match f.cursor_view.filter(|_| active) {
+            Some((rect, at, held)) => {
+                let inside = |(x, y): (i32, i32)| x >= rect[0] && y >= rect[1] && x < rect[0] + rect[2] && y < rect[1] + rect[3];
+                if self.edge && !f.unlocking && (!held || !inside(f.pointer)) {
+                    self.edge = false;
+                    plan.leave_edge = true;
+                    if !inside(f.pointer) {
+                        self.edge_after = f.now + EDGE_PAUSE;
+                    }
+                } else if !self.edge && held && !f.unlocking && f.now >= self.edge_after {
+                    self.edge = true;
+                    plan.enter_edge = Some(at);
+                }
+            }
+            None if self.edge => {
+                self.edge = false;
+                // (Still captured, snapping: hidden again.)
+                plan.leave_edge = f.captured;
+            }
+            None => {}
+        }
+        // (Entering the edge mode the system pointer shows only once it is
+        // at the world cursor, after this frame: the cursor is drawn till
+        // then.)
+        let entering = plan.enter_edge.is_some();
+        plan.hidden = (f.captured && !self.edge) || f.snap.is_some() || f.unlocking || entering;
+        plan.marks = if let Some(p) = f.snap {
+            Marks { world: vec![], window: vec![p], system: None }
+        } else if f.captured {
+            let at = f.cursor_view.map(|(_, at, _)| at);
+            Marks { world: f.world_cursor.clone(), window: vec![], system: if self.edge && !f.unlocking && !entering { at } else { None } }
+        } else {
+            let world = f.pointer_world.filter(|_| f.pointer_inside).into_iter().collect();
+            Marks { world, window: vec![], system: (!f.unlocking).then_some(f.pointer) }
+        };
+        plan
+    }
+}
+
 /// Where the viewer draws the cursor this frame.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Marks {
@@ -307,6 +425,140 @@ mod tests {
         assert_eq!(system_pointer(scene::Cursor::System(scene::SystemCursor::Wait), &art, false, false), Shown::Icon(CursorIcon::Wait));
         assert_eq!(system_pointer(scene::Cursor::Default, &art, false, true), Shown::Custom(7));
         assert_eq!(system_pointer(scene::Cursor::Default, &Art::default(), false, true), Shown::Icon(CursorIcon::Crosshair));
+    }
+
+    /// The views: A (left) at 1:1 showing world (0, 0)..; B (right) at 2:1
+    /// following the world cursor, showing world `b_at`..; an interface on
+    /// top.
+    fn views(b_at: (i32, i32)) -> Vec<Camera> {
+        let a = cam((0, 0), (400, 300), (0, 0), (1, 1));
+        let b = cam((400, 0), (400, 300), b_at, (2, 1));
+        vec![a, b, Camera { cells: false, ..Camera::new((800, 300)) }]
+    }
+
+    /// What must hold of every frame: the cursor shows once per place.
+    fn check(f: &Facts, p: &Plan, cameras: &[Camera]) {
+        let s = sprites(SpriteSetId::from_raw(1), &p.marks, cameras, cameras.len() as u32, (0, 0));
+        // The system pointer shows exactly when it is not hidden, and then
+        // nothing is drawn where it is.
+        assert_eq!(p.hidden, p.marks.system.is_none(), "{f:?} {p:?}");
+        if let Some((sx, sy)) = p.marks.system {
+            assert!(s.iter().all(|s| (s.x - sx).abs() > 2 || (s.y - sy).abs() > 2), "drawn under the system pointer: {f:?} {s:?}");
+        }
+        // No two drawings at one place.
+        for (i, a) in s.iter().enumerate() {
+            assert!(s[i + 1..].iter().all(|b| (a.x, a.y) != (b.x, b.y)), "twice at {:?}", (a.x, a.y));
+        }
+        if let Some(q) = f.snap {
+            assert!(p.hidden && p.marks.world.is_empty() && p.marks.window == [q]);
+        } else if f.captured {
+            // The world cursor, and only it, is drawn while captured.
+            assert_eq!(p.marks.world, f.world_cursor);
+        } else {
+            // Free: no world cursor markers, only the pointer's own spot.
+            assert!(p.marks.world.iter().all(|w| Some(*w) == f.pointer_world), "{p:?}");
+        }
+    }
+
+    fn free(pointer: (i32, i32), world: Option<(i32, i32)>) -> Facts {
+        Facts { pointer, pointer_inside: true, pointer_world: world, ..Default::default() }
+    }
+
+    fn captured(cursor: (i32, i32), at: (i32, i32), held: bool, pointer: (i32, i32), now: f64) -> Facts {
+        Facts { captured: true, world_cursor: vec![cursor], cursor_view: Some(([400, 0, 400, 300], at, held)), pointer, pointer_inside: true, now, ..Default::default() }
+    }
+
+    #[test]
+    fn capture_edge_release_and_capture_again_show_one_cursor_a_place() {
+        let mut m = Machine::default();
+        let step = |m: &mut Machine, f: Facts, cameras: &[Camera]| {
+            let p = m.step(&f);
+            check(&f, &p, cameras);
+            p
+        };
+        // Free over A at world (150, 120): the system pointer there, B
+        // (following the pointer's world spot) draws it in its middle.
+        let p = step(&mut m, free((150, 120), Some((150, 120))), &views((50, 45)));
+        assert!(!p.hidden);
+        assert_eq!(p.marks.system, Some((150, 120)));
+        assert_eq!(sprites(SpriteSetId::from_raw(1), &p.marks, &views((50, 45)), 3, (0, 0)).len(), 1);
+        // Captured, centred in B: hidden, drawn in A and B.
+        let p = step(&mut m, captured((150, 120), (600, 150), false, (600, 150), 1.0), &views((50, 45)));
+        assert!(p.hidden && p.enter_edge.is_none());
+        // B held at the world's edge, the cursor off its middle: the system
+        // pointer is to show at the cursor; this frame still draws it.
+        let p = step(&mut m, captured((20, 120), (420, 150), true, (600, 150), 2.0), &views((10, 45)));
+        assert_eq!(p.enter_edge, Some((420, 150)));
+        assert!(p.hidden);
+        assert!(m.edge());
+        // Waiting for the frame: still drawn, still hidden.
+        let mut f = captured((20, 120), (420, 150), true, (420, 150), 2.1);
+        f.unlocking = true;
+        let p = step(&mut m, f, &views((10, 45)));
+        assert!(p.hidden && p.marks.system.is_none());
+        // Shown: the system pointer at the cursor, not drawn in B there (A
+        // still draws it where it shows that spot).
+        let p = step(&mut m, captured((20, 120), (420, 150), true, (420, 150), 2.2), &views((10, 45)));
+        assert!(!p.hidden && !p.leave_edge);
+        assert_eq!(p.marks.system, Some((420, 150)));
+        let drawn = sprites(SpriteSetId::from_raw(1), &p.marks, &views((10, 45)), 3, (0, 0));
+        assert_eq!(drawn.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>(), [(20, 120)]);
+        // Back in the middle: captured and drawn again.
+        let p = step(&mut m, captured((150, 120), (600, 150), false, (600, 150), 3.0), &views((50, 45)));
+        assert!(p.leave_edge && p.hidden && !m.edge());
+        // Let go: the pointer waits a frame (drawn where it goes), then the
+        // system shows it; no world cursor is drawn any more.
+        let mut f = free((600, 150), Some((150, 120)));
+        f.unlocking = true;
+        let p = step(&mut m, f, &views((50, 45)));
+        assert!(p.hidden);
+        let p = step(&mut m, free((600, 150), Some((150, 120))), &views((50, 45)));
+        assert!(!p.hidden);
+        let drawn = sprites(SpriteSetId::from_raw(1), &p.marks, &views((50, 45)), 3, (0, 0));
+        assert_eq!(drawn.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>(), [(150, 120)]);
+        // Captured again.
+        let p = step(&mut m, captured((150, 120), (600, 150), false, (600, 150), 4.0), &views((50, 45)));
+        assert!(p.hidden);
+    }
+
+    #[test]
+    fn snapping_and_the_edge_mode_take_turns() {
+        let mut m = Machine::default();
+        let cams = views((10, 45));
+        // At the edge, shown.
+        m.step(&captured((20, 120), (420, 150), true, (420, 150), 1.0));
+        let p = m.step(&captured((20, 120), (420, 150), true, (420, 150), 1.1));
+        check(&captured((20, 120), (420, 150), true, (420, 150), 1.1), &p, &cams);
+        assert!(!p.hidden);
+        // Snapping: hidden, the snapping pointer drawn, the edge mode over.
+        let mut f = captured((20, 120), (420, 150), true, (420, 150), 1.2);
+        f.snap = Some((30, 280));
+        let p = m.step(&f);
+        check(&f, &p, &cams);
+        assert!(p.leave_edge && p.hidden && !m.edge());
+        // Snapping ends: the edge mode starts again at the world cursor.
+        let f = captured((20, 120), (420, 150), true, (30, 280), 1.3);
+        let p = m.step(&f);
+        check(&f, &p, &cams);
+        assert_eq!(p.enter_edge, Some((420, 150)));
+    }
+
+    #[test]
+    fn a_pointer_leaving_the_held_view_is_captured_again_for_a_while() {
+        let mut m = Machine::default();
+        let cams = views((10, 45));
+        m.step(&captured((20, 120), (420, 150), true, (420, 150), 1.0));
+        m.step(&captured((20, 120), (420, 150), true, (420, 150), 1.1));
+        // Out of B into A.
+        let f = captured((0, 120), (400, 150), true, (390, 150), 1.2);
+        let p = m.step(&f);
+        check(&f, &p, &cams);
+        assert!(p.leave_edge && p.hidden);
+        // Not at once again (no flicker), but after the pause.
+        let f = captured((0, 120), (400, 150), true, (390, 150), 1.3);
+        assert_eq!(m.step(&f).enter_edge, None);
+        let f = captured((0, 120), (400, 150), true, (390, 150), 1.6);
+        assert_eq!(m.step(&f).enter_edge, Some((400, 150)));
     }
 
     #[test]

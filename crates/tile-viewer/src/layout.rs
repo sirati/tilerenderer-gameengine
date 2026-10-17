@@ -1727,6 +1727,40 @@ impl Layout {
         if self.locked { None } else { self.world_under(self.pointer) }
     }
 
+    /// The view following the world cursor in the last frame: its window
+    /// rectangle (x, y, w, h), where the world cursor is in it, and whether
+    /// the view is held at the edge of a world that does not wrap, so the
+    /// cursor is off its middle (for the cursor's drawing, `crate::cursor`).
+    pub fn world_cursor_view(&self) -> Option<([i32; 4], (i32, i32), bool)> {
+        let (_, c) = self.shown.iter().find(|(h, _)| self.follow_of(*h) == Some(Follow::Pointer))?;
+        let (n, d) = (c.zoom.0.max(1), c.zoom.1.max(1));
+        let span = ((c.viewport.0 * d).div_ceil(n) as i32, (c.viewport.1 * d).div_ceil(n) as i32);
+        let held = self.bounds.is_some_and(|b| b.clamp_center(0, self.cursor.0, span.0) != self.cursor.0 || b.clamp_center(1, self.cursor.1, span.1) != self.cursor.1);
+        let rect = [c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32];
+        Some((rect, self.cursor_on_window()?, held))
+    }
+
+    /// While the mouse is captured: the world cursor goes under window pixel
+    /// `p` (kept inside the view following it), as the system pointer shows
+    /// it while that view is held at the world's edge; what the driver gets.
+    pub fn pointer_to(&mut self, p: (i32, i32)) -> Vec<Input> {
+        let Some((_, c)) = self.shown.iter().find(|(h, _)| self.follow_of(*h) == Some(Follow::Pointer)).copied() else { return vec![] };
+        if !self.locked {
+            return vec![];
+        }
+        let x = p.0.clamp(c.origin.0, c.origin.0 + c.viewport.0 as i32 - 1);
+        let y = p.1.clamp(c.origin.1, c.origin.1 + c.viewport.1 as i32 - 1);
+        self.cursor = world_at(&c, (x, y));
+        self.motion_rest = (0.0, 0.0);
+        if let Some(b) = self.bounds {
+            self.cursor = b.clamp_point(self.cursor);
+        }
+        match self.route_world(self.cursor) {
+            Ok((x, y)) => vec![Input::MouseMove { x, y }],
+            Err(_) => vec![],
+        }
+    }
+
     /// The window size of the last frame.
     pub fn window(&self) -> (u32, u32) {
         self.window
