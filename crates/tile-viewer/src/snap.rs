@@ -612,6 +612,22 @@ impl Snapper {
             self.pos = targets[k].center();
             self.flight = Flight::rest(self.pos);
         }
+        if log::log_enabled!(log::Level::Debug) {
+            let list: Vec<String> = targets
+                .iter()
+                .map(|t| {
+                    let kind = match t.kind {
+                        TargetKind::Button => "button",
+                        TargetKind::ListItem { .. } => "entry",
+                        TargetKind::List { .. } => "list",
+                        TargetKind::Capture { .. } => "capture",
+                    };
+                    let [x, y, w, h] = t.rect;
+                    format!("{kind} {:x} {x:.0},{y:.0} {w:.0}x{h:.0}", t.id)
+                })
+                .collect();
+            log::debug!("snap: {} targets: {}", targets.len(), list.join("; "));
+        }
         let k = resume.or_else(|| nearest(targets, at)).or_else(|| targets.iter().position(Target::is_capture));
         match k {
             Some(k) => {
@@ -1023,6 +1039,7 @@ impl SnapInput {
             // (Held, it repeats.)
             Input::Key { vk: VK_MENU, down: true, .. } if self.alt => vec![],
             Input::Key { vk: VK_MENU, down: true, .. } => {
+                log::debug!("snap: Alt pressed at {now:.3} s (the mode {}, the mouse {})", if self.snapper.snapping() { "on" } else { "off" }, if layout.captured() { "captured" } else { "free" });
                 self.alt = true;
                 self.alt_entered = false;
                 self.alt_sent = false;
