@@ -491,6 +491,16 @@ pub struct Layout {
     screen: Option<String>,
     /// Whether the last frame had a popup (for the log).
     popup_shown: bool,
+    /// Seconds of frames so far (when presses were made).
+    clock: f64,
+    /// The last press that went to the driver: where it was made in the
+    /// window, where the driver got it, when.
+    last_press: Option<((i32, i32), (i32, i32), f64)>,
+    /// How far the open popup moves, when it opened at a click.
+    popup_anchor: Option<(i32, i32)>,
+    /// The world cursor to capture the mouse at again once the popup that
+    /// let it go closes.
+    recapture: Option<(i32, i32)>,
     moved: Vec<([i32; 4], (i32, i32))>,
     /// Whether the last frame showed the magnifier (it may be left out, or
     /// be under a screen fitted into a pane).
@@ -586,6 +596,10 @@ impl Default for Layout {
             reachable: None,
             screen: None,
             popup_shown: false,
+            clock: 0.0,
+            last_press: None,
+            popup_anchor: None,
+            recapture: None,
             moved: Vec::new(),
             magnifier_shown: true,
             world_shown: true,
@@ -1319,9 +1333,14 @@ impl Layout {
                 None => log::info!("viewer: screen {} closed", self.screen.as_deref().unwrap_or_default()),
             }
         }
+        self.clock += dt;
         if popup.is_some() != self.popup_shown {
             self.popup_shown = popup.is_some();
             log::info!("viewer: popup {}", if self.popup_shown { "open, a view of its own" } else { "closed" });
+            match popup {
+                Some(i) => self.popup_opened(rect_of(&base[i])),
+                None => self.popup_closed(),
+            }
         }
         self.screen = parts.screen.clone();
         self.focus = scene.focus;
@@ -1608,10 +1627,45 @@ impl Layout {
         })
     }
 
-    /// How far the popup at `rect` moves: with the views' roles `UnitMouse`
-    /// and a split, fully into the main pane if it fits there (the least
-    /// way); else nowhere.
+    /// A popup at `rect` opened. One the driver opened where a click went
+    /// (a context menu: its corner at the click) goes where that click was
+    /// made in the window (e.g. at the world cursor in B), inside the
+    /// window. While it is open the mouse is let go, so that the pointer can
+    /// reach it (captured again once it closes).
+    fn popup_opened(&mut self, [x, y, w, h]: [i32; 4]) {
+        self.popup_anchor = self.last_press.filter(|&(_, (qx, qy), t)| self.clock - t < 2.0 && (x - qx).abs() <= 40 && (y - qy).abs() <= 40).map(|((px, py), (qx, qy), _)| {
+            let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
+            ((x + px - qx).clamp(0, (ww - w).max(0)) - x, (y + py - qy).clamp(0, (wh - h).max(0)) - y)
+        });
+        if let Some(d) = self.popup_anchor {
+            log::info!("viewer: the popup opened at the click: moved by {d:?}");
+        }
+        if self.locked {
+            self.recapture = Some(self.cursor);
+            self.release_here("a popup is open");
+        }
+    }
+
+    /// The popup closed: a mouse let go for it is captured again.
+    fn popup_closed(&mut self) {
+        self.popup_anchor = None;
+        if let Some(cursor) = self.recapture.take().filter(|_| self.follows_pointer() && !self.locked) {
+            self.cursor = cursor;
+            self.locked = true;
+            self.grab = Some(true);
+            self.against = None;
+            log::info!("viewer: mouse captured again (the popup closed)");
+        }
+    }
+
+    /// How far the popup at `rect` moves: where the click it came from was
+    /// made (see [`Layout::popup_opened`]); else, with the views' roles
+    /// `UnitMouse` and a split, fully into the main pane if it fits there
+    /// (the least way); else nowhere.
     fn popup_shift(&self, [x, y, w, h]: [i32; 4], a: [i32; 4]) -> (i32, i32) {
+        if let Some(d) = self.popup_anchor {
+            return d;
+        }
         if self.roles != Roles::UnitMouse || self.split.is_none() || w > a[2] || h > a[3] {
             return (0, 0);
         }
@@ -2163,6 +2217,10 @@ impl Layout {
         match self.route_point(p) {
             Ok(q) => {
                 self.pressed[b] = true;
+                // (Where it was made in the window: the world cursor while
+                // the mouse is captured.)
+                let at = if self.locked { self.cursor_on_window().unwrap_or(p) } else { p };
+                self.last_press = Some((at, q, self.clock));
                 vec![Input::MouseButton { button, down, x: q.0, y: q.1 }]
             }
             // A world pixel the driver's window does not take input for:
@@ -3448,6 +3506,43 @@ mod tests {
         let mut l = split_1to1();
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!(f.cameras[f.view_cameras[3].unwrap() as usize].screen_shift, (0, 0));
+    }
+
+    #[test]
+    fn a_context_menu_opens_where_the_click_was_made_and_lets_the_mouse_go() {
+        let unit_mouse = settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse));
+        let mut l = arranged(&unit_mouse);
+        mv(&mut l, (600, 300));
+        frame(&mut l, vec![]);
+        click(&mut l, (600, 300));
+        assert!(l.captured());
+        // The world cursor into what the driver's view shows.
+        let c = l.cursor;
+        l.motion(((1400 - c.0).rem_euclid(8000) as f64, (800 - c.1) as f64));
+        let f = frame(&mut l, vec![]);
+        // A right click at the world cursor (B's middle) the driver's view shows.
+        let at = l.cursor_on_window().unwrap();
+        let out = l.route(Input::MouseButton { button: Button::Right, down: true, x: 600, y: 300 });
+        let Input::MouseButton { x: qx, y: qy, .. } = out[0] else { panic!("{out:?} {:?}", f.cameras) };
+        l.route(Input::MouseButton { button: Button::Right, down: false, x: 600, y: 300 });
+        // The driver opens its menu there.
+        let mut s = with_parts(None);
+        let part = |id, origin, viewport| ViewState { id, view: View { interface_only: true, origin, viewport, ..Default::default() }, overlay: vec![] };
+        s.views.push(part(257, (qx, qy), (150, 200)));
+        s.interface.popup = Some(257);
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let c = f.cameras[f.view_cameras[3].unwrap() as usize];
+        assert_eq!(c.origin, (at.0.min(800 - 150), at.1.min(600 - 200)));
+        // The mouse is let go, the pointer at the menu; its rows take clicks.
+        assert!(!l.captured());
+        assert_eq!(l.take_grab(), Some(false));
+        let row = (c.origin.0 + 20, c.origin.1 + 30);
+        assert_eq!(click(&mut l, row)[0], Input::MouseButton { button: Button::Left, down: true, x: qx + 20, y: qy + 30 });
+        // Closed: captured again, at the world cursor it had.
+        let cursor = l.cursor;
+        l.frame(&with_parts(None), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(l.captured());
+        assert_eq!((l.take_grab(), l.cursor), (Some(true), cursor));
     }
 
     // ---- Mouse capture ----------------------------------------------------
