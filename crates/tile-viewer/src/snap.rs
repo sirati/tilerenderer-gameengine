@@ -455,6 +455,17 @@ pub struct Snapper {
     scrolled: bool,
     /// Where each button's press went.
     pressed: [Option<Point>; 3],
+    /// When the element now snapped to was picked (for the log: how long
+    /// the pointer takes to come to rest on it).
+    picked: Option<f64>,
+    /// Whether the pointer has reached the element picked, and where it was
+    /// when it was picked (for the log).
+    reached: bool,
+    picked_from: Point,
+    /// Steps taken while snapping and the longest (for the log).
+    steps: u32,
+    longest_step: f64,
+    started: f64,
 }
 
 fn button_index(b: Button) -> usize {
@@ -514,6 +525,7 @@ impl Snapper {
     pub fn enter(&mut self, now: f64, at: Point, targets: &[Target], rates: Rates) {
         *self = Self { pressed: self.pressed, ..Self::default() };
         self.phase = Phase::Snapping;
+        self.started = now;
         self.spring = Spring::at(at);
         self.glide = Glide::at(at);
         self.last = now;
@@ -534,6 +546,10 @@ impl Snapper {
             return vec![];
         }
         let p = (self.spring.pos.0.round(), self.spring.pos.1.round());
+        let took = self.last - self.started;
+        if took > 0.0 {
+            log::debug!("snap: {} steps in {:.2} s ({:.0} a second), the longest {:.0} ms", self.steps, took, self.steps as f64 / took, self.longest_step * 1000.0);
+        }
         let had = self.hovered && self.spring.at_rest();
         self.phase = Phase::Parked(p);
         if had { vec![] } else { vec![Action::Move(p)] }
@@ -602,6 +618,8 @@ impl Snapper {
             return out;
         }
         let dt = (now - self.last).clamp(0.0, MAX_STEP);
+        self.steps += 1;
+        self.longest_step = self.longest_step.max(now - self.last);
         self.last = now;
         self.glide.step(dt);
         self.glide.clamp(window);
@@ -621,7 +639,18 @@ impl Snapper {
         }
         let was_at_rest = self.spring.at_rest();
         self.spring.step(dt, Spring::omega(rates.updates_per_second));
+        if let (Some(t0), false) = (self.picked, self.reached) {
+            // (Got there: no longer short of it, seen from where it came from.)
+            let (t, p, f) = (self.spring.target, self.spring.pos, self.picked_from);
+            if (t.0 - p.0) * (t.0 - f.0) + (t.1 - p.1) * (t.1 - f.1) <= 0.0 {
+                self.reached = true;
+                log::debug!("snap: reached {:?} {:.0} ms after it was picked", self.spring.target, (now - t0) * 1000.0);
+            }
+        }
         if self.spring.settle() {
+            if let Some(t0) = self.picked.take().filter(|_| self.snapped.is_some()) {
+                log::debug!("snap: at rest on {:?} {:.0} ms after it was picked (update interval {:.0} ms)", self.spring.target, (now - t0) * 1000.0, 1000.0 / rates.updates_per_second);
+            }
             if self.snapped.is_some() && !self.hovered {
                 // At rest on the element: it shows its hover, and the hidden
                 // pointer goes on from it.
@@ -635,6 +664,7 @@ impl Snapper {
         match self.scroll.step(dt) {
             0 => {}
             n => {
+                log::debug!("snap: the list scrolls a notch {}", if n > 0 { "up" } else { "down" });
                 out.push(Action::Wheel { delta: n * NOTCH, at: self.spring.pos });
                 self.scrolled = true;
             }
@@ -654,8 +684,12 @@ impl Snapper {
         self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }) });
         let c = t.center();
         if c != self.spring.target {
+            log::debug!("snap: at {:.3} s picked {:?} ({:?}) at {c:?}", self.last, t.id, t.kind);
             self.spring.target = c;
             self.hovered = false;
+            self.picked = Some(self.last);
+            self.reached = false;
+            self.picked_from = self.spring.pos;
         }
     }
 
@@ -762,7 +796,25 @@ fn to_inputs(actions: Vec<Action>, layout: &Layout) -> Vec<Input> {
 impl SnapInput {
     /// The targets in `scene` as `layout` shows them.
     fn targets(scene: &scene::Scene, layout: &Layout) -> Vec<Target> {
-        targets(&scene.interactables, layout.screen_mapping(), layout.window())
+        let mut out = targets(&scene.interactables, layout.screen_mapping(), layout.window());
+        // What lies in a part of the interface drawn elsewhere (a popup moved
+        // into a view, a screen moved below the zoom strip) is there.
+        for t in &mut out {
+            let c = t.center();
+            let moved = layout.moved_parts().iter().find(|([x, y, w, h], (dx, dy))| {
+                let (ox, oy) = ((x - dx) as f64, (y - dy) as f64);
+                c.0 >= ox && c.1 >= oy && c.0 < ox + *w as f64 && c.1 < oy + *h as f64
+            });
+            if let Some((_, (dx, dy))) = moved {
+                t.rect[0] += *dx as f64;
+                t.rect[1] += *dy as f64;
+                if let TargetKind::List { scroll, .. } = &mut t.kind {
+                    scroll[0] += *dx as f64;
+                    scroll[1] += *dy as f64;
+                }
+            }
+        }
+        out
     }
 
     /// A window input at time `now`: what goes to the driver.
@@ -873,7 +925,16 @@ impl SnapInput {
     /// the ghost, then the pointer over it.
     pub fn sprites(&self, compiled: &render_desc::Compiled, scene: &scene::Scene, frame: &crate::layout::Frame, layout: &Layout) -> Vec<tile_render::PlacedSprite> {
         let Some(pointer) = self.snapper.pointer() else { return vec![] };
-        let interface = scene.views.iter().zip(&frame.view_cameras).filter(|(v, _)| v.view.interface_only).filter_map(|(_, c)| *c).last();
+        // (The whole interface's camera, not one of a part drawn elsewhere,
+        // which shows only its rectangle.)
+        let parts = [scene.interface.roaming, scene.interface.popup, scene.interface.screen_view];
+        let interface = scene
+            .views
+            .iter()
+            .zip(&frame.view_cameras)
+            .filter(|(v, _)| v.view.interface_only && !parts.contains(&Some(v.id)))
+            .filter_map(|(_, c)| *c)
+            .last();
         let camera = interface.or_else(|| frame.cameras.iter().position(|c| c.origin == (0, 0) && c.zoom == (1, 1)).map(|c| c as u32)).unwrap_or(0);
         let ((ox, oy), (n, d)) = layout.screen_mapping();
         let to_screen = |(x, y): Point| (((x - ox as f64) * d as f64 / n.max(1) as f64).round() as i32, ((y - oy as f64) * d as f64 / n.max(1) as f64).round() as i32);

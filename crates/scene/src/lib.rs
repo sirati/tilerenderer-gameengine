@@ -244,18 +244,34 @@ pub struct Interface {
     /// "City", "Menu"); none: its usual screen over the world. A renderer
     /// may place a named screen in one of its own views.
     pub screen: Option<String>,
-    /// An interface-only view holding a copy of controls that belong with
-    /// whichever of the renderer's views the pointer is in (e.g. a game's
-    /// menu buttons in the top-left corner; the view's `origin` and
-    /// `viewport` are their rectangle). Its overlay duplicates what the
-    /// interface shows there: a renderer draws it only where it moved it
-    /// (and maps pointer input there back to where the driver put it).
+    /// An interface-only view holding controls that belong with whichever
+    /// of the renderer's views the pointer is in (e.g. a game's menu buttons
+    /// in the top-left corner, with the tooltip they show; the view's
+    /// `origin` and `viewport` are their rectangle). The other interface
+    /// views do not have them: a renderer draws this view where it places
+    /// it, where the driver put it if nowhere else (and maps pointer input
+    /// there back to where the driver put it).
     pub roaming: Option<u32>,
+    /// An interface-only view holding what shows in the roaming controls'
+    /// place while they cannot be used (the mouse captured: a hint how to
+    /// let it go); its `origin` and `viewport` are its rectangle. A renderer
+    /// draws it where it would draw `roaming`, instead of it, when so.
+    pub capture_hint: Option<u32>,
     /// An interface-only view holding the open popup (its `origin` and
     /// `viewport` are the popup's rectangle; the other interface views do
     /// not have it). A renderer may draw it elsewhere (and map pointer input
     /// there back to where the driver put it).
     pub popup: Option<u32>,
+    /// An interface-only view holding the named screen (`screen`) where it
+    /// lies over the window, smaller than it, and what is drawn over it
+    /// (its `origin` and `viewport` are its rectangle; the other interface
+    /// views do not have it). A renderer may move it out from under its own
+    /// views over the window (and map pointer input there back).
+    pub screen_view: Option<u32>,
+    /// The named screen's main control (x, y, w, h, in the driver's window
+    /// pixels; e.g. a city screen's production box): where a renderer that
+    /// lets go of a captured mouse when the screen opens puts the pointer.
+    pub focus_control: Option<[i32; 4]>,
     /// A rectangle (x, y, w, h) of controls the pointer has to reach from
     /// every view of the renderer's (e.g. the active unit's orders), while
     /// they are shown.
@@ -590,6 +606,12 @@ pub enum Input {
     /// views of its own besides the driver's main view (a split pane,
     /// insets): a driver may mark them (e.g. on a minimap).
     Views([(i32, i32, i32, i32); 4]),
+    /// The world rectangle (x, y, w, h) the renderer shows of the driver's
+    /// main view where that is not all of it, as the driver has it (a split
+    /// or a zoom strip crops it, a zoom shows less or more, it follows
+    /// something else); w 0: all of it. A driver may mark that rather than
+    /// its own view (e.g. on a minimap).
+    MainView { x: i32, y: i32, w: i32, h: i32 },
     /// The renderer shows the world at these zooms (`(num, den)` reduced;
     /// `(0, 0)`: unused): a driver may make art for them (e.g. text at that
     /// size, `FreeSprite::zoom_art` 2) and list them in `Scene::zooms`.

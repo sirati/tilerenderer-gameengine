@@ -5,7 +5,7 @@
 use crate::{Beside, Button, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, Patch, SystemCursor, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 26;
+pub const VERSION: u32 = 27;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -341,13 +341,15 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.bool(i.screen.is_some());
                 w.u32(screen.len() as u32);
                 w.0.extend_from_slice(screen.as_bytes());
-                for view in [i.roaming, i.popup] {
+                for view in [i.roaming, i.popup, i.screen_view, i.capture_hint] {
                     w.bool(view.is_some());
                     w.u32(view.unwrap_or_default());
                 }
-                w.bool(i.reachable.is_some());
-                for v in i.reachable.unwrap_or_default() {
-                    w.i32(v);
+                for rect in [i.reachable, i.focus_control] {
+                    w.bool(rect.is_some());
+                    for v in rect.unwrap_or_default() {
+                        w.i32(v);
+                    }
                 }
                 w.bool(i.beside.is_some());
                 let beside = i.beside.unwrap_or(Beside { screen: [0; 4], edge: Edge::Left });
@@ -482,9 +484,13 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     let id = r.u32()?;
                     Ok(some.then_some(id))
                 };
-                let (roaming, popup) = (view()?, view()?);
-                let some = r.bool()?;
-                let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                let (roaming, popup, screen_view, capture_hint) = (view()?, view()?, view()?, view()?);
+                let mut rect = || -> Result<Option<[i32; 4]>, WireError> {
+                    let some = r.bool()?;
+                    let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                    Ok(some.then_some(rect))
+                };
+                let (reachable, focus_control) = (rect()?, rect()?);
                 let beside = r.bool()?;
                 let screen_rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
                 let edge = match r.u8()? {
@@ -497,8 +503,11 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 Update::Interface(Interface {
                     screen: named.then_some(screen),
                     roaming,
+                    capture_hint,
                     popup,
-                    reachable: some.then_some(rect),
+                    screen_view,
+                    reachable,
+                    focus_control,
                     beside: beside.then_some(Beside { screen: screen_rect, edge }),
                 })
             }
@@ -627,6 +636,12 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
+            Input::MainView { x, y, w: ww, h } => {
+                w.u8(12);
+                for v in [x, y, ww, h] {
+                    w.i32(v);
+                }
+            }
         }
     }
     w.0
@@ -665,6 +680,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
             5 => Input::Quit,
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
             11 => Input::Edge { x: r.i32()?, y: r.i32()? },
+            12 => Input::MainView { x: r.i32()?, y: r.i32()?, w: r.i32()?, h: r.i32()? },
             8 => {
                 let mut views = [(0, 0, 0, 0); 4];
                 for v in &mut views {
@@ -758,8 +774,11 @@ mod tests {
         s.interface = Interface {
             screen: Some("F4".into()),
             roaming: Some(256),
+            capture_hint: Some(259),
             popup: None,
+            screen_view: Some(258),
             reachable: Some([-1, 2, 300, 40]),
+            focus_control: Some([5, 6, 7, 8]),
             beside: Some(Beside { screen: [448, 156, 1024, 768], edge: Edge::Bottom }),
         };
         s.interactables = vec![
@@ -806,6 +825,7 @@ mod tests {
             Input::Look { x: -5, y: 7000 },
             Input::Zooms([(3, 2), (2, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]),
             Input::Views([(10, -20, 300, 200), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]),
+            Input::MainView { x: 5, y: -6, w: 700, h: 400 },
             Input::WorldButton { button: Button::Right, down: true, x: -64, y: 4096 },
             Input::WorldButton { button: Button::Middle, down: false, x: 0, y: 0 },
             Input::WorldKey { vk: 0x66, down: true, text: Some('6'), x: 130, y: -2 },
