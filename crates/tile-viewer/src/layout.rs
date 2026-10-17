@@ -523,6 +523,9 @@ pub struct Layout {
     pointer: (i32, i32),
     /// The world cursor, and the motion not yet a whole world pixel.
     cursor: (i32, i32),
+    /// Whether the world cursor has been put where the driver first shows a
+    /// world (while it settles, it follows the driver's view).
+    cursor_placed: bool,
     motion_rest: (f64, f64),
     /// Whether the mouse is captured (moving the world cursor), and a
     /// change of that for the window to make.
@@ -577,6 +580,7 @@ impl Default for Layout {
             window: (1, 1),
             pointer: (0, 0),
             cursor: (0, 0),
+            cursor_placed: false,
             motion_rest: (0.0, 0.0),
             locked: false,
             grab: None,
@@ -939,9 +943,13 @@ impl Layout {
 
     /// Captures the mouse at window pixel `p` of `hit` (a view following
     /// the world cursor): the world cursor starts there.
-    fn capture(&mut self, hit: Hit, p: (i32, i32)) {
+    fn capture(&mut self, hit: Hit, _p: (i32, i32)) {
+        // Only a capture: the world cursor at the middle of the view as it
+        // is (where it was when the mouse was let go), the view staying
+        // put; nothing goes to the driver.
         if let Some((_, camera)) = self.shown.iter().find(|(h, _)| *h == hit) {
-            self.cursor = world_at(camera, p);
+            let (w, h) = camera.source_size();
+            self.cursor = (camera.x + w as i32 / 2, camera.y + h as i32 / 2);
         }
         self.locked = true;
         self.grab = Some(true);
@@ -1390,8 +1398,10 @@ impl Layout {
         }
         self.screen = parts.screen.clone();
         self.focus = scene.focus;
-        // Where the views look (from what the last frame showed).
-        if !self.locked {
+        // Where the views look (from what the last frame showed). (While a
+        // view follows the world cursor it stays where the mouse was let
+        // go, whatever the pointer is over.)
+        if !self.locked && !self.follows_pointer() {
             if let Some(w) = self.world_under(self.pointer).filter(|_| self.hit_follow(self.pointer) != Some(Follow::Pointer)) {
                 self.cursor = w;
             }
@@ -1405,6 +1415,16 @@ impl Layout {
             self.cursor = b.clamp_point(self.cursor);
         }
         let driver = self.main.map(|m| (m.x + m.viewport.0 as i32 / 2, m.y + m.viewport.1 as i32 / 2));
+        // The world cursor starts where the driver first shows a world (a
+        // view following it shows that until the mouse is captured there).
+        if !self.cursor_placed && !self.locked {
+            if let Some(d) = driver.filter(|_| scene.shape.cols > 0 && scene.shape.rows > 0) {
+                if !self.follows_pointer() || self.world_frames > SETTLE_FRAMES {
+                    self.cursor_placed = true;
+                }
+                self.cursor = d;
+            }
+        }
         // The main pane following the driver at zoom 1 shows the driver's
         // window pixels where it is (its middle there).
         let main_driver = match (self.main, self.main_view.zoom == ONE) {
@@ -2125,6 +2145,10 @@ impl Layout {
     pub fn motion(&mut self, (dx, dy): (f64, f64)) -> Vec<Input> {
         if !self.locked {
             return vec![];
+        }
+        // (Ctrl held while the mouse moves is no tap: it does not let go.)
+        if dx != 0.0 || dy != 0.0 {
+            self.ctrl_alone = false;
         }
         let zoom = self
             .shown
@@ -3680,6 +3704,64 @@ mod tests {
         frame(&mut l, vec![]);
         l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!((l.take_warp(), l.pointer), (None, (100, 100)));
+    }
+
+    #[test]
+    fn a_click_capturing_the_mouse_is_only_that() {
+        let unit_mouse = settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse));
+        let mut l = arranged(&unit_mouse);
+        // The pointer over A first: B stays where it is.
+        mv(&mut l, (100, 100));
+        let before = frame(&mut l, vec![]);
+        let b = camera_at(&before, (404, 0));
+        mv(&mut l, (700, 500));
+        // The capturing click: nothing for the driver, B does not move, the
+        // world cursor at its middle.
+        assert!(click(&mut l, (700, 500)).is_empty());
+        assert!(l.captured());
+        let after = frame(&mut l, vec![]);
+        assert_eq!(camera_at(&after, (404, 0)), b);
+        let (w, h) = b.source_size();
+        assert_eq!(l.cursor, (b.x + w as i32 / 2, b.y + h as i32 / 2));
+    }
+
+    #[test]
+    fn the_divider_closes_and_opens_with_the_capture_only() {
+        let unit_mouse = settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse));
+        let captured = || {
+            let mut l = arranged(&unit_mouse);
+            click(&mut l, (600, 300));
+            frame(&mut l, vec![]);
+            assert_eq!(l.open_spans(), []);
+            l
+        };
+        let middle = [(200, 400)];
+        // Ctrl down: still captured, the divider solid; up, alone: let go,
+        // the middle third open.
+        let mut l = captured();
+        key(&mut l, VK_CONTROL, true);
+        frame(&mut l, vec![]);
+        assert!(l.captured() && l.open_spans().is_empty());
+        key(&mut l, VK_CONTROL, false);
+        frame(&mut l, vec![]);
+        assert!(!l.captured());
+        assert_eq!(l.open_spans(), middle);
+        // Ctrl with another key: no change.
+        let mut l = captured();
+        key(&mut l, VK_CONTROL, true);
+        key(&mut l, 0x43, true);
+        key(&mut l, 0x43, false);
+        key(&mut l, VK_CONTROL, false);
+        frame(&mut l, vec![]);
+        assert!(l.captured() && l.open_spans().is_empty());
+        // Ctrl held while the mouse moves: no change.
+        let mut l = captured();
+        key(&mut l, VK_CONTROL, true);
+        l.motion((5.0, 0.0));
+        frame(&mut l, vec![]);
+        key(&mut l, VK_CONTROL, false);
+        frame(&mut l, vec![]);
+        assert!(l.captured() && l.open_spans().is_empty());
     }
 
     // ---- Mouse capture ----------------------------------------------------
