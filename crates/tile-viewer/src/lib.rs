@@ -69,11 +69,14 @@ struct Slot {
     growths: Vec<(u64, Arc<render_desc::Growth>)>,
     /// The latest generation given (whole or grown).
     latest: u64,
+    /// Atlas pages (colour, index) to make room for, if asked (see
+    /// [`Assets::reserve`]).
+    reserve: Option<(u32, u32)>,
 }
 
 impl Assets {
     pub fn new(compiled: Arc<Compiled>) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Slot { generation: 1, whole: Some(compiled), growths: Vec::new(), latest: 1 })))
+        Self(Arc::new(std::sync::Mutex::new(Slot { generation: 1, whole: Some(compiled), growths: Vec::new(), latest: 1, reserve: None })))
     }
 
     fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
@@ -88,7 +91,7 @@ impl Assets {
     /// Replaces the description by `compiled` of generation `generation`
     /// (what scenes refer to, `Scene::assets`).
     pub fn set(&self, compiled: Arc<Compiled>, generation: u64) {
-        *self.slot() = Slot { generation, whole: Some(compiled), growths: Vec::new(), latest: generation };
+        *self.slot() = Slot { generation, whole: Some(compiled), growths: Vec::new(), latest: generation, reserve: None };
     }
 
     /// Grows the latest description by `growth` (made for it as grown so
@@ -97,6 +100,17 @@ impl Assets {
         let mut slot = self.slot();
         slot.growths.push((generation, growth));
         slot.latest = slot.latest.max(generation);
+    }
+
+    /// Asks the viewer to make room in its atlas for `pages` colour and
+    /// `index_pages` index pages (art expected soon), so that growing it
+    /// does not move it again and again (`TileRenderer::reserve_atlas`).
+    pub fn reserve(&self, pages: u32, index_pages: u32) {
+        self.slot().reserve = Some((pages, index_pages));
+    }
+
+    fn take_reserve(&self) -> Option<(u32, u32)> {
+        self.slot().reserve.take()
     }
 
     /// The latest generation given (whole or grown).
@@ -909,6 +923,12 @@ impl App {
             self.whole_version = version;
             self.assets_version = version;
         }
+        if let Some((pages, index_pages)) = self.assets.take_reserve() {
+            let started = std::time::Instant::now();
+            gpu.renderer.reserve_atlas(&gpu.device, &gpu.queue, pages, index_pages);
+            let (rgba, index) = gpu.renderer.atlas_room();
+            log::info!("viewer: atlas room for {rgba} colour and {index} index pages made in {} ms", started.elapsed().as_millis());
+        }
         let mut grown = false;
         if version == self.whole_version {
             let growths = self.assets.take_growths(version);
@@ -922,13 +942,12 @@ impl App {
                     bytes += growth.atlas.bytes();
                     self.assets_version = generation;
                 }
-                let (pages, room) = gpu.renderer.atlas_room();
+                let (rgba, index) = gpu.renderer.atlas_room();
                 log::info!(
-                    "viewer: grown by {sprites} sprites ({} KiB of pixels) in {} ms; {} sprites, atlas room for {pages} pages ({} MiB)",
+                    "viewer: grown by {sprites} sprites ({} KiB of pixels) in {} ms; {} sprites, atlas room for {rgba} colour and {index} index pages",
                     bytes >> 10,
                     started.elapsed().as_millis(),
                     self.compiled.atlas.sprites.len(),
-                    room >> 20
                 );
                 grown = true;
             }
