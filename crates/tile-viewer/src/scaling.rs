@@ -347,8 +347,12 @@ pub fn arrange(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, rect_of: i
     // A frame in panels needs a camera per side or corner in use: if that
     // is more than the renderer draws, its panels go to the top-left one.
     let extra: usize = panelled.iter().map(|p| p.2.len() - 1).sum();
-    if extra > tile_render::MAX_VIEWS.saturating_sub(frame.cameras.len() + 1) {
-        log::warn!("viewer: the frame's panels need {extra} views more than the renderer draws: drawn as one");
+    let required = frame.cameras.len() + extra + 1;
+    if required > tile_render::MAX_VIEWS {
+        // A driver can supply arbitrarily many views. Report this bounded
+        // renderer's fallback once, rather than on every rendered frame.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| log::warn!("viewer: the frame and panels need {required} views, limit {}: panels drawn as one (not repeated)", tile_render::MAX_VIEWS));
         for (c, i, anchors, _) in panelled.drain(..) {
             shown.retain(|(p, _, _)| !anchors.iter().any(|a| a.0 == *p));
             shown.extend(scene.views[i].overlay.iter().filter_map(&rect_of).map(|r| (Affine::IDENTITY, r, (0, 0))));
@@ -604,6 +608,69 @@ mod tests {
                 let routed = layout.route(scene::Input::MouseButton { button: scene::Button::Left, down: true, x: at.0, y: at.1 });
                 assert_eq!(routed, vec![scene::Input::MouseButton { button: scene::Button::Left, down: true, x: driver.0, y: driver.1 }], "×{pixel_scale} at {at:?}");
                 layout.route(scene::Input::MouseButton { button: scene::Button::Left, down: false, x: at.0, y: at.1 });
+            }
+        }
+    }
+
+    #[test]
+    fn a_scaled_split_keeps_worker_panels_and_optional_views_separate() {
+        // Worker orders cross the divider near the bottom, opening a
+        // second passage. Each passage needs two fill views and each
+        // closed stretch its line. The frame still needs four HUD anchors.
+        let (mut scene, rect_of) = game_scene();
+        scene.interface.reachable = Some([836, 1030, 256, 32]);
+        let settings = viewer_settings::Layout {
+            split: viewer_settings::Split::Vertical1To1,
+            roles: viewer_settings::Roles::UnitMouse,
+            ..Default::default()
+        };
+        for canvas in [(1920, 1080), (2560, 1440)] {
+            for frame_scale in [1.0, 1.35] {
+                let mut base_views = 0;
+                for optional_views in [false, true] {
+                    let p = plan(canvas, 1.0, (1920, 1080), &res(1, 1.0, frame_scale, 1.35));
+                    let mut layout = layout::Layout::default();
+                    layout.apply_settings(&settings);
+                    layout.set_map_movement(viewer_settings::MapMovement::Drag);
+                    layout.world_scale = p.world;
+                    layout.driver_screen = Some(p.screen);
+                    layout.frame(&scene, canvas, (0, 0, 0, 0), vec![], None);
+                    if optional_views {
+                        layout.configure("magnifier=world").unwrap();
+                        for (x, y) in [(100, 100), (500, 200), (300, 400)] {
+                            layout.route(scene::Input::MouseMove { x, y });
+                            for (vk, down) in [(0x11, true), (0x10, true), (0x49, true), (0x49, false), (0x10, false), (0x11, false)] {
+                                layout.route(scene::Input::Key { vk, down, text: None });
+                            }
+                        }
+                    }
+                    let mut f = layout.frame(&scene, canvas, (0, 0, 0, 0), vec![], None);
+                    if optional_views {
+                        assert_eq!(f.cameras.len(), base_views + 8, "all three framed insets and the magnifier remain visible");
+                    } else {
+                        base_views = f.cameras.len();
+                    }
+                    let arranged = arrange(&p, &scene, &mut f, &rect_of);
+                    let what = format!("{canvas:?}, frame scale {frame_scale}, optional views {optional_views}");
+                    if canvas == (1920, 1080) {
+                        assert_eq!(f.cameras.len(), if optional_views { 25 } else { 17 }, "the worker layout exceeds the former 16-view limit: {what}");
+                    }
+                    let (_, cameras) = arranged.overlay_cameras.iter().find(|(view, _)| *view == 1).expect("the HUD keeps its panel cameras");
+                    assert_eq!(cameras.len(), scene.views[1].overlay.len(), "{what}");
+                    assert_eq!(cameras.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), 4, "{what}");
+                    assert_eq!(cameras[0], cameras[1], "pieces of the minimap share its camera: {what}");
+                    // The cursor and FPS views are added after arrangement.
+                    assert!(f.cameras.len() + 2 <= tile_render::MAX_VIEWS, "{what}: {} arranged cameras", f.cameras.len());
+                    assert!(arranged.overlay.is_some(), "viewer overlays retained: {what}");
+                    let shown = arranged.shown.as_ref().unwrap();
+                    for (driver, anchor) in [([5, 949, 280, 130], (0, 2)), ([21, 12, 107, 30], (0, 0)), ([1621, 942, 294, 137], (2, 2)), ([836, 1030, 256, 32], (1, 2))] {
+                        let piece = shown.iter().find(|s| s.driver == driver).expect("every HUD panel remains interactive");
+                        assert_eq!(piece.rect, p.frame_piece(anchor).rect(driver), "{what}: panel {driver:?}");
+                        let at = (piece.rect[0] + piece.rect[2] / 2, piece.rect[1] + piece.rect[3] / 2);
+                        let back = piece.to_driver(at);
+                        assert!((back.0 - (driver[0] + driver[2] / 2)).abs() <= 1 && (back.1 - (driver[1] + driver[3] / 2)).abs() <= 1, "{what}: panel input {driver:?} -> {back:?}");
+                    }
+                }
             }
         }
     }
