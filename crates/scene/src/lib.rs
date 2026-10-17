@@ -260,6 +260,33 @@ pub struct Interface {
     /// every view of the renderer's (e.g. the active unit's orders), while
     /// they are shown.
     pub reachable: Option<[i32; 4]>,
+    /// The driver asks for its screen and its world side by side (e.g. a
+    /// menu with a preview of the world it picks).
+    pub beside: Option<Beside>,
+}
+
+/// The driver's screen and its world side by side (`Interface::beside`):
+/// the part of the screen that matters (`screen`, x, y, w, h in the
+/// driver's window pixels, e.g. a dialog) goes to one edge of the window,
+/// its interface moved with it (pointer input mapped back), and the
+/// world, all of it, fitted into the rest (shown as small as it takes,
+/// see `View::downscale`). The world is not the driver's view then: pointer
+/// input on it does not reach the driver.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Beside {
+    pub screen: [i32; 4],
+    /// The window edge the screen goes to.
+    pub edge: Edge,
+}
+
+/// An edge of the window.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Edge {
+    #[default]
+    Left,
+    Right,
+    Top,
+    Bottom,
 }
 
 /// Something in the driver's interface the user can point at and act on,

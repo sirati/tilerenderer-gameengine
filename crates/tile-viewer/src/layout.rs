@@ -54,6 +54,10 @@
 //!   that the views give room to.
 //! - **Screens**: a screen the driver names (`Scene::interface`) goes over
 //!   the window, or its whole picture is fitted into A or B (as `ui=pane`).
+//! - **Beside**: the driver may ask for its screen and its world side by side
+//!   (`scene::Beside`, e.g. a menu previewing the world it picks): its
+//!   screen goes to an edge of the window and the whole world, shown as
+//!   small as it takes, into the rest; the viewer's own views wait meanwhile.
 //! - **Roles**: `Free` (A shows the driver's view, B is moved by hand), or
 //!   `UnitMouse` (A follows the focus of interest, B follows the world
 //!   cursor and captures the mouse; an open popup moves fully into A where
@@ -395,6 +399,8 @@ enum Hit {
     /// A part of the driver's interface the viewer drew elsewhere (index
     /// into `Layout::moved`).
     Moved(usize),
+    /// The world shown beside the driver's screen (`scene::Beside`).
+    Beside,
 }
 
 /// One of the two views of a split.
@@ -464,6 +470,9 @@ pub struct Layout {
     pub roles: Roles,
     /// Where the driver's named screens go (from the settings).
     pub screen_places: BTreeMap<String, ScreenPlace>,
+    /// The world's grid steps (`Compiled::step`; a world shown smaller
+    /// divides them evenly, see `fit_world`).
+    pub grid_step: (u32, u32),
     /// Seconds passed since the last frame ([`Layout::advance`]).
     step: f64,
     /// The view the pointer is in (none: not known since it entered).
@@ -490,6 +499,9 @@ pub struct Layout {
     /// Where a world magnifier looked last (it keeps looking there while
     /// nothing is under the pointer).
     magnifier_center: Option<(i32, i32)>,
+    /// From the last frame: the driver's screen and its world side by side
+    /// (`scene::Interface::beside`): the world's rectangle.
+    beside: Option<[i32; 4]>,
     /// From the last frame: the focus of interest.
     focus: Option<(i32, i32)>,
     /// Whether zoomed views show text at their resolution (the driver's
@@ -563,6 +575,7 @@ impl Default for Layout {
             smooth: false,
             roles: Roles::Free,
             screen_places: BTreeMap::new(),
+            grid_step: (64, 32),
             step: 0.0,
             side: None,
             against: None,
@@ -575,6 +588,7 @@ impl Default for Layout {
             screen: None,
             moved: Vec::new(),
             magnifier_center: None,
+            beside: None,
             focus: None,
             ctrl: false,
             shift: false,
@@ -626,6 +640,69 @@ fn world_at_floor(camera: &Camera, (px, py): (i32, i32)) -> (i32, i32) {
 fn world_at(camera: &Camera, (px, py): (i32, i32)) -> (i32, i32) {
     let (n, d) = (camera.zoom.0.max(1) as i32, camera.zoom.1.max(1) as i32);
     (camera.x + (px - camera.origin.0) * d / n, camera.y + (py - camera.origin.1) * d / n)
+}
+
+/// Where the driver's screen and its world go when it asks for them side
+/// by side in a window of `window`: how far its screen moves, and the
+/// world's rectangle (the rest of the window, a gap from the screen).
+fn beside_geometry(beside: scene::Beside, window: (u32, u32)) -> ((i32, i32), [i32; 4]) {
+    let [sx, sy, sw, sh] = beside.screen;
+    let (w, h) = (window.0 as i32, window.1 as i32);
+    // Along the edge it stays where it is, within the window.
+    let along = |at: i32, size: i32, room: i32| at.clamp(0, (room - size).max(0));
+    let (to, world) = match beside.edge {
+        scene::Edge::Left => ((0, along(sy, sh, h)), [sw + GAP, 0, w - sw - GAP, h]),
+        scene::Edge::Right => (((w - sw).max(0), along(sy, sh, h)), [0, 0, w - sw - GAP, h]),
+        scene::Edge::Top => ((along(sx, sw, w), 0), [0, sh + GAP, w, h - sh - GAP]),
+        scene::Edge::Bottom => ((along(sx, sw, w), (h - sh).max(0)), [0, 0, w, h - sh - GAP]),
+    };
+    ((to.0 - sx, to.1 - sy), [world[0], world[1], world[2].max(0), world[3].max(0)])
+}
+
+/// A camera showing all of a world of `bounds` (the pixels of `camera`'s
+/// world, at downscale 1) in `rect`, centred: the world shown `n` times
+/// smaller (`Camera::downscale`) and then zoomed by the fraction that makes
+/// it fit. `n` divides the grid's steps (`step`; the cells of a world shown
+/// smaller lie on whole pixels), the one nearest to fitting either way
+/// (zoomed least). A world the driver shows smaller itself (its view's
+/// downscale, e.g. with sprites laid out for it) is only zoomed. Staggered
+/// rows reach a step further right than the columns.
+fn fit_world(camera: &Camera, bounds: WorldBounds, rect: [i32; 4], step: (u32, u32)) -> Camera {
+    // (`bounds` are in the pixels of the world as the driver shows it.)
+    let shown = camera.downscale.max(1);
+    let step = (step.0 / shown, step.1 / shown);
+    let (ww, wh) = ((bounds.size.0 as i64 + step.0 as i64).max(1), (bounds.size.1 as i64).max(1));
+    let (rw, rh) = (rect[2].max(1) as i64, rect[3].max(1) as i64);
+    // The zoom showing the world n times smaller in the rectangle: the
+    // smaller of the two ratios, as a fraction.
+    let zoom = |n: i64| if rw * wh <= rh * ww { (rw * n, ww) } else { (rh * n, wh) };
+    let common = if shown > 1 { 1 } else { gcd(step.0, step.1) as i64 };
+    let divisors: Vec<i64> = (1..=common).filter(|n| common % n == 0).collect();
+    let least = ((ww + rw - 1) / rw).max((wh + rh - 1) / rh).max(1);
+    // The smallest dividing n at which the world fits unzoomed, and the
+    // largest below it (zoomed out a little instead).
+    let above = divisors.iter().copied().find(|&n| n >= least);
+    let below = divisors.iter().copied().rev().find(|&n| n < least);
+    // (How far from 1 a zoom is, either way.)
+    let off = |(a, b): (i64, i64)| if a >= b { a as f64 / b as f64 } else { b as f64 / a as f64 };
+    let n = [above, below].into_iter().flatten().min_by(|&a, &b| off(zoom(a)).total_cmp(&off(zoom(b)))).unwrap_or(1);
+    let (a, b) = zoom(n);
+    let g = gcd(a as u32, b as u32) as i64;
+    let zoom = ((a / g) as u32, (b / g) as u32);
+    // The rectangle in the view's own pixels, the world in the middle.
+    let (source_w, source_h) = (rw * zoom.1 as i64 / zoom.0 as i64, rh * zoom.1 as i64 / zoom.0 as i64);
+    let (x, y) = ((ww / n - source_w) / 2, (wh / n - source_h) / 2);
+    Camera {
+        x: x as i32,
+        y: y as i32,
+        zoom,
+        viewport: (rect[2].max(1) as u32, rect[3].max(1) as u32),
+        origin: (rect[0], rect[1]),
+        cull: None,
+        screen_shift: (0, 0),
+        downscale: shown * n as u32,
+        ..*camera
+    }
 }
 
 fn gcd(a: u32, b: u32) -> u32 {
@@ -1093,7 +1170,7 @@ impl Layout {
     /// pushes against the divider.
     fn constrain(&mut self, from: (i32, i32), to: (i32, i32)) -> (i32, i32) {
         self.against = None;
-        let Some(((g0, g1), _)) = self.gap().filter(|_| !self.locked && self.drag.is_none()) else {
+        let Some(((g0, g1), _)) = self.gap().filter(|_| !self.locked && self.drag.is_none() && self.beside.is_none()) else {
             self.side = None;
             return to;
         };
@@ -1239,6 +1316,10 @@ impl Layout {
     ) -> Frame {
         self.window = window;
         self.bounds = bounds;
+        if let Some(beside) = scene.interface.beside {
+            return self.frame_beside(scene, overhang, beside, bounds);
+        }
+        self.beside = None;
         let dt = std::mem::take(&mut self.step).min(MAX_STEP);
         let base = crate::scene_cameras(scene, window, overhang);
         // Its own views show the world as the driver's do (their world
@@ -1485,6 +1566,59 @@ impl Layout {
         frame
     }
 
+    /// The frame for a driver asking for its screen and its world side by
+    /// side (`scene::Beside`): the screen at the edge it asks for (kept
+    /// where it is along that edge), its interface moved with it, and the
+    /// whole world fitted into the rest of the window (`fit_world`). None of
+    /// the viewer's own views: the arrangement is the driver's.
+    fn frame_beside(&mut self, scene: &Scene, overhang: (u32, u32, u32, u32), beside: scene::Beside, bounds: Option<WorldBounds>) -> Frame {
+        let base = crate::scene_cameras(scene, self.window, overhang);
+        self.step = 0.0;
+        self.main = None;
+        self.fit = None;
+        self.shown.clear();
+        self.driver_rects.clear();
+        self.interface.clear();
+        self.insets_shown = 0;
+        self.reachable = None;
+        self.screen = None;
+        self.art_zooms = scene.zooms.clone();
+        self.focus = None;
+        let (shift, world) = beside_geometry(beside, self.window);
+        // Everything but the world is the driver's screen, moved.
+        self.moved = vec![([0, 0, self.window.0 as i32, self.window.1 as i32], shift)];
+        self.beside = Some(world);
+        let mut frame = Frame { view_cameras: vec![None; scene.views.len()], ..Default::default() };
+        // The world: the driver's first world view, all of it, fitted.
+        let main = scene.views.iter().position(|v| !v.view.interface_only);
+        if let (Some(m), Some(b)) = (main, bounds.filter(|_| world[2] > 0 && world[3] > 0)) {
+            let mut camera = fit_world(&base[m], b, world, self.grid_step);
+            // (Text comes as drawn at 1:1 and is shown at the view's zoom: drawn
+            // from outlines at the zoom, world text does not show in a view of
+            // a world shown smaller.)
+            camera.zoomed_art = false;
+            frame.cameras.push(camera);
+            frame.view_cameras[m] = Some(frame.cameras.len() as u32 - 1);
+            self.shown.push((Hit::Beside, camera));
+        }
+        // The interface: only the part of the screen asked for (what is
+        // around it, e.g. a background filling the window, would cover the
+        // world), moved (screen sprites are in window pixels, moved by the
+        // shift; the view's rectangle clips them).
+        let [sx, sy, sw, sh] = beside.screen;
+        for (i, (_, c)) in scene.views.iter().zip(&base).enumerate().filter(|(_, (v, _))| v.view.interface_only) {
+            let (x0, y0) = (c.origin.0.max(sx), c.origin.1.max(sy));
+            let (x1, y1) = ((c.origin.0 + c.viewport.0 as i32).min(sx + sw), (c.origin.1 + c.viewport.1 as i32).min(sy + sh));
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let origin = (x0 + shift.0, y0 + shift.1);
+            frame.cameras.push(Camera { origin, viewport: ((x1 - x0) as u32, (y1 - y0) as u32), screen_shift: shift, ..*c });
+            frame.view_cameras[i] = Some(frame.cameras.len() as u32 - 1);
+        }
+        frame
+    }
+
     /// The side whose controls are shown: the one the pointer is in (the
     /// view following the world cursor while the mouse is captured).
     pub fn active_side(&self) -> Side {
@@ -1609,7 +1743,17 @@ impl Layout {
         }
     }
 
+    /// With the driver's screen and its world side by side: the world, or
+    /// else the driver's screen (moved).
+    fn beside_hit(&self, p: (i32, i32)) -> Option<Hit> {
+        let world = self.beside?;
+        Some(if inside(world, p) { Hit::Beside } else { Hit::Moved(0) })
+    }
+
     fn hit(&self, p: (i32, i32)) -> Hit {
+        if let Some(b) = self.beside_hit(p) {
+            return b;
+        }
         if self.magnifier.is_some_and(|m| inside(self.magnifier_geometry(&m).0, p)) {
             return Hit::Magnifier;
         }
@@ -1618,6 +1762,9 @@ impl Layout {
 
     /// [`Layout::hit`] as if there were no magnifier.
     fn hit_below_magnifier(&self, p: (i32, i32)) -> Hit {
+        if let Some(b) = self.beside_hit(p) {
+            return b;
+        }
         // (The interface and the driver's other views lie over the window,
         // unless they are in a pane; the parts drawn elsewhere on top.)
         if self.fit.is_none() {
@@ -1769,8 +1916,11 @@ impl Layout {
     /// How the driver's screen (its window pixels, those of its interface)
     /// lies in the window, as of the last frame: driver pixel `s` is at
     /// window pixel `origin + s · zoom.0 / zoom.1` (1:1 at the window's
-    /// corner unless it is fitted into a pane).
+    /// corner unless it is fitted into a pane or moved beside its world).
     pub fn screen_mapping(&self) -> ((i32, i32), (u32, u32)) {
+        if self.beside.is_some() {
+            return (self.moved.first().map_or((0, 0), |m| m.1), (1, 1));
+        }
         self.fit.map_or(((0, 0), (1, 1)), |f| (f.origin, f.zoom))
     }
 
@@ -1825,6 +1975,8 @@ impl Layout {
         match self.hit(p) {
             Hit::Interface => Ok(p),
             Hit::Divider => Err(None),
+            // (Not the driver's view: nothing reaches it.)
+            Hit::Beside => Err(None),
             // Drawn elsewhere: where the driver put it.
             Hit::Moved(k) => {
                 let (_, (dx, dy)) = *self.moved.get(k).ok_or(None)?;
@@ -2138,6 +2290,7 @@ impl Layout {
                     m.zoom = next(m.zoom).max(ONE);
                 }
             }
+            Some(Hit::Beside) => {}
             Some(hit @ (Hit::Main | Hit::Pane | Hit::Inset(_))) => {
                 if let Some(v) = self.free_view(hit) {
                     v.zoom = next(v.zoom);
@@ -2451,6 +2604,58 @@ mod tests {
         assert!(f.cameras[1].stacked);
         assert_eq!(f.view_cameras, [Some(0), Some(1)]);
         assert_eq!(click(&mut l, (100, 270))[0], Input::MouseButton { button: Button::Left, down: true, x: 200, y: 540 });
+    }
+
+    #[test]
+    fn a_screen_beside_its_world_goes_left_and_the_whole_world_fits_the_rest() {
+        // The driver's dialog (1024×768 in the middle of 1920×1080) asks to be
+        // left of its world; the user's split does not apply meanwhile.
+        let mut l = Layout::default();
+        l.configure("split=vertical").unwrap();
+        let mut s = scene();
+        s.interface.beside = Some(scene::Beside { screen: [448, 156, 1024, 768], edge: scene::Edge::Left });
+        let f = l.frame(&s, (1920, 1080), (0, 0, 0, 0), vec![[448, 156, 1024, 768]], BOUNDS);
+        assert_eq!(f.cameras.len(), 2, "the world and the interface only");
+        let (world, ui) = (f.cameras[0], f.cameras[1]);
+        assert_eq!(f.view_cameras, [Some(0), Some(1)]);
+        // The interface moved left by 448, kept at its height, only the
+        // dialog of it.
+        assert_eq!((ui.origin, ui.viewport, ui.screen_shift), ((0, 156), (1024, 768), (-448, 0)));
+        // The world in the rest (from 1028, past the gap), all of it: 8064
+        // world pixels wide into 892, 8 times smaller (16 would be zoomed
+        // more), a little zoomed out to fill.
+        assert_eq!((world.origin, world.viewport), ((1028, 0), (892, 1080)));
+        assert_eq!(world.downscale, 8);
+        assert!(world.zoom.0 < world.zoom.1);
+        let shown = |c: &Camera| {
+            let (sw, sh) = c.source_size();
+            [c.x, c.y, c.x + sw as i32, c.y + sh as i32]
+        };
+        let [x0, y0, x1, y1] = shown(&world);
+        assert!(x0 <= 0 && y0 <= 0 && x1 >= 8064 / 9 - 1 && y1 >= 4000 / 9, "{:?} {:?}", world.zoom, shown(&world));
+        // A click on the dialog reaches the driver where it drew it; one on
+        // the world nothing; the snapping pointer knows where the dialog is.
+        assert_eq!(click(&mut l, (100, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 548, y: 300 });
+        assert!(click(&mut l, (1500, 500)).is_empty());
+        assert_eq!(l.screen_mapping(), ((-448, 0), (1, 1)));
+        // Without it, back to the user's arrangement.
+        let f = l.frame(&scene(), (1920, 1080), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(f.cameras.len() > 2);
+        assert_eq!(l.screen_mapping(), ((0, 0), (1, 1)));
+    }
+
+    #[test]
+    fn a_world_of_any_size_fits() {
+        for (size, rect) in [((100, 50), [0, 0, 892, 1080]), ((20_000, 30_000), [10, 20, 300, 200]), ((8960, 4544), [1028, 0, 892, 1080])] {
+            let c = fit_world(&Camera::new((1, 1)), WorldBounds { size, wrap: (false, false) }, rect, (64, 32));
+            assert!(64 % c.downscale == 0 && 32 % c.downscale == 0, "{size:?}: {c:?}");
+            let (sw, sh) = c.source_size();
+            let n = c.downscale as i32;
+            assert!(c.x <= 0 && c.y <= 0, "{size:?}: {c:?}");
+            assert!(c.x + sw as i32 >= (size.0 + 64) / n - 1 && c.y + sh as i32 >= size.1 / n - 1, "{size:?}: {c:?}");
+            // Filling the rectangle one way.
+            assert!(sw as i32 <= (size.0 + 64) / n + 2 || sh as i32 <= size.1 / n + 2, "{size:?}: {c:?}");
+        }
     }
 
     /// A split whose pane (right half) shows world (5000, 2000) around its

@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Button, Cursor, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, Patch, SystemCursor, Update, View, WorldShape};
+use crate::{Beside, Button, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, Patch, SystemCursor, Update, View, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 25;
+pub const VERSION: u32 = 26;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -349,6 +349,17 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 for v in i.reachable.unwrap_or_default() {
                     w.i32(v);
                 }
+                w.bool(i.beside.is_some());
+                let beside = i.beside.unwrap_or(Beside { screen: [0; 4], edge: Edge::Left });
+                for v in beside.screen {
+                    w.i32(v);
+                }
+                w.u8(match beside.edge {
+                    Edge::Left => 0,
+                    Edge::Right => 1,
+                    Edge::Top => 2,
+                    Edge::Bottom => 3,
+                });
             }
             Update::Interactables(items) => {
                 w.u8(12);
@@ -474,7 +485,22 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let (roaming, popup) = (view()?, view()?);
                 let some = r.bool()?;
                 let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-                Update::Interface(Interface { screen: named.then_some(screen), roaming, popup, reachable: some.then_some(rect) })
+                let beside = r.bool()?;
+                let screen_rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                let edge = match r.u8()? {
+                    0 => Edge::Left,
+                    1 => Edge::Right,
+                    2 => Edge::Top,
+                    3 => Edge::Bottom,
+                    t => return Err(WireError::Tag(t)),
+                };
+                Update::Interface(Interface {
+                    screen: named.then_some(screen),
+                    roaming,
+                    popup,
+                    reachable: some.then_some(rect),
+                    beside: beside.then_some(Beside { screen: screen_rect, edge }),
+                })
             }
             12 => {
                 let n = r.len(INTERACTABLE_BYTES)?;
@@ -729,7 +755,13 @@ mod tests {
         settings.layout.screens.insert("Spy".into(), viewer_settings::ScreenPlace { vertical: viewer_settings::Place::RightOrTop, horizontal: viewer_settings::Place::LeftOrBottom });
         settings.input.snap_updates_per_second = 4.5;
         s.settings = Some(settings);
-        s.interface = Interface { screen: Some("F4".into()), roaming: Some(256), popup: None, reachable: Some([-1, 2, 300, 40]) };
+        s.interface = Interface {
+            screen: Some("F4".into()),
+            roaming: Some(256),
+            popup: None,
+            reachable: Some([-1, 2, 300, 40]),
+            beside: Some(Beside { screen: [448, 156, 1024, 768], edge: Edge::Bottom }),
+        };
         s.interactables = vec![
             Interactable { rect: [10, 20, 100, 24], kind: InteractableKind::Button, id: 0x1_0000_0002 },
             Interactable { rect: [5, 50, 200, 300], kind: InteractableKind::List { scroll: [5, 60, 190, 280], step: 20 }, id: 7 },
@@ -741,7 +773,7 @@ mod tests {
         updates.push(Update::Phases(vec![(0, 5, 200)]));
         updates.push(Update::Offsets(vec![(1, 2, (-1, 32767))]));
         updates.push(Update::View { id: 2, view: None });
-        updates.push(Update::Interface(Interface { screen: None, roaming: None, popup: Some(7), reachable: None }));
+        updates.push(Update::Interface(Interface { popup: Some(7), ..Default::default() }));
         updates.push(Update::Cursor(Cursor::Sprite(42)));
         updates.push(Update::Cursor(Cursor::System(SystemCursor::ResizeNesw)));
         updates.push(Update::Cursor(Cursor::Default));

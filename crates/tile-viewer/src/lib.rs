@@ -311,6 +311,26 @@ pub fn render_offscreen(
     gpu.render_views(&mut renderer, &scene_cameras(scene, size, config.overhang), size, scene.tick, config.clear)
 }
 
+/// Renders `scene` as a freshly opened viewer arranges it (`layout`; the
+/// user's settings left at their defaults) into an offscreen target of
+/// `size` (for tools and pixel comparisons).
+pub fn render_arranged(
+    gpu: &tile_render::Headless,
+    compiled: &Compiled,
+    scene: &Scene,
+    size: (u32, u32),
+    config: &ViewerConfig,
+) -> RgbaImage {
+    let mut layout = layout::Layout::default();
+    layout.grid_step = compiled.step;
+    let frame = layout.frame(scene, size, config.overhang, interface_rects(compiled, scene), Some(world_bounds(compiled, scene)));
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
+    renderer.set_world(&gpu.device, &scene_world_for(compiled, scene, &frame.view_cameras));
+    apply_patches(&renderer, &gpu.queue, compiled, &scene.patches);
+    gpu.render_views(&mut renderer, &frame.cameras, size, scene.tick, config.clear)
+}
+
 /// Opens the window and runs until it is closed, drawing what `display`
 /// receives. Blocks the calling thread, which need not be the process's
 /// main thread (the viewer usually runs inside someone else's process).
@@ -806,6 +826,7 @@ impl App {
                     self.layout.advance(now - at);
                 }
                 let bounds = world_bounds(&self.compiled, scene);
+                self.layout.grid_step = self.compiled.step;
                 let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
                 self.drawn_frame = Some(arranged.clone());
                 arranged
