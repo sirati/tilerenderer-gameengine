@@ -107,13 +107,16 @@ pub enum Place {
 pub enum Zoom {
     #[default]
     Off,
-    /// A box on top, its size `1:3:1` of the window (margin : box : margin).
+    /// A box on top, `1:3:1` of the width (margin : box : margin), its height
+    /// from that at the window's aspect ratio. Not sized by `zoom_strip`.
     Floating131,
     /// As `Floating131`, `1:7:1`.
     Floating171,
-    /// A box hovering about the mouse, `1:1:1`.
+    /// A box at the mouse: above it (below where there is no room), centred
+    /// on it across; `1:1:1` of the width, [`Layout::zoom_strip`] of the
+    /// height.
     Mouse111,
-    /// A box hovering about the mouse, `1:3:1`.
+    /// As `Mouse111`, `1:3:1` of the width.
     Mouse131,
     /// A strip across the top (a horizontal split), its height
     /// [`Layout::zoom_strip`] of the window.
@@ -160,7 +163,9 @@ pub struct Layout {
     /// Where the zoom box goes in a vertical split (else unused).
     pub zoom_place: Place,
     pub zoom: Zoom,
-    /// Height of [`Zoom::TopStrip`] as a fraction of the window, 0.1..=0.5.
+    /// Height of [`Zoom::TopStrip`] and of the boxes at the mouse
+    /// ([`Zoom::Mouse111`], [`Zoom::Mouse131`]) as a fraction of the window
+    /// (or of the view they are in), 0.05..=0.5.
     pub zoom_strip: f32,
     /// Where each screen goes.
     pub screens: BTreeMap<ScreenKind, ScreenPlace>,

@@ -45,8 +45,9 @@ impl Range {
 
 /// The fractional scales (menus, the game's frame, the world map).
 pub const SCALE_RANGE: Range = Range { min: 0.5, max: 3.0, step: 0.05 };
-/// The height of the zoom strip ([`Layout::zoom_strip`]).
-pub const ZOOM_STRIP_RANGE: Range = Range { min: 0.1, max: 0.5, step: 0.05 };
+/// The height of the zoom strip and of the boxes at the mouse
+/// ([`Layout::zoom_strip`]).
+pub const ZOOM_STRIP_RANGE: Range = Range { min: 0.05, max: 0.5, step: 0.05 };
 /// How often the snapping cursor's target is recomputed, per second.
 pub const SNAP_RATE_RANGE: Range = Range { min: 1.0, max: 30.0, step: 1.0 };
 /// How often the snapping cursor's ghost follows, per second.
@@ -312,7 +313,7 @@ mod tests {
         assert!(s.set_control("layout.zoom_strip", &ControlValue::Number(0.9)));
         assert_eq!(s.layout.zoom_strip, 0.5);
         assert!(s.set_control("layout.zoom_strip", &ControlValue::Number(0.0)));
-        assert_eq!(s.layout.zoom_strip, 0.1);
+        assert_eq!(s.layout.zoom_strip, 0.05);
         assert!(s.set_control("resolution.menu_scale", &ControlValue::Number(1.333)));
         assert_eq!(s.resolution.menu_scale, 1.35);
         assert!(s.set_control("input.snap_updates_per_second", &ControlValue::Number(f32::NAN)));
