@@ -614,7 +614,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
             }
             16 => Update::ScreenSize((r.u32()?, r.u32()?)),
             17 => {
-                let n = r.len(23)?;
+                let n = r.len(22)?;
                 let mut looks = Vec::with_capacity(n);
                 for _ in 0..n {
                     let id = r.u32()? as u64 | (r.u32()? as u64) << 32;
@@ -632,7 +632,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     for _ in 0..m {
                         let view = r.u32()?;
                         let sprites = (r.u32()?, r.u32()?);
-                        let k = r.len(6)?;
+                        let k = r.len(5)?;
                         let states = (0..k).map(|_| Ok((r.look_state()?, r.sprites()?))).collect::<Result<_, WireError>>()?;
                         views.push(ViewLooks { view, sprites, states });
                     }
@@ -962,4 +962,22 @@ mod tests {
         assert_eq!(decode_updates(&[VERSION as u8, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[0xFE, 0, 0, 0]), Err(WireError::Version(0xFE)));
     }
+
+    #[test]
+    fn minimal_control_looks_roundtrip() {
+        let hidden = Looks { id: 1, ..Default::default() };
+        let empty_state = Looks {
+            id: 2,
+            views: vec![ViewLooks {
+                states: vec![(LookState::default(), Vec::new())],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for look in [hidden, empty_state] {
+            let updates = vec![Update::Looks(vec![look])];
+            assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
+        }
+    }
+
 }
