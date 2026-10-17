@@ -455,6 +455,9 @@ pub struct Snapper {
     scrolled: bool,
     /// Where each button's press went.
     pressed: [Option<Point>; 3],
+    /// When the element now snapped to was picked (for the log: how long
+    /// the pointer takes to come to rest on it).
+    picked: Option<f64>,
 }
 
 fn button_index(b: Button) -> usize {
@@ -622,6 +625,9 @@ impl Snapper {
         let was_at_rest = self.spring.at_rest();
         self.spring.step(dt, Spring::omega(rates.updates_per_second));
         if self.spring.settle() {
+            if let Some(t0) = self.picked.take().filter(|_| self.snapped.is_some()) {
+                log::debug!("snap: at rest on {:?} {:.0} ms after it was picked (update interval {:.0} ms)", self.spring.target, (now - t0) * 1000.0, 1000.0 / rates.updates_per_second);
+            }
             if self.snapped.is_some() && !self.hovered {
                 // At rest on the element: it shows its hover, and the hidden
                 // pointer goes on from it.
@@ -654,8 +660,10 @@ impl Snapper {
         self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }) });
         let c = t.center();
         if c != self.spring.target {
+            log::debug!("snap: at {:.3} s picked {:?} ({:?}) at {c:?}", self.last, t.id, t.kind);
             self.spring.target = c;
             self.hovered = false;
+            self.picked = Some(self.last);
         }
     }
 

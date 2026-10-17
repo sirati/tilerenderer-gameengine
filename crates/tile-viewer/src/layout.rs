@@ -2045,6 +2045,7 @@ impl Layout {
                 // back too).
                 let (x, y) = self.constrain(from, (x, y));
                 if (x, y) != self.raw_pointer {
+                    log::debug!("viewer: the divider holds the pointer at {:?} (it went to {:?})", (x, y), self.raw_pointer);
                     self.warp = Some((x, y));
                 }
                 self.pointer = (x, y);
