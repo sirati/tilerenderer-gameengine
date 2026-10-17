@@ -310,3 +310,73 @@ mod tests {
         assert!(moved != last && moved.iter().all(|s| s.x >= 640));
     }
 }
+
+/// Frame times for the log (`TILE_VIEWER_FRAME_TIMES=1`): every
+/// [`FrameLog::EVERY`], how far apart the frames presented were and how
+/// long the longest took to draw: a stall shows as a long gap (the viewer
+/// presents at least once a beat, see `FRAME`).
+#[derive(Clone, Debug, Default)]
+pub struct FrameLog {
+    last: Option<f64>,
+    since: Option<f64>,
+    /// Gaps between presented frames, and the time each took to draw, in
+    /// milliseconds.
+    gaps: Vec<f64>,
+    worst_draw: f64,
+}
+
+impl FrameLog {
+    /// How often a line is logged, in seconds.
+    pub const EVERY: f64 = 2.0;
+    /// A gap this long (in milliseconds) counts as a stall.
+    pub const STALL_MS: f64 = 50.0;
+
+    /// A frame presented at `now` (seconds) that took `draw_ms` to draw;
+    /// the line to log once [`FrameLog::EVERY`] has passed.
+    pub fn presented(&mut self, now: f64, draw_ms: f64) -> Option<String> {
+        if let Some(last) = self.last.replace(now) {
+            self.gaps.push((now - last) * 1000.0);
+        }
+        self.worst_draw = self.worst_draw.max(draw_ms);
+        let since = *self.since.get_or_insert(now);
+        if now - since < Self::EVERY || self.gaps.is_empty() {
+            return None;
+        }
+        let mut gaps = std::mem::take(&mut self.gaps);
+        gaps.sort_by(f64::total_cmp);
+        let n = gaps.len();
+        let mean = gaps.iter().sum::<f64>() / n as f64;
+        let p99 = gaps[((n as f64 * 0.99) as usize).min(n - 1)];
+        let stalls = gaps.iter().filter(|&&g| g >= Self::STALL_MS).count();
+        let line = format!(
+            "frame times over {:.1} s: {} frames, gaps mean {mean:.1} ms, 99th {p99:.1} ms, worst {:.1} ms, {stalls} over {} ms; longest draw {:.1} ms",
+            now - since,
+            n + 1,
+            gaps[n - 1],
+            Self::STALL_MS,
+            self.worst_draw
+        );
+        self.since = Some(now);
+        self.worst_draw = 0.0;
+        Some(line)
+    }
+}
+
+#[cfg(test)]
+mod frame_log_tests {
+    use super::FrameLog;
+
+    #[test]
+    fn a_line_every_two_seconds_with_the_stalls() {
+        let mut log = FrameLog::default();
+        let mut lines = Vec::new();
+        let mut t = 0.0;
+        for i in 0..200 {
+            // One frame of 16 ms each, but the 100th 120 ms after the one before.
+            t += if i == 100 { 0.120 } else { 0.016 };
+            lines.extend(log.presented(t, 2.0));
+        }
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("worst 120.0 ms, 1 over 50 ms"), "{}", lines[0]);
+    }
+}

@@ -536,6 +536,8 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         latency: cursor::Latency::default(),
         latency_logged: Instant::now(),
         frames_presented: 0,
+        frame_log: frame_times().then(fps::FrameLog::default),
+        beside_drawn: None,
         unlock_pending: None,
         machine: cursor::Machine::default(),
         system_pointer: (0, 0),
@@ -671,6 +673,10 @@ struct App {
     latency: cursor::Latency,
     latency_logged: Instant,
     frames_presented: u32,
+    /// Frame times for the log (`TILE_VIEWER_FRAME_TIMES`), and the world
+    /// last drawn beside a screen (`scene::Beside`, for the log).
+    frame_log: Option<fps::FrameLog>,
+    beside_drawn: Option<(scene::WorldShape, Option<[i32; 4]>)>,
     /// What happens to the system pointer after the next frame (see
     /// `unlock_after_frame`).
     unlock_pending: Option<Unlock>,
@@ -723,6 +729,11 @@ const FRAME: Duration = Duration::from_millis(16);
 /// How long the event loop waits for the driver when it was woken for
 /// nothing (see `about_to_wait`).
 const IDLE_WAIT: Duration = Duration::from_millis(1);
+
+/// Whether frame times are logged (`TILE_VIEWER_FRAME_TIMES`, see `fps::FrameLog`).
+fn frame_times() -> bool {
+    std::env::var("TILE_VIEWER_FRAME_TIMES").is_ok_and(|v| !v.is_empty() && v != "0")
+}
 
 /// Whether to log the cursor's latency (`TILE_VIEWER_LATENCY=1`).
 fn log_latency() -> bool {
@@ -1332,6 +1343,12 @@ impl App {
         }
         if matches {
             self.drawn_seq = scene.seq;
+            // (For measuring how soon a world asked for beside a screen shows.)
+            let beside = scene.interface.beside.map(|b| (scene.shape, b.world));
+            if beside.is_some() && beside != self.beside_drawn {
+                log::info!("viewer: the world beside the screen drawn: {:?} (scene {})", beside, scene.seq);
+            }
+            self.beside_drawn = beside;
         }
         // (For measuring how long a game takes to show its map.)
         if !self.map_drawn && matches && scene.shape.cols > 0 && scene.views.iter().any(|v| !v.view.interface_only) {
@@ -1387,6 +1404,9 @@ impl App {
             self.fps.counter.presented(seconds);
         }
         self.frames_presented += 1;
+        if let Some(line) = self.frame_log.as_mut().and_then(|l| l.presented(seconds, started.elapsed().as_secs_f64() * 1000.0)) {
+            log::info!("viewer: {line}");
+        }
         self.presented = true;
         if let (Some(since), true) = (since, log_latency()) {
             self.latency.start.push(started.saturating_duration_since(since).as_secs_f64() * 1000.0);
