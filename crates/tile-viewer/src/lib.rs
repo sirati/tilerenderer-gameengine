@@ -8,6 +8,7 @@ pub mod cursor;
 pub mod fps;
 mod input;
 pub mod layout;
+pub mod looks;
 pub mod scaling;
 pub mod profile;
 pub mod snap;
@@ -294,7 +295,50 @@ pub fn scene_cells_changed(compiled: &Compiled, scene: &Scene, world: &mut TileW
 pub fn scene_free_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[Option<u32>], overlay_cameras: &[(usize, Vec<u32>)]) -> Vec<tile_render::PlacedSprite> {
     // The camera showing scene view `id`, if one does.
     let camera_of = |id: u32| scene.views.iter().zip(view_cameras).find(|(v, _)| v.id == id).and_then(|(_, c)| *c);
-    let placed = |s: &scene::FreeSprite, view: Option<u32>| tile_render::PlacedSprite {
+    let mut free: Vec<_> = scene.sprites.iter().map(|s| placed_sprite(compiled, s, None, s.not_in_view.and_then(camera_of))).collect();
+    for (i, (v, camera)) in scene.views.iter().zip(view_cameras).enumerate() {
+        match overlay_cameras.iter().find(|(view, _)| *view == i) {
+            Some((_, cameras)) => free.extend(v.overlay.iter().zip(cameras).map(|(s, c)| placed_sprite(compiled, s, Some(*c), None))),
+            None => {
+                if let Some(c) = camera {
+                    free.extend(v.overlay.iter().map(|s| placed_sprite(compiled, s, Some(*c), None)));
+                }
+            }
+        }
+    }
+    free
+}
+
+/// Where [`scene_world_for`] puts each drawn view's overlay among the
+/// world's free sprites: (view id, first index, how many, camera).
+pub fn overlay_spans(scene: &Scene, view_cameras: &[Option<u32>]) -> Vec<looks::Span> {
+    overlay_spans_arranged(scene, view_cameras, &[])
+}
+
+/// [`overlay_spans`] with each scaled panel's sprite cameras retained.
+pub fn overlay_spans_arranged(scene: &Scene, view_cameras: &[Option<u32>], overlay_cameras: &[(usize, Vec<u32>)]) -> Vec<looks::Span> {
+    let mut at = scene.sprites.len();
+    let mut out = Vec::new();
+    for (i, (v, camera)) in scene.views.iter().zip(view_cameras).enumerate() {
+        let cameras = match overlay_cameras.iter().find(|(view, _)| *view == i) {
+            Some((_, cameras)) => cameras.iter().copied().take(v.overlay.len()).collect(),
+            None => match camera {
+                Some(c) => vec![*c; v.overlay.len()],
+                None => continue,
+            },
+        };
+        let len = cameras.len();
+        out.push(looks::Span { view: v.id, start: at, len, cameras });
+        at += len;
+    }
+    out
+}
+
+/// A scene's sprite as the renderer places it: in every view, or only in
+/// the one drawn by camera `view` (an overlay's); `not_in`: drawn in every
+/// view but the one of that camera.
+pub fn placed_sprite(compiled: &Compiled, s: &scene::FreeSprite, view: Option<u32>, not_in: Option<u32>) -> tile_render::PlacedSprite {
+    tile_render::PlacedSprite {
         set: tile_render::SpriteSetId::from_raw(s.set),
         x: s.x,
         y: s.y,
@@ -304,8 +348,8 @@ pub fn scene_free_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[O
         ticks_per_frame: s.ticks_per_frame.max(1),
         blend: tile_render::Blend::from_scale_den(s.scale_den, s.tint),
         clip: s.clip,
-        view: view.or_else(|| s.not_in_view.and_then(camera_of)),
-        except_view: view.is_none() && s.not_in_view.and_then(camera_of).is_some(),
+        view: view.or(not_in),
+        except_view: view.is_none() && not_in.is_some(),
         zoom_art: match s.zoom_art {
             1 => tile_render::ZoomArt::Low,
             2 => tile_render::ZoomArt::Zoomed { zoom: (u32::from(s.zoom.0), u32::from(s.zoom.1)), offset: s.zoom_offset },
@@ -313,19 +357,7 @@ pub fn scene_free_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[O
         },
         text: s.glyph.and_then(|g| outline_glyph(compiled, &g, s.tint)),
         palette: s.palette,
-    };
-    let mut free: Vec<_> = scene.sprites.iter().map(|s| placed(s, None)).collect();
-    for (i, (v, camera)) in scene.views.iter().zip(view_cameras).enumerate() {
-        match overlay_cameras.iter().find(|(view, _)| *view == i) {
-            Some((_, cameras)) => free.extend(v.overlay.iter().zip(cameras).map(|(s, c)| placed(s, Some(*c)))),
-            None => {
-                if let Some(c) = camera {
-                    free.extend(v.overlay.iter().map(|s| placed(s, Some(*c))));
-                }
-            }
-        }
     }
-    free
 }
 
 /// A scene's glyph (in `tint`, 0xRRGGBB) as the renderer draws it from its
@@ -667,6 +699,11 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         profile: profile::env_on("TILE_VIEWER_PROFILE").then(|| profile::Profile::new("viewer", Duration::from_secs(5))),
         received_seq: 0,
         constraints: constraints::Constraints::default(),
+        feedback: looks::Feedback::from_env(),
+        drawn_looks: Vec::new(),
+        base_free: Vec::new(),
+        spans: Vec::new(),
+        look_scene: looks::LookScene::default(),
     };
     // The arrangement to start with: the user's settings.
     app.set_settings(load_settings());
@@ -838,6 +875,16 @@ struct App {
     received_seq: u64,
     /// The system's pointer constraints (Wayland).
     constraints: constraints::Constraints,
+    /// The interaction looks drawn here (hover, pressed, selected), and
+    /// those the last frame drew.
+    feedback: looks::Feedback,
+    drawn_looks: Vec<(u64, scene::LookState)>,
+    /// The world's free sprites as built (no looks drawn), where the
+    /// views' overlays lie among them, and the interactables and looks of
+    /// the scene it was built from.
+    base_free: Vec<tile_render::PlacedSprite>,
+    spans: Vec<looks::Span>,
+    look_scene: looks::LookScene,
 }
 
 /// Adds the time since `t` to span `name` of the profile, if one is kept,
@@ -1241,6 +1288,18 @@ impl App {
         );
     }
 
+    /// Input for the driver: also what the interaction looks follow (a
+    /// frame is drawn at once when they may change).
+    fn send(&mut self, input: Input) {
+        let now = self.now();
+        if self.feedback.sent(&input, &self.look_scene, now) {
+            if let Some(gpu) = &self.gpu {
+                gpu.window.request_redraw();
+            }
+        }
+        self.display.send_input(input);
+    }
+
     /// Seconds since the viewer started (the snapping pointer's clock).
     fn now(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
@@ -1351,10 +1410,17 @@ impl App {
             let (x, y) = self.plan.map_or(p, |plan| plan.to_window(p));
             if self.constraints.move_pointer(&gpu.window, (x, y)) {
                 log::debug!("viewer: moving the pointer to {x}, {y} (lock and hint)");
-            } else if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
-                log::debug!("viewer: moving the pointer to {x}, {y}: {e}");
-                // (The divider cannot hold back what it cannot move.)
-                self.layout.pointer_cannot_be_moved();
+                // Input follows it after the compositor activates the lock.
+            } else {
+                match gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
+                    Ok(()) => self.pointer_placed((x, y)),
+                    Err(e) => {
+                        log::debug!("viewer: moving the pointer to {x}, {y}: {e}");
+                        // (The divider cannot hold back what it cannot move.)
+                        self.layout.pointer_cannot_be_moved();
+                        self.pointer_placement_failed();
+                    }
+                }
             }
         }
         if grab == Some(false) {
@@ -1398,7 +1464,35 @@ impl App {
         }
         self.update_system_pointer(event_loop);
         if let Some(gpu) = &self.gpu {
-            self.constraints.update(&gpu.window, &mut self.layout, self.plan.map(|p| p.present), self.pointer_inside);
+            match self.constraints.update(&gpu.window, &mut self.layout, self.plan.map(|p| p.present), self.pointer_inside) {
+                Some(constraints::Placement::Hinted(at)) => self.pointer_placed(at),
+                Some(constraints::Placement::Cancelled) => self.pointer_placement_failed(),
+                None => {}
+            }
+        }
+    }
+
+    fn pointer_placed(&mut self, (x, y): (i32, i32)) {
+        // A Wayland hint can move the pointer without CursorMoved. Clicks
+        // and wheels must use its new position once the lock is released.
+        let at = (x as f64, y as f64);
+        self.system_pointer = self.input.place_pointer(at);
+        self.constraints.pointer_moved(at);
+        self.reconcile_system_pointer();
+    }
+
+    fn pointer_placement_failed(&mut self) {
+        // Use the latest physical motion, including any received while the
+        // move was pending. Do not replace a captured or snapping pointer.
+        self.system_pointer = self.input.pointer();
+        self.reconcile_system_pointer();
+    }
+
+    fn reconcile_system_pointer(&mut self) {
+        if self.pointer_inside && self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus()) && !self.layout.captured() && !self.snap.snap_mode_active() {
+            for input in self.layout.system_pointer_placed(self.system_pointer) {
+                self.send(input);
+            }
         }
     }
 
@@ -1923,10 +2017,9 @@ impl App {
             log::debug!("viewer: own views now show {views:?}");
             self.display.send_input(Input::Views(views));
         }
-        // The world made anew (new art, a new world) or only what changed
-        // of it: cells, free sprites (also when the views drawing the
-        // scene's overlays move).
-        let views_moved = (arranged.view_cameras != self.drawn_views || self.drawn_overlay != self.built_overlay) && matches;
+        // Cells and free sprites have independent update paths. Local
+        // interaction looks replace only the free sprites they affect.
+        let views_moved = arranged.view_cameras != self.drawn_views || self.drawn_overlay != self.built_overlay;
         let full = new_assets || changes.world || self.world.is_none();
         let cells_changed = !full && !changes.cells.is_empty();
         let free_changed = !full && (changes.sprites || changes.views || views_moved);
@@ -1938,22 +2031,33 @@ impl App {
                 }
                 if free_changed {
                     world.free = scene_free_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay);
-                    self.built_overlay = self.drawn_overlay.clone();
                     mark(&mut self.profile, "free sprites build", &mut t);
                 }
             }
             _ => {
                 self.world = Some(scene_world_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay));
-                self.built_overlay = self.drawn_overlay.clone();
                 mark(&mut self.profile, "world build", &mut t);
             }
         }
-        if matches {
-            self.world_assets_version = self.assets_version;
+        if full || free_changed {
+            self.base_free = self.world.as_ref().expect("built above").free.clone();
+            self.spans = overlay_spans_arranged(scene, &arranged.view_cameras, &self.drawn_overlay);
+            self.built_overlay = self.drawn_overlay.clone();
         }
+        let looks_metadata_changed = (full || scene.seq != self.drawn_seq) && self.look_scene.refresh(scene);
+        self.world_assets_version = self.assets_version;
         if let Some(p) = &mut self.profile {
             p.count("cells changed", changes.cells.len());
         }
+        let now = self.started.elapsed().as_secs_f64();
+        let replacements = self.feedback.replacements(&self.look_scene, now);
+        let looks_changed = full || free_changed || looks_metadata_changed || self.feedback.drawn() != &self.drawn_looks[..];
+        if looks_changed {
+            let compiled = &self.compiled;
+            self.world.as_mut().expect("built above").free = looks::splice(&self.base_free, &self.spans, &replacements, |s, camera| placed_sprite(compiled, s, Some(camera), None));
+        }
+        self.drawn_looks = self.feedback.drawn().to_vec();
+        drop(replacements);
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
         markers.extend(divider_sprites(&self.compiled, &arranged.divider));
@@ -1978,10 +2082,19 @@ impl App {
             // edge: the system pointer goes where the drawn cursor is and
             // shows there once this frame is out (`unlock_after_frame`).
             let w = plan.to_window(q);
-            if let Err(e) = gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(w.0, w.1)) {
-                log::debug!("viewer: moving the pointer to the world cursor: {e}");
+            match gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(w.0, w.1)) {
+                Ok(()) => {
+                    // Like pointer_placed, without borrowing the whole App
+                    // while this frame still holds the GPU mutably.
+                    let at = (w.0 as f64, w.1 as f64);
+                    self.system_pointer = self.input.place_pointer(at);
+                    self.constraints.pointer_moved(at);
+                }
+                Err(e) => {
+                    log::debug!("viewer: moving the pointer to the world cursor: {e}");
+                    self.system_pointer = q;
+                }
             }
-            self.system_pointer = q;
             self.unlock_pending = Some(Unlock::Edge);
             self.presented = false;
             log::info!("viewer: world cursor at the world's edge: the system pointer shows it at {q:?}");
@@ -2038,7 +2151,7 @@ impl App {
             if cells_changed {
                 gpu.renderer.update_cells(&gpu.device, &gpu.queue, world, &dirty);
             }
-            if free_changed {
+            if free_changed || looks_changed {
                 gpu.renderer.update_free(&gpu.device, &gpu.queue, world);
             }
         }
@@ -2072,7 +2185,7 @@ impl App {
             log::info!("viewer: first map drawn (scene {})", scene.seq);
         }
         // A software renderer draws a frame only when it differs from the last.
-        let unchanged = !full && !cells_changed && !free_changed && !markers_moved && scene.tick == self.drawn_tick && window == self.drawn_window && !gpu.reconfigured;
+        let unchanged = !full && !cells_changed && !free_changed && !looks_changed && !markers_moved && scene.tick == self.drawn_tick && window == self.drawn_window && !gpu.reconfigured;
         // The pointer's motion is drawn (or there was nothing to draw): the
         // cursor moved, or the views following it.
         let views_followed = self.drawn_frame.as_ref().map(|f| &f.cameras) != self.cursor_cameras.as_ref();
@@ -2143,6 +2256,7 @@ impl App {
         }
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
+        self.feedback.presented(self.started.elapsed().as_secs_f64());
         self.cached_picture = Some(CachedPicture { plan, copies: copies.to_vec() });
         self.record_presented(started);
         mark(&mut self.profile, "present", &mut t);
@@ -2230,7 +2344,7 @@ impl ApplicationHandler for App {
         }
         if let WindowEvent::Focused(false) = event {
             for input in self.snap.focus_lost(&mut self.layout) {
-                self.display.send_input(input);
+                self.send(input);
             }
             self.layout.released();
             self.grab(false);
@@ -2239,14 +2353,23 @@ impl ApplicationHandler for App {
         // window is no longer the one the user works in).
         if matches!(event, WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. }) {
             for input in self.layout.pointer_gone() {
-                self.display.send_input(input);
+                self.send(input);
             }
+            self.feedback.pointer_gone(self.started.elapsed().as_secs_f64());
         }
         let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
         for input in self.input.translate(&event) {
             // (Through button snapping, which passes on what is not its.)
-            for input in self.snap.route(input, &mut self.layout, self.display.scene(), now, rates) {
-                self.display.send_input(input);
+            let routed = self.snap.route(input.clone(), &mut self.layout, self.display.scene(), now, rates);
+            // The pointer moved where the driver does not get it, a release
+            // the driver does not get: no longer over its interactables.
+            match input {
+                Input::MouseMove { .. } if !self.layout.captured() && !routed.iter().any(|i| matches!(i, Input::MouseMove { .. })) => self.feedback.pointer_gone(now),
+                Input::MouseButton { button: scene::Button::Left, down: false, .. } if !routed.iter().any(|i| matches!(i, Input::MouseButton { button: scene::Button::Left, down: false, .. })) => self.feedback.released(now),
+                _ => {}
+            }
+            for input in routed {
+                self.send(input);
             }
         }
         // (After a redraw too: what the pointer is over may have changed.)
@@ -2275,7 +2398,7 @@ impl ApplicationHandler for App {
             let delta = (delta.0 / s, delta.1 / s);
             let inputs = self.snap.motion(delta).unwrap_or_else(|| if edge { vec![] } else { self.layout.motion(delta) });
             for input in inputs {
-                self.display.send_input(input);
+                self.send(input);
             }
             if self.pointer_hidden() {
                 self.pointer_moved();
@@ -2316,7 +2439,7 @@ impl ApplicationHandler for App {
         }
         let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
         for input in self.snap.tick(&mut self.layout, self.display.scene(), now, rates) {
-            self.display.send_input(input);
+            self.send(input);
         }
         // (Snapping may have put the pointer somewhere, or let go of it.)
         self.apply_layout_requests(event_loop);

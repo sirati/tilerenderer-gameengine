@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Beside, Button, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, Patch, SystemCursor, Update, View, WorldShape};
+use crate::{Beside, Button, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SystemCursor, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 29;
+pub const VERSION: u32 = 31;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -141,9 +141,29 @@ impl Writer {
             self.u32(f.palette);
         }
     }
+
+    fn look_state(&mut self, s: LookState) {
+        let pointer = match s.pointer {
+            PointerState::Normal => 0,
+            PointerState::Hover => 1,
+            PointerState::Pressed => 2,
+        };
+        self.u8(pointer | u8::from(s.selected) << 2);
+    }
 }
 
 impl Reader<'_> {
+    fn look_state(&mut self) -> Result<LookState, WireError> {
+        let b = self.u8()?;
+        let pointer = match b & 3 {
+            0 => PointerState::Normal,
+            1 => PointerState::Hover,
+            2 => PointerState::Pressed,
+            _ => return Err(WireError::Tag(b)),
+        };
+        Ok(LookState { pointer, selected: b & 4 != 0 })
+    }
+
     fn glyph(&mut self) -> Result<Option<Glyph>, WireError> {
         if !self.bool()? {
             return Ok(None);
@@ -405,6 +425,34 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u32(*width);
                 w.u32(*height);
             }
+            Update::Looks(looks) => {
+                w.u8(17);
+                w.u32(looks.len() as u32);
+                for l in looks {
+                    w.u32(l.id as u32);
+                    w.u32((l.id >> 32) as u32);
+                    let (tag, group) = match l.select {
+                        Select::None => (0, 0),
+                        Select::Toggle => (1, 0),
+                        Select::Pick { group } => (2, group),
+                    };
+                    w.u8(tag);
+                    w.u32(group as u32);
+                    w.u32((group >> 32) as u32);
+                    w.look_state(l.shown);
+                    w.u32(l.views.len() as u32);
+                    for v in &l.views {
+                        w.u32(v.view);
+                        w.u32(v.sprites.0);
+                        w.u32(v.sprites.1);
+                        w.u32(v.states.len() as u32);
+                        for (state, sprites) in &v.states {
+                            w.look_state(*state);
+                            w.sprites(sprites);
+                        }
+                    }
+                }
+            }
         }
     }
     w.0
@@ -565,6 +613,33 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 })
             }
             16 => Update::ScreenSize((r.u32()?, r.u32()?)),
+            17 => {
+                let n = r.len(22)?;
+                let mut looks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let id = r.u32()? as u64 | (r.u32()? as u64) << 32;
+                    let tag = r.u8()?;
+                    let group = r.u32()? as u64 | (r.u32()? as u64) << 32;
+                    let select = match tag {
+                        0 => Select::None,
+                        1 => Select::Toggle,
+                        2 => Select::Pick { group },
+                        t => return Err(WireError::Tag(t)),
+                    };
+                    let shown = r.look_state()?;
+                    let m = r.len(16)?;
+                    let mut views = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        let view = r.u32()?;
+                        let sprites = (r.u32()?, r.u32()?);
+                        let k = r.len(5)?;
+                        let states = (0..k).map(|_| Ok((r.look_state()?, r.sprites()?))).collect::<Result<_, WireError>>()?;
+                        views.push(ViewLooks { view, sprites, states });
+                    }
+                    looks.push(Looks { id, select, shown, views });
+                }
+                Update::Looks(looks)
+            }
             t => return Err(WireError::Tag(t)),
         });
     }
@@ -821,6 +896,18 @@ mod tests {
             Interactable { rect: [5, 60, 190, 20], kind: InteractableKind::ListItem, id: 8 },
         ];
         s.screen_size = (1920, 1080);
+        let hover = LookState { pointer: PointerState::Hover, selected: false };
+        let picked = LookState { pointer: PointerState::Pressed, selected: true };
+        s.looks = vec![
+            Looks {
+                id: 0x1_0000_0002,
+                select: Select::None,
+                shown: LookState::default(),
+                views: vec![ViewLooks { view: 2, sprites: (0, 1), states: vec![(hover, vec![FreeSprite { set: 9, x: 10, y: 20, screen: true, ..Default::default() }]), (picked, vec![])] }],
+            },
+            Looks { id: 8, select: Select::Pick { group: 0x7_0000_0000 }, shown: picked, views: vec![] },
+            Looks { id: 9, select: Select::Toggle, shown: hover, views: vec![ViewLooks { view: 0, sprites: (3, 3), states: vec![] }] },
+        ];
         let mut updates = s.updates_since(&Scene::default());
         assert!(updates.iter().any(|u| matches!(u, Update::Settings(_))));
         updates.push(Update::Cells(vec![(1, 0, 9)]));
@@ -875,4 +962,22 @@ mod tests {
         assert_eq!(decode_updates(&[VERSION as u8, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[0xFE, 0, 0, 0]), Err(WireError::Version(0xFE)));
     }
+
+    #[test]
+    fn minimal_control_looks_roundtrip() {
+        let hidden = Looks { id: 1, ..Default::default() };
+        let empty_state = Looks {
+            id: 2,
+            views: vec![ViewLooks {
+                states: vec![(LookState::default(), Vec::new())],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for look in [hidden, empty_state] {
+            let updates = vec![Update::Looks(vec![look])];
+            assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
+        }
+    }
+
 }

@@ -995,11 +995,68 @@ impl Panels {
     /// Draws `panel` placed in `area` (x, y, w, h), measuring text with
     /// `measure` (see [`estimate`]).
     pub fn draw(&self, panel: &Panel, state: &PanelState, area: [i32; 4], measure: &dyn Fn(&TextStyle, &str) -> TextMetrics) -> Vec<Draw> {
+        let mut out = Vec::new();
+        for (n, item) in panel.items.iter().enumerate().filter(|(_, i)| Self::visible(i, state)) {
+            out.extend(self.draw_item(panel, state, area, measure, n, item));
+        }
+        out
+    }
+
+    /// The panel's controls as things to point at, with their draws as
+    /// they are and in their other states: under the pointer or not,
+    /// selected or not (a choice's option chosen, a check box on), for a
+    /// renderer to draw those itself at once (`scene::Looks`). Ids are
+    /// stable per panel and item, clear of a game's object addresses.
+    pub fn looks(&self, panel: &Panel, state: &PanelState, area: [i32; 4], measure: &dyn Fn(&TextStyle, &str) -> TextMetrics) -> Vec<ControlLooks> {
+        use scene::{LookState, PointerState};
+        let origin = self.origin(panel, area);
+        let mut out = Vec::new();
+        for (n, item) in panel.items.iter().enumerate().rev() {
+            let usable = item.control().is_some() && Self::visible(item, state) && Self::enabled(item, state);
+            let Some(rect) = self.rect(item, state, origin).filter(|_| usable) else { continue };
+            let (select, selected) = match &item.kind {
+                Kind::Choice { control, value } => (scene::Select::Pick { group: id_hash(&panel.name, control) }, state.values.get(control).is_some_and(|v| v.matches(value))),
+                Kind::Checkbox { control } => (scene::Select::Toggle, state.values.get(control).is_some_and(Value::truthy)),
+                _ => (scene::Select::None, false),
+            };
+            // The item drawn with the pointer over it or not, selected or not.
+            let draws_in = |look: LookState| {
+                let mut s = state.clone();
+                s.hover = (look.pointer != PointerState::Normal).then_some(n);
+                s.pressed = (look.pointer == PointerState::Pressed).then_some(n);
+                match &item.kind {
+                    Kind::Choice { control, value } => {
+                        let other = if look.selected { value.clone() } else { format!("{value}\u{0}") };
+                        s.values.insert(control.clone(), Value::Text(other));
+                    }
+                    Kind::Checkbox { control } => {
+                        s.values.insert(control.clone(), Value::On(look.selected));
+                    }
+                    _ => {}
+                }
+                self.draw_item(panel, &s, area, measure, n, item)
+            };
+            let shown = LookState { pointer: if state.hover == Some(n) { PointerState::Hover } else { PointerState::Normal }, selected };
+            let selections: &[bool] = if select == scene::Select::None { &[false] } else { &[false, true] };
+            let states = selections
+                .iter()
+                .flat_map(|&selected| [PointerState::Normal, PointerState::Hover].map(|pointer| LookState { pointer, selected }))
+                .filter(|&l| l != shown)
+                .map(|l| (l, draws_in(l)))
+                .collect();
+            let draws = self.draw_item(panel, state, area, measure, n, item);
+            out.push(ControlLooks { id: id_hash(&panel.name, &n.to_string()), rect, select, shown, draws, states });
+        }
+        out
+    }
+
+    /// The draws of item `n` of `panel`.
+    fn draw_item(&self, panel: &Panel, state: &PanelState, area: [i32; 4], measure: &dyn Fn(&TextStyle, &str) -> TextMetrics, n: usize, item: &Item) -> Vec<Draw> {
         let (ox, oy) = self.origin(panel, area);
         let clip = [ox, oy, ox + panel.size.0 as i32, oy + panel.size.1 as i32];
         let mut out = Vec::new();
         let mut d = Drawer { panels: self, state, clip, measure, out: &mut out };
-        for (n, item) in panel.items.iter().enumerate().filter(|(_, i)| Self::visible(i, state)) {
+        {
             let enabled = Self::enabled(item, state);
             let hover = enabled && state.hover == Some(n);
             let (x, y) = (ox + item.at.0, oy + item.at.1);
@@ -1100,6 +1157,39 @@ impl Panels {
         }
         out
     }
+}
+
+/// A panel's control: where it is (window pixels x, y, w, h), its id as
+/// something to point at, and how it is drawn now and in its other states
+/// (see [`Panels::looks`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControlLooks {
+    pub id: u64,
+    pub rect: [i32; 4],
+    pub select: scene::Select,
+    pub shown: scene::LookState,
+    pub draws: Vec<Draw>,
+    pub states: Vec<(scene::LookState, Vec<Draw>)>,
+}
+
+impl ControlLooks {
+    /// The group a click picks it in (0: none).
+    pub fn select_group(&self) -> u64 {
+        match self.select {
+            scene::Select::Pick { group } => group,
+            _ => 0,
+        }
+    }
+}
+
+/// A stable id for `key` of panel `panel` (FNV-1a, the top two bits set:
+/// clear of a game's object addresses and of the menus' ids).
+fn id_hash(panel: &str, key: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in panel.bytes().chain([0]).chain(key.bytes()) {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h | 3 << 62
 }
 
 /// How a text is shown: greyed out, selected, under the pointer.
@@ -1445,6 +1535,33 @@ mod tests {
         assert!(down.consumed && up.consumed && up.events.is_empty());
         // Keys are never the panel's.
         assert!(!panels.input(p, &mut s, AREA, &Input::Key { vk: 13, down: true, text: None }).consumed);
+    }
+
+    #[test]
+    fn controls_come_with_their_looks_in_other_states() {
+        use scene::{LookState, PointerState, Select};
+        let panels = Panels::parse(PANELS).unwrap();
+        let p = panels.panel("p").unwrap();
+        let measure = |s: &TextStyle, t: &str| estimate(s, t);
+        let mut s = state("one");
+        s.hover = Some(1);
+        let looks = panels.looks(p, &s, AREA, &measure);
+        // The two tabs only (the rest is hidden), topmost first.
+        assert_eq!(looks.iter().map(|l| l.rect).collect::<Vec<_>>(), [[260, 100, 50, 20], [200, 100, 50, 20]]);
+        let (one, two) = (&looks[1], &looks[0]);
+        assert_eq!(one.select, Select::Pick { group: two.select_group() });
+        assert_eq!(one.shown, LookState { pointer: PointerState::Normal, selected: true });
+        assert_eq!(two.shown, LookState { pointer: PointerState::Hover, selected: false });
+        assert_eq!(one.draws, panels.draw_item(p, &s, AREA, &measure, 0, &p.items[0]));
+        // Tab two chosen: what it draws when the tab is two.
+        let mut chosen = s.clone();
+        chosen.values.insert("tab".into(), Value::Text("two".into()));
+        let selected = two.states.iter().find(|(l, _)| *l == LookState { pointer: PointerState::Hover, selected: true }).unwrap();
+        assert_eq!(selected.1, panels.draw_item(p, &chosen, AREA, &measure, 1, &p.items[1]));
+        assert_ne!(selected.1, two.draws);
+        assert_eq!(two.states.len(), 3);
+        // Ids stay with the item.
+        assert_eq!(panels.looks(p, &state("one"), AREA, &measure)[0].id, two.id);
     }
 
     #[test]

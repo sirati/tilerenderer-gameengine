@@ -185,6 +185,11 @@ pub struct Scene {
     /// (0, 0): unknown, the renderer's window). A renderer whose window is
     /// larger may show it scaled up (see [`Input::Resized`]).
     pub screen_size: (u32, u32),
+    /// How some of them look in their other states (hover, pressed,
+    /// selected), for a renderer to show those itself the moment the
+    /// pointer asks for them, rather than wait for the driver's interface to
+    /// draw them.
+    pub looks: Vec<Looks>,
 }
 
 /// A mouse pointer.
@@ -346,6 +351,77 @@ pub enum InteractableKind {
     List { scroll: [i32; 4], step: i32 },
 }
 
+/// The state an interactable is drawn in: where the pointer is and whether
+/// it is selected.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LookState {
+    pub pointer: PointerState,
+    /// Selected (a list's entry, a tab) or checked (a check box).
+    pub selected: bool,
+}
+
+/// What the pointer does to an interactable.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PointerState {
+    /// Elsewhere.
+    #[default]
+    Normal,
+    /// Over it, no button down.
+    Hover,
+    /// The left button went down on it and the pointer is still over it.
+    Pressed,
+}
+
+/// What a click (left button down and up on it) does to an interactable's
+/// selection.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Select {
+    /// Nothing (a button).
+    #[default]
+    None,
+    /// Flips it (a check box).
+    Toggle,
+    /// Selects it, and unselects the others of its group (a list's
+    /// entries, tabs).
+    Pick { group: u64 },
+}
+
+/// How the interactable [`Interactable::id`] `id` looks in the states a
+/// renderer may draw it in itself: when the pointer moves onto it, presses
+/// it, leaves it, or a click selects it, the renderer draws that state's
+/// sprites in place of what the driver's interface draws for it, until the
+/// driver shows the same (then the sprites drawn are the driver's own
+/// again, and look the same). A state the driver shows that is none of
+/// these (e.g. disabled) comes without looks: the driver's drawing stays.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Looks {
+    pub id: u64,
+    pub select: Select,
+    /// The state the driver's interface shows it in now.
+    pub shown: LookState,
+    /// Per view drawing it (e.g. a copy of it in another view).
+    pub views: Vec<ViewLooks>,
+}
+
+/// An interactable's looks in one view.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViewLooks {
+    pub view: u32,
+    /// The sprites of the view's overlay drawing it now (start, end): what
+    /// another state's sprites replace.
+    pub sprites: (u32, u32),
+    /// Its sprites in each state there is art for (overlay sprites of that
+    /// view: screen space).
+    pub states: Vec<(LookState, Vec<FreeSprite>)>,
+}
+
+impl ViewLooks {
+    /// Its sprites in `state`, if there is art for it.
+    pub fn state(&self, state: LookState) -> Option<&[FreeSprite]> {
+        self.states.iter().find(|(s, _)| *s == state).map(|(_, v)| &v[..])
+    }
+}
+
 /// The pixels of one atlas sprite (row-major RGBA, its exact size).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Patch {
@@ -394,6 +470,8 @@ pub enum Update {
     Cursor(Cursor),
     /// See [`Scene::screen_size`].
     ScreenSize((u32, u32)),
+    /// See [`Scene::looks`] (replaced).
+    Looks(Vec<Looks>),
 }
 
 impl Scene {
@@ -508,6 +586,7 @@ impl Scene {
             Update::Interactables(i) => self.interactables = i,
             Update::Cursor(c) => self.cursor = c,
             Update::ScreenSize(s) => self.screen_size = s,
+            Update::Looks(l) => self.looks = l,
         }
     }
 
@@ -595,6 +674,9 @@ impl Scene {
         }
         if self.screen_size != old.screen_size {
             out.push(Update::ScreenSize(self.screen_size));
+        }
+        if self.looks != old.looks {
+            out.push(Update::Looks(self.looks.clone()));
         }
         out
     }
