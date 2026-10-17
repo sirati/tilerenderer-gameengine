@@ -1425,12 +1425,11 @@ impl Layout {
                 self.cursor = d;
             }
         }
-        // The main pane following the driver at zoom 1 shows the driver's
-        // window pixels where it is (its middle there).
-        let main_driver = match (self.main, self.main_view.zoom == ONE) {
-            (Some(m), true) => Some((m.x + main_rect[0] - m.origin.0 + main_rect[2] / 2, m.y + main_rect[1] - m.origin.1 + main_rect[3] / 2)),
-            _ => driver,
-        };
+        // The main pane following the driver shows the middle of the
+        // driver's view in its own middle (a split or a zoom strip crops it
+        // round its middle): what the driver centres on (the active unit,
+        // a popup's subject, a place looked at) is in the middle of A.
+        let main_driver = driver;
         let (cursor, focus) = (self.cursor, scene.focus);
         let has_world = scene.shape.cols > 0 && scene.shape.rows > 0;
         self.world_frames = if has_world { self.world_frames.saturating_add(1) } else { 0 };
@@ -2764,7 +2763,7 @@ mod tests {
             Input::WorldButton { button: Button::Right, down: false, x: wx, y: wy }
         ]);
         // On the main pane, buttons still go to the driver's window.
-        assert_eq!(click(&mut l, (100, 100))[0], Input::MouseButton { button: Button::Left, down: true, x: 100, y: 100 });
+        assert_eq!(click(&mut l, (100, 100))[0], Input::MouseButton { button: Button::Left, down: true, x: 300, y: 100 });
     }
 
     #[test]
@@ -2996,7 +2995,7 @@ mod tests {
         ctrl_shift(&mut l, 0x20);
         assert!(!l.locked);
         assert_eq!(l.take_grab(), None);
-        assert_eq!(click(&mut l, (100, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 100, y: 300 });
+        assert_eq!(click(&mut l, (100, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 300, y: 300 });
         // Over the pane following it: taken; again: released.
         l.route(Input::MouseMove { x: 600, y: 300 });
         ctrl_shift(&mut l, 0x20);
@@ -3076,7 +3075,7 @@ mod tests {
         assert_eq!(l.take_main_view_change(), None);
         // A split: A's half (the driver's view is at 1000, 500, 800x600).
         let mut l = arranged(&settings(|s| s.split = S::Vertical1To1));
-        assert_eq!(l.take_main_view_change(), Some((1000, 500, 400, 600)));
+        assert_eq!(l.take_main_view_change(), Some((1200, 500, 400, 600)));
         assert_eq!(l.take_main_view_change(), None);
         // Zoomed in 2/1 in one view: half as much each way, about its middle.
         let mut l = arranged(&Settings::default());
@@ -3111,8 +3110,9 @@ mod tests {
             if let Some(b) = b {
                 assert_eq!(rect(&camera_at(&f, (b[0], b[1]))), b, "{split:?}");
             }
-            // A shows the driver's view unmoved (its window pixels, cropped).
-            assert_eq!((f.cameras[0].x, f.cameras[0].y), (1000, 500), "{split:?}");
+            // A shows the middle of the driver's view in its middle (the
+            // driver's view, 800x600 at 1000, 500, cropped round it).
+            assert_eq!((f.cameras[0].x, f.cameras[0].y), (1400 - a[2] / 2, 800 - a[3] / 2), "{split:?}");
         }
     }
 
@@ -3279,7 +3279,7 @@ mod tests {
         assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, [0, 0, 800, 150]);
         assert_eq!(rect(&f.cameras[0]), [0, 154, 800, 446]);
         // The driver's view is cropped, not moved: its window pixels stay.
-        assert_eq!((f.cameras[0].x, f.cameras[0].y), (1000, 654));
+        assert_eq!((f.cameras[0].x, f.cameras[0].y), (1000, 577));
         assert!(l.main_unmoved());
         // In a vertical split over one column, the other keeps its height.
         let left = settings(|s| (s.split, s.zoom, s.zoom_place, s.zoom_strip) = (S::Vertical1To1, Zoom::TopStrip, Place::LeftOrBottom, 0.5));
@@ -3326,7 +3326,7 @@ mod tests {
         assert_eq!(fit, Some(Fit { hit: Hit::Pane, origin: (404, 0), zoom: (99, 200) }));
         assert_eq!((f.cameras[0].origin, f.cameras[0].zoom), ((404, 0), (99, 200)));
         let a = camera_at(&f, (0, 0));
-        assert_eq!((rect(&a), a.x, a.y), ([0, 0, 400, 600], 1000, 500));
+        assert_eq!((rect(&a), a.x, a.y), ([0, 0, 400, 600], 1200, 500));
         // Floating, unnamed and unknown screens: over the window.
         assert_eq!(fitted(&s, "Help").0, None);
         assert_eq!(fitted(&s, "F7").0, None);
@@ -3350,7 +3350,7 @@ mod tests {
         // B's pixel (404 + 99, 100) is the driver's (200, 202).
         assert_eq!(click(&mut l, (503, 100))[0], Input::MouseButton { button: Button::Left, down: true, x: 200, y: 202 });
         // A is a view of the viewer's own now: the driver marks it.
-        assert_eq!(l.take_views_change().unwrap()[0], (1000, 500, 400, 600));
+        assert_eq!(l.take_views_change().unwrap()[0], (1200, 500, 400, 600));
         // No divider scrolling into the fitted screen; A is the viewer's.
         assert!(!l.main_unmoved());
     }
@@ -3371,7 +3371,7 @@ mod tests {
         // A's picture goes on two pixels into the gap, B's from the other
         // side, the same world pixels as next to them.
         let b = camera_at(&f, (404, 0));
-        assert_eq!(fillers, [((400, 200), (2, 200), (1400, 700)), ((402, 200), (2, 200), (b.x - 2, b.y + 200))]);
+        assert_eq!(fillers, [((400, 200), (2, 200), (1600, 700)), ((402, 200), (2, 200), (b.x - 2, b.y + 200))]);
         // Horizontal: the same across.
         let mut h = arranged(&settings(|s| s.split = S::Horizontal1To1));
         assert_eq!(h.open_spans(), [(266, 534)]);
@@ -3388,12 +3388,12 @@ mod tests {
         // system pointer moved back, and the driver's view (shown unmoved)
         // scrolls as at its right edge.
         let out = mv(&mut l, (600, 100));
-        assert_eq!(out, [Input::MouseMove { x: 399, y: 100 }, Input::Edge { x: 1, y: 0 }]);
+        assert_eq!(out, [Input::MouseMove { x: 599, y: 100 }, Input::Edge { x: 1, y: 0 }]);
         assert_eq!(l.take_warp(), Some((399, 100)));
         assert_eq!((l.side, l.against), (Some(Side::A), Some(Side::A)));
         // The window moving the pointer back reports it there: it still
         // rests against the wall (no new edge).
-        assert_eq!(mv(&mut l, (399, 100)), [Input::MouseMove { x: 399, y: 100 }]);
+        assert_eq!(mv(&mut l, (399, 100)), [Input::MouseMove { x: 599, y: 100 }]);
         assert_eq!(l.against, Some(Side::A));
         // Clicks go where it was held.
         l.route(Input::MouseMove { x: 650, y: 120 });
@@ -3401,12 +3401,12 @@ mod tests {
         assert_eq!(l.route(Input::MouseButton { button: Button::Left, down: true, x: 650, y: 120 }), [Input::MouseButton {
             button: Button::Left,
             down: true,
-            x: 399,
+            x: 599,
             y: 120
         }]);
         l.route(Input::MouseButton { button: Button::Left, down: false, x: 650, y: 120 });
         // Away from it: no more scrolling.
-        assert_eq!(mv(&mut l, (300, 100)), [Input::MouseMove { x: 300, y: 100 }, Input::Edge { x: 0, y: 0 }]);
+        assert_eq!(mv(&mut l, (300, 100)), [Input::MouseMove { x: 500, y: 100 }, Input::Edge { x: 0, y: 0 }]);
         assert_eq!(l.against, None);
         // Through the open middle third: freely into B, neither view moves.
         mv(&mut l, (300, 300));
@@ -3503,7 +3503,7 @@ mod tests {
         assert_eq!((l.pointer, l.side, l.against), ((600, 100), Some(Side::B), None));
         mv(&mut l, (100, 100));
         assert_eq!((l.pointer, l.side, l.take_warp()), ((100, 100), Some(Side::A), None));
-        assert_eq!(click(&mut l, (100, 100))[0], Input::MouseButton { button: Button::Left, down: true, x: 100, y: 100 });
+        assert_eq!(click(&mut l, (100, 100))[0], Input::MouseButton { button: Button::Left, down: true, x: 300, y: 100 });
     }
 
     #[test]
@@ -3962,7 +3962,7 @@ mod tests {
         // pixels, the driver's labels with it; the edge still scrolls it.
         l.advance(std::time::Duration::from_millis(16));
         let f = l.frame(&at(1064), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert!(f.cameras[0].x > 1000 && f.cameras[0].x < 1064, "{}", f.cameras[0].x);
+        assert!(f.cameras[0].x > 1200 && f.cameras[0].x < 1264, "{}", f.cameras[0].x);
         assert_eq!(f.cameras[0].screen_shift.0, 1064 - f.cameras[0].x);
         assert!(l.main_unmoved());
         assert_eq!(mv(&mut l, (2, 300)).last(), Some(&Input::Edge { x: -3, y: 0 }));
@@ -3971,6 +3971,7 @@ mod tests {
             l.frame(&at(1064), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         }
         let f = l.frame(&at(1064), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!((f.cameras[0].x, f.cameras[0].screen_shift, f.cameras[0].cull), (1064, (0, 0), None));
+        // (A shows the driver's middle in its own: 200 pixels further on.)
+        assert_eq!((f.cameras[0].x, f.cameras[0].screen_shift, f.cameras[0].cull), (1264, (-200, 0), None));
     }
 }
