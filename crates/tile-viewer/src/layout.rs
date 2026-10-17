@@ -507,8 +507,10 @@ pub struct Layout {
     /// let it go closes; the screen likewise.
     recapture: Option<(i32, i32)>,
     recapture_screen: Option<(i32, i32)>,
-    /// The pointer goes to the screen just opened (this frame).
+    /// The pointer goes to the screen just opened (this frame), or to the
+    /// popup.
     pointer_to_screen: bool,
+    pointer_to_popup: bool,
     /// Whether button snapping is on (see [`Layout::set_snapping`]).
     snapping: bool,
     moved: Vec<([i32; 4], (i32, i32))>,
@@ -619,6 +621,7 @@ impl Default for Layout {
             recapture: None,
             recapture_screen: None,
             pointer_to_screen: false,
+            pointer_to_popup: false,
             snapping: false,
             moved: Vec::new(),
             magnifier_shown: true,
@@ -1709,6 +1712,15 @@ impl Layout {
                 }
             }
         }
+        // The pointer on the popup the mouse was let go for (where it shows:
+        // moved into A it may lie beyond the divider's wall).
+        if std::mem::take(&mut self.pointer_to_popup) {
+            if let Some(&([x, y, w, h], _)) = popup.and_then(|i| self.moved.iter().find(|(r, d)| *r == { let b = rect_of(&base[i]); [b[0] + d.0, b[1] + d.1, b[2], b[3]] })) {
+                let p = (x + w / 2, y + h / 2);
+                (self.pointer, self.raw_pointer, self.warp) = (p, p, Some(p));
+                self.side = self.side_of(p);
+            }
+        }
         // The pointer on the screen that just opened: its main control (as
         // the driver names it), else its middle, where the screen shows.
         if std::mem::take(&mut self.pointer_to_screen) {
@@ -1767,6 +1779,8 @@ impl Layout {
         if self.locked {
             self.recapture = Some(self.cursor);
             self.release_here("a popup is open");
+            // (On the popup, where it shows: below, once it is placed.)
+            self.pointer_to_popup = self.popup_anchor.is_none();
         }
     }
 
@@ -3684,6 +3698,25 @@ mod tests {
         key(&mut l, VK_CONTROL, false);
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert!(f.view_cameras[2].is_some() && f.view_cameras[3].is_none());
+    }
+
+    #[test]
+    fn a_popup_opening_while_the_mouse_is_captured_gets_the_pointer() {
+        let mut l = arranged(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse)));
+        mv(&mut l, (600, 300));
+        frame(&mut l, vec![]);
+        click(&mut l, (600, 300));
+        assert!(l.captured());
+        // A popup the game opens by itself (not at a click): moved into A,
+        // the mouse let go, the pointer on it there (beyond the divider's
+        // wall from B).
+        let _ = l.take_warp();
+        let f = l.frame(&with_parts(Some(300)), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let c = f.cameras[f.view_cameras[3].unwrap() as usize];
+        assert!(!l.captured());
+        assert_eq!(l.take_warp(), Some((c.origin.0 + 150, c.origin.1 + 75)));
+        let row = (c.origin.0 + 20, c.origin.1 + 30);
+        assert_eq!(click(&mut l, row)[0], Input::MouseButton { button: Button::Left, down: true, x: 320, y: 230 });
     }
 
     #[test]
