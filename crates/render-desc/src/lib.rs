@@ -230,6 +230,9 @@ struct Placer {
     row_base: u32,
     own: Vec<u32>,
     rows: HashMap<std::sync::Arc<Vec<u32>>, u32>,
+    /// Sprite ids whose source art could not be placed, even though their
+    /// transparent placeholders retain the normal numeric ids.
+    unavailable: BTreeSet<u32>,
 }
 
 /// Where a [`Placer`] puts sprites.
@@ -253,6 +256,7 @@ impl Placer {
             row_base: 0,
             own: tile_render::atlas::no_palettes(),
             rows: HashMap::new(),
+            unavailable: BTreeSet::new(),
         }
     }
 
@@ -272,7 +276,14 @@ impl Placer {
             row_base: rows,
             own: Vec::new(),
             rows: growing.rows.clone(),
+            unavailable: BTreeSet::new(),
         }
+    }
+
+    /// Whether this sprite's art was replaced by a placeholder, including
+    /// sprites from the earlier compilation that a growth refers to.
+    fn unavailable(&self, id: SpriteId, known: Option<&Compiled>) -> bool {
+        self.unavailable.contains(&id.0) || known.is_some_and(|compiled| compiled.unavailable.contains(&id.0))
     }
 
     /// The sprites placed (of a growth or a compile without pixels).
@@ -332,7 +343,9 @@ impl Placer {
         if w > self.page_size || h > self.page_size {
             log::warn!("sprite {name} of {w}×{h} does not fit an atlas page of {0}×{0}: left out", self.page_size);
             let blank = cut.map(|_| Cut::Rgba(RgbaImage::new(1, 1)));
-            return self.add(name, blank.as_ref(), (1, 1), anchor, scaling, [0, 0, 1, 1], 0, known);
+            let id = self.add(name, blank.as_ref(), (1, 1), anchor, scaling, [0, 0, 1, 1], 0, known)?;
+            self.unavailable.insert(id.0);
+            return Ok(id);
         }
         let id = match cut {
             None => {
@@ -646,10 +659,10 @@ pub enum BlendDesc {
 const GENERATED: [&str; 8] = ["solid:", "line:", "arrow:", "crosshair:", "panes:", "pointer:", "rects:", "glyphs:"];
 
 /// The characters of a [`glyphs`] image, one cell each, in this order.
-pub const GLYPHS: &str = " 0123456789.%fpsmki";
+pub const GLYPHS: &str = " 0123456789.%fpsmkingart";
 
 /// The rows of each of [`GLYPHS`] in 5 × 7 pixels (bit 4 the left column).
-const GLYPH_ROWS: [[u8; 7]; 19] = [
+const GLYPH_ROWS: [[u8; 7]; 24] = [
     [0; 7],
     [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
     [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
@@ -669,6 +682,11 @@ const GLYPH_ROWS: [[u8; 7]; 19] = [
     [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10001, 0b10001],
     [0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010],
     [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
+    [0b00000, 0b00000, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001],
+    [0b00000, 0b00000, 0b01111, 0b10001, 0b01111, 0b00001, 0b01110],
+    [0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
+    [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000],
+    [0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110],
 ];
 
 /// The cell of each glyph of a [`glyphs`] image at scale `n`: a 5 × 7 glyph
@@ -1472,7 +1490,7 @@ impl Description {
         self.add_sheets(loader, &mut placer, None, &mut sprites, &mut sheet_len, cache, seen.as_mut())?;
         // The palette table: row 0, the sprites' own rows, the named ones.
         let (named, palette_rows) = self.palette_rows(loader)?;
-        let Placer { target, own, texels, rows, .. } = placer;
+        let Placer { target, own, texels, rows, unavailable, .. } = placer;
         let shelves = match &target {
             Target::Atlas(a) => (a.shelves().0.clone(), a.shelves().1.clone()),
             _ => (Shelves::new(page_size), Shelves::new(page_size)),
@@ -1585,6 +1603,7 @@ impl Description {
             fonts,
             palette_rows,
             sprite_ids: sprites.into_iter().collect(),
+            unavailable,
         };
         Ok(compiled)
     }
@@ -1712,12 +1731,8 @@ impl Description {
             // Parts of a sprite compiled before.
             if let Some(of) = &sheet.sprite {
                 let err = |message: String| DescError::Sheet { sheet: sheet_name.clone(), message };
-                let base = sprites
-                    .get(of)
-                    .copied()
-                    .or_else(|| existing(of))
-                    .and_then(|id| placer.sprite(id, known))
-                    .ok_or_else(|| DescError::Unknown { kind: "sprite", name: of.clone() })?;
+                let base_id = sprites.get(of).copied().or_else(|| existing(of)).ok_or_else(|| DescError::Unknown { kind: "sprite", name: of.clone() })?;
+                let base = placer.sprite(base_id, known).ok_or_else(|| DescError::Unknown { kind: "sprite", name: of.clone() })?;
                 if sheet.scaled_origin.is_some() || sheet.outline.is_some() || sheet.sample_from == SampleFrom::Box || !sheet.image.is_empty() || sheet.all_frames {
                     return Err(err("a sheet of a sprite's parts has no image, frames, scaled origin, outline or box sampling".into()));
                 }
@@ -1739,6 +1754,7 @@ impl Description {
                     let mut desc = tile_render::atlas::sprite_at((base.page, base.atlas_x + x, base.atlas_y + y), (cw, ch), (sheet.anchor[0], sheet.anchor[1]));
                     (desc.scaling, desc.palette, desc.remap) = (scaling, base.palette, base.remap);
                     let id = placer.alias(desc);
+                    if placer.unavailable(base_id, known) { placer.unavailable.insert(id.0); }
                     if sprites.insert(name.clone(), id).is_some() {
                         return Err(err(format!("sprite {name} defined twice")));
                     }
@@ -1915,11 +1931,13 @@ pub struct Growth {
     fonts: Vec<(String, std::sync::Arc<tile_render::gpu_text::Face>)>,
     /// New named palettes and their rows.
     named: Vec<(String, u32)>,
+    /// Global sprite ids whose art was replaced by transparent placeholders.
+    unavailable: BTreeSet<u32>,
 }
 
 impl Growth {
     pub fn is_empty(&self) -> bool {
-        self.atlas.sprites.is_empty() && self.sets.is_empty() && self.fonts.is_empty() && self.named.is_empty()
+        self.atlas.sprites.is_empty() && self.sets.is_empty() && self.fonts.is_empty() && self.named.is_empty() && self.unavailable.is_empty()
     }
 }
 
@@ -2062,7 +2080,7 @@ impl Growing {
             }
         }
         let fonts = desc.load_fonts(loader, |n| compiled.font(n).is_some());
-        let Placer { target, mut own, texels, rows: colourings, .. } = placer;
+        let Placer { target, mut own, texels, rows: colourings, unavailable, .. } = placer;
         // New named palettes after the new own rows (a named palette's row
         // counts from the first, wherever it is in the table).
         let size = tile_render_shared::PALETTE_SIZE as usize;
@@ -2089,6 +2107,7 @@ impl Growing {
             layer_values,
             fonts,
             named,
+            unavailable,
         };
         // (Only now: nothing is added on error.)
         self.shelves = shelves;
@@ -2145,6 +2164,7 @@ impl Compiled {
         }
         self.fonts.extend(growth.fonts.iter().cloned());
         self.palette_rows.extend(growth.named.iter().cloned());
+        self.unavailable.extend(growth.unavailable.iter().copied());
     }
 }
 
@@ -2168,6 +2188,9 @@ pub struct Compiled {
     palette_rows: HashMap<String, u32>,
     /// Every sprite by name.
     sprite_ids: HashMap<String, SpriteId>,
+    /// Source sprites that could not fit in the atlas. Their transparent
+    /// descriptors preserve ids but must not satisfy visible-art readiness.
+    unavailable: BTreeSet<u32>,
 }
 
 impl Compiled {
@@ -2196,6 +2219,7 @@ impl Compiled {
             fonts: self.fonts.clone(),
             palette_rows: self.palette_rows.clone(),
             sprite_ids: self.sprite_ids.clone(),
+            unavailable: self.unavailable.clone(),
         }
     }
 
@@ -2207,6 +2231,23 @@ impl Compiled {
     /// Sprite `name`.
     pub fn sprite(&self, name: &str) -> Option<SpriteId> {
         self.sprite_ids.get(name).copied()
+    }
+
+    /// Whether this id has compiled art, including any zoomed-out twin.
+    /// Transparent source art is available; a transparent placeholder made
+    /// because a sprite did not fit the atlas is unavailable.
+    pub fn sprite_available(&self, id: SpriteId) -> bool {
+        let Some(sprite) = self.atlas.sprites.get(id.0 as usize) else { return false };
+        !self.unavailable.contains(&id.0) && (sprite.downscaled == 0 || !self.unavailable.contains(&(sprite.downscaled - 1)))
+    }
+
+    /// Whether a named set has at least one frame and every frame's art
+    /// was compiled. This does not mistake omitted art for a valid clear
+    /// sprite just because its numeric placeholder exists.
+    pub fn set_available(&self, name: &str) -> bool {
+        let Some((set, _)) = self.set(name) else { return false };
+        let mut frames = (0..).map_while(|i| self.sets.frame(set, i)).peekable();
+        frames.peek().is_some() && frames.all(|id| self.sprite_available(id))
     }
 
     /// The cell value that draws set `set` on layer `layer` with palette row
@@ -2434,6 +2475,11 @@ mod tests {
         assert!(glyphs("1,2,3,4:5,6,7,8:0").is_err());
         assert!(glyphs("1,2,3,4:5,6,7,8").is_err());
         assert_eq!(GLYPHS.chars().count(), GLYPH_ROWS.len());
+        assert_eq!(&GLYPHS[..19], " 0123456789.%fpsmki", "existing glyph indices must stay stable");
+        for c in "missing art".chars() {
+            let index = GLYPHS.chars().position(|glyph| glyph == c).expect("diagnostic letters must be generated without game assets");
+            if c != ' ' { assert!(GLYPH_ROWS[index].iter().any(|row| *row != 0), "missing pixels for {c}"); }
+        }
     }
 
     #[test]
@@ -2755,6 +2801,78 @@ mod tests {
         assert_eq!(tables(&small), tables(&small_full));
         assert!(small.atlas.sprites.iter().any(|s| (s.width, s.height) == (1, 1)));
         assert!(small_full.atlas.sprites.iter().all(|s| s.width <= 8 && s.height <= 8));
+    }
+
+    const UNAVAILABLE_ART: &str = r#"
+        [images.clear]
+        source = "solid:0,0,0,0:1x1"
+        [sheets.clear]
+        image = "clear"
+        cell = [1, 1]
+        grid = [1, 1]
+        [images.large]
+        source = "solid:255,10,20,255:8x2"
+        [sheets.large]
+        image = "large"
+        cell = [8, 2]
+        grid = [1, 1]
+        [sheets.part]
+        sprite = "large/0"
+        cell = [1, 1]
+        grid = [1, 1]
+        [sets.mixed]
+        frames = ["clear/0", "large/0"]
+        "#;
+
+    #[test]
+    fn oversized_art_is_unavailable_without_confusing_legitimate_transparency() {
+        let description = Description::parse(&format!("grid = {{ layout = \"orthogonal\", step = [1, 1] }}\n{UNAVAILABLE_ART}")).unwrap();
+        let mut cache = SheetCache::default();
+        let small = description.compile_cached(&Checker, 4, &mut cache).unwrap();
+        let layout = description.compile_layout(&Checker, 4).unwrap();
+        let tables = small.without_pixels();
+        for compiled in [&small, &layout, &tables] {
+            assert!(compiled.set_available("clear/0"), "legitimate transparent art is complete");
+            assert!(compiled.sprite("large/0").is_some() && compiled.set("large/0").is_some(), "omission preserves numeric lookup");
+            assert_eq!(compiled.atlas.sprites[compiled.sprite("large/0").unwrap().0 as usize].width, 1);
+            assert!(!compiled.sprite_available(compiled.sprite("large/0").unwrap()));
+            assert!(!compiled.set_available("large/0"), "an opaque source replaced with a clear pixel is missing art");
+            assert!(!compiled.set_available("part/0"), "aliases of missing art remain unavailable");
+            assert!(!compiled.set_available("mixed"), "every animation frame needs its source art");
+        }
+        let recovered = description.compile_cached(&Checker, 16, &mut cache).unwrap();
+        assert_eq!(small.sprite_names, recovered.sprite_names);
+        assert_eq!(small.sprite("large/0"), recovered.sprite("large/0"));
+        assert_eq!(small.set("mixed"), recovered.set("mixed"));
+        assert!(recovered.set_available("large/0") && recovered.set_available("part/0") && recovered.set_available("mixed"), "cache retains source art rather than the unavailable placeholder");
+        assert_eq!(sprite_pixels(&recovered, "large/0"), vec![[255, 10, 20, 255]; 16]);
+    }
+
+    #[test]
+    fn unavailable_growth_metadata_survives_apply_cloning_and_later_aliases() {
+        let base = Description::parse("grid = { layout = \"orthogonal\", step = [1, 1] }").unwrap();
+        let (mut full, mut growing) = base.compile_growing(&Checker, 4, true).unwrap();
+        let (mut layout, mut layout_growing) = base.compile_growing(&Checker, 4, false).unwrap();
+        let mut tables = full.without_pixels();
+        let growth = growing.grow(&full, UNAVAILABLE_ART, &Checker).unwrap();
+        let copy = growth.clone();
+        let layout_growth = layout_growing.grow(&layout, UNAVAILABLE_ART, &Checker).unwrap();
+        full.apply(&growth);
+        tables.apply(&copy);
+        layout.apply(&layout_growth);
+        assert_eq!(full.sprite_names, layout.sprite_names);
+        assert_eq!(full.sprite_names, tables.sprite_names);
+        let alias = "[sheets.late]\nsprite = \"large/0\"\ncell = [1, 1]\ngrid = [1, 1]\n";
+        let next = growing.grow(&full, alias, &Checker).unwrap();
+        let layout_next = layout_growing.grow(&layout, alias, &Checker).unwrap();
+        full.apply(&next);
+        tables.apply(&next);
+        layout.apply(&layout_next);
+        for compiled in [&full, &tables, &layout, &full.without_pixels()] {
+            assert!(compiled.set_available("clear/0"));
+            for name in ["large/0", "part/0", "mixed", "late/0"] { assert!(!compiled.set_available(name), "{name}"); }
+            assert_eq!(compiled.sprite("late/0"), full.sprite("late/0"));
+        }
     }
 
     #[test]

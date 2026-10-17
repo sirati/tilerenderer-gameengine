@@ -93,7 +93,7 @@ impl Element {
             if i64::from(x) >= i64::from(clip[2]) || i64::from(y) >= i64::from(clip[3])
                 || i64::from(x) + i64::from(w) <= i64::from(clip[0]) || i64::from(y) + i64::from(h) <= i64::from(clip[1]) { return true; }
         }
-        compiled.set(&name).and_then(|(set, _)| compiled.sets.frame(set, 0)).and_then(|id| compiled.atlas.sprites.get(id.0 as usize)).is_some()
+        compiled.set_available(&name)
     }
 
     /// Whether it covers no pixels (nothing to draw or describe).
@@ -397,6 +397,22 @@ mod tests {
         assert!(sprite.ready(&compiled));
         if let Element::Sprite { name, palette, .. } = &mut sprite { *name = "empty".into(); palette.clear(); }
         assert!(!sprite.ready(&compiled), "an empty named animation has no drawable frame");
+    }
+
+    #[test]
+    fn oversized_opaque_screen_art_is_not_ready_because_its_placeholder_exists() {
+        let region = Region { source: "solid:255,10,20,255:8x2".into(), rect: [0, 0, 8, 2], keyed: false, mask: None, palette: None };
+        let image = Element::Image { region: region.clone(), at: (0, 0), clip: [0, 0, 8, 2] };
+        let sprite = Element::Sprite { name: region_sprite(&region), at: (0, 0), clip: [0, 0, 8, 2], scale_den: 0, palette: String::new() };
+        let mut art = ScreenArt::default();
+        art.add(std::slice::from_ref(&image));
+        let description = render_desc::Description::parse(&format!("grid = {{ layout = \"orthogonal\", step = [1, 1] }}\n{}", art.description("", "", |_, _| String::new()))).unwrap();
+        let small = description.compile(&Plain, 4).unwrap();
+        assert!(small.set(&region_sprite(&region)).is_some(), "oversized placeholders retain their names and ids");
+        assert!(!image.ready(&small) && !sprite.ready(&small));
+        assert!(!image.ready(&small.without_pixels()));
+        let complete = description.compile(&Plain, 16).unwrap();
+        assert!(image.ready(&complete) && sprite.ready(&complete));
     }
 
     #[test]
