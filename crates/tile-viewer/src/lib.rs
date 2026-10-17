@@ -293,6 +293,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         drawn_window: (0, 0),
         started: std::time::Instant::now(),
         art_waiting: None,
+        drawn_frame: None,
         error: None,
     };
     // The arrangement to start with (see `layout::Layout::configure`).
@@ -346,6 +347,9 @@ struct App {
     started: std::time::Instant,
     /// Since when newer art is waiting for a scene that refers to it.
     art_waiting: Option<std::time::Instant>,
+    /// The arrangement drawn last (drawn again while a scene waits for its
+    /// art).
+    drawn_frame: Option<layout::Frame>,
     error: Option<ViewerError>,
 }
 
@@ -440,8 +444,9 @@ impl App {
         let gave_up = self.art_waiting.get_or_insert_with(std::time::Instant::now).elapsed() > Duration::from_secs(3);
         let new_assets = version != self.assets_version && (refers_to == 0 || refers_to == version || gave_up);
         if new_assets {
-            log::info!("viewer: new assets ({} sprites)", compiled.sprite_names.len());
+            let started = std::time::Instant::now();
             gpu.renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
+            log::info!("viewer: new assets ({} sprites, uploaded in {} ms)", compiled.sprite_names.len(), started.elapsed().as_millis());
             // The pixels are on the GPU now: keep only the rest.
             let light = Arc::new(compiled.without_pixels());
             drop(compiled);
@@ -457,16 +462,25 @@ impl App {
             return;
         }
         let window = (gpu.config.width, gpu.config.height);
-        let bounds = world_bounds(&self.compiled, scene);
-        let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
+        // A scene for other art than the renderer has waits: the last frame
+        // is drawn meanwhile as it was, its world in its arrangement (the
+        // waiting scene's views may differ, e.g. a screen opened with a view
+        // of its own).
+        let matches = scene.assets == 0 || scene.assets == self.assets_version || gave_up;
+        let arranged = match &self.drawn_frame {
+            Some(frame) if !matches && self.world.is_some() && window == self.drawn_window => frame.clone(),
+            _ => {
+                let bounds = world_bounds(&self.compiled, scene);
+                let arranged = self.layout.frame(scene, window, self.config.overhang, interface_rects(&self.compiled, scene), Some(bounds));
+                self.drawn_frame = Some(arranged.clone());
+                arranged
+            }
+        };
         // Views following something move without input: tell the driver.
         if let Some(views) = self.layout.take_views_change() {
             self.display.send_input(Input::Views(views));
         }
         let views_moved = arranged.view_cameras != self.drawn_views;
-        // A scene for other art than the renderer has waits (its last world is
-        // drawn meanwhile).
-        let matches = scene.assets == 0 || scene.assets == self.assets_version || gave_up;
         let rebuilt = new_assets || ((scene.seq != self.drawn_seq || views_moved) && matches) || self.world.is_none();
         if rebuilt {
             self.world = Some(scene_world_for(&self.compiled, scene, &arranged.view_cameras));
@@ -559,6 +573,13 @@ impl ApplicationHandler for App {
         if let WindowEvent::Focused(false) = event {
             self.layout.released();
             self.grab(false);
+        }
+        // The pointer is at no edge of the window once it left (or the
+        // window is no longer the one the user works in).
+        if matches!(event, WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. }) {
+            for input in self.layout.pointer_gone() {
+                self.display.send_input(input);
+            }
         }
         for input in self.input.translate(&event) {
             for input in self.layout.route(input) {

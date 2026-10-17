@@ -55,6 +55,54 @@ pub enum DescError {
 /// keys other than `source`, for the loader to interpret.
 pub trait ImageLoader {
     fn load(&self, source: &str, options: &toml::Table) -> Result<Vec<RgbaImage>, String>;
+
+    /// The sizes of the frames [`ImageLoader::load`] gives, which a loader
+    /// may tell without making the pixels (by default it makes them).
+    fn sizes(&self, source: &str, options: &toml::Table) -> Result<Vec<(u32, u32)>, String> {
+        Ok(self.load(source, options)?.iter().map(|f| (f.width, f.height)).collect())
+    }
+}
+
+/// The sprites of one sheet as compiled (named by the compile: the same
+/// art may be another sheet's next time).
+struct Sliced {
+    sprites: Vec<SlicedSprite>,
+    /// How many cells the sheet has (`only` may leave some out).
+    cells: u32,
+}
+
+struct SlicedSprite {
+    /// The cell's index in the sheet.
+    index: u32,
+    /// The pixels, if compiled with them.
+    image: Option<RgbaImage>,
+    size: (u32, u32),
+    anchor: (i32, i32),
+}
+
+/// The sheets of the last [`Description::compile_cached`], by what makes
+/// them, so that the next compile of a description that has them too (e.g.
+/// one that grew) only loads and slices the new ones. Holds the sprites'
+/// pixels: about the atlas's size.
+#[derive(Default)]
+pub struct SheetCache {
+    sheets: Option<HashMap<String, std::sync::Arc<Sliced>>>,
+}
+
+impl SheetCache {
+    /// An empty cache (also for statics).
+    pub const fn new() -> Self {
+        Self { sheets: None }
+    }
+
+    /// How many sheets it holds.
+    pub fn len(&self) -> usize {
+        self.sheets.as_ref().map_or(0, HashMap::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// The parsed TOML.
@@ -494,79 +542,202 @@ impl Description {
         })
     }
 
-    /// Loads every image, slices the sheets and builds the tile renderer's
+    /// The sizes of image `name`'s frames, without its pixels where the
+    /// loader can tell them so (see [`ImageLoader::sizes`]).
+    fn frame_sizes(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc) -> Result<Vec<(u32, u32)>, DescError> {
+        let generated = ["solid:", "line:", "arrow:", "crosshair:"].iter().any(|p| img.source.starts_with(p));
+        if generated {
+            return Ok(self.load_frames(loader, name, img, false)?.iter().map(|f| (f.width, f.height)).collect());
+        }
+        let mut options = self.loader.clone();
+        options.extend(img.options.clone());
+        options.remove("blank");
+        loader.sizes(&img.source, &options).map_err(|message| DescError::Image { name: name.to_owned(), message })
+    }
+
+    /// Loads the images, slices the sheets and builds the tile renderer's
     /// tables. `page_size` is the atlas page size (e.g. 4096).
     pub fn compile(&self, loader: &dyn ImageLoader, page_size: u32) -> Result<Compiled, DescError> {
-        let mut atlas = AtlasBuilder::new(page_size);
-        let mut images: HashMap<&str, Vec<RgbaImage>> = HashMap::new();
-        for (name, img) in &self.images {
-            images.insert(name, self.load_frames(loader, name, img, false)?);
-        }
+        self.compile_with(loader, page_size, true, None)
+    }
+
+    /// Like [`Description::compile`], reusing the sprites of every sheet
+    /// `cache` has from an earlier compile (the same sheet of the same image,
+    /// loaded the same way): only new sheets load their images. The cache
+    /// keeps this compile's sheets afterwards, no others.
+    pub fn compile_cached(&self, loader: &dyn ImageLoader, page_size: u32, cache: &mut SheetCache) -> Result<Compiled, DescError> {
+        self.compile_with(loader, page_size, true, Some(cache))
+    }
+
+    /// The tables [`Description::compile`] makes without the pixels: sprite
+    /// names, sizes and anchors, sets and layers, as
+    /// [`Compiled::without_pixels`] keeps them (the sprites' places in the
+    /// atlas are not decided). Only the images' sizes are needed
+    /// ([`ImageLoader::sizes`]), not their pixels: for a side that draws
+    /// nothing itself.
+    pub fn compile_layout(&self, loader: &dyn ImageLoader, page_size: u32) -> Result<Compiled, DescError> {
+        self.compile_with(loader, page_size, false, None)
+    }
+
+    /// What `sheet`'s sprites are made from, beyond `self.loader` and
+    /// `self.blank_loader` (`globals`, the same for all sheets): its image
+    /// and how it is cut, not what the sheet, its image or its sprites are
+    /// called (names are given in the order things were added, and move as
+    /// art is added). For [`SheetCache`].
+    fn sheet_key(&self, sheet: &SheetDesc, globals: &str) -> String {
+        let shape = SheetDesc { image: String::new(), group: None, first_index: 0, index_stride: 1, ..sheet.clone() };
+        format!("{shape:?}|{:?}|{globals}", self.images.get(&sheet.image))
+    }
+
+    /// The sprites of sheet `name` (`pixels`: with their pixels, else their
+    /// sizes only), from the frames of its image (`frames` loads an image's
+    /// frames, `blank` them as the load that finds boxes makes them, `sizes`
+    /// gives their sizes).
+    fn slice(
+        &self,
+        name: &str,
+        sheet: &SheetDesc,
+        pixels: bool,
+        frames: &mut dyn FnMut(&str, bool) -> Result<std::rc::Rc<Vec<RgbaImage>>, DescError>,
+        sizes: &mut dyn FnMut(&str) -> Result<std::rc::Rc<Vec<(u32, u32)>>, DescError>,
+    ) -> Result<Sliced, DescError> {
+        let err = |message: String| DescError::Sheet { sheet: name.to_owned(), message };
+        let no_frame = || err(format!("image has no frame {}", sheet.frame));
+        let all = if pixels { Some(frames(&sheet.image, false)?) } else { None };
+        let img = match &all {
+            Some(all) => Some(all.get(sheet.frame).ok_or_else(no_frame)?),
+            None => None,
+        };
+        let (iw, ih) = match img {
+            Some(img) => (img.width, img.height),
+            None => *sizes(&sheet.image)?.get(sheet.frame).ok_or_else(no_frame)?,
+        };
         // The images again as the sprite format sees them, for the sheets
         // that sample from their boxes (only those shrunk need them).
-        let mut blank_images: HashMap<&str, Vec<RgbaImage>> = HashMap::new();
+        let boxed = sheet.sample_from == SampleFrom::Box && sheet.downscale > 1;
+        let all_blank = if boxed && pixels { Some(frames(&sheet.image, true)?) } else { None };
+        let blank_img = match &all_blank {
+            Some(all) => {
+                let blank = all.get(sheet.frame).ok_or_else(no_frame)?;
+                if (blank.width, blank.height) != (iw, ih) {
+                    return Err(err(format!("the image loads as {}×{} for its box but as {iw}×{ih} to draw", blank.width, blank.height)));
+                }
+                Some(blank)
+            }
+            None => None,
+        };
+        let [cw, ch] = sheet.cell;
+        let [ox, oy] = sheet.origin;
+        let [sx, sy] = sheet.spacing;
+        if cw == 0 || ch == 0 {
+            return Err(err(format!("empty cell {cw}×{ch}")));
+        }
+        let fit = |total: u32, o: u32, c: u32, s: u32| if total < o + c { 0 } else { (total - o + s) / (c + s) };
+        let [cols, rows] = sheet.grid.unwrap_or_else(|| [fit(iw, ox, cw, sx), fit(ih, oy, ch, sy)]);
+        if ox + cols * (cw + sx) - sx > iw || oy + rows * (ch + sy) - sy > ih {
+            return Err(err(format!("{cols}×{rows} cells of {cw}×{ch} exceed the {iw}×{ih} image")));
+        }
+        let grow = sheet.outline.as_ref().map_or(0, |o| o.width);
+        let mut sprites = Vec::new();
+        for i in 0..cols * rows {
+            if sheet.only.as_ref().is_some_and(|o| !o.contains(&i)) {
+                continue;
+            }
+            let (c, r) = (i % cols, i / cols);
+            let (x, y) = (ox + c * (cw + sx), oy + r * (ch + sy));
+            let shape = |cell: RgbaImage| match &sheet.outline {
+                Some(o) => outline(&cell, o.width, o.color),
+                None => cell,
+            };
+            let image = img.map(|img| {
+                let sprite = shape(img.crop(x, y, cw, ch));
+                match blank_img {
+                    Some(blank) => downscale_from_box(&sprite, sheet.downscale, opaque_box(&shape(blank.crop(x, y, cw, ch)))),
+                    None if sheet.downscale > 1 => downscale(&sprite, sheet.downscale),
+                    None => sprite,
+                }
+            });
+            // (Every way of shrinking rounds the grown cell's size down.)
+            let n = sheet.downscale.max(1);
+            let size = image.as_ref().map_or(((cw + 2 * grow) / n, (ch + 2 * grow) / n), |i| (i.width, i.height));
+            let anchor = (sheet.anchor[0] - grow as i32, sheet.anchor[1] - grow as i32);
+            sprites.push(SlicedSprite { index: i, image, size, anchor });
+        }
+        Ok(Sliced { sprites, cells: cols * rows })
+    }
+
+    fn compile_with(&self, loader: &dyn ImageLoader, page_size: u32, pixels: bool, mut cache: Option<&mut SheetCache>) -> Result<Compiled, DescError> {
+        use std::rc::Rc;
+        // Images are loaded when a sheet needs them, once per compile.
+        let mut loaded: HashMap<(String, bool), Rc<Vec<RgbaImage>>> = HashMap::new();
+        let mut frames = |name: &str, blank: bool| -> Result<Rc<Vec<RgbaImage>>, DescError> {
+            if let Some(f) = loaded.get(&(name.to_owned(), blank)) {
+                return Ok(f.clone());
+            }
+            let img = self.images.get(name).ok_or(DescError::Unknown { kind: "image", name: name.to_owned() })?;
+            let f = Rc::new(self.load_frames(loader, name, img, blank)?);
+            loaded.insert((name.to_owned(), blank), f.clone());
+            Ok(f)
+        };
+        let mut measured: HashMap<String, Rc<Vec<(u32, u32)>>> = HashMap::new();
+        let mut sizes = |name: &str| -> Result<Rc<Vec<(u32, u32)>>, DescError> {
+            if let Some(s) = measured.get(name) {
+                return Ok(s.clone());
+            }
+            let img = self.images.get(name).ok_or(DescError::Unknown { kind: "image", name: name.to_owned() })?;
+            let s = Rc::new(self.frame_sizes(loader, name, img)?);
+            measured.insert(name.to_owned(), s.clone());
+            Ok(s)
+        };
+        let globals = format!("{:?}|{:?}", self.loader, self.blank_loader);
+        let mut kept: HashMap<String, std::sync::Arc<Sliced>> = HashMap::new();
+        let mut atlas = AtlasBuilder::new(page_size);
+        let mut placed: Vec<tile_render_shared::SpriteDesc> = Vec::new();
 
         // Sprites, named "sheet/index".
         let mut sprites: BTreeMap<String, SpriteId> = BTreeMap::new();
-        let mut sheet_len: HashMap<&str, u32> = HashMap::new();
+        let mut sheet_len: HashMap<String, u32> = HashMap::new();
         for (sheet_name, sheet) in &self.sheets {
-            let err = |message: String| DescError::Sheet { sheet: sheet_name.clone(), message };
-            let frames = images.get(sheet.image.as_str()).ok_or(DescError::Unknown { kind: "image", name: sheet.image.clone() })?;
-            let img = frames.get(sheet.frame).ok_or_else(|| err(format!("image has no frame {}", sheet.frame)))?;
-            let boxed = sheet.sample_from == SampleFrom::Box && sheet.downscale > 1;
-            let blank_img = if boxed {
-                let name = sheet.image.as_str();
-                if !blank_images.contains_key(name) {
-                    blank_images.insert(name, self.load_frames(loader, name, &self.images[name], true)?);
+            let sliced = match cache.as_deref_mut() {
+                Some(cache) => {
+                    let key = self.sheet_key(sheet, &globals);
+                    let sliced = match cache.sheets.as_ref().and_then(|c| c.get(&key)) {
+                        Some(s) => s.clone(),
+                        None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes)?),
+                    };
+                    kept.insert(key, sliced.clone());
+                    sliced
                 }
-                let blank = blank_images[name].get(sheet.frame).ok_or_else(|| err(format!("image has no frame {}", sheet.frame)))?;
-                if (blank.width, blank.height) != (img.width, img.height) {
-                    return Err(err(format!("the image loads as {}×{} for its box but as {}×{} to draw", blank.width, blank.height, img.width, img.height)));
-                }
-                Some(blank)
-            } else {
-                None
+                None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes)?),
             };
-            let [cw, ch] = sheet.cell;
-            let [ox, oy] = sheet.origin;
-            let [sx, sy] = sheet.spacing;
-            if cw == 0 || ch == 0 {
-                return Err(err(format!("empty cell {cw}×{ch}")));
-            }
-            let fit = |total: u32, o: u32, c: u32, s: u32| if total < o + c { 0 } else { (total - o + s) / (c + s) };
-            let [cols, rows] = sheet.grid.unwrap_or_else(|| [fit(img.width, ox, cw, sx), fit(img.height, oy, ch, sy)]);
-            if ox + cols * (cw + sx) - sx > img.width || oy + rows * (ch + sy) - sy > img.height {
-                return Err(err(format!("{cols}×{rows} cells of {cw}×{ch} exceed the {}×{} image", img.width, img.height)));
-            }
-            for i in 0..cols * rows {
-                if sheet.only.as_ref().is_some_and(|o| !o.contains(&i)) {
-                    continue;
-                }
-                let (c, r) = (i % cols, i / cols);
-                let (x, y) = (ox + c * (cw + sx), oy + r * (ch + sy));
-                let shape = |cell: RgbaImage| match &sheet.outline {
-                    Some(o) => (outline(&cell, o.width, o.color), o.width as i32),
-                    None => (cell, 0),
+            for s in &sliced.sprites {
+                let id = match &s.image {
+                    Some(image) => atlas.add(image, s.anchor)?,
+                    None => {
+                        let (w, h) = s.size;
+                        if w > page_size || h > page_size {
+                            return Err(tile_render::atlas::AtlasError::TooLarge(w, h, page_size).into());
+                        }
+                        placed.push(tile_render_shared::SpriteDesc { width: w, height: h, anchor_x: s.anchor.0, anchor_y: s.anchor.1, ..Default::default() });
+                        SpriteId(placed.len() as u32 - 1)
+                    }
                 };
-                let (sprite, grow) = shape(img.crop(x, y, cw, ch));
-                let sprite = match blank_img {
-                    Some(blank) => downscale_from_box(&sprite, sheet.downscale, opaque_box(&shape(blank.crop(x, y, cw, ch)).0)),
-                    None if sheet.downscale > 1 => downscale(&sprite, sheet.downscale),
-                    None => sprite,
-                };
-                let id = atlas.add(&sprite, (sheet.anchor[0] - grow, sheet.anchor[1] - grow))?;
                 let name = match &sheet.group {
-                    Some(g) => format!("{g}/{}", sheet.first_index + i * sheet.index_stride),
-                    None => format!("{sheet_name}/{i}"),
+                    Some(g) => format!("{g}/{}", sheet.first_index + s.index * sheet.index_stride),
+                    None => format!("{sheet_name}/{}", s.index),
                 };
                 if sprites.insert(name.clone(), id).is_some() {
-                    return Err(err(format!("sprite {name} defined twice")));
+                    return Err(DescError::Sheet { sheet: sheet_name.clone(), message: format!("sprite {name} defined twice") });
                 }
             }
-            let group = sheet.group.as_deref().unwrap_or(sheet_name);
+            let group = sheet.group.clone().unwrap_or_else(|| sheet_name.clone());
             let len = sheet_len.entry(group).or_insert(0);
-            *len = (*len).max(sheet.first_index + cols * rows * sheet.index_stride);
+            *len = (*len).max(sheet.first_index + sliced.cells * sheet.index_stride);
         }
+        if let Some(cache) = cache {
+            cache.sheets = Some(kept);
+        }
+        let atlas = if pixels { atlas.finish() } else { tile_render::Atlas { page_size, pages: Vec::new(), sprites: placed } };
 
         // Sets: explicit ones, plus an implicit single-frame set per sprite.
         let mut sets = SpriteSets::default();
@@ -596,7 +767,7 @@ impl Description {
                 if let Some(prefix) = pattern.strip_suffix('*') {
                     let mut matched: Vec<&String> = set_ids.keys().filter(|n| n.starts_with(prefix)).collect();
                     // "sheet/*" in sprite-index order, not lexicographic.
-                    if let Some(sheet) = prefix.strip_suffix('/').filter(|s| sheet_len.contains_key(s)) {
+                    if let Some(sheet) = prefix.strip_suffix('/').filter(|s| sheet_len.contains_key(*s)) {
                         matched.sort_by_key(|n| n[sheet.len() + 1..].parse::<u32>().unwrap_or(u32::MAX));
                     }
                     names.extend(matched.into_iter().cloned());
@@ -645,7 +816,7 @@ impl Description {
                 }
                 names
             },
-            atlas: atlas.finish(),
+            atlas,
             sets,
             layers,
             values,
@@ -897,6 +1068,114 @@ mod tests {
         assert_eq!((s5.anchor_x, s5.anchor_y), (0, -4));
         let mut w = c.world(3, 3, true, false);
         w.set(tile_render::LayerId(0), 1, 1, c.value("base", "s/3").unwrap());
+    }
+
+    /// A description with most kinds of sheet: grids fitted and given,
+    /// groups, `only`, outlines, shrunk from the box, generated images.
+    const MIXED: &str = r#"
+        grid = { layout = "orthogonal", step = [8, 4] }
+        [images.a]
+        source = "a"
+        [images.b]
+        source = "b"
+        [images.bar]
+        source = "solid:1,2,3,255:5x2"
+        [sheets.s]
+        image = "a"
+        cell = [10, 10]
+        grid = [4, 2]
+        anchor = [0, -4]
+        only = [0, 2, 5]
+        [sheets.ring]
+        image = "b"
+        cell = [8, 8]
+        group = "Ring"
+        first_index = 3
+        outline = { width = 2, color = [9, 9, 9, 255] }
+        [sheets.small]
+        image = "b"
+        cell = [8, 6]
+        grid = [2, 1]
+        downscale = 2
+        sample_from = "box"
+        anchor = [-3, 1]
+        [sheets.bar]
+        image = "bar"
+        cell = [5, 2]
+        [sets.anim]
+        frames = ["s/0", "Ring/3", "small/1"]
+        [[layers]]
+        name = "l"
+        sets = ["s/*", "anim", "bar/0"]
+        "#;
+
+    /// Counts its loads.
+    struct Counting(std::cell::Cell<usize>);
+    impl ImageLoader for Counting {
+        fn load(&self, source: &str, options: &toml::Table) -> Result<Vec<RgbaImage>, String> {
+            self.0.set(self.0.get() + 1);
+            Checker.load(source, options)
+        }
+        fn sizes(&self, _: &str, _: &toml::Table) -> Result<Vec<(u32, u32)>, String> {
+            Ok(vec![(40, 20)])
+        }
+    }
+
+    fn tables(c: &Compiled) -> (Vec<String>, Vec<(u32, u32, i32, i32)>, Vec<Option<u32>>) {
+        let sprites = c.atlas.sprites.iter().map(|s| (s.width, s.height, s.anchor_x, s.anchor_y)).collect();
+        let values = ["s/0", "s/5", "anim", "bar/0", "Ring/3"].iter().map(|n| c.value("l", n)).collect();
+        (c.sprite_names.clone(), sprites, values)
+    }
+
+    #[test]
+    fn the_layout_alone_is_the_compiled_layout_without_loading_pixels() {
+        let d = Description::parse(MIXED).unwrap();
+        let full = d.compile(&Checker, 256).unwrap();
+        let counting = Counting(std::cell::Cell::new(0));
+        let layout = d.compile_layout(&counting, 256).unwrap();
+        assert_eq!(tables(&layout), tables(&full));
+        assert_eq!(layout.set("anim").map(|s| s.0), full.set("anim").map(|s| s.0));
+        assert!(layout.atlas.pages.is_empty());
+        assert_eq!(counting.0.get(), 0, "sizes only");
+        // A sheet too big for a page fails as compiling it would.
+        assert!(d.compile_layout(&Checker, 8).is_err());
+    }
+
+    #[test]
+    fn cached_compiles_load_only_new_sheets_and_agree_with_plain_ones() {
+        let d = Description::parse(MIXED).unwrap();
+        let counting = Counting(std::cell::Cell::new(0));
+        let mut cache = SheetCache::default();
+        d.compile_cached(&counting, 256, &mut cache).unwrap();
+        let first = counting.0.get();
+        assert!(first > 0);
+        // Grown by a sheet of a new image: only that one is loaded.
+        let grown = format!("{MIXED}\n[images.c]\nsource = \"ccc\"\n[sheets.t]\nimage = \"c\"\ncell = [4, 4]\ngrid = [2, 1]\n");
+        let d2 = Description::parse(&grown).unwrap();
+        let cached = d2.compile_cached(&counting, 256, &mut cache).unwrap();
+        assert_eq!(counting.0.get(), first + 1);
+        let plain = d2.compile(&Checker, 256).unwrap();
+        assert_eq!(tables(&cached), tables(&plain));
+        let pixels = |c: &Compiled| -> Vec<Vec<[u8; 4]>> {
+            c.atlas.sprites.iter().map(|s| (0..s.height).flat_map(|y| (0..s.width).map(move |x| (x, y))).map(|(x, y)| c.atlas.pages[s.page as usize].get(s.atlas_x + x, s.atlas_y + y)).collect()).collect()
+        };
+        assert_eq!(pixels(&cached), pixels(&plain));
+        // A changed sheet is made again; the cache keeps only what was used.
+        let changed = grown.replace("anchor = [0, -4]", "anchor = [1, -4]");
+        let n = cache.len();
+        let c = Description::parse(&changed).unwrap().compile_cached(&counting, 256, &mut cache).unwrap();
+        assert_eq!(counting.0.get(), first + 2);
+        assert_eq!(c.atlas.sprites[c.sprite_names.iter().position(|s| s == "s/0").unwrap()].anchor_x, 1);
+        assert_eq!(cache.len(), n);
+        Description::parse(MIXED).unwrap().compile_cached(&counting, 256, &mut cache).unwrap();
+        assert_eq!(cache.len(), n - 1);
+        // Renamed (as art added earlier in the order renames what follows):
+        // the same art, nothing loaded.
+        let loads = counting.0.get();
+        let renamed = MIXED.replace("[images.b]", "[images.b2]").replace("image = \"b\"", "image = \"b2\"").replace("[sheets.s]", "[sheets.s0]").replace("s/", "s0/");
+        let c = Description::parse(&renamed).unwrap().compile_cached(&counting, 256, &mut cache).unwrap();
+        assert_eq!(counting.0.get(), loads);
+        assert!(c.sprite_names.contains(&"s0/5".to_owned()));
     }
 
     #[test]

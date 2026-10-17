@@ -386,6 +386,7 @@ version = "0.1.0"
 dependencies = [
  "gdi-text",
  "image",
+ "log",
  "render-desc",
  "thiserror 2.0.21",
  "tile-render",

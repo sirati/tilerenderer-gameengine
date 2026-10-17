@@ -322,7 +322,20 @@ pub enum Input {
     /// in such a view, sent instead of `Key`: a driver may act on the world
     /// there, or take it as the `Key` it would have been.
     WorldKey { vk: u32, down: bool, text: Option<char>, x: i32, y: i32 },
+    /// The pointer rests at the edge of the renderer's window over the
+    /// driver's main view, which shows the driver's view unmoved (each
+    /// window pixel the driver's own): it is at the driver's screen edge as
+    /// much as at the window's, and a driver may scroll the way it does when
+    /// its own pointer is there. Per axis: 0 if the pointer is not within
+    /// [`EDGE_ZONE`] pixels of that axis's edges, else how far from the edge
+    /// it is plus one, negative for the left (top) edge, positive for the
+    /// right (bottom) one; `(0, 0)` once it is at no edge (or left the window
+    /// or such a view). Sent when it changes.
+    Edge { x: i32, y: i32 },
 }
+
+/// How near the window's edge the pointer counts as at it ([`Input::Edge`]).
+pub const EDGE_ZONE: i32 = 16;
 
 /// Connects a driver (the game side) and a renderer, each on its own
 /// thread: updates flow to the renderer, input flows back, both through
