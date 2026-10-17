@@ -881,6 +881,16 @@ impl App {
     }
 
     fn draw(&mut self) {
+        // (Measuring: frames that take long.)
+        let began = std::time::Instant::now();
+        self.draw_frame();
+        let took = began.elapsed();
+        if took >= Duration::from_millis(40) && self.map_drawn {
+            log::info!("viewer: a frame took {} ms", took.as_millis());
+        }
+    }
+
+    fn draw_frame(&mut self) {
         let started = Instant::now();
         let Some(gpu) = &mut self.gpu else { return };
         // A software renderer still at the last frame: no new one yet (the
