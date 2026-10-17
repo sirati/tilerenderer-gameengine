@@ -120,6 +120,77 @@ impl ScreenArt {
         new
     }
 
+    /// What this has that `other` does not.
+    pub fn minus(&self, other: &ScreenArt) -> ScreenArt {
+        ScreenArt {
+            regions: self.regions.difference(&other.regions).cloned().collect(),
+            fills: self.fills.difference(&other.fills).cloned().collect(),
+            dynamic: self.dynamic.difference(&other.dynamic).cloned().collect(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty() && self.fills.is_empty() && self.dynamic.is_empty()
+    }
+
+    /// One line per region, fill and run-time picture (tab-separated
+    /// fields), for keeping a list of what screens showed (see
+    /// [`ScreenArt::parse_lines`]).
+    pub fn to_lines(&self) -> String {
+        let mut out = String::new();
+        for r in &self.regions {
+            let [x, y, w, h] = r.rect;
+            let (mask, (mx, my)) = r.mask.as_ref().map_or(("-", (0, 0)), |(m, d)| (m.as_str(), *d));
+            let (palette, first, count) = r.palette.as_ref().map_or(("-", 0, 0), |p| (p.image.as_str(), p.first, p.count));
+            let _ = writeln!(out, "region\t{}\t{x},{y},{w},{h}\t{}\t{mask}\t{mx},{my}\t{palette}\t{first},{count}", r.source, if r.keyed { "k" } else { "o" });
+        }
+        for ([r, g, b, a], (w, h)) in &self.fills {
+            let _ = writeln!(out, "fill\t{r},{g},{b},{a}\t{w}x{h}");
+        }
+        for (name, (w, h)) in &self.dynamic {
+            let _ = writeln!(out, "dynamic\t{name}\t{w}x{h}");
+        }
+        out
+    }
+
+    /// The art of the lines of [`ScreenArt::to_lines`] among `text` (other
+    /// lines are left out).
+    pub fn parse_lines(text: &str) -> ScreenArt {
+        fn nums<T: std::str::FromStr>(s: &str, sep: char) -> Option<Vec<T>> {
+            s.split(sep).map(|v| v.trim().parse().ok()).collect()
+        }
+        let mut out = ScreenArt::default();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            match f.as_slice() {
+                ["region", source, rect, keyed, mask, offset, palette, range] => {
+                    let (Some(rect), Some(offset), Some(range)) = (nums::<i32>(rect, ','), nums::<i32>(offset, ','), nums::<u32>(range, ',')) else { continue };
+                    let (Ok(rect), [mx, my], [first, count]) = (<[i32; 4]>::try_from(rect), offset.as_slice(), range.as_slice()) else { continue };
+                    out.regions.insert(Region {
+                        source: source.to_string(),
+                        rect,
+                        keyed: *keyed == "k",
+                        mask: (*mask != "-").then(|| (mask.to_string(), (*mx, *my))),
+                        palette: (*palette != "-").then(|| PaletteFrom { image: palette.to_string(), first: *first, count: *count }),
+                    });
+                }
+                ["fill", rgba, size] => {
+                    let (Some(c), Some(wh)) = (nums::<u8>(rgba, ','), nums::<u32>(size, 'x')) else { continue };
+                    if let (Ok(c), [w, h]) = (<[u8; 4]>::try_from(c), wh.as_slice()) {
+                        out.fills.insert((c, (*w, *h)));
+                    }
+                }
+                ["dynamic", name, size] => {
+                    if let Some([w, h]) = nums::<u32>(size, 'x').as_deref().and_then(|v| <[u32; 2]>::try_from(v).ok()) {
+                        out.dynamic.insert((name.to_string(), (w, h)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// Whether everything `other` needs is here.
     pub fn covers(&self, other: &ScreenArt) -> bool {
         other.regions.is_subset(&self.regions) && other.fills.is_subset(&self.fills) && other.dynamic.is_subset(&self.dynamic)
@@ -237,6 +308,23 @@ pub fn patch(compiled: &Compiled, name: &str, size: (u32, u32), rgba: Vec<u8>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn art_lists_round_trip() {
+        let mut art = ScreenArt::default();
+        art.regions.insert(Region { source: "Art/Advisors/a b.pcx".into(), rect: [1, -2, 30, 40], keyed: true, mask: None, palette: None });
+        art.regions.insert(Region {
+            source: "Art/x.pcx".into(),
+            rect: [0, 0, 5, 5],
+            keyed: false,
+            mask: Some(("Art/m.pcx".into(), (-3, 4))),
+            palette: Some(PaletteFrom { image: "Art/p.pcx".into(), first: 16, count: 32 }),
+        });
+        art.fills.insert(([1, 2, 3, 128], (640, 1)));
+        art.dynamic.insert(("minimap".into(), (230, 107)));
+        assert_eq!(ScreenArt::parse_lines(&format!("# a comment\n{}font\tLucida\n", art.to_lines())), art);
+    }
+
 
     struct Plain;
     impl render_desc::ImageLoader for Plain {
