@@ -12,6 +12,7 @@ pub mod looks;
 pub mod scaling;
 pub mod profile;
 pub mod snap;
+pub mod smooth_menus;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -418,6 +419,7 @@ pub fn placed_sprite(compiled: &Compiled, s: &scene::FreeSprite, view: Option<u3
         },
         text: s.glyph.and_then(|g| outline_glyph(compiled, &g, s.tint)),
         palette: s.palette,
+        category: s.category,
     }
 }
 
@@ -460,12 +462,14 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
                 overhang,
                 cull: v.cull,
                 origin: v.origin,
+                target_clip: None,
                 cells: !v.interface_only,
                 screen_shift: (0, 0),
                 zoomed_art: false,
                 stacked: false,
                 hairline: false,
                 downscale: v.downscale.max(1),
+                hidden_categories: v.hidden_categories,
             }
         })
         .collect()
@@ -561,6 +565,28 @@ fn sprite_rect(compiled: &Compiled, s: &scene::FreeSprite) -> Option<[i32; 4]> {
     (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
 }
 
+/// A placed screen sprite's bounds in the driver's pixels, before its
+/// camera's scale and placement. Used to clip list pixels without moving
+/// unrelated controls or the world beneath a production popup.
+fn placed_rect(compiled: &Compiled, s: &tile_render::PlacedSprite) -> Option<[i32; 4]> {
+    let (mut x0, mut y0, mut x1, mut y1) = match s.text {
+        Some(g) => {
+            let em = (g.em64 as i32 + 63) / 64;
+            (s.x, s.y - em, s.x + g.advance.max(1), s.y + em / 3)
+        }
+        None => {
+            let id = compiled.sets.frame(s.set, 0)?;
+            let sprite = compiled.atlas.sprites.get(id.0 as usize)?;
+            let (x0, y0) = (s.x + sprite.anchor_x, s.y + sprite.anchor_y);
+            (x0, y0, x0 + sprite.width as i32, y0 + sprite.height as i32)
+        }
+    };
+    if let Some([cx0, cy0, cx1, cy1]) = s.clip {
+        (x0, y0, x1, y1) = (x0.max(cx0), y0.max(cy0), x1.min(cx1), y1.min(cy1));
+    }
+    (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
+}
+
 /// The window rectangles (x, y, w, h) the scene's interface-only views
 /// cover: their sprites' first frames, clipped (not the parts the layout
 /// may draw elsewhere, `scene::Interface`, which it knows itself).
@@ -568,6 +594,25 @@ fn interface_rects(compiled: &Compiled, scene: &Scene) -> Vec<[i32; 4]> {
     let parts = [scene.interface.roaming, scene.interface.popup, scene.interface.screen_view, scene.interface.capture_hint];
     let views = scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id)));
     views.flat_map(|v| v.overlay.iter().filter(|s| s.glyph.is_none()).filter_map(|s| sprite_rect(compiled, s))).collect()
+}
+
+/// The active named panel's bounds, without the map's HUD behind it.
+fn named_screen_content(compiled: &Compiled, scene: &Scene) -> Option<[i32; 4]> {
+    scene.interface.screen.as_ref()?;
+    if let Some(id) = scene.interface.screen_view.or(scene.interface.popup) {
+        let v = scene.view(id)?.view;
+        if v.viewport.0 > 0 && v.viewport.1 > 0 {
+            return Some([v.origin.0, v.origin.1, v.viewport.0 as i32, v.viewport.1 as i32]);
+        }
+    }
+    let city = scene.interface.screen.as_deref() == Some("City");
+    let parts = [scene.interface.roaming, scene.interface.capture_hint];
+    let rects = scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id))
+        && if city { v.view.camera_x == 0 && v.view.camera_y == 0 } else { v.view.menu })
+        .flat_map(|v| v.overlay.iter().filter(|s| s.glyph.is_none()).filter_map(|s| sprite_rect(compiled, s)));
+    let [l, t, r, b] = rects.map(|[x, y, w, h]| [x, y, x + w, y + h])
+        .reduce(|a, r| [a[0].min(r[0]), a[1].min(r[1]), a[2].max(r[2]), a[3].max(r[3])])?;
+    Some([l, t, r - l, b - t])
 }
 
 /// Writes run-time sprite pixels into the atlas; patches for sprites the
@@ -768,6 +813,7 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         base_free: Vec::new(),
         spans: Vec::new(),
         look_scene: looks::LookScene::default(),
+        menu_scroll: smooth_menus::SmoothMenus::default(),
     };
     // The arrangement to start with: the user's settings.
     app.set_settings(load_settings());
@@ -957,6 +1003,8 @@ struct App {
     base_free: Vec<tile_render::PlacedSprite>,
     spans: Vec<looks::Span>,
     look_scene: looks::LookScene,
+    /// Pixel transitions and matching pointer maps of scrollable menu lists.
+    menu_scroll: smooth_menus::SmoothMenus,
 }
 
 /// Adds the time since `t` to span `name` of the profile, if one is kept,
@@ -976,7 +1024,7 @@ fn mark(profile: &mut Option<profile::Profile>, name: &str, t: &mut Instant) {
 enum Unlock {
     /// The mouse is let go.
     Release,
-    /// It shows at the world cursor, kept inside the window, moving it
+    /// It shows at the world cursor, kept inside its view, moving it
     /// (`cursor::Machine::edge`).
     Edge,
 }
@@ -1313,7 +1361,7 @@ mod shown_scene_tests {
             },
             Update::View { id: 5, view: Some(View::default()) },
             Update::Overlay { view: 5, sprites: vec![FreeSprite { set: 10, ..Default::default() }] },
-            Update::Interactables(vec![Interactable { id: 1, rect: [10, 10, 20, 20], kind: InteractableKind::Button }]),
+            Update::Interactables(vec![Interactable { anchor: None, id: 1, rect: [10, 10, 20, 20], kind: InteractableKind::Button }]),
             Update::Looks(vec![Looks {
                 id: 1,
                 views: vec![ViewLooks { view: 5, sprites: (0, 1), states: vec![(hover, vec![FreeSprite { set: 11, ..Default::default() }])] }],
@@ -1861,7 +1909,9 @@ impl App {
     /// for testing.
     fn set_settings(&mut self, settings: viewer_settings::Settings) {
         self.layout.apply_settings(&settings.layout);
+        self.layout.clean_map = settings.clean_map.clone();
         self.layout.set_map_movement(settings.input.map_movement);
+        self.layout.set_capture_sensitivity(settings.input.capture_sensitivity);
         if let Ok(spec) = std::env::var("TILE_VIEWER_LAYOUT") {
             if let Err(e) = self.layout.configure(&spec) {
                 log::warn!("TILE_VIEWER_LAYOUT: {e}");
@@ -1912,12 +1962,30 @@ impl App {
     /// frame is drawn at once when they may change).
     fn send(&mut self, input: Input) {
         let now = self.now();
+        let input = if self.snap.snap_mode_active() { input } else {
+            let Some(input) = self.menu_scroll.route(input, now) else {
+                self.feedback.pointer_gone(now);
+                return;
+            };
+            input
+        };
         if self.feedback.sent(&input, &self.look_scene, now) {
             if let Some(gpu) = &self.gpu {
                 gpu.window.request_redraw();
             }
         }
         self.display.send_input(input);
+    }
+
+    /// Retarget only against pixels the user can see. A failed surface
+    /// acquisition or a software frame still in flight must not report a
+    /// future camera position to the game.
+    fn refresh_presented_world_pointer(&mut self) {
+        let active = self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus())
+            && (self.pointer_inside || self.layout.captured()) && !self.snap.snap_mode_active();
+        for input in self.layout.refresh_world_pointer(active) {
+            self.display.send_input(input);
+        }
     }
 
     /// Seconds since the viewer started (the snapping pointer's clock).
@@ -2014,7 +2082,15 @@ impl App {
     /// before it shows again (while still captured: on Wayland the place
     /// is a hint the release takes).
     fn apply_layout_requests(&mut self, event_loop: &ActiveEventLoop) {
+        for input in self.layout.take_unit_order_events() {
+            self.send(input);
+        }
         let grab = self.layout.take_grab();
+        if grab.is_some() {
+            self.machine.cancel_edge();
+            self.layout.set_pointer_at_edge(false);
+            self.unlock_pending = None;
+        }
         let warp = self.layout.take_warp();
         if let Some(icon) = self.layout.take_pointer_icon() {
             // A click captures the mouse there.
@@ -2082,6 +2158,7 @@ impl App {
             }
         }
         self.update_system_pointer(event_loop);
+        self.layout.set_pointer_at_edge(self.machine.edge());
         if let Some(gpu) = &self.gpu {
             match self.constraints.update(&gpu.window, &mut self.layout, self.plan.map(|p| p.present), self.pointer_inside) {
                 Some(constraints::Placement::Hinted(at)) => self.pointer_placed(at),
@@ -2117,7 +2194,7 @@ impl App {
 
     /// Once a frame went out after the system pointer was moved (see
     /// `Unlock`): lets go of the mouse, or keeps the pointer inside the
-    /// window only (the edge mode); the pointer shows then.
+    /// active view only (the edge mode); the pointer shows then.
     fn unlock_after_frame(&mut self) {
         if !std::mem::take(&mut self.presented) {
             return;
@@ -2125,9 +2202,9 @@ impl App {
         match self.unlock_pending.take() {
             Some(Unlock::Release) => self.grab(false),
             Some(Unlock::Edge) => {
-                if let Some(gpu) = &self.gpu {
-                    let _ = gpu.window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
-                }
+                // winit's region covers the whole window and prevents our
+                // Wayland walls from taking ownership of the pointer.
+                self.grab(false);
             }
             None => {}
         }
@@ -2579,6 +2656,8 @@ impl App {
         gpu.queue.present(frame);
         gpu.reconfigured = false;
         self.record_presented(started);
+        // Retained pixels may predate the pending layout; do not retarget
+        // the game until a matching scene is presented again.
         mark(&mut self.profile, "present", &mut t);
         if let Some(profile) = &mut self.profile {
             profile.event("frames replayed while art waits", 1);
@@ -2652,10 +2731,24 @@ impl App {
                 self.interface = Some((key, interface_rects(&self.compiled, scene)));
             }
             let rects = self.interface.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
+            self.layout.screen_content = named_screen_content(&self.compiled, scene);
             let mut arranged = self.layout.frame(scene, window, self.config.overhang, rects, Some(bounds));
             let compiled = &self.compiled;
-            let shown = scaling::arrange(&plan, scene, &mut arranged, |s| sprite_rect(compiled, s));
-            self.layout.interface_shown = shown.shown;
+            let shown = scaling::arrange_panned(&plan, scene, &mut arranged, &mut self.layout.menu_pan, |s| sprite_rect(compiled, s));
+            self.layout.set_interface_shown(shown.shown);
+            // A middle drag suppresses hover while the menu moves. Restore
+            // it through the map of the pixels this frame actually shows.
+            if self.layout.menu_pan.take_hover_refresh() {
+                if let Some((x, y)) = self.layout.route_window(self.layout.pointer_in_window()) {
+                    let now = self.started.elapsed().as_secs_f64();
+                    if let Some(input) = self.menu_scroll.route(Input::MouseMove { x, y }, now) {
+                        self.feedback.sent(&input, &self.look_scene, now);
+                        self.display.send_input(input);
+                    } else {
+                        self.feedback.pointer_gone(now);
+                    }
+                }
+            }
             self.drawn_overlay = shown.overlay_cameras;
             self.overlay_camera = shown.overlay;
             self.drawn_frame = Some(arranged.clone());
@@ -2704,13 +2797,33 @@ impl App {
         }
         let now = self.started.elapsed().as_secs_f64();
         let replacements = self.feedback.replacements(&self.look_scene, now);
-        let looks_changed = full || free_changed || looks_metadata_changed || self.feedback.drawn() != &self.drawn_looks[..];
+        let menu_was_scrolling = self.menu_scroll.running();
+        let mut looks_changed = full || free_changed || looks_metadata_changed || self.feedback.drawn() != &self.drawn_looks[..]
+            || self.menu_scroll.running();
         if looks_changed {
             let compiled = &self.compiled;
             self.world.as_mut().expect("built above").free = looks::splice(&self.base_free, &self.spans, &replacements, |s, camera| placed_sprite(compiled, s, Some(camera), None));
         }
         self.drawn_looks = self.feedback.drawn().to_vec();
         drop(replacements);
+        if let Some(scrolled) = self.menu_scroll.draw(scene, &self.world.as_ref().expect("built above").free, &self.spans,
+            now, self.settings.input.smooth_menu_scrolling && !self.snap.snap_mode_active(), self.whole_version, |s| placed_rect(&self.compiled, s)) {
+            self.world.as_mut().expect("built above").free = scrolled;
+            looks_changed = true;
+        }
+        if (menu_was_scrolling || self.menu_scroll.running()) && self.pointer_inside && !self.layout.captured() && !self.snap.snap_mode_active() {
+            if let Some(point) = self.layout.route_window(self.layout.pointer_in_window()) {
+                match self.menu_scroll.refresh_pointer(point, now) {
+                    smooth_menus::PointerRefresh::Move { x, y } => {
+                        let input = Input::MouseMove { x, y };
+                        self.feedback.sent(&input, &self.look_scene, now);
+                        self.display.send_input(input);
+                    }
+                    smooth_menus::PointerRefresh::Gone => self.feedback.pointer_gone(now),
+                    smooth_menus::PointerRefresh::Unchanged => {}
+                }
+            }
+        }
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
         markers.extend(divider_sprites(&self.compiled, &arranged.divider));
@@ -2723,14 +2836,21 @@ impl App {
             unlocking: self.unlock_pending.is_some(),
             world_cursor: arranged.markers.iter().filter_map(|m| if let layout::Marker::Cursor(p) = m { Some(*p) } else { None }).collect(),
             cursor_view: self.layout.world_cursor_view(),
+            cursor_axes: self.layout.world_cursor_axes().unwrap_or((false, false)),
             pointer: if captured { self.system_pointer } else { self.layout.pointer_in_window() },
             pointer_inside: self.pointer_inside,
             pointer_world: self.layout.pointer_world(),
             now: self.started.elapsed().as_secs_f64(),
         };
         let steps = self.machine.step(&facts);
+        if steps.enter_edge.is_some() { self.layout.set_pointer_at_edge(false); }
+        self.layout.set_pointer_at_edge(self.machine.edge());
         let marks = steps.marks;
         if let Some(q) = steps.enter_edge {
+            // A change from a line to a corner, or to another line, may
+            // need a new Wayland position hint. Own the lock before it.
+            self.constraints.winit_grab(true);
+            layout_captured_grab(&gpu.window);
             // The view following the world cursor is held at the world's
             // edge: the system pointer goes where the drawn cursor is and
             // shows there once this frame is out (`unlock_after_frame`).
@@ -2755,6 +2875,7 @@ impl App {
         if steps.leave_edge {
             // Centred again: captured and hidden (at once; this frame
             // draws the cursor where the pointer is).
+            self.constraints.winit_grab(true);
             let locked = layout_captured_grab(&gpu.window);
             log::info!("viewer: world cursor centred again: drawn, the system pointer captured (locked: {locked})");
         }
@@ -2837,18 +2958,20 @@ impl App {
             self.map_drawn = true;
             log::info!("viewer: first map drawn (scene {})", scene.seq);
         }
-        // A software renderer draws a frame only when it differs from the last.
-        let unchanged = !full && !cells_changed && !free_changed && !looks_changed && !markers_moved && scene.tick == self.drawn_tick && window == self.drawn_window && !gpu.reconfigured;
+        let views_followed = self.drawn_frame.as_ref().map(|f| &f.cameras) != self.cursor_cameras.as_ref();
+        // A software renderer draws a frame only when it differs from the
+        // last. A panned menu can change only the cameras.
+        let unchanged = !full && !cells_changed && !free_changed && !looks_changed && !markers_moved && !views_followed && scene.tick == self.drawn_tick && window == self.drawn_window && !gpu.reconfigured;
         // The pointer's motion is drawn (or there was nothing to draw): the
         // cursor moved, or the views following it.
-        let views_followed = self.drawn_frame.as_ref().map(|f| &f.cameras) != self.cursor_cameras.as_ref();
-        self.cursor_cameras = self.drawn_frame.as_ref().map(|f| f.cameras.clone());
         let since = self.pointer_since.take().filter(|_| cursor_moved || views_followed);
         // (Not while the mouse waits to be let go after a frame.)
         if gpu.software && unchanged && self.unlock_pending.is_none() {
             if show_fps {
                 self.fps.counter.skipped(seconds);
             }
+            // The cached picture has exactly these cameras and UI mapping.
+            self.refresh_presented_world_pointer();
             return;
         }
         self.drawn_tick = scene.tick;
@@ -2909,9 +3032,13 @@ impl App {
         }
         gpu.window.pre_present_notify();
         gpu.queue.present(frame);
+        // Keep the last presented cameras when acquiring a frame failed,
+        // so a static menu pan is retried on a software renderer.
+        self.cursor_cameras = Some(arranged.cameras.clone());
         self.feedback.presented(self.started.elapsed().as_secs_f64());
         self.cached_picture = Some(CachedPicture { plan, copies: copies.to_vec() });
         self.record_presented(started);
+        self.refresh_presented_world_pointer();
         mark(&mut self.profile, "present", &mut t);
         if let (Some(since), true) = (since, log_latency()) {
             self.latency.start.push(started.saturating_duration_since(since).as_secs_f64() * 1000.0);
@@ -2996,6 +3123,7 @@ impl ApplicationHandler for App {
             _ => {}
         }
         if let WindowEvent::Focused(false) = event {
+            self.menu_scroll.focus_lost();
             for input in self.snap.focus_lost(&mut self.layout) {
                 self.send(input);
             }
@@ -3049,7 +3177,7 @@ impl ApplicationHandler for App {
             let edge = self.machine.edge() && self.unlock_pending.is_none();
             let s = self.plan.map_or(1.0, |p| p.factor());
             let delta = (delta.0 / s, delta.1 / s);
-            let inputs = self.snap.motion(delta).unwrap_or_else(|| if edge { vec![] } else { self.layout.motion(delta) });
+            let inputs = self.snap.motion(delta).unwrap_or_else(|| if edge { self.layout.edge_motion(delta) } else { self.layout.motion(delta) });
             for input in inputs {
                 self.send(input);
             }

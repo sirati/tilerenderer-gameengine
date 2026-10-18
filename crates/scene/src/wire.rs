@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Beside, Button, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SystemCursor, Update, View, ViewLooks, WorldShape};
+use crate::{Beside, Button, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 31;
+pub const VERSION: u32 = 37;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -113,6 +113,7 @@ impl Writer {
         self.bool(v.interface_only);
         self.bool(v.menu);
         self.u32(v.downscale);
+        self.u32(v.hidden_categories);
     }
 
     fn sprites(&mut self, sprites: &[FreeSprite]) {
@@ -139,6 +140,7 @@ impl Writer {
             self.u32(f.not_in_view.unwrap_or(0));
             self.glyph(f.glyph.as_ref());
             self.u32(f.palette);
+            self.u32(f.category);
         }
     }
 
@@ -194,11 +196,12 @@ impl Reader<'_> {
         let interface_only = self.bool()?;
         let menu = self.bool()?;
         let downscale = self.u32()?;
-        Ok(View { camera_x, camera_y, zoom, viewport, cull: has_cull.then_some(cull), origin, interface_only, menu, downscale })
+        let hidden_categories = self.u32()?;
+        Ok(View { camera_x, camera_y, zoom, viewport, cull: has_cull.then_some(cull), origin, interface_only, menu, downscale, hidden_categories })
     }
 
     fn sprites(&mut self) -> Result<Vec<FreeSprite>, WireError> {
-        let n = self.len(72)?;
+        let n = self.len(76)?;
         (0..n)
             .map(|_| {
                 Ok(FreeSprite {
@@ -229,6 +232,7 @@ impl Reader<'_> {
                     },
                     glyph: self.glyph()?,
                     palette: self.u32()?,
+                    category: self.u32()?,
                 })
             })
             .collect()
@@ -337,6 +341,20 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
+            Update::CameraFocus(focus) => {
+                w.u8(18);
+                w.bool(focus.is_some());
+                let focus = focus.unwrap_or_default();
+                w.u32(focus.serial as u32);
+                w.u32((focus.serial >> 32) as u32);
+                w.i32(focus.center.0);
+                w.i32(focus.center.1);
+            }
+            Update::MapWheelStep((x, y)) => {
+                w.u8(19);
+                w.i32(*x);
+                w.i32(*y);
+            }
             Update::Assets(n) => {
                 w.u8(8);
                 w.u32(*n as u32);
@@ -396,12 +414,17 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     for v in i.rect {
                         w.i32(v);
                     }
+                    w.bool(i.anchor.is_some());
+                    for v in i.anchor.unwrap_or_default() {
+                        w.i32(v);
+                    }
                     w.u32(i.id as u32);
                     w.u32((i.id >> 32) as u32);
                     let (tag, scroll, step) = match i.kind {
                         InteractableKind::Button => (0, [0; 4], 0),
                         InteractableKind::ListItem => (1, [0; 4], 0),
                         InteractableKind::List { scroll, step } => (2, scroll, step),
+                        InteractableKind::Slider { track, value } => (3, track, value),
                     };
                     w.u8(tag);
                     for v in scroll {
@@ -459,7 +482,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
 }
 
 /// Bytes of one encoded [`Interactable`].
-const INTERACTABLE_BYTES: usize = 16 + 8 + 1 + 16 + 4;
+const INTERACTABLE_BYTES: usize = 16 + 1 + 8 + 8 + 1 + 16 + 4;
 
 /// Decodes a batch of updates.
 pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
@@ -524,6 +547,13 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let p = (r.i32()?, r.i32()?);
                 Update::Focus(some.then_some(p))
             }
+            18 => {
+                let some = r.bool()?;
+                let serial = r.u32()? as u64 | (r.u32()? as u64) << 32;
+                let center = (r.i32()?, r.i32()?);
+                Update::CameraFocus(some.then_some(CameraFocus { serial, center }))
+            }
+            19 => Update::MapWheelStep((r.i32()?, r.i32()?)),
             8 => Update::Assets(r.u32()? as u64 | (r.u32()? as u64) << 32),
             9 => {
                 let n = r.len(8)?;
@@ -580,6 +610,9 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let mut items = Vec::with_capacity(n);
                 for _ in 0..n {
                     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                    let has_anchor = r.bool()?;
+                    let point = [r.i32()?, r.i32()?];
+                    let anchor = has_anchor.then_some(point);
                     let id = r.u32()? as u64 | (r.u32()? as u64) << 32;
                     let tag = r.u8()?;
                     let scroll = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
@@ -588,9 +621,10 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                         0 => InteractableKind::Button,
                         1 => InteractableKind::ListItem,
                         2 => InteractableKind::List { scroll, step },
+                        3 => InteractableKind::Slider { track: scroll, value: step },
                         t => return Err(WireError::Tag(t)),
                     };
-                    items.push(Interactable { rect, kind, id });
+                    items.push(Interactable { anchor, rect, kind, id });
                 }
                 Update::Interactables(items)
             }
@@ -658,6 +692,18 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
     };
     for e in events {
         match *e {
+            Input::Slider { id, action, value } => {
+                w.u8(16);
+                w.u32(id as u32);
+                w.u32((id >> 32) as u32);
+                w.u8(match action {
+                    SliderAction::Begin => 0,
+                    SliderAction::Preview => 1,
+                    SliderAction::Commit => 2,
+                    SliderAction::Cancel => 3,
+                });
+                w.i32(value);
+            }
             Input::MouseMove { x, y } => {
                 w.u8(0);
                 w.i32(x);
@@ -688,6 +734,21 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.u32(height);
             }
             Input::Quit => w.u8(5),
+            Input::WorldMove { x, y } => {
+                w.u8(14);
+                w.i32(x);
+                w.i32(y);
+            }
+            Input::UnitOrder { action, x, y } => {
+                w.u8(15);
+                w.u8(match action {
+                    UnitOrderAction::Preview => 0,
+                    UnitOrderAction::Confirm => 1,
+                    UnitOrderAction::Cancel => 2,
+                });
+                w.i32(x);
+                w.i32(y);
+            }
             Input::Look { x, y } => {
                 w.u8(6);
                 w.i32(x);
@@ -762,6 +823,17 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
     };
     for _ in 0..n {
         out.push(match r.u8()? {
+            16 => {
+                let id = r.u32()? as u64 | (r.u32()? as u64) << 32;
+                let action = match r.u8()? {
+                    0 => SliderAction::Begin,
+                    1 => SliderAction::Preview,
+                    2 => SliderAction::Commit,
+                    3 => SliderAction::Cancel,
+                    tag => return Err(WireError::Tag(tag)),
+                };
+                Input::Slider { id, action, value: r.i32()? }
+            }
             0 => Input::MouseMove { x: r.i32()?, y: r.i32()? },
             1 => {
                 let button = button(&mut r)?;
@@ -777,6 +849,16 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
             4 => Input::Resized { width: r.u32()?, height: r.u32()? },
             5 => Input::Quit,
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
+            14 => Input::WorldMove { x: r.i32()?, y: r.i32()? },
+            15 => {
+                let action = match r.u8()? {
+                    0 => UnitOrderAction::Preview,
+                    1 => UnitOrderAction::Confirm,
+                    2 => UnitOrderAction::Cancel,
+                    tag => return Err(WireError::Tag(tag)),
+                };
+                Input::UnitOrder { action, x: r.i32()?, y: r.i32()? }
+            }
             11 => Input::Edge { x: r.i32()?, y: r.i32()? },
             12 => Input::MainView { x: r.i32()?, y: r.i32()?, w: r.i32()?, h: r.i32()? },
             13 => Input::Window { width: r.u32()?, height: r.u32()?, scale_milli: r.u32()? },
@@ -859,19 +941,55 @@ mod tests {
     use crate::Scene;
 
     #[test]
+    fn semantic_camera_repeats_and_shutdown_cross_the_wire() {
+        let mut before = Scene::default();
+        before.camera_focus = Some(CameraFocus { serial: 0x1_0000_0001, center: (-64, 4096) });
+        let mut after = before.clone();
+        after.camera_focus.as_mut().unwrap().serial += 1;
+        let updates = after.updates_since(&before);
+        assert_eq!(updates, vec![Update::CameraFocus(after.camera_focus)]);
+        let decoded = decode_updates(&encode_updates(&updates)).unwrap();
+        for update in decoded { before.apply(update); }
+        assert_eq!(before.camera_focus, after.camera_focus);
+        after.camera_focus = None;
+        let decoded = decode_updates(&encode_updates(&after.updates_since(&before))).unwrap();
+        for update in decoded { before.apply(update); }
+        assert_eq!(before.camera_focus, None);
+    }
+
+    #[test]
+    fn map_wheel_preferences_update_without_refocusing_the_camera() {
+        let mut before = Scene::default();
+        before.camera_focus = Some(CameraFocus { serial: 7, center: (3000, 2000) });
+        before.map_wheel_step = (128, 64);
+        let mut after = before.clone();
+        after.map_wheel_step = (64, 32);
+        let updates = after.updates_since(&before);
+        assert_eq!(updates, vec![Update::MapWheelStep((64, 32))]);
+        for update in decode_updates(&encode_updates(&updates)).unwrap() { before.apply(update); }
+        assert_eq!(before.camera_focus, after.camera_focus);
+        assert_eq!(before.map_wheel_step, after.map_wheel_step);
+        after.map_wheel_step = (0, 0);
+        let updates = after.updates_since(&before);
+        for update in decode_updates(&encode_updates(&updates)).unwrap() { before.apply(update); }
+        assert_eq!(before.map_wheel_step, (0, 0));
+    }
+
+    #[test]
     fn updates_and_input_round_trip() {
         let mut s = Scene::empty(WorldShape { cols: 3, rows: 2, wrap_x: true, wrap_y: false }, 2);
         s.tick = 7;
-        s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false, menu: true, downscale: 2 };
+        s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false, menu: true, downscale: 2, hidden_categories: 0x123 };
         s.set(1, 2, 1, 0xABCDEF);
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
         s.layers[1].offsets = Some(vec![(0, 0), (-300, 7), (0, 0), (5, -1), (0, 0), (0, 0)]);
-        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, tint: 0x123456, zoom_art: 2, zoom: (3, 2), zoom_offset: (-4, 7), clip: None, not_in_view: Some(3), glyph: None, palette: 7 });
+        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, tint: 0x123456, zoom_art: 2, zoom: (3, 2), zoom_offset: (-4, 7), clip: None, not_in_view: Some(3), glyph: None, palette: 7, category: 0x456 });
         s.sprites.push(FreeSprite { x: 7, y: 30, zoom_art: 2, tint: 0xFFFF00, glyph: Some(Glyph { font: 1, ch: 'é', em64: 640, advance: 6, bold: true, italic: false, key: Some([255, 0, 255]), bar: None }), ..Default::default() });
         s.sprites.push(FreeSprite { x: 13, y: 30, zoom_art: 2, glyph: Some(Glyph { font: 0, ch: ' ', em64: 768, advance: 4, bold: false, italic: true, key: None, bar: Some((1, 2)) }), ..Default::default() });
-        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, tint: 0, zoom_art: 0, zoom: (0, 0), zoom_offset: (0, 0), clip: Some([1, -2, 300, 40]), not_in_view: None, glyph: None, palette: 0 });
+        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, tint: 0, zoom_art: 0, zoom: (0, 0), zoom_offset: (0, 0), clip: Some([1, -2, 300, 40]), not_in_view: None, glyph: None, palette: 0, category: 0x789 });
         s.patches.push(Patch { sprite: "Screen@x/0".into(), width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
         s.focus = Some((-64, 96));
+        s.camera_focus = Some(CameraFocus { serial: 0x1_0000_0002, center: (-4096, 1234) });
         s.assets = 3;
         s.zooms = vec![(3, 2)];
         let mut settings = viewer_settings::Settings::default();
@@ -891,9 +1009,10 @@ mod tests {
             beside: Some(Beside { screen: [448, 156, 1024, 768], edge: Edge::Bottom, world: Some([-64, 32, 1280, 640]) }),
         };
         s.interactables = vec![
-            Interactable { rect: [10, 20, 100, 24], kind: InteractableKind::Button, id: 0x1_0000_0002 },
-            Interactable { rect: [5, 50, 200, 300], kind: InteractableKind::List { scroll: [5, 60, 190, 280], step: 20 }, id: 7 },
-            Interactable { rect: [5, 60, 190, 20], kind: InteractableKind::ListItem, id: 8 },
+            Interactable { anchor: None, rect: [10, 20, 100, 24], kind: InteractableKind::Button, id: 0x1_0000_0002 },
+            Interactable { anchor: None, rect: [5, 50, 200, 300], kind: InteractableKind::List { scroll: [5, 60, 190, 280], step: 20 }, id: 7 },
+            Interactable { anchor: Some([193, 69]), rect: [5, 60, 190, 20], kind: InteractableKind::ListItem, id: 8 },
+            Interactable { anchor: None, rect: [10, 20, 200, 24], kind: InteractableKind::Slider { track: [20, 32, 180, 1], value: 123_456 }, id: 9 },
         ];
         s.screen_size = (1920, 1080);
         let hover = LookState { pointer: PointerState::Hover, selected: false };
@@ -937,6 +1056,10 @@ mod tests {
         assert!(matches!(decode_updates(&bad.0), Err(WireError::Settings(_))));
         assert_eq!(got.views.len(), 1);
         let events = vec![
+            Input::Slider { id: 0xfedc_ba98_7654_3210, action: SliderAction::Begin, value: 123_456 },
+            Input::Slider { id: 2, action: SliderAction::Preview, value: 1_000_000 },
+            Input::Slider { id: 2, action: SliderAction::Commit, value: 1_000_000 },
+            Input::Slider { id: 2, action: SliderAction::Cancel, value: -1 },
             Input::MouseMove { x: 1, y: -2 },
             Input::MouseButton { button: Button::Right, down: true, x: 3, y: 4 },
             Input::Wheel { delta: -120, x: 0, y: 0 },
@@ -945,6 +1068,10 @@ mod tests {
             Input::Resized { width: 800, height: 600 },
             Input::Quit,
             Input::Look { x: -5, y: 7000 },
+            Input::WorldMove { x: -64, y: 12345 },
+            Input::UnitOrder { action: UnitOrderAction::Preview, x: -100, y: 9999 },
+            Input::UnitOrder { action: UnitOrderAction::Confirm, x: 1234, y: -555 },
+            Input::UnitOrder { action: UnitOrderAction::Cancel, x: 0, y: 0 },
             Input::Zooms([(3, 2), (2, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]),
             Input::Views([(10, -20, 300, 200), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]),
             Input::MainView { x: 5, y: -6, w: 700, h: 400 },

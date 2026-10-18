@@ -406,6 +406,19 @@ pub struct PanelState {
     /// way, and the pointer's moves go below while one of those is held).
     pub ours: u8,
     pub theirs: u8,
+    /// Alt slider transaction: control id, item index, exact initial value.
+    pub slider_edit: Option<(u64, usize, f32)>,
+}
+
+impl PanelState {
+    /// Cancels an Alt slider edit, even after its control stops being visible.
+    pub fn cancel_slider(&mut self, panel: &Panel) -> Option<PanelEvent> {
+        let (_, index, original) = self.slider_edit.take()?;
+        let control = panel.items.get(index)?.control()?.to_owned();
+        let changed = self.values.get(&control) != Some(&Value::Number(original));
+        self.values.insert(control.clone(), Value::Number(original));
+        changed.then_some(PanelEvent::Slid { control, value: original })
+    }
 }
 
 /// One condition of `show_if` / `enable_if`.
@@ -858,6 +871,19 @@ impl Panels {
         panel.items.iter().filter(|i| Self::visible(i, state)).filter_map(|i| self.rect(i, state, origin)).any(|r| inside(r, x, y))
     }
 
+    /// Whether the panel intercepts any part of a rectangle. A driver
+    /// excludes controls below that rectangle from button snapping, so a
+    /// pointer cannot snap through a panel's painted cover.
+    pub fn covers_any(&self, panel: &Panel, state: &PanelState, area: [i32; 4], [x, y, w, h]: [i32; 4]) -> bool {
+        if w <= 0 || h <= 0 {
+            return false;
+        }
+        let origin = self.origin(panel, area);
+        panel.items.iter().filter(|i| Self::visible(i, state)).filter_map(|i| self.rect(i, state, origin)).any(|[ix, iy, iw, ih]| {
+            iw > 0 && ih > 0 && x < ix + iw && ix < x + w && y < iy + ih && iy < y + h
+        })
+    }
+
     /// The control (item index) under window point (x, y) that can be
     /// used.
     fn hit(&self, panel: &Panel, state: &PanelState, area: [i32; 4], x: i32, y: i32) -> Option<usize> {
@@ -895,7 +921,48 @@ impl Panels {
             Button::Middle => 4,
         };
         let mut events = Vec::new();
+        if let Some((_, index, _)) = state.slider_edit {
+            let valid = panel.items.get(index).is_some_and(|i| Self::visible(i, state) && Self::enabled(i, state));
+            let ordinary_press = matches!(input, Input::MouseButton { down: true, .. });
+            if !valid || ordinary_press {
+                events.extend(state.cancel_slider(panel));
+            }
+        }
         let consumed = match *input {
+            Input::Slider { id, action, value } => {
+                use scene::SliderAction;
+                let index = panel.items.iter().enumerate().find_map(|(n, i)| {
+                    (id_hash(&panel.name, &n.to_string()) == id && matches!(i.kind, Kind::Slider { .. })).then_some(n)
+                });
+                if let Some(index) = index {
+                    if action == SliderAction::Begin {
+                        events.extend(state.cancel_slider(panel));
+                        let item = &panel.items[index];
+                        if Self::visible(item, state) && Self::enabled(item, state) {
+                            let Kind::Slider { control, min, .. } = &item.kind else { unreachable!() };
+                            let original = match state.values.get(control) { Some(Value::Number(v)) => *v, _ => *min };
+                            state.slider_edit = Some((id, index, original));
+                            state.hover = Some(index);
+                        }
+                    } else if state.slider_edit.is_some_and(|edit| edit.0 == id) {
+                        match action {
+                            SliderAction::Cancel => events.extend(state.cancel_slider(panel)),
+                            SliderAction::Commit => { state.slider_edit = None; }
+                            SliderAction::Preview => {
+                                if let Kind::Slider { control, min, max, step, .. } = &panel.items[index].kind {
+                                    let value = snap(min + (max - min) * value.clamp(0, 1_000_000) as f32 / 1_000_000.0, *min, *max, *step);
+                                    if state.values.get(control) != Some(&Value::Number(value)) {
+                                        state.values.insert(control.clone(), Value::Number(value));
+                                        events.push(PanelEvent::Slid { control: control.clone(), value });
+                                    }
+                                }
+                            }
+                            SliderAction::Begin => unreachable!(),
+                        }
+                    }
+                    true
+                } else { false }
+            }
             Input::MouseMove { x, y } => {
                 if let Some(i) = state.dragging {
                     if let Some((control, value)) = self.slide(panel, state, area, i, x) {
@@ -1045,7 +1112,16 @@ impl Panels {
                 .map(|l| (l, draws_in(l)))
                 .collect();
             let draws = self.draw_item(panel, state, area, measure, n, item);
-            out.push(ControlLooks { id: id_hash(&panel.name, &n.to_string()), rect, select, shown, draws, states });
+            let kind = match &item.kind {
+                Kind::Slider { control, min, max, knob, .. } => {
+                    let kw = knob.as_ref().and_then(|k| self.art_named(k, state)).and_then(|a| a.size).map_or(0, |s| s.0 as i32);
+                    let value = match state.values.get(control) { Some(Value::Number(v)) => *v, _ => *min };
+                    let value = (((value - min) / (max - min)).clamp(0.0, 1.0) * 1_000_000.0).round() as i32;
+                    scene::InteractableKind::Slider { track: [rect[0] + kw / 2, rect[1] + rect[3] / 2, (rect[2] - kw).max(1), 1], value }
+                }
+                _ => scene::InteractableKind::Button,
+            };
+            out.push(ControlLooks { id: id_hash(&panel.name, &n.to_string()), rect, kind, select, shown, draws, states });
         }
         out
     }
@@ -1166,6 +1242,7 @@ impl Panels {
 pub struct ControlLooks {
     pub id: u64,
     pub rect: [i32; 4],
+    pub kind: scene::InteractableKind,
     pub select: scene::Select,
     pub shown: scene::LookState,
     pub draws: Vec<Draw>,
@@ -1472,6 +1549,22 @@ mod tests {
     }
 
     #[test]
+    fn panel_target_mask_follows_visible_items_and_rectangle_edges() {
+        let panels = Panels::parse(PANELS).unwrap();
+        let panel = panels.panel("p").unwrap();
+        let mut state = state("one");
+        assert!(!panels.covers_any(panel, &state, AREA, [220, 150, 20, 20]));
+        assert!(panels.covers_any(panel, &state, AREA, [190, 105, 11, 5]));
+        assert!(!panels.covers_any(panel, &state, AREA, [190, 105, 10, 5]), "touching edges do not overlap");
+        assert!(!panels.covers_any(panel, &state, AREA, [200, 100, 0, 20]));
+        assert!(!panels.covers_any(panel, &state, AREA, [200, 100, 20, -1]));
+        state.values.insert("tab".into(), Value::Text("two".into()));
+        state.values.insert("locked".into(), Value::On(true));
+        assert!(panels.covers_any(panel, &state, AREA, [220, 150, 20, 20]), "painted cover still blocks the native control when its own control is disabled");
+        assert!(!panels.covers_any(panel, &state, AREA, [600, 150, 20, 20]));
+    }
+
+    #[test]
     fn parses_repeats_and_checks_names() {
         let panels = Panels::parse(PANELS).unwrap();
         let p = panels.panel("p").unwrap();
@@ -1676,4 +1769,78 @@ mod tests {
         assert_eq!(snap(1.3333, 0.5, 3.0, 0.25), 1.25);
         assert_eq!(substitute("{a}-{b}-{", |k| (k == "a").then(|| "x".into())), "x--{");
     }
+
+    #[test]
+    fn alt_slider_transactions_preview_commit_and_restore_exact_original_value() {
+        use scene::SliderAction;
+        let panels = Panels::parse(PANELS).unwrap();
+        let panel = panels.panel("p").unwrap();
+        let mut state = state("two");
+        // This value is deliberately between ordinary drag steps. Cancelling
+        // must restore its bits rather than quantize it through a pixel.
+        let original = 1.123_456_7f32;
+        state.values.insert("scale".into(), Value::Number(original));
+        let slider = panels.looks(panel, &state, AREA, &estimate).into_iter().find(|c| matches!(c.kind, scene::InteractableKind::Slider { .. })).unwrap();
+        assert_eq!(slider.rect, [210, 250, 120, 10]);
+        assert!(matches!(slider.kind, scene::InteractableKind::Slider { track: [215, 255, 110, 1], .. }));
+        let edit = |state: &mut PanelState, action, value| panels.input(panel, state, AREA, &Input::Slider { id: slider.id, action, value });
+        assert!(edit(&mut state, SliderAction::Begin, 900_000).events.is_empty());
+        assert_eq!(state.values["scale"], Value::Number(original));
+        assert_eq!(edit(&mut state, SliderAction::Preview, 600_000).events, [PanelEvent::Slid { control: "scale".into(), value: 2.0 }]);
+        assert_eq!(edit(&mut state, SliderAction::Cancel, 0).events, [PanelEvent::Slid { control: "scale".into(), value: original }]);
+        assert_eq!(state.values["scale"], Value::Number(original));
+        edit(&mut state, SliderAction::Begin, 0);
+        edit(&mut state, SliderAction::Preview, 1_000_000);
+        assert!(edit(&mut state, SliderAction::Commit, 0).events.is_empty());
+        assert_eq!(state.values["scale"], Value::Number(3.0));
+        assert!(edit(&mut state, SliderAction::Cancel, 0).events.is_empty());
+        assert_eq!(state.values["scale"], Value::Number(3.0));
+    }
+
+    #[test]
+    fn alt_slider_restores_before_tabs_or_controls_hide_and_ignores_inactive_requests() {
+        use scene::SliderAction;
+        let panels = Panels::parse(PANELS).unwrap();
+        let panel = panels.panel("p").unwrap();
+        let mut state = state("two");
+        state.values.insert("scale".into(), Value::Number(1.0));
+        let slider = panels.looks(panel, &state, AREA, &estimate).into_iter().find(|c| matches!(c.kind, scene::InteractableKind::Slider { .. })).unwrap();
+        let edit = |state: &mut PanelState, action, value| panels.input(panel, state, AREA, &Input::Slider { id: slider.id, action, value });
+        assert!(edit(&mut state, SliderAction::Preview, 900_000).events.is_empty());
+        edit(&mut state, SliderAction::Begin, 0);
+        edit(&mut state, SliderAction::Preview, 1_000_000);
+        state.values.insert("tab".into(), Value::Text("one".into()));
+        let routed = edit(&mut state, SliderAction::Preview, 900_000);
+        assert_eq!(routed.events, [PanelEvent::Slid { control: "scale".into(), value: 1.0 }]);
+        assert!(state.slider_edit.is_none());
+        assert!(edit(&mut state, SliderAction::Begin, 0).events.is_empty());
+        assert!(state.slider_edit.is_none(), "a hidden slider cannot start editing");
+        assert_eq!(state.values["scale"], Value::Number(1.0));
+        state.values.insert("tab".into(), Value::Text("two".into()));
+        edit(&mut state, SliderAction::Begin, 0);
+        edit(&mut state, SliderAction::Preview, 1_000_000);
+        let routed = panels.input(panel, &mut state, AREA, &Input::MouseButton { button: Button::Left, down: true, x: 205, y: 105 });
+        assert_eq!(routed.events, [PanelEvent::Slid { control: "scale".into(), value: 1.0 }]);
+        assert!(state.slider_edit.is_none());
+    }
+
+    #[test]
+    fn disabling_an_alt_slider_restores_it_and_removes_its_target() {
+        use scene::SliderAction;
+        let panels = Panels::parse(&PANELS.replace("slider = \"scale\"", "slider = \"scale\"\nenable_if = \"!locked\"")).unwrap();
+        let panel = panels.panel("p").unwrap();
+        let mut state = state("two");
+        state.values.insert("scale".into(), Value::Number(1.25));
+        let slider = panels.looks(panel, &state, AREA, &estimate).into_iter().find(|c| matches!(c.kind, scene::InteractableKind::Slider { .. })).unwrap();
+        panels.input(panel, &mut state, AREA, &Input::Slider { id: slider.id, action: SliderAction::Begin, value: 0 });
+        panels.input(panel, &mut state, AREA, &Input::Slider { id: slider.id, action: SliderAction::Preview, value: 1_000_000 });
+        state.values.insert("locked".into(), Value::On(true));
+        let cancelled = panels.input(panel, &mut state, AREA, &Input::Slider { id: slider.id, action: SliderAction::Preview, value: 0 });
+        assert_eq!(cancelled.events, [PanelEvent::Slid { control: "scale".into(), value: 1.25 }]);
+        assert!(state.slider_edit.is_none());
+        assert!(!panels.looks(panel, &state, AREA, &estimate).iter().any(|c| c.id == slider.id));
+        assert!(panels.input(panel, &mut state, AREA, &Input::Slider { id: slider.id, action: SliderAction::Begin, value: 0 }).events.is_empty());
+        assert!(state.slider_edit.is_none());
+    }
+
 }

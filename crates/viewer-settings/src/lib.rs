@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub mod controls;
+pub mod clean_map;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
@@ -34,6 +35,7 @@ pub struct Settings {
     pub layout: Layout,
     pub input: Input,
     pub display: Display,
+    pub clean_map: clean_map::CleanMap,
 }
 
 /// The "Resolution" tab.
@@ -145,8 +147,8 @@ pub enum Place {
 pub enum Zoom {
     #[default]
     Off,
-    /// A box on top, `1:3:1` of the width (margin : box : margin), its height
-    /// from that at the window's aspect ratio. Not sized by `zoom_strip`.
+    /// A floating box centred in its region, `1:3:1` of the width, its height
+    /// from [`Layout::zoom_box_height`], or the window's aspect ratio on Auto.
     Floating131,
     /// As `Floating131`, `1:7:1`.
     Floating171,
@@ -205,6 +207,16 @@ pub struct Layout {
     /// ([`Zoom::Mouse111`], [`Zoom::Mouse131`]) as a fraction of the window
     /// (or of the view they are in), 0.05..=0.5.
     pub zoom_strip: f32,
+    /// Height of floating boxes ([`Zoom::Floating131`], [`Zoom::Floating171`])
+    /// as a fraction of their region, 0.05..=1.0. Zero keeps their automatic
+    /// height at the window's aspect ratio.
+    pub zoom_box_height: f32,
+    /// Hold the pointer outside floating zoom boxes instead of moving the
+    /// box clear of it. Top strips always hold the pointer below them.
+    pub zoom_box_block_pointer: bool,
+    /// Open generic menus and popups in the view that held the mouse when
+    /// they opened. Named advisors and City keep their own screen placement.
+    pub menu_follows_pointer: bool,
     /// Where each screen goes.
     pub screens: BTreeMap<ScreenKind, ScreenPlace>,
     /// The world moves smoothly (by pixels, easing) instead of snapping to
@@ -220,6 +232,9 @@ impl Default for Layout {
             zoom_place: Place::Floating,
             zoom: Zoom::Off,
             zoom_strip: 0.25,
+            zoom_box_height: 0.0,
+            zoom_box_block_pointer: false,
+            menu_follows_pointer: true,
             screens: BTreeMap::new(),
             smooth_world_movement: false,
             roles: Roles::Free,
@@ -247,7 +262,8 @@ pub enum MapMovement {
     /// Civilization IV style: the left button held on the map and dragged
     /// past a few pixels grabs it, the map following the pointer 1:1 and
     /// sliding on with momentum when let go (a shorter click is a click);
-    /// no edge scrolling.
+    /// no edge scrolling. A short right click opens the unit menu, while
+    /// right-drag previews a unit order for a separate left-click confirmation.
     Drag,
 }
 
@@ -260,13 +276,18 @@ pub struct Input {
     pub snap_updates_per_second: f32,
     /// How often the translucent target cursor follows, per second.
     pub snap_ghost_fps: f32,
+    /// Additional motion multiplier for the captured world cursor only.
+    /// The desktop pointer, menu snapping and free map movement keep their speed.
+    pub capture_sensitivity: f32,
     /// Edge scrolling, or grabbing the map and dragging it.
     pub map_movement: MapMovement,
+    /// Animate list scrolling in menus independently of map movement.
+    pub smooth_menu_scrolling: bool,
 }
 
 impl Default for Input {
     fn default() -> Self {
-        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, map_movement: MapMovement::EdgeScroll }
+        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 1.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false }
     }
 }
 
@@ -375,6 +396,29 @@ mod tests {
     }
 
     #[test]
+    fn older_top_boxes_keep_auto_height_and_explicit_height_round_trips() {
+        let old = "[layout]\nzoom = 'Floating131'\nzoom_strip = 0.35\n";
+        let mut s: Settings = toml::from_str(old).unwrap();
+        assert_eq!(s.layout.zoom_box_height, 0.0);
+        assert!(!s.layout.zoom_box_block_pointer);
+        assert_eq!(s.layout.zoom_strip, 0.35);
+        s.layout.zoom_box_height = 0.6;
+        s.layout.zoom_box_block_pointer = true;
+        let saved = toml::to_string(&s).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), s);
+    }
+
+    #[test]
+    fn menus_follow_the_mouse_in_older_configs_and_the_setting_round_trips() {
+        let old: Settings = toml::from_str("[layout]\nsplit = 'Vertical1To1'\n[layout.screens.Menu]\nvertical = 'LeftOrBottom'\n").unwrap();
+        assert!(old.layout.menu_follows_pointer);
+        assert_eq!(old.layout.screens["Menu"].vertical, Place::LeftOrBottom);
+        let explicit: Settings = toml::from_str("[layout]\nmenu_follows_pointer = false\n").unwrap();
+        assert!(!explicit.layout.menu_follows_pointer);
+        assert_eq!(toml::from_str::<Settings>(&toml::to_string(&explicit).unwrap()).unwrap(), explicit);
+    }
+
+    #[test]
     fn the_frame_counter_is_off_by_default_and_older_files_still_load() {
         assert!(!Settings::default().display.show_fps);
         // A file from before the setting existed.
@@ -396,9 +440,14 @@ mod tests {
     #[test]
     fn map_movement_is_edge_scrolling_by_default_and_older_files_still_load() {
         assert_eq!(Settings::default().input.map_movement, MapMovement::EdgeScroll);
+        assert!(!Settings::default().input.smooth_menu_scrolling);
         // A file from before the setting existed (its input section too).
         let old: Settings = toml::from_str("[input]\nsnap_updates_per_second = 5.0\n").unwrap();
         assert_eq!((old.input.map_movement, old.input.snap_updates_per_second), (MapMovement::EdgeScroll, 5.0));
+        assert!(!old.input.smooth_menu_scrolling);
+        let smooth: Settings = toml::from_str("[input]\nsmooth_menu_scrolling = true\n").unwrap();
+        assert!(smooth.input.smooth_menu_scrolling);
+        assert_eq!(toml::from_str::<Settings>(&toml::to_string(&smooth).unwrap()).unwrap(), smooth);
         let drag: Settings = toml::from_str("[input]\nmap_movement = \"Drag\"\n").unwrap();
         assert_eq!(drag.input.map_movement, MapMovement::Drag);
         assert_eq!(drag.input.snap_ghost_fps, Input::default().snap_ghost_fps);
@@ -406,6 +455,17 @@ mod tests {
         assert!(text.contains("map_movement = \"Drag\""), "{text}");
         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), drag);
         assert!(toml::from_str::<Settings>("[input]\nmap_movement = \"Wobble\"\n").is_err());
+    }
+
+    #[test]
+    fn capture_sensitivity_defaults_for_older_files_and_round_trips() {
+        for text in ["", "[input]\nsnap_updates_per_second = 5.0\n"] {
+            let settings: Settings = toml::from_str(text).unwrap();
+            assert_eq!(settings.input.capture_sensitivity, 1.0);
+        }
+        let settings: Settings = toml::from_str("[input]\ncapture_sensitivity = 2.5\n").unwrap();
+        assert_eq!(settings.input.capture_sensitivity, 2.5);
+        assert_eq!(toml::from_str::<Settings>(&toml::to_string(&settings).unwrap()).unwrap(), settings);
     }
 
     #[test]

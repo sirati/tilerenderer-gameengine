@@ -19,5 +19,8 @@ thiserror.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 wl-pointer = { path = "../wl-pointer" }
 
+[target.'cfg(windows)'.dependencies]
+inproc = { path = "../inproc" }
+
 [dev-dependencies]
 toml = "0.9"

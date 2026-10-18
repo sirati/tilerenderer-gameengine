@@ -301,6 +301,7 @@ impl Menus {
                 not_in_view: None,
                 glyph: None,
                 palette: 0,
+                category: 0,
             });
         };
         let text = |font: &Font, s: &str, (x, y): (i32, i32), put: &mut dyn FnMut(Art, (i32, i32))| {
@@ -389,7 +390,7 @@ impl Menus {
         menu.items
             .iter()
             .filter_map(|item| match item {
-                Item::Button { id, at, size, .. } => Some(scene::Interactable {
+                Item::Button { id, at, size, .. } => Some(scene::Interactable { anchor: None,
                     rect: [ox + at.0, oy + at.1, size.0 as i32, size.1 as i32],
                     kind: scene::InteractableKind::Button,
                     id: id_hash(&menu.name, id),

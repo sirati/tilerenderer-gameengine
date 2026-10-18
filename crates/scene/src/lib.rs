@@ -43,6 +43,8 @@ pub struct View {
     /// world pixels the renderer reports for it (`Input::Look`, ...) and
     /// [`Scene::focus`]; cells and world sprites stay at full size.
     pub downscale: u32,
+    /// Category bits hidden in this view. Category zero is always visible.
+    pub hidden_categories: u32,
 }
 
 /// Shape of the cell grid (layout and spacing come from the description).
@@ -107,6 +109,8 @@ pub struct FreeSprite {
     /// The named palette its indexed sprites are drawn with (an index into
     /// the render description's palettes; 0: none).
     pub palette: u32,
+    /// Visibility category bit for per-camera clean-map filtering.
+    pub category: u32,
 }
 
 /// A glyph drawn from a font's outline (see [`FreeSprite::glyph`]).
@@ -167,6 +171,14 @@ pub struct Scene {
     /// unit a player is moving), if any (in the pixels of its views, see
     /// [`View::downscale`]).
     pub focus: Option<(i32, i32)>,
+    /// Semantic main-camera request independent of the native rendering camera.
+    /// A new serial repeats a request even when its destination is unchanged.
+    /// None retains the driver-camera behavior of older drivers.
+    pub camera_focus: Option<CameraFocus>,
+    /// Map displacement for one wheel notch in current game-pixel units.
+    /// Positive magnitudes; Shift selects X, otherwise Y. Zero preserves
+    /// ordinary driver wheel routing for drivers without this metadata.
+    pub map_wheel_step: (i32, i32),
     /// New pixels for atlas sprites whose content changes at run time.
     pub patches: Vec<Patch>,
     /// The renderer's own settings as the driver last sent them (the driver
@@ -191,6 +203,14 @@ pub struct Scene {
     /// pointer asks for them, rather than wait for the driver's interface to
     /// draw them.
     pub looks: Vec<Looks>,
+}
+
+/// An explicit request to focus the primary renderer view.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CameraFocus {
+    pub serial: u64,
+    /// Center in the driver's current zoom-world pixels.
+    pub center: (i32, i32),
 }
 
 /// A mouse pointer.
@@ -331,6 +351,10 @@ pub enum Edge {
 pub struct Interactable {
     /// x, y, width, height.
     pub rect: [i32; 4],
+    /// Preferred pointer tip within `rect`, in the same driver pixels.
+    /// None places the pointer at the control centre. The hit rectangle
+    /// stays intact when an entry has blank space after its icon or text.
+    pub anchor: Option<[i32; 2]>,
     pub kind: InteractableKind,
     /// Chosen by the driver, the same while the element is there (e.g. the
     /// address of a game's control object): a renderer may keep pointing at
@@ -350,6 +374,9 @@ pub enum InteractableKind {
     /// height) they scroll in, `step` how many pixels they move for one
     /// wheel notch (`Input::Wheel` with a delta of 120; 0: not known).
     List { scroll: [i32; 4], step: i32 },
+    /// A slider's knob-center travel rectangle and current position in
+    /// millionths of its range. A tall track is vertical, otherwise horizontal.
+    Slider { track: [i32; 4], value: i32 },
 }
 
 /// The state an interactable is drawn in: where the pointer is and whether
@@ -456,6 +483,10 @@ pub enum Update {
     Tick(u32),
     /// The point of interest moved (see [`Scene::focus`]).
     Focus(Option<(i32, i32)>),
+    /// See [`Scene::camera_focus`].
+    CameraFocus(Option<CameraFocus>),
+    /// See [`Scene::map_wheel_step`].
+    MapWheelStep((i32, i32)),
     /// The scene now refers to art generation `n` (see [`Scene::assets`]).
     Assets(u64),
     /// See [`Scene::zooms`].
@@ -580,6 +611,8 @@ impl Scene {
             }
             Update::Tick(tick) => self.tick = tick,
             Update::Focus(focus) => self.focus = focus,
+            Update::CameraFocus(focus) => self.camera_focus = focus,
+            Update::MapWheelStep(step) => self.map_wheel_step = step,
             Update::Assets(n) => self.assets = n,
             Update::Zooms(z) => self.zooms = z,
             Update::Settings(s) => self.settings = Some(s),
@@ -652,6 +685,12 @@ impl Scene {
         if self.tick != old.tick {
             out.push(Update::Tick(self.tick));
         }
+        if self.camera_focus != old.camera_focus {
+            out.push(Update::CameraFocus(self.camera_focus));
+        }
+        if self.map_wheel_step != old.map_wheel_step {
+            out.push(Update::MapWheelStep(self.map_wheel_step));
+        }
         if self.focus != old.focus {
             out.push(Update::Focus(self.focus));
         }
@@ -690,9 +729,33 @@ pub enum Button {
     Middle,
 }
 
+/// A unit order gesture keeps the native go-to preview open until a separate
+/// click confirms its destination. A driver must reject a confirmation whose
+/// tile, selected unit, or world differs from the last preview.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UnitOrderAction {
+    Preview,
+    Confirm,
+    Cancel,
+}
+
+/// An Alt slider edit is a transaction. Begin must preserve the current
+/// value, Preview updates it, Commit accepts it, and Cancel restores the
+/// exact value from Begin. A driver ignores unknown or inactive controls.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SliderAction {
+    Begin,
+    Preview,
+    Commit,
+    Cancel,
+}
+
 /// User input captured by the renderer, in viewport pixels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
+    /// Edit a driver's slider without pressing or moving its pointer. The
+    /// value is a fraction of its range in millionths, clamped by the driver.
+    Slider { id: u64, action: SliderAction, value: i32 },
     MouseMove { x: i32, y: i32 },
     MouseButton { button: Button, down: bool, x: i32, y: i32 },
     Wheel { delta: i32, x: i32, y: i32 },
@@ -728,6 +791,14 @@ pub enum Input {
     /// The user wants to see world pixel (x, y) in the driver's main view
     /// (e.g. clicked it in another view): a driver may move its camera there.
     Look { x: i32, y: i32 },
+    /// The pointer moved over a world pixel the driver's original window
+    /// does not show. A driver can update hover and targeting directly
+    /// without moving its camera. Coordinates use the main world scale.
+    WorldMove { x: i32, y: i32 },
+    /// Preview, confirm, or cancel a unit go-to order at a world pixel.
+    /// Releasing the initiating button never confirms the order. Confirmation
+    /// is valid only for the tile of the most recent preview.
+    UnitOrder { action: UnitOrderAction, x: i32, y: i32 },
     /// A button went down or up on world pixel (x, y) in a view of the
     /// renderer's own whose pointer input does not reach the driver's
     /// window (it shows what the driver's main view does not, or what the

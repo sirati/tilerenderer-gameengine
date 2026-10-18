@@ -422,6 +422,7 @@ name = "civ3-sys"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "gdi-text",
  "inproc",
  "log",
  "thiserror 2.0.21",
@@ -2562,6 +2563,7 @@ dependencies = [
 name = "tile-viewer"
 version = "0.1.0"
 dependencies = [
+ "inproc",
  "log",
  "pollster",
  "render-desc",

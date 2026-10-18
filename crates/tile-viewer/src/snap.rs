@@ -56,7 +56,7 @@
 
 use std::f64::consts::PI;
 
-use scene::{Button, Input, Interactable, InteractableKind};
+use scene::{Button, Input, Interactable, InteractableKind, SliderAction};
 
 use crate::layout::Layout;
 
@@ -139,6 +139,8 @@ const VK_ESCAPE: u32 = 0x1B;
 pub struct Target {
     /// x, y, width, height.
     pub rect: [f64; 4],
+    /// Preferred pointer tip, transformed with the same affine as `rect`.
+    pub anchor: Option<Point>,
     pub kind: TargetKind,
     pub id: u64,
 }
@@ -146,6 +148,8 @@ pub struct Target {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum TargetKind {
     Button,
+    /// A slider's shown knob-center travel and position in millionths.
+    Slider { track: [f64; 4], value: i32 },
     /// An entry, of the list at this index of the targets if it lies in one.
     ListItem { list: Option<usize> },
     /// A list whose entries scroll in `scroll`, `step` pixels a notch;
@@ -164,7 +168,7 @@ impl Target {
     /// The capture view `rect` (window pixels), the world cursor at `at`.
     pub fn capture(rect: [i32; 4], at: (i32, i32)) -> Self {
         let [x, y, w, h] = rect;
-        Self { rect: [x as f64, y as f64, w as f64, h as f64], kind: TargetKind::Capture { at: (at.0 as f64, at.1 as f64) }, id: CAPTURE_ID }
+        Self { rect: [x as f64, y as f64, w as f64, h as f64], anchor: None, kind: TargetKind::Capture { at: (at.0 as f64, at.1 as f64) }, id: CAPTURE_ID }
     }
 
     /// Where the pointer goes on it.
@@ -173,8 +177,11 @@ impl Target {
             return at;
         }
         let [x, y, w, h] = self.rect;
-        // (Whole pixels: the driver gets them.)
-        ((x + w / 2.0).floor(), (y + h / 2.0).floor())
+        // Whole pixels strictly inside the visible hit rectangle. A text
+        // or icon anchor never changes the entry's actual hit area.
+        let (px, py) = self.anchor.unwrap_or((x + w / 2.0, y + h / 2.0));
+        (px.floor().clamp(x.ceil(), ((x + w).ceil() - 1.0).max(x.ceil())),
+         py.floor().clamp(y.ceil(), ((y + h).ceil() - 1.0).max(y.ceil())))
     }
 
     /// How far `p` is from the rectangle (0 inside).
@@ -198,7 +205,7 @@ impl Target {
         match self.kind {
             TargetKind::ListItem { list } => list,
             TargetKind::List { .. } => Some(index),
-            TargetKind::Button | TargetKind::Capture { .. } => None,
+            TargetKind::Button | TargetKind::Slider { .. } | TargetKind::Capture { .. } => None,
         }
     }
 }
@@ -222,8 +229,24 @@ pub fn targets_mapped(items: &[Interactable], map: impl Fn([i32; 4]) -> [f64; 4]
         .iter()
         .map(|i| Target {
             rect: map(i.rect),
+            anchor: i.anchor.map(|[x, y]| {
+                // Choose the affine from the full control rectangle. An
+                // anchor on the other side of an overlap must not select
+                // a different interface piece or placement.
+                let shown = map(i.rect);
+                (shown[0] + (x - i.rect[0]) as f64 * shown[2] / i.rect[2].max(1) as f64,
+                 shown[1] + (y - i.rect[1]) as f64 * shown[3] / i.rect[3].max(1) as f64)
+            }),
             kind: match i.kind {
                 InteractableKind::Button => TargetKind::Button,
+                InteractableKind::Slider { track, value } => {
+                    let shown = map(i.rect);
+                    let (sx, sy) = (shown[2] / i.rect[2].max(1) as f64, shown[3] / i.rect[3].max(1) as f64);
+                    let track = [shown[0] + (track[0] - i.rect[0]) as f64 * sx,
+                                 shown[1] + (track[1] - i.rect[1]) as f64 * sy,
+                                 track[2] as f64 * sx, track[3] as f64 * sy];
+                    TargetKind::Slider { track, value }
+                }
                 InteractableKind::ListItem => TargetKind::ListItem { list: None },
                 InteractableKind::List { scroll, step } => {
                     // (Its step as large as it shows.)
@@ -266,6 +289,39 @@ pub fn targets_mapped(items: &[Interactable], map: impl Fn([i32; 4]) -> [f64; 4]
         }
     }
     out
+}
+
+/// Clip hit areas after their affine and semantic anchor have been placed.
+/// Preserve each list relationship when invisible targets are removed.
+fn clip_targets(targets: &mut Vec<Target>, clip: impl Fn(&Target) -> Option<[f64; 4]>) {
+    let ids: Vec<u64> = targets.iter().map(|t| t.id).collect();
+    let intersection = |[x, y, w, h]: [f64; 4], [cx, cy, cw, ch]: [f64; 4]| {
+        let (l, t) = (x.max(cx), y.max(cy));
+        let (r, b) = ((x + w).min(cx + cw), (y + h).min(cy + ch));
+        // Driver pointer events use whole pixels. A subpixel sliver with
+        // no whole pixel inside it cannot be clicked.
+        (l.ceil() < r.ceil() && t.ceil() < b.ceil()).then_some([l, t, r - l, b - t])
+    };
+    targets.retain_mut(|target| {
+        let Some(clip) = clip(target) else { return false };
+        let Some(rect) = intersection(target.rect, clip) else { return false };
+        target.rect = rect;
+        if let TargetKind::List { scroll, .. } = &mut target.kind {
+            *scroll = intersection(*scroll, clip).unwrap_or(rect);
+        }
+        true
+    });
+    let placed_ids: Vec<u64> = targets.iter().map(|t| t.id).collect();
+    let mut children = vec![false; targets.len()];
+    for target in targets.iter_mut() {
+        if let TargetKind::ListItem { list } = &mut target.kind {
+            *list = list.and_then(|old| ids.get(old)).and_then(|id| placed_ids.iter().position(|candidate| candidate == id));
+            if let Some(k) = *list { children[k] = true; }
+        }
+    }
+    for (k, target) in targets.iter_mut().enumerate() {
+        if let TargetKind::List { has_items, .. } = &mut target.kind { *has_items = children[k]; }
+    }
 }
 
 /// The driver's element to snap to from `p`: the nearest (by distance to
@@ -634,6 +690,7 @@ impl Snapper {
                 .map(|t| {
                     let kind = match t.kind {
                         TargetKind::Button => "button",
+                        TargetKind::Slider { .. } => "slider",
                         TargetKind::ListItem { .. } => "entry",
                         TargetKind::List { .. } => "list",
                         TargetKind::Capture { .. } => "capture",
@@ -944,6 +1001,14 @@ impl Snapper {
     }
 }
 
+#[derive(Debug)]
+struct SliderEdit {
+    id: u64,
+    track: [f64; 4],
+    value: f64,
+    dirty: bool,
+}
+
 /// Button snapping in the viewer: Alt turns the mode on and off; buttons
 /// and the wheel go to the snapping pointer; everything else goes on to
 /// the layout.
@@ -961,6 +1026,10 @@ pub struct SnapInput {
     esc: bool,
     /// Whether the system pointer is to be hidden, when that changes.
     hide_pointer: Option<bool>,
+    /// Mouse motion edits this slider while the snapping pointer stays put.
+    slider: Option<SliderEdit>,
+    /// Initial selection and confirm/cancel presses never reach the driver.
+    swallowed_buttons: [bool; 3],
 }
 
 /// An action as the driver gets it (nothing for a point it does not take
@@ -1010,13 +1079,24 @@ impl SnapInput {
                 if let Some((_, (dx, dy))) = moved {
                     t.rect[0] += *dx as f64;
                     t.rect[1] += *dy as f64;
-                    if let TargetKind::List { scroll, .. } = &mut t.kind {
-                        scroll[0] += *dx as f64;
-                        scroll[1] += *dy as f64;
+                    if let Some(at) = &mut t.anchor {
+                        at.0 += *dx as f64;
+                        at.1 += *dy as f64;
+                    }
+                    match &mut t.kind {
+                        TargetKind::List { scroll: rect, .. } | TargetKind::Slider { track: rect, .. } => {
+                            rect[0] += *dx as f64;
+                            rect[1] += *dy as f64;
+                        }
+                        _ => {}
                     }
                 }
             }
         }
+        clip_targets(&mut out, |target| {
+            scene.interactables.iter().find(|item| item.id == target.id)
+                .and_then(|item| layout.driver_target_clip(item.rect))
+        });
         if let Some((rect, at)) = layout.capture_view() {
             out.push(Target::capture(rect, at));
         }
@@ -1079,19 +1159,81 @@ impl SnapInput {
         self.sync(layout)
     }
 
+    fn slider_preview(&mut self) -> Vec<Input> {
+        let Some(edit) = &mut self.slider else { return vec![] };
+        if !std::mem::take(&mut edit.dirty) { return vec![] }
+        vec![Input::Slider { id: edit.id, action: SliderAction::Preview, value: edit.value.round() as i32 }]
+    }
+
+    fn end_slider(&mut self, action: SliderAction) -> Vec<Input> {
+        let mut out = if action == SliderAction::Commit { self.slider_preview() } else { vec![] };
+        if let Some(edit) = self.slider.take() {
+            out.push(Input::Slider { id: edit.id, action, value: edit.value.round() as i32 });
+            // Editing motion never becomes a delayed navigation or list scroll.
+            self.snapper.moved = (0.0, 0.0);
+            self.snapper.scroll = Scroller::default();
+        }
+        out
+    }
+
+    fn validate_slider(&mut self, targets: &[Target]) -> Vec<Input> {
+        let Some(edit) = &mut self.slider else { return vec![] };
+        if let Some(Target { kind: TargetKind::Slider { track, .. }, .. }) = targets.iter().find(|t| t.id == edit.id) {
+            edit.track = *track;
+            vec![]
+        } else {
+            self.end_slider(SliderAction::Cancel)
+        }
+    }
+
+    fn begin_slider(&mut self, target: Target) -> Vec<Input> {
+        let TargetKind::Slider { track, value } = target.kind else { return vec![] };
+        let at = self.snapper.flight.to;
+        self.snapper.flight = Flight::rest(at);
+        self.snapper.pos = at;
+        self.snapper.arrived = true;
+        self.snapper.rested = Some(target.id);
+        self.snapper.ghost = Some(at);
+        self.snapper.moved = (0.0, 0.0);
+        self.slider = Some(SliderEdit { id: target.id, track, value: value.clamp(0, 1_000_000) as f64, dirty: false });
+        vec![Input::Slider { id: target.id, action: SliderAction::Begin, value }]
+    }
+
     /// Turns the mode off (the pointer lands).
     fn leave(&mut self, layout: &mut Layout, why: &str) -> Vec<Input> {
         if !self.snapper.snapping() {
             return vec![];
         }
+        let mut out = self.end_slider(SliderAction::Cancel);
         let actions = self.snapper.leave();
         log::debug!("viewer: button snapping off ({why})");
-        self.perform(actions, layout)
+        out.extend(self.perform(actions, layout));
+        out
     }
 
     /// A window input at time `now`: what goes to the driver.
     pub fn route(&mut self, input: Input, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
-        match input {
+        let targets = Self::targets(scene, layout);
+        let mut before = self.validate_slider(&targets);
+        if let Input::MouseButton { button, down, .. } = input {
+            let b = button_index(button);
+            if !down && std::mem::take(&mut self.swallowed_buttons[b]) {
+                return before;
+            }
+            if down && self.slider.is_some() {
+                self.swallowed_buttons[b] = true;
+                before.extend(self.end_slider(if button == Button::Right { SliderAction::Cancel } else { SliderAction::Commit }));
+                return before;
+            }
+            if down && button == Button::Left && self.snapper.snapping() {
+                if let Some(target) = targets.iter().find(|t| Some(t.id) == self.snapper.target_id() && matches!(t.kind, TargetKind::Slider { .. })) {
+                    self.swallowed_buttons[b] = true;
+                    before.extend(self.begin_slider(*target));
+                    return before;
+                }
+            }
+        }
+        let out = match input {
             // (Held, it repeats.)
             Input::Key { vk: VK_MENU, down: true, .. } if self.alt => vec![],
             Input::Key { vk: VK_MENU, down: true, .. } => {
@@ -1100,19 +1242,22 @@ impl SnapInput {
                 self.alt_entered = false;
                 self.alt_sent = false;
                 if self.snapper.snapping() {
-                    return self.leave(layout, "Alt");
+                    before.extend(self.leave(layout, "Alt"));
+                    return before;
                 }
                 if self.ctrl {
                     log::debug!("viewer: Alt with Ctrl held: the driver's");
                     self.alt_sent = true;
-                    return layout.route(input);
+                    before.extend(layout.route(input));
+                    return before;
                 }
                 // (Nothing of the driver's to snap to, e.g. before its first
                 // screen: Alt is the driver's.)
                 if !Self::targets(scene, layout).iter().any(|t| !t.is_capture()) {
                     log::debug!("snap: nothing to snap to: Alt is the driver's");
                     self.alt_sent = true;
-                    return layout.route(input);
+                    before.extend(layout.route(input));
+                    return before;
                 }
                 self.alt_entered = true;
                 self.enter(layout, scene, now, rates)
@@ -1142,6 +1287,7 @@ impl SnapInput {
                 self.alt_sent = true;
                 let mut out = Vec::new();
                 if std::mem::take(&mut self.alt_entered) && self.snapper.snapping() {
+                    before.extend(self.end_slider(SliderAction::Cancel));
                     self.snapper.stop();
                     log::debug!("viewer: Alt with a key: a shortcut, no button snapping");
                     out.extend(self.sync(layout));
@@ -1157,6 +1303,7 @@ impl SnapInput {
                 Some(actions) => self.perform(actions, layout),
                 None => layout.route(Input::MouseButton { button, down, x, y }),
             },
+            Input::Wheel { .. } if self.slider.is_some() => vec![],
             Input::Wheel { delta, .. } if !self.ctrl => match self.snapper.wheel(delta) {
                 Some(actions) => self.perform(actions, layout),
                 None => layout.route(input),
@@ -1171,27 +1318,53 @@ impl SnapInput {
                     i => i,
                 })
                 .collect(),
+            Input::Quit => {
+                before.extend(self.end_slider(SliderAction::Cancel));
+                layout.route(input)
+            }
             other => layout.route(other),
-        }
+        };
+        before.extend(out);
+        before
     }
 
     /// Raw mouse motion: `None` if it is the layout's (as without
     /// snapping), else what goes to the driver.
     pub fn motion(&mut self, d: (f64, f64)) -> Option<Vec<Input>> {
+        if let Some(edit) = &mut self.slider {
+            let vertical = edit.track[3] > edit.track[2];
+            let (motion, span) = if vertical { (d.1, edit.track[3]) } else { (d.0, edit.track[2]) };
+            if motion.is_finite() && span.is_finite() && span > 0.0 {
+                let value = (edit.value + motion * MOTION_GAIN * 1_000_000.0 / span).clamp(0.0, 1_000_000.0);
+                edit.dirty |= edit.value.round() != value.round();
+                edit.value = value;
+            }
+            return Some(vec![]);
+        }
         self.snapper.motion(d).then(Vec::new)
     }
 
     /// Time `now`: the pointer moves on; what goes to the driver.
     pub fn tick(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
-        let actions = self.snapper.tick(now, &Self::targets(scene, layout), rates);
-        self.perform(actions, layout)
+        let targets = Self::targets(scene, layout);
+        let mut out = self.validate_slider(&targets);
+        if self.slider.is_some() {
+            self.snapper.last = now;
+            out.extend(self.slider_preview());
+            return out;
+        }
+        let actions = self.snapper.tick(now, &targets, rates);
+        out.extend(self.perform(actions, layout));
+        out
     }
 
     /// The window lost the keyboard: no key is held any more, the mode ends.
     pub fn focus_lost(&mut self, layout: &mut Layout) -> Vec<Input> {
+        let mut out = self.end_slider(SliderAction::Cancel);
         self.snapper.stop();
         (self.ctrl, self.alt, self.alt_entered, self.alt_sent, self.esc) = (false, false, false, false, false);
-        self.sync(layout)
+        out.extend(self.sync(layout));
+        out
     }
 
     /// Whether to hide the system pointer, when that changes.
@@ -1217,3 +1390,15 @@ impl SnapInput {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "snap/content_anchors.rs"]
+mod content_anchors;
+
+#[cfg(test)]
+#[path = "snap/sliders.rs"]
+mod sliders;
+
+#[cfg(test)]
+#[path = "snap/status_controls.rs"]
+mod status_controls;

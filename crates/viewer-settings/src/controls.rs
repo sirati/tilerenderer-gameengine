@@ -48,17 +48,21 @@ pub const SCALE_RANGE: Range = Range { min: 0.5, max: 3.0, step: 0.05 };
 /// The height of the zoom strip and of the boxes at the mouse
 /// ([`Layout::zoom_strip`]).
 pub const ZOOM_STRIP_RANGE: Range = Range { min: 0.05, max: 0.5, step: 0.05 };
+/// Height of a floating box; zero selects its automatic aspect-ratio height.
+pub const ZOOM_BOX_HEIGHT_RANGE: Range = Range { min: 0.0, max: 1.0, step: 0.05 };
 /// How often the snapping cursor's target is recomputed, per second.
 pub const SNAP_RATE_RANGE: Range = Range { min: 1.0, max: 30.0, step: 1.0 };
 /// How often the snapping cursor's ghost follows, per second.
 pub const SNAP_GHOST_RANGE: Range = Range { min: 1.0, max: 120.0, step: 1.0 };
+/// Additional sensitivity for captured world-cursor motion.
+pub const CAPTURE_SENSITIVITY_RANGE: Range = Range { min: 0.1, max: 5.0, step: 0.1 };
 
 /// The prefix of the screen place controls: `"layout.screens.F1"`, ...
 pub const SCREENS_PREFIX: &str = "layout.screens.";
 
 /// Every key [`Settings::control`] answers (besides one screen place per
 /// screen of [`Layout::SCREENS`], and the derived `"layout.orientation"`).
-pub const KEYS: [&str; 14] = [
+pub const KEYS: [&str; 19] = [
     "resolution.pixel_scale",
     "resolution.menu_scale",
     "resolution.frame_scale",
@@ -67,11 +71,16 @@ pub const KEYS: [&str; 14] = [
     "layout.zoom_place",
     "layout.zoom",
     "layout.zoom_strip",
+    "layout.zoom_box_height",
+    "layout.zoom_box_block_pointer",
+    "layout.menu_follows_pointer",
     "layout.smooth_world_movement",
     "layout.roles",
     "input.snap_updates_per_second",
     "input.snap_ghost_fps",
+    "input.capture_sensitivity",
     "input.map_movement",
+    "input.smooth_menu_scrolling",
     "display.show_fps",
 ];
 
@@ -80,8 +89,10 @@ pub fn range(key: &str) -> Option<Range> {
     match key {
         "resolution.menu_scale" | "resolution.frame_scale" | "resolution.world_scale" => Some(SCALE_RANGE),
         "layout.zoom_strip" => Some(ZOOM_STRIP_RANGE),
+        "layout.zoom_box_height" => Some(ZOOM_BOX_HEIGHT_RANGE),
         "input.snap_updates_per_second" => Some(SNAP_RATE_RANGE),
         "input.snap_ghost_fps" => Some(SNAP_GHOST_RANGE),
+        "input.capture_sensitivity" => Some(CAPTURE_SENSITIVITY_RANGE),
         _ => None,
     }
 }
@@ -166,6 +177,7 @@ impl Settings {
     /// `"horizontal"`, which of the two screen places the screen shows.
     pub fn control(&self, key: &str) -> Option<ControlValue> {
         let (r, l, i) = (&self.resolution, &self.layout, &self.input);
+        if key.starts_with("clean_map.") { return self.clean_map.control(key); }
         match key {
             "resolution.pixel_scale" => Some(ControlValue::Choice(match r.pixel_scale {
                 Resolution::AUTO => "auto".into(),
@@ -178,12 +190,17 @@ impl Settings {
             "layout.zoom_place" => choice(l.zoom_place),
             "layout.zoom" => choice(l.zoom),
             "layout.zoom_strip" => Some(ControlValue::Number(l.zoom_strip)),
+            "layout.zoom_box_height" => Some(ControlValue::Number(l.zoom_box_height)),
+            "layout.zoom_box_block_pointer" => Some(ControlValue::On(l.zoom_box_block_pointer)),
+            "layout.menu_follows_pointer" => Some(ControlValue::On(l.menu_follows_pointer)),
             "layout.smooth_world_movement" => Some(ControlValue::On(l.smooth_world_movement)),
             "layout.roles" => choice(l.roles),
             "layout.orientation" => Some(ControlValue::Choice(if horizontal(l) { "horizontal" } else { "vertical" }.into())),
             "input.snap_updates_per_second" => Some(ControlValue::Number(i.snap_updates_per_second)),
             "input.snap_ghost_fps" => Some(ControlValue::Number(i.snap_ghost_fps)),
+            "input.capture_sensitivity" => Some(ControlValue::Number(i.capture_sensitivity)),
             "input.map_movement" => choice(i.map_movement),
+            "input.smooth_menu_scrolling" => Some(ControlValue::On(i.smooth_menu_scrolling)),
             "display.show_fps" => Some(ControlValue::On(self.display.show_fps)),
             _ => {
                 let kind = key.strip_prefix(SCREENS_PREFIX)?;
@@ -199,6 +216,7 @@ impl Settings {
             .map(|k| k.to_string())
             .chain(std::iter::once("layout.orientation".to_owned()))
             .chain(screens)
+            .chain(crate::clean_map::CleanMap::keys())
             .filter_map(|k| self.control(&k).map(|v| (k, v)))
             .collect()
     }
@@ -207,6 +225,7 @@ impl Settings {
     /// snapped to its step); whether the settings changed. A screen's place
     /// is set for the split's orientation, the other kept.
     pub fn set_control(&mut self, key: &str, value: &ControlValue) -> bool {
+        if key.starts_with("clean_map.") { return self.clean_map.set_control(key, value); }
         let before = self.clone();
         let ok = {
             let (r, l, i, d) = (&mut self.resolution, &mut self.layout, &mut self.input, &mut self.display);
@@ -232,6 +251,21 @@ impl Settings {
                 "layout.zoom_place" => set_choice(&mut l.zoom_place, value),
                 "layout.zoom" => set_choice(&mut l.zoom, value),
                 "layout.zoom_strip" => set_number(&mut l.zoom_strip, key, value),
+                "layout.zoom_box_height" => set_number(&mut l.zoom_box_height, key, value),
+                "layout.zoom_box_block_pointer" => match value {
+                    ControlValue::On(on) => {
+                        l.zoom_box_block_pointer = *on;
+                        true
+                    }
+                    _ => false,
+                },
+                "layout.menu_follows_pointer" => match value {
+                    ControlValue::On(on) => {
+                        l.menu_follows_pointer = *on;
+                        true
+                    }
+                    _ => false,
+                },
                 "layout.smooth_world_movement" => match value {
                     ControlValue::On(on) => {
                         l.smooth_world_movement = *on;
@@ -242,7 +276,15 @@ impl Settings {
                 "layout.roles" => set_choice(&mut l.roles, value),
                 "input.snap_updates_per_second" => set_number(&mut i.snap_updates_per_second, key, value),
                 "input.snap_ghost_fps" => set_number(&mut i.snap_ghost_fps, key, value),
+                "input.capture_sensitivity" => set_number(&mut i.capture_sensitivity, key, value),
                 "input.map_movement" => set_choice(&mut i.map_movement, value),
+                "input.smooth_menu_scrolling" => match value {
+                    ControlValue::On(on) => {
+                        i.smooth_menu_scrolling = *on;
+                        true
+                    }
+                    _ => false,
+                },
                 "display.show_fps" => match value {
                     ControlValue::On(on) => {
                         d.show_fps = *on;
@@ -291,11 +333,16 @@ mod tests {
             ("layout.zoom_place", ControlValue::Choice("RightOrTop".into())),
             ("layout.zoom", ControlValue::Choice("TopStrip".into())),
             ("layout.zoom_strip", ControlValue::Number(0.35)),
+            ("layout.zoom_box_height", ControlValue::Number(0.6)),
+            ("layout.zoom_box_block_pointer", ControlValue::On(true)),
+            ("layout.menu_follows_pointer", ControlValue::On(false)),
             ("layout.smooth_world_movement", ControlValue::On(true)),
             ("layout.roles", ControlValue::Choice("UnitMouse".into())),
             ("input.snap_updates_per_second", ControlValue::Number(7.0)),
+            ("input.capture_sensitivity", ControlValue::Number(2.5)),
             ("display.show_fps", ControlValue::On(true)),
             ("input.map_movement", ControlValue::Choice("Drag".into())),
+            ("input.smooth_menu_scrolling", ControlValue::On(true)),
             ("layout.screens.City", ControlValue::Choice("LeftOrBottom".into())),
         ] {
             assert!(s.set_control(key, &value), "{key}");
@@ -343,6 +390,35 @@ mod tests {
     }
 
     #[test]
+    fn capture_sensitivity_has_its_own_range_and_leaves_other_input_settings_alone() {
+        let mut s = Settings::default();
+        let before = s.input.clone();
+        assert!(s.set_control("input.capture_sensitivity", &ControlValue::Number(2.53)));
+        assert_eq!(s.input.capture_sensitivity, 2.5);
+        assert!(s.set_control("input.capture_sensitivity", &ControlValue::Number(8.0)));
+        assert_eq!(s.input.capture_sensitivity, 5.0);
+        assert!(s.set_control("input.capture_sensitivity", &ControlValue::Number(-1.0)));
+        assert_eq!(s.input.capture_sensitivity, 0.1);
+        assert!(!s.set_control("input.capture_sensitivity", &ControlValue::Number(f32::NAN)));
+        assert!(!s.set_control("input.capture_sensitivity", &ControlValue::On(true)));
+        s.input.capture_sensitivity = before.capture_sensitivity;
+        assert_eq!(s.input, before);
+    }
+
+    #[test]
+    fn top_box_height_has_its_own_range_and_auto_value() {
+        let mut s = Settings::default();
+        assert!(s.set_control("layout.zoom_box_height", &ControlValue::Number(0.62)));
+        assert_eq!(s.layout.zoom_box_height, 0.6);
+        assert!(s.set_control("layout.zoom_box_height", &ControlValue::Number(2.0)));
+        assert_eq!(s.layout.zoom_box_height, 1.0);
+        assert!(s.set_control("layout.zoom_box_height", &ControlValue::Number(-1.0)));
+        assert_eq!(s.layout.zoom_box_height, 0.0);
+        assert!(!s.set_control("layout.zoom_box_height", &ControlValue::Number(f32::NAN)));
+        assert_eq!(s.layout.zoom_strip, 0.25);
+    }
+
+    #[test]
     fn screen_places_follow_the_orientation_and_keep_the_other() {
         let mut s = Settings::default();
         let set = |s: &mut Settings, v: &str| s.set_control("layout.screens.F3", &ControlValue::Choice(v.into()));
@@ -362,7 +438,10 @@ mod tests {
     fn controls_list_every_setting_and_screen() {
         let s = Settings::default();
         let controls = s.controls();
-        assert_eq!(controls.len(), KEYS.len() + 1 + Layout::SCREENS.len());
+        assert_eq!(controls.len(), KEYS.len() + 1 + Layout::SCREENS.len() + crate::clean_map::CleanMap::keys().count());
+        for key in crate::clean_map::CleanMap::keys() {
+            assert_eq!(controls.iter().filter(|(k, _)| *k == key).count(), 1, "{key}");
+        }
         assert!(controls.contains(&("layout.screens.Help".into(), ControlValue::Choice("Floating".into()))));
         assert!(controls.contains(&("resolution.pixel_scale".into(), ControlValue::Choice("auto".into()))));
     }

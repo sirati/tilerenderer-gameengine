@@ -189,6 +189,90 @@ pub fn plan(window: (u32, u32), desktop: f64, screen: (u32, u32), settings: &Res
     Plan { present, screen, menu, frame: ratio(settings.frame_scale), world: ratio(settings.world_scale) }
 }
 
+/// Pans an oversized menu at its requested scale rather than shrinking its
+/// pixels to fit. A middle-button drag never reaches the driver. The same
+/// offset is used for rendering, hover and click mapping.
+#[derive(Clone, Debug, Default)]
+pub struct MenuPan {
+    key: Option<(Option<String>, Option<u32>)>,
+    offset: (i32, i32),
+    /// Allowed offset on each axis.
+    bounds: [(i32, i32); 2],
+    rect: Option<[i32; 4]>,
+    clip: Option<[i32; 4]>,
+    drag: Option<((i32, i32), (i32, i32))>,
+    hover_refresh: bool,
+}
+
+impl MenuPan {
+    fn place(&mut self, key: (Option<String>, Option<u32>), rect: Option<[i32; 4]>, canvas: (u32, u32)) -> (i32, i32) {
+        self.place_in(key, rect, [0, 0, canvas.0 as i32, canvas.1 as i32])
+    }
+
+    fn place_in(&mut self, key: (Option<String>, Option<u32>), rect: Option<[i32; 4]>, region: [i32; 4]) -> (i32, i32) {
+        if self.key.as_ref() != Some(&key) {
+            self.offset = (0, 0);
+            self.key = Some(key);
+            self.cancel_drag();
+        }
+        let bounds = rect.map_or([(0, 0); 2], |r| {
+            let axis = |at: i32, len: i32, start: i32, span: i32| if len > span {
+                (start + span - at - len, start - at)
+            } else { (0, 0) };
+            [axis(r[0], r[2], region[0], region[2]), axis(r[1], r[3], region[1], region[3])]
+        });
+        if bounds != self.bounds {
+            self.cancel_drag();
+        }
+        self.bounds = bounds;
+        self.clip = Some(region);
+        self.offset = (self.offset.0.clamp(self.bounds[0].0, self.bounds[0].1), self.offset.1.clamp(self.bounds[1].0, self.bounds[1].1));
+        self.rect = rect.map(|r| [r[0] + self.offset.0, r[1] + self.offset.1, r[2], r[3]]);
+        self.offset
+    }
+
+    /// Ends a drag when the window loses the mouse or the menu changes.
+    pub fn cancel_drag(&mut self) {
+        self.drag = None;
+        self.hover_refresh = false;
+    }
+
+    pub fn is_dragging(&self) -> bool { self.drag.is_some() }
+
+    /// Restores hover after a drag, once the panned input map is drawn.
+    pub fn take_hover_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.hover_refresh)
+    }
+
+    /// Whether the input belongs to panning the menu. Other buttons and
+    /// ordinary scrolling retain their driver behaviour.
+    pub fn route(&mut self, input: &scene::Input) -> bool {
+        use scene::{Button, Input};
+        match *input {
+            Input::MouseButton { button: Button::Middle, down: false, .. } => {
+                let consumed = self.drag.take().is_some();
+                self.hover_refresh |= consumed;
+                consumed
+            }
+            Input::MouseButton { button: Button::Middle, down: true, x, y }
+                if self.bounds.iter().any(|&(a, b)| a != b)
+                    && self.clip.is_none_or(|r| x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3])
+                    && self.rect.is_some_and(|r| x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3]) => {
+                self.drag = Some(((x, y), self.offset));
+                self.hover_refresh = false;
+                true
+            }
+            Input::MouseMove { x, y } => {
+                let Some((from, offset)) = self.drag else { return false };
+                self.offset = ((offset.0 + x - from.0).clamp(self.bounds[0].0, self.bounds[0].1),
+                    (offset.1 + y - from.1).clamp(self.bounds[1].0, self.bounds[1].1));
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// One piece of the driver's interface (or one of its other views) as
 /// shown: where it takes the pointer (the canvas's pixels), where that is
 /// in the driver's window, and back.
@@ -244,28 +328,39 @@ const PANEL_GAP: i32 = 6;
 /// menus and the driver's views within them about the middle (a popup
 /// about its own middle, where the layout put it), the frame's panels each
 /// at its side or corner (one camera per side or corner in use), the
-/// roaming controls at their top-left (`scene::Interface`); no menu or
-/// panel larger than the canvas. The viewer's own views (the world, panes, insets) are
+/// roaming controls at their top-left (`scene::Interface`). Oversized menus
+/// retain their requested scale; their viewport can be panned with the
+/// middle button. The viewer's own views (the world, panes, insets) are
 /// the canvas's already. `rect_of`: a screen sprite's rectangle.
 pub fn arrange(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, rect_of: impl Fn(&FreeSprite) -> Option<[i32; 4]>) -> Arranged {
+    arrange_panned(plan, scene, frame, &mut MenuPan::default(), rect_of)
+}
+
+/// Arranges the interface with a persistent oversized-menu pan position.
+pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan: &mut MenuPan, rect_of: impl Fn(&FreeSprite) -> Option<[i32; 4]>) -> Arranged {
     let mut out = Arranged::default();
     // A driver's screen fitted into a pane of the layout's (its views
     // stacked, drawn into its picture): the layout placed it all.
-    if frame.cameras.iter().any(|c| c.stacked) {
+    if frame.placed.is_empty() && frame.cameras.iter().any(|c| c.stacked) {
+        pan.place((None, None), None, plan.canvas());
         return out;
     }
     let canvas = plan.canvas();
     let parts = &scene.interface;
+    let menu_region = frame.menu_region;
+    let popup_region = frame.popup_region;
+    let canvas_rect = [0, 0, canvas.0 as i32, canvas.1 as i32];
     // Per camera: its map, if it is one of the driver's; or (a frame in
     // panels) the scene view and per panel its map and rectangle, per
     // sprite its panel.
     let mut pieces: Vec<Option<Affine>> = vec![None; frame.cameras.len()];
+    let mut clips: Vec<Option<[i32; 4]>> = vec![None; frame.cameras.len()];
     let mut panelled: Vec<(usize, usize, Vec<(Affine, [i32; 4])>, Vec<usize>)> = Vec::new();
     // What takes the pointer: per rectangle (the driver's pixels) its map
     // and how far the layout moved it.
-    let mut shown: Vec<(Affine, [i32; 4], (i32, i32))> = Vec::new();
-    // A menu no larger than the canvas: scaled up only as far as it fits
-    // (else its edges, and buttons on them, would be off it).
+    let mut shown: Vec<(Affine, [i32; 4], (i32, i32), Option<[i32; 4]>)> = Vec::new();
+    // HUD panels stay on the canvas; menus retain their requested scale
+    // and use a pannable viewport when larger than the canvas.
     let fitting = |zoom: Ratio, rect: Option<[i32; 4]>| match rect {
         Some([_, _, w, h]) if w > 0 && h > 0 => {
             let most = fit((w as u32, h as u32), canvas);
@@ -280,18 +375,46 @@ pub fn arrange(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, rect_of: i
         let into = |at: i32, len: i32, side: u32| if len <= side as i32 { at.clamp(0, side as i32 - len) - at } else { 0 };
         Affine { to: (piece.to.0 + into(x, w, canvas.0), piece.to.1 + into(y, h, canvas.1)), ..piece }
     };
-    let menu_rects: Vec<[i32; 4]> = scene.views.iter().filter(|v| v.view.interface_only && v.view.menu).flat_map(|v| v.overlay.iter().filter_map(&rect_of)).collect();
+    let menu_rects: Vec<[i32; 4]> = scene.views.iter().enumerate().filter(|(i, v)| v.view.interface_only && v.view.menu && frame.view_cameras.get(*i).copied().flatten().is_some_and(|c| !frame.placed.contains(&c))).map(|(_, v)| v).flat_map(|v| v.overlay.iter().filter_map(&rect_of)).collect();
     let menu_box = bounding(&menu_rects);
     // (About the middle, but moved as little as needed to be whole on the
     // canvas: e.g. a menu at the top of a screen larger than the canvas.)
-    let menu = Affine { zoom: fitting(plan.menu.zoom, menu_box), ..plan.menu };
-    let menu = menu_box.map_or(menu, |b| kept(menu, b));
+    let menu = menu_box.map_or(plan.menu, |b| match menu_region {
+        Some([x, y, w, h]) => Affine { from: (b[0] + b[2] / 2, b[1] + b[3] / 2), to: (x + w / 2, y + h / 2), zoom: plan.menu.zoom },
+        None => kept(plan.menu, b),
+    });
     // The driver's other views outside its menus: about the middle, as
     // large as they are.
     let middle = Affine { zoom: (1, 1), ..plan.menu };
+    let screen_piece = |camera: Camera, popup: bool| {
+        let (o, size, d) = (camera.origin, camera.viewport, camera.screen_shift);
+        let (w, h) = (size.0 as i32, size.1 as i32);
+        let zoom = plan.menu.zoom;
+        let from = (o.0 - d.0 + w / 2, o.1 - d.1 + h / 2);
+        let placed = menu_region.map_or_else(|| middle.apply(from), |[x, y, w, h]| (x + w / 2 - d.0, y + h / 2 - d.1));
+        let (hw, hh) = (scaled(w as i64 / 2, zoom) as i32, scaled(h as i64 / 2, zoom) as i32);
+        let [rx, ry, rw, rh] = if popup { popup_region.or(menu_region) } else { menu_region }.unwrap_or(canvas_rect);
+        let keep = |v: i32, half: i32, origin: i32, span: i32| if 2 * half <= span { v.clamp(origin + half, origin + span - half) } else { origin + span / 2 };
+        Affine { from: (from.0 + d.0, from.1 + d.1), to: (keep(placed.0 + d.0, hw, rx, rw), keep(placed.1 + d.1, hh, ry, rh)), zoom }
+    };
+    let active = parts.popup.or(parts.screen_view);
+    let active_rect = active.and_then(|id| scene.views.iter().position(|v| v.id == id))
+        .and_then(|i| frame.view_cameras.get(i).copied().flatten())
+        .map(|c| frame.cameras[c as usize])
+        .filter(|c| c.viewport.0 > 0 && c.viewport.1 > 0)
+        .map(|c| screen_piece(c, parts.popup.is_some()).rect([c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32]))
+        .or_else(|| menu_box.map(|r| menu.rect(r)));
+    let offset = if frame.placed.is_empty() {
+        pan.place_in((parts.screen.clone(), active), active_rect, popup_region.or(menu_region).unwrap_or(canvas_rect))
+    } else {
+        pan.place((None, None), None, canvas)
+    };
+    let panned = |piece: Affine| Affine { to: (piece.to.0 + offset.0, piece.to.1 + offset.1), ..piece };
+    let menu = panned(menu);
     for (i, v) in scene.views.iter().enumerate() {
         let Some(c) = frame.view_cameras.get(i).copied().flatten().map(|c| c as usize) else { continue };
         let camera = frame.cameras[c];
+        if frame.placed.contains(&(c as u32)) { continue; }
         if !v.view.interface_only {
             // (The main one is the layout's own arrangement.)
             if v.view.viewport.0 > 0 && v.view.viewport.1 > 0 {
@@ -299,7 +422,7 @@ pub fn arrange(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, rect_of: i
                 let within = menu_box.is_some_and(|m| r[0] >= m[0] && r[1] >= m[1] && r[0] + r[2] <= m[0] + m[2] && r[1] + r[3] <= m[1] + m[3]);
                 let piece = if within { menu } else { middle };
                 pieces[c] = Some(piece);
-                shown.push((piece, r, (0, 0)));
+                shown.push((piece, r, (0, 0), None));
             }
             continue;
         }
@@ -310,14 +433,7 @@ pub fn arrange(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, rect_of: i
             // A popup, or a screen part (an advisor): about its middle,
             // placed as the menus are (and moved as the layout moved it),
             // kept on the canvas.
-            let d = camera.screen_shift;
-            let (w, h) = (size.0 as i32, size.1 as i32);
-            let zoom = fitting(plan.menu.zoom, Some([0, 0, w, h]));
-            let from = (o.0 - d.0 + w / 2, o.1 - d.1 + h / 2);
-            let placed = middle.apply(from);
-            let (hw, hh) = (scaled(w as i64 / 2, zoom) as i32, scaled(h as i64 / 2, zoom) as i32);
-            let keep = |v: i32, half: i32, side: u32| if 2 * half <= side as i32 { v.clamp(half, side as i32 - half) } else { side as i32 / 2 };
-            Affine { from: (from.0 + d.0, from.1 + d.1), to: (keep(placed.0 + d.0, hw, canvas.0), keep(placed.1 + d.1, hh, canvas.1)), zoom }
+            panned(screen_piece(camera, parts.popup == Some(v.id)))
         } else if parts.roaming == Some(v.id) {
             let r = [o.0, o.1, size.0 as i32, size.1 as i32];
             kept(about(o, fitting(plan.frame, Some(r))), r)
@@ -333,7 +449,7 @@ pub fn arrange(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, rect_of: i
             }).collect();
             if anchors.len() > 1 || anchors.first().is_some_and(|a| a.0.zoom != (1, 1) || a.0.from != a.0.to) {
                 for (s, &k) in v.overlay.iter().zip(&of_sprite) {
-                    shown.extend(rect_of(s).map(|r| (anchors[k].0, r, (0, 0))));
+                    shown.extend(rect_of(s).map(|r| (anchors[k].0, r, (0, 0), None)));
                 }
                 panelled.push((c, i, anchors, of_sprite));
                 continue;
@@ -341,8 +457,9 @@ pub fn arrange(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, rect_of: i
             Affine::IDENTITY
         };
         pieces[c] = Some(piece);
+        clips[c] = if parts.popup == Some(v.id) { popup_region.or(menu_region) } else if parts.screen_view == Some(v.id) || v.view.menu { menu_region } else { None };
         let d = camera.screen_shift;
-        shown.extend(v.overlay.iter().filter_map(&rect_of).map(|r| (piece, [r[0] + d.0, r[1] + d.1, r[2], r[3]], d)));
+        shown.extend(v.overlay.iter().filter_map(&rect_of).map(|r| (piece, [r[0] + d.0, r[1] + d.1, r[2], r[3]], d, clips[c])));
     }
     // A frame in panels needs a camera per side or corner in use: if that
     // is more than the renderer draws, its panels go to the top-left one.
@@ -354,11 +471,15 @@ pub fn arrange(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, rect_of: i
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| log::warn!("viewer: the frame and panels need {required} views, limit {}: panels drawn as one (not repeated)", tile_render::MAX_VIEWS));
         for (c, i, anchors, _) in panelled.drain(..) {
-            shown.retain(|(p, _, _)| !anchors.iter().any(|a| a.0 == *p));
-            shown.extend(scene.views[i].overlay.iter().filter_map(&rect_of).map(|r| (Affine::IDENTITY, r, (0, 0))));
+            shown.retain(|(p, _, _, _)| !anchors.iter().any(|a| a.0 == *p));
+            shown.extend(scene.views[i].overlay.iter().filter_map(&rect_of).map(|r| (Affine::IDENTITY, r, (0, 0), None)));
             pieces[c] = Some(Affine::IDENTITY);
         }
     }
+    let intersection = |a: [i32; 4], b: [i32; 4]| {
+        let (x, y) = (a[0].max(b[0]), a[1].max(b[1]));
+        [x, y, (a[0] + a[2]).min(b[0] + b[2]) - x, (a[1] + a[3]).min(b[1] + b[3]) - y]
+    };
     let mut cameras = Vec::with_capacity(frame.cameras.len() + extra + 1);
     let mut index = vec![0u32; frame.cameras.len()];
     for (k, camera) in frame.cameras.iter().enumerate() {
@@ -373,7 +494,11 @@ pub fn arrange(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, rect_of: i
                 }
                 out.overlay_cameras.push((*i, of_sprite.iter().map(|&a| first + a as u32).collect()));
             }
-            (None, Some(piece)) if !camera.cells => cameras.push(overlaid(piece.camera(camera))),
+            (None, Some(piece)) if !camera.cells => {
+                let mut camera = overlaid(piece.camera(camera));
+                if let Some([x, y, w, h]) = clips[k] { camera.target_clip = Some([x, y, x + w, y + h]); }
+                cameras.push(camera);
+            },
             (None, Some(piece)) => cameras.push(piece.camera(camera)),
             (None, None) => cameras.push(*camera),
         }
@@ -384,13 +509,19 @@ pub fn arrange(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, rect_of: i
     for d in &mut frame.divider {
         d.0 = index[d.0 as usize];
     }
+    for c in &mut frame.placed {
+        *c = index[*c as usize];
+    }
     // The viewer's own screen sprites: over everything.
     if cameras.len() < tile_render::MAX_VIEWS {
         cameras.push(Camera { cells: false, ..Camera::new(canvas) });
         out.overlay = Some(cameras.len() as u32 - 1);
     }
     frame.cameras = cameras;
-    let shown = shown.into_iter().map(|(piece, r, shift)| ShownPiece { rect: piece.rect(r), driver: [r[0] - shift.0, r[1] - shift.1, r[2], r[3]], piece, shift });
+    let shown = shown.into_iter().map(|(piece, r, shift, clip)| {
+        let rect = piece.rect(r);
+        ShownPiece { rect: clip.map_or(rect, |clip| intersection(rect, clip)), driver: [r[0] - shift.0, r[1] - shift.1, r[2], r[3]], piece, shift }
+    });
     out.shown = Some(shown.filter(|s| s.rect[2] > 0 && s.rect[3] > 0).collect());
     out
 }
@@ -724,10 +855,10 @@ mod tests {
     }
 
     #[test]
-    fn every_setting_keeps_a_whole_picture() {
+    fn every_setting_preserves_scale_and_reachable_interface() {
         // Every pixel scale, desktop scale and part scale from the slider's
-        // ends to its middle: whole boxes; the world fills the picture, every part has
-        // a camera that draws over what is below it (none blots out the
+        // ends to its middle: whole pixels; the world fills the picture,
+        // every part has a camera that draws over what is below it (none blots out the
         // world), takes the pointer where it shows and maps it back to the
         // driver's pixel it shows.
         let (scene, rect_of) = game_scene();
@@ -777,19 +908,128 @@ mod tests {
                             (m.0 - 960).abs() <= 8 && (m.1 - 540).abs() <= 8
                         });
                         assert!(menu_piece.is_some(), "{what}: {shown:?}");
-                        // The menu (1024×768 in the middle) on the picture whole.
-                        let whole = shown.iter().filter_map(|s| {
-                            let c = s.rect;
-                            (c[2] * 2 >= canvas.0 as i32 / 3).then_some(c)
-                        });
-                        for c in whole {
-                            assert!(c[0] >= -1 && c[1] >= -1 && c[0] + c[2] <= canvas.0 as i32 + 1 && c[1] + c[3] <= canvas.1 as i32 + 1, "{what}: menu at {c:?} on {canvas:?}");
+                        // Fitting axes remain wholly visible. Oversized
+                        // axes cover the canvas and retain their scale.
+                        for piece in shown {
+                            let c = piece.rect;
+                            for (at, len, side) in [(c[0], c[2], canvas.0 as i32), (c[1], c[3], canvas.1 as i32)] {
+                                if len <= side {
+                                    assert!(at >= -1 && at + len <= side + 1, "{what}: {c:?} on {canvas:?}");
+                                } else {
+                                    assert!(at <= 0 && at + len >= side, "{what}: {c:?} on {canvas:?}");
+                                }
+                            }
+                            if matches!(piece.driver, [448, 156, 1024, 768] | [800, 400, 320, 200]) {
+                                assert_eq!(piece.piece.zoom, ratio(menu), "{what}");
+                            }
                         }
                         assert!(shown.iter().all(|s| s.rect[2] > 0 && s.rect[3] > 0), "{what}");
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn pixel_scale_grows_full_menus_screens_and_popups_through_six() {
+        for kind in ["menu", "screen", "popup"] {
+            for menu_scale in [1.0, 1.5] {
+                for pixel_scale in 1..=6 {
+                    let (mut scene, _) = game_scene();
+                    scene.views.retain(|v| v.id == 0 || v.id == 255);
+                    scene.interface = scene::Interface::default();
+                    let v = &mut scene.views[1];
+                    v.view.origin = (448, 156);
+                    v.view.viewport = (1024, 768);
+                    v.view.menu = kind == "menu";
+                    if kind == "screen" {
+                        scene.interface.screen_view = Some(v.id);
+                        scene.interface.screen = Some("Preferences".into());
+                    } else if kind == "popup" {
+                        scene.interface.popup = Some(v.id);
+                    }
+                    let p = plan((3840, 2160), 2.0, scene.screen_size, &res(pixel_scale, menu_scale, 1.0, 1.0));
+                    let mut layout = layout::Layout::default();
+                    layout.driver_screen = Some(p.screen);
+                    let mut f = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+                    let mut pan = MenuPan::default();
+                    let a = arrange_panned(&p, &scene, &mut f, &mut pan, |_| Some([448, 156, 1024, 768]));
+                    let piece = a.shown.unwrap()[0];
+                    assert_eq!(piece.piece.zoom, ratio(menu_scale), "{kind} ×{pixel_scale}");
+                    assert_eq!(piece.rect[2] as u32 * p.present.zoom.0, (1024.0 * menu_scale) as u32 * pixel_scale);
+                    assert_eq!(piece.rect[3] as u32 * p.present.zoom.0, (768.0 * menu_scale) as u32 * pixel_scale);
+                    let c = f.cameras[f.view_cameras[1].unwrap() as usize];
+                    assert_eq!(c.zoom, ratio(menu_scale));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_menu_pans_to_every_corner_and_clicks_follow_its_pixels() {
+        use scene::{Button, Input};
+        let (mut scene, rect_of) = game_scene();
+        scene.views.retain(|v| v.id == 0 || v.id == 255);
+        scene.interface = scene::Interface::default();
+        let p = plan((3840, 2160), 2.0, scene.screen_size, &res(6, 1.0, 1.0, 1.0));
+        let mut layout = layout::Layout::default();
+        layout.driver_screen = Some(p.screen);
+        let draw = |layout: &mut layout::Layout| {
+            let mut f = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+            let a = arrange_panned(&p, &scene, &mut f, &mut layout.menu_pan, &rect_of);
+            let piece = a.shown.as_ref().unwrap()[0];
+            layout.interface_shown = a.shown;
+            piece
+        };
+        draw(&mut layout);
+        for (dx, dy) in [(-10000, -10000), (10000, -10000), (-10000, 10000), (10000, 10000)] {
+            assert!(layout.route(Input::MouseButton { button: Button::Middle, down: true, x: 320, y: 180 }).is_empty());
+            assert!(layout.route(Input::MouseMove { x: 320 + dx, y: 180 + dy }).is_empty());
+            assert!(layout.route(Input::MouseButton { button: Button::Middle, down: false, x: 320, y: 180 }).is_empty());
+            let piece = draw(&mut layout);
+            assert_eq!(piece.rect[0], if dx > 0 { 0 } else { 640 - 1024 });
+            assert_eq!(piece.rect[1], if dy > 0 { 0 } else { 360 - 768 });
+            let expected = piece.to_driver((320, 180));
+            // Release requests hover only after this displayed map is
+            // current. The same coordinates then reach hover and clicks.
+            assert!(layout.menu_pan.take_hover_refresh());
+            assert!(!layout.menu_pan.take_hover_refresh());
+            assert_eq!(layout.route_window(layout.pointer_in_window()), Some(expected));
+            assert_eq!(layout.route(Input::MouseMove { x: 320, y: 180 }),
+                vec![Input::MouseMove { x: expected.0, y: expected.1 }]);
+            for down in [true, false] {
+                assert_eq!(layout.route(Input::MouseButton { button: Button::Left, down, x: 320, y: 180 }),
+                    vec![Input::MouseButton { button: Button::Left, down, x: expected.0, y: expected.1 }]);
+            }
+        }
+        // Losing focus stops the gesture; moving afterwards cannot pan.
+        layout.route(Input::MouseButton { button: Button::Middle, down: true, x: 320, y: 180 });
+        layout.released();
+        let before = draw(&mut layout).rect;
+        layout.route(Input::MouseMove { x: 100, y: 100 });
+        assert_eq!(draw(&mut layout).rect, before);
+        // Leaving the window can lose the middle-button release. Coming
+        // back moves the pointer without continuing the old gesture.
+        layout.route(Input::MouseButton { button: Button::Middle, down: true, x: 320, y: 180 });
+        layout.pointer_gone();
+        let before = draw(&mut layout).rect;
+        layout.route(Input::MouseMove { x: 420, y: 250 });
+        assert_eq!(draw(&mut layout).rect, before);
+        assert!(!layout.menu_pan.take_hover_refresh());
+        // Resizing clamps the offset and cancels an old gesture.
+        layout.menu_pan.route(&Input::MouseButton { button: Button::Middle, down: true, x: 320, y: 180 });
+        layout.menu_pan.place((None, None), Some([0, 0, 1024, 768]), (1920, 1080));
+        assert_eq!(layout.menu_pan.offset, (0, 0));
+        assert!(!layout.menu_pan.route(&Input::MouseMove { x: 10, y: 10 }));
+        // A new screen resets navigation even when its bounds match.
+        layout.menu_pan.place((Some("F1".into()), None), Some([-192, -204, 1024, 768]), (640, 360));
+        layout.menu_pan.route(&Input::MouseButton { button: Button::Middle, down: true, x: 320, y: 180 });
+        layout.menu_pan.route(&Input::MouseMove { x: 100, y: 100 });
+        layout.menu_pan.place((Some("F2".into()), None), Some([-192, -204, 1024, 768]), (640, 360));
+        assert_eq!(layout.menu_pan.offset, (0, 0));
+        assert!(!layout.menu_pan.route(&Input::MouseMove { x: 20, y: 20 }));
+        assert!(!layout.menu_pan.route(&Input::MouseButton { button: Button::Right, down: true, x: 320, y: 180 }));
+        assert!(!layout.menu_pan.route(&Input::Wheel { delta: 120, x: 320, y: 180 }));
     }
 
     #[test]

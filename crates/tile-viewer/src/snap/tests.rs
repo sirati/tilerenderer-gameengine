@@ -8,15 +8,15 @@ const TICK: f64 = 1.0 / 120.0;
 const D: f64 = 4.0 / 9.0;
 
 fn button(id: u64, rect: [i32; 4]) -> Interactable {
-    Interactable { rect, kind: InteractableKind::Button, id }
+    Interactable { anchor: None, rect, kind: InteractableKind::Button, id }
 }
 
 fn item(id: u64, rect: [i32; 4]) -> Interactable {
-    Interactable { rect, kind: InteractableKind::ListItem, id }
+    Interactable { anchor: None, rect, kind: InteractableKind::ListItem, id }
 }
 
 fn list(id: u64, rect: [i32; 4], step: i32) -> Interactable {
-    Interactable { rect, kind: InteractableKind::List { scroll: rect, step }, id }
+    Interactable { anchor: None, rect, kind: InteractableKind::List { scroll: rect, step }, id }
 }
 
 /// A 20×20 button with its middle at (x, y).
@@ -897,12 +897,13 @@ fn snapping_works_with_the_mouse_free_and_hands_the_pointer_back_where_it_ended(
     let mut l = Layout::default();
     frame(&mut l, &s);
     assert!(!l.captured());
-    // The pointer at the window's left edge: the driver scrolls.
-    assert_eq!(l.route(Input::MouseMove { x: 0, y: 300 }), [Input::MouseMove { x: 0, y: 300 }, Input::Edge { x: -1, y: 0 }]);
+    // The pointer at the window's left edge scrolls the local camera;
+    // the separate native game's edge scroller remains disabled.
+    assert_eq!(l.route(Input::MouseMove { x: 0, y: 300 }), [Input::MouseMove { x: 0, y: 300 }]);
     let mut snap = SnapInput::default();
     // On: no edge any more.
     let out = snap.route(key(ALT, true), &mut l, &s, 0.0, Rates::default());
-    assert_eq!(out, [Input::Edge { x: 0, y: 0 }]);
+    assert!(out.is_empty());
     assert!(snap.active() && l.snapping());
     assert_eq!(snap.snapper.target(), Some((130.0, 535.0)));
     snap.route(key(ALT, false), &mut l, &s, 0.0, Rates::default());
@@ -918,8 +919,8 @@ fn snapping_works_with_the_mouse_free_and_hands_the_pointer_back_where_it_ended(
     assert_eq!(snap.snapper.pointer(), None);
     assert_eq!(l.take_warp(), Some((330, 535)));
     assert_eq!(l.pointer_in_window(), (330, 535));
-    // Under the usual rules again: at the edge, the driver scrolls.
-    assert_eq!(l.route(Input::MouseMove { x: 0, y: 300 }), [Input::MouseMove { x: 0, y: 300 }, Input::Edge { x: -1, y: 0 }]);
+    // Under the usual rules again, without native edge-scroller input.
+    assert_eq!(l.route(Input::MouseMove { x: 0, y: 300 }), [Input::MouseMove { x: 0, y: 300 }]);
 }
 
 #[test]
@@ -1016,4 +1017,29 @@ impl render_desc::ImageLoader for NoFiles {
     fn load(&self, source: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> {
         Err(format!("no file {source}"))
     }
+}
+
+#[test]
+fn capture_sensitivity_does_not_change_menu_snapping_motion_or_gestures() {
+    use crate::cursor::SnapMode;
+    let (mut slow, scene) = captured();
+    let mut fast = slow.clone();
+    slow.set_capture_sensitivity(0.1);
+    fast.set_capture_sensitivity(5.0);
+    let mut a = SnapInput::default();
+    let mut b = SnapInput::default();
+    assert_eq!(a.route(key(ALT, true), &mut slow, &scene, 0.0, Rates::default()),
+        b.route(key(ALT, true), &mut fast, &scene, 0.0, Rates::default()));
+    assert!(a.snap_mode_active() && b.snap_mode_active());
+    for step in 1..=60 {
+        assert_eq!(a.motion((5.25, -0.375)), b.motion((5.25, -0.375)));
+        let now = step as f64 / 60.0;
+        assert_eq!(a.tick(&mut slow, &scene, now, Rates::default()), b.tick(&mut fast, &scene, now, Rates::default()));
+        assert_eq!(a.snapper.pointer(), b.snapper.pointer());
+        assert_eq!(a.snapper.ghost(), b.snapper.ghost());
+    }
+    let click = Input::MouseButton { button: Button::Left, down: true, x: 400, y: 300 };
+    assert_eq!(a.route(click.clone(), &mut slow, &scene, 1.0, Rates::default()), b.route(click, &mut fast, &scene, 1.0, Rates::default()));
+    let wheel = Input::Wheel { delta: 120, x: 400, y: 300 };
+    assert_eq!(a.route(wheel.clone(), &mut slow, &scene, 1.0, Rates::default()), b.route(wheel, &mut fast, &scene, 1.0, Rates::default()));
 }

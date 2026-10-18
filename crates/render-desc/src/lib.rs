@@ -643,6 +643,11 @@ pub struct LayerDesc {
     /// remapped indices are drawn through (see [`Compiled::value_in`]).
     #[serde(default)]
     pub palettes: bool,
+    /// Visibility category bit for per-camera clean-map filtering. Zero is
+    /// always visible. The value is a bit mask so a layer may belong to more
+    /// than one category.
+    #[serde(default)]
+    pub category: u32,
 }
 
 /// `blend = "alpha"` (default) or `blend = { scale = 16 }` (the
@@ -1566,6 +1571,7 @@ impl Description {
             spec.blend = blend_of(layer.blend)
                 .ok_or_else(|| DescError::Unknown { kind: "blend (scale denominator 1..=32) of layer", name: layer.name.clone() })?;
             // (Enough bits for every row, and row 0.)
+            spec.category = layer.category;
             spec.palette_bits = if layer.palettes { (u32::BITS - (palette_rows.len() as u32).leading_zeros()).max(1) } else { 0 };
             if layers.last().is_some_and(|l: &LayerSpec| l.pass > spec.pass) {
                 return Err(DescError::Unknown { kind: "pass order for layer", name: layer.name.clone() });

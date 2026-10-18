@@ -13,15 +13,11 @@
 //! (the game's own screen edge works the same over its interface). Not
 //! while button snapping holds the pointer.
 //!
-//! - **The driver's view** (A following the driver's main view, its screen
-//!   not fitted into a pane, at any zoom): the driver scrolls it itself,
-//!   told where the pointer is at the edge (`Input::Edge`; the Civ III
-//!   bridge has the game see its pointer as far from its own edge, and the
-//!   game scrolls faster nearer the edge).
-//! - **The viewer's views** (B, A following anything else, insets): the
-//!   viewer moves them, at [`EDGE_PAN_SPEED`] screen pixels a second at the
-//!   outermost pixel down to [`EDGE_SLOWEST`] of that at the zone's inner
-//!   end ([`edge_speed`]), sub-pixel steps carried over between frames.
+//! Every world view uses the same viewer clock and speed curve, at
+//! [`EDGE_PAN_SPEED`] window pixels a second at the outermost pixel down to
+//! [`EDGE_SLOWEST`] of that at the zone's inner end ([`edge_speed`]). Zoom
+//! converts that speed to world pixels, with fractional steps carried over
+//! between frames. The driver's tile-based edge scrolling stays disabled.
 //!
 //! # Dragging
 //!
@@ -34,18 +30,16 @@
 //! the last moments ([`Tracker`]) and slows with friction ([`Momentum`],
 //! the deceleration of Apple's scroll views); a pointer held still before
 //! it was let go does not slide, and any press on a view stops a slide. No
-//! edge scrolling in this mode. Insets, A and B alike; a view following
+//! edge scrolling in this mode except while a held right drag previews a
+//! unit go-to order. That preview scrolls at the edge until release; a
+//! separate left click confirms it. `unit_orders` owns that gesture.
+//! Insets, A and B alike; a view following
 //! the world cursor moves the world cursor (it keeps it in its middle).
 //!
-//! The driver's view cannot be moved by pixels from outside (Civ III
-//! centres its view on a tile), so while it is dragged and slides A is
-//! placed by the viewer (it shows the world itself, the driver's view
-//! staying where it was), and on letting go the driver is asked to look
-//! where A will come to rest (`Input::Look`, the bridge clicks the minimap
-//! there). Once A rests and the driver's view moved (or after
-//! [`HANDBACK_WAIT`] seconds) A follows the driver's view again: it lands
-//! on the nearest place the driver can show (with smooth world movement it
-//! glides the rest of the way).
+//! Panning A while it follows the driver preserves its exact pixel centre.
+//! It follows again when the driver requests a new semantic camera focus,
+//! or moves its native camera if it supplies no semantic metadata. Panning
+//! does not recenter the driver's camera or quantize A to a tile on release.
 
 use scene::{Button, EDGE_ZONE, Input};
 use viewer_settings::MapMovement;
@@ -61,9 +55,6 @@ pub const DRAG_THRESHOLD: i32 = 4;
 /// How long the pointer may rest before it is let go and the map still
 /// slides on (seconds).
 pub const STILL_BEFORE_RELEASE: f64 = 0.06;
-/// How long A waits for the driver's view to move after a drag before it
-/// follows that view again anyway (seconds).
-pub const HANDBACK_WAIT: f64 = 0.5;
 
 /// Per axis, where pointer coordinate `v` of a window `size` long is at its
 /// edge, as in `Input::Edge`: 0 if not within [`EDGE_ZONE`] of an edge the
@@ -202,8 +193,6 @@ struct Grab {
     /// World pixels per window pixel.
     scale: f64,
     tracker: Tracker,
-    /// A following the driver's view: handed back to it when let go.
-    look: bool,
 }
 
 /// A view sliding on after it was let go.
@@ -215,13 +204,6 @@ struct Coast {
     scale: f64,
 }
 
-/// A moved by hand off the driver's view, waiting to follow it again.
-#[derive(Copy, Clone, Debug, PartialEq)]
-struct Handback {
-    driver_at: Option<(i32, i32)>,
-    waited: f64,
-}
-
 /// The state of map movement (a part of [`Layout`]).
 #[derive(Clone, Debug, Default)]
 pub struct Pan {
@@ -231,9 +213,9 @@ pub struct Pan {
     press: Option<Press>,
     grab: Option<Grab>,
     coast: Option<Coast>,
-    handback: Option<Handback>,
-    /// A's centre less the driver's view's while A follows it.
-    main_offset: (f64, f64),
+    /// The native camera where a manual A pan began. A keeps its exact
+    /// centre until the game itself next moves that camera.
+    manual_driver: Option<(i32, i32)>,
     /// The view scrolled at the edge, and the motion not yet a world pixel.
     edge_view: Option<(Hit, (i32, i32))>,
     edge_rest: (f64, f64),
@@ -254,6 +236,7 @@ impl Layout {
     /// How the mouse moves the map (from the settings).
     pub fn set_map_movement(&mut self, m: MapMovement) {
         if self.pan.mode != m {
+            self.cancel_unit_order();
             log::info!("viewer: map movement: {}", if m == MapMovement::Drag { "dragging (left or middle button)" } else { "edge scrolling" });
             self.pan.mode = m;
             self.pan.press = None;
@@ -265,11 +248,8 @@ impl Layout {
         self.pan.mode
     }
 
-    /// Whether the driver scrolls the main pane itself: it follows the
-    /// driver's main view (at any zoom), the driver's screen not fitted
-    /// into a pane.
-    fn driver_scrolls_main(&self) -> bool {
-        self.main.is_some() && self.main_view.follow == Follow::Driver && self.fit.is_none() && self.shown.iter().any(|(h, _)| *h == Hit::Main)
+    pub(super) fn pan_has_gesture(&self) -> bool {
+        self.pan.press.is_some() || self.pan.grab.is_some()
     }
 
     fn driver_center(&self) -> Option<(i32, i32)> {
@@ -302,14 +282,20 @@ impl Layout {
     }
 
     /// Puts the middle of view `hit` at world pixel `c` (moved by hand; a
-    /// view following the world cursor moves the cursor).
+    /// view following the world cursor moves the cursor). A following the
+    /// driver keeps that mode, but ignores the unchanged native camera.
     fn place_view(&mut self, hit: Hit, c: (i32, i32)) {
+        let driver = hit == Hit::Main && self.main_view.follow == Follow::Driver;
+        if driver && self.pan.manual_driver.is_none() {
+            self.pan.manual_driver = self.driver_center();
+        }
         match self.follow_of(hit) {
             Some(Follow::Pointer) => self.cursor = self.bounds.map_or(c, |b| b.clamp_point(c)),
             Some(_) => {
                 let focus = self.focus;
                 if let Some(v) = self.free_view(hit) {
                     v.moved_by_hand(c, focus);
+                    if driver { v.follow = Follow::Driver; }
                 }
             }
             None => {}
@@ -335,7 +321,7 @@ impl Layout {
                     return None;
                 }
             }
-            Hit::Magnifier | Hit::Divider | Hit::Beside => return None,
+            Hit::Magnifier | Hit::Divider | Hit::Beside | Hit::Screen => return None,
         };
         self.shown.iter().any(|(h, _)| *h == hit).then_some(hit)
     }
@@ -349,6 +335,13 @@ impl Layout {
         let [x, y, w, h] = super::rect_of(cam);
         let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
         let mut e = (edge_axis(p.0, ww, x <= 0, x + w >= ww), edge_axis(p.1, wh, y <= 0, y + h >= wh));
+        // A top strip reserves the window's top. The first map row below
+        // it becomes the upward scroll boundary for the affected pane.
+        if let Some((strip, _)) = self.strip() {
+            if y == strip[1] + strip[3] + super::GAP && p.0 >= strip[0] && p.0 < strip[0] + strip[2] {
+                e.1 = edge_axis(p.1 - y, h, true, false);
+            }
+        }
         if let (Some(side), Some(split)) = (self.against, self.split) {
             if side.hit() == hit {
                 let toward = if side == Side::A { 1 } else { -1 };
@@ -361,17 +354,37 @@ impl Layout {
         Some((hit, e))
     }
 
-    /// Where the pointer at `p` is at the driver's edge (`Input::Edge`):
-    /// in the main pane while the driver scrolls it, edge scrolling on, the
-    /// mouse free and nothing dragged.
-    pub(super) fn driver_edge(&self, p: (i32, i32)) -> (i32, i32) {
-        if self.pan.mode != MapMovement::EdgeScroll || self.locked || self.snapping || self.drag.is_some() || self.pan.grab.is_some() || !self.driver_scrolls_main() {
-            return (0, 0);
-        }
-        match self.view_edge(p) {
-            Some((Hit::Main, e)) => e,
-            _ => (0, 0),
-        }
+    /// A native map wheel notch moves tiles, rather than scrolling the
+    /// parked native camera or depending on how large this pane is drawn.
+    /// UI wheels and drivers without map-wheel metadata keep their routing.
+    pub(super) fn map_wheel(&mut self, delta: i32, p: (i32, i32)) -> Option<Vec<Input>> {
+        if self.map_wheel_step == (0, 0) || self.snapping { return None; }
+        let hit = if self.locked {
+            self.shown.iter().find(|(hit, _)| self.follow_of(*hit) == Some(Follow::Pointer)).map(|(hit, _)| *hit)?
+        } else {
+            if !matches!(self.hit(p), Hit::Main | Hit::Pane | Hit::Inset(_) | Hit::Magnifier) { return None; }
+            self.pan_view_at(p)?
+        };
+        if self.fit.is_some_and(|fit| fit.hit == hit) { return None; }
+        let (center, _) = self.shown_center(hit)?;
+        let notches = -(delta / 120) as f64;
+        if notches == 0.0 { return Some(vec![]); }
+        let step = if self.shift { (self.map_wheel_step.0 as f64, 0.0) } else { (0.0, self.map_wheel_step.1 as f64) };
+        let (to, _) = self.clamp_view_center(hit, (center.0 + notches * step.0, center.1 + notches * step.1));
+        self.pan.coast = None;
+        self.place_view(hit, (to.0.round() as i32, to.1.round() as i32));
+        let old_point = if self.locked { Some(self.cursor) } else { self.world_under(p) };
+        let out = old_point.map(|old| {
+            let point = if self.locked { self.cursor } else { (old.0 + (to.0 - center.0).round() as i32, old.1 + (to.1 - center.1).round() as i32) };
+            Input::WorldMove { x: point.0, y: point.1 }
+        }).into_iter().collect();
+        Some(out)
+    }
+
+    /// All arranged world panes scroll locally. Keep the native edge
+    /// pointer neutral so its tile-based scrolling cannot race the viewer.
+    pub(super) fn driver_edge(&self, _p: (i32, i32)) -> (i32, i32) {
+        (0, 0)
     }
 
     /// The pointer left the window (or it lost the focus).
@@ -440,9 +453,15 @@ impl Layout {
             self.grab(press.hit, Button::Left, press.at);
         }
         let g = self.pan.grab?;
-        // (The divider does not hold a drag back.)
+        // A drag may pass through the divider, but a reserved zoom area
+        // still holds the pointer outside, as OS confinement does.
+        let raw = p;
+        let p = self.constrain_zoom(self.pointer, p);
+        if p != raw && self.walls == super::Walls::Warp {
+            self.warp = Some(p);
+        }
         self.pointer = p;
-        self.raw_pointer = p;
+        self.raw_pointer = raw;
         self.against = None;
         self.side = self.side_of(p).or(self.side);
         let desired = (g.start.0 - (p.0 - g.from.0) as f64 * g.scale, g.start.1 - (p.1 - g.from.1) as f64 * g.scale);
@@ -460,27 +479,14 @@ impl Layout {
     /// Grabs view `hit` at window pixel `from`.
     fn grab(&mut self, hit: Hit, button: Button, from: (i32, i32)) {
         let Some((center, scale)) = self.shown_center(hit) else { return };
-        let mut look = false;
-        if hit == Hit::Main {
-            if self.driver_scrolls_main() {
-                // (Where A sits while it follows the driver.)
-                if let Some(d) = self.driver_center() {
-                    self.pan.main_offset = (center.0 - d.0 as f64, center.1 - d.1 as f64);
-                }
-                look = true;
-            } else {
-                // Grabbed again before it went back to the driver's view.
-                look = self.pan.handback.take().is_some() && self.main_view.follow == Follow::Free;
-            }
-        }
         self.pan.coast = None;
         self.pan.edge_view = None;
-        self.pan.grab = Some(Grab { hit, button, from, start: center, at: center, scale, tracker: Tracker::new(from), look });
+        self.pan.grab = Some(Grab { hit, button, from, start: center, at: center, scale, tracker: Tracker::new(from) });
         log::info!("viewer: {} grabbed ({button:?} button) at {from:?}", view_name(hit));
     }
 
-    /// Lets go of the view grabbed at `p`: it slides on; A moved off the
-    /// driver's view has the driver look where it comes to rest.
+    /// Lets go of the view grabbed at `p`: it slides on at its exact
+    /// pixel position, without asking the driver to quantize its camera.
     fn let_go(&mut self, p: (i32, i32)) -> Vec<Input> {
         let Some(g) = self.pan.grab.take() else { return vec![] };
         let momentum = Momentum { vel: g.tracker.release(p) };
@@ -488,32 +494,28 @@ impl Layout {
         if momentum.moving() {
             self.pan.coast = Some(Coast { hit: g.hit, pos: g.at, momentum, scale: g.scale });
         }
-        if g.look {
-            let d = momentum.distance();
-            let (end, _) = self.clamp_view_center(g.hit, (g.at.0 - d.0 * g.scale, g.at.1 - d.1 * g.scale));
-            let (x, y) = ((end.0 - self.pan.main_offset.0).round() as i32, (end.1 - self.pan.main_offset.1).round() as i32);
-            out.push(Input::Look { x, y });
-            self.pan.handback = Some(Handback { driver_at: self.driver_center(), waited: 0.0 });
-            log::info!("viewer: A let go, sliding at {:.0?} px/s; the driver looks at world pixel ({x}, {y})", momentum.vel);
-        } else {
-            log::info!("viewer: {} let go, sliding at {:.0?} px/s", view_name(g.hit), momentum.vel);
-        }
+        log::info!("viewer: {} let go, sliding at {:.0?} px/s", view_name(g.hit), momentum.vel);
         out.extend(self.edge_change(self.driver_edge(p)));
         out
     }
 
     /// A frame `dt` seconds after the last (the driver's screen fitted into
     /// `fitted`, if it is): the dragging pointer's velocity sampled, a
-    /// sliding view moved on, A handed back to the driver's view, and the
-    /// view the pointer is at the edge of scrolled.
-    pub(super) fn pan_frame(&mut self, dt: f64, fitted: Option<Hit>) {
+    /// sliding view moved on and the view at the pointer's edge scrolled.
+    /// Drivers without semantic camera requests resume A following when
+    /// their own camera moves.
+    pub(super) fn pan_frame(&mut self, dt: f64, fitted: Option<Hit>, native_follow: bool) {
         let pointer = self.pointer;
         if let Some(g) = &mut self.pan.grab {
             g.tracker.sample(pointer, dt);
         }
         self.slide(dt);
-        self.hand_back(dt);
         self.edge_scroll(dt, fitted);
+        if native_follow {
+            self.follow_driver();
+        } else if self.main_view.follow != Follow::Driver {
+            self.pan.manual_driver = None;
+        }
     }
 
     fn slide(&mut self, dt: f64) {
@@ -536,32 +538,58 @@ impl Layout {
         self.pan.coast = c.momentum.moving().then_some(c);
     }
 
-    fn hand_back(&mut self, dt: f64) {
-        let Some(mut h) = self.pan.handback else { return };
-        if self.pan.grab.is_some_and(|g| g.hit == Hit::Main) || self.pan.coast.is_some_and(|c| c.hit == Hit::Main) {
-            return;
-        }
-        if self.main_view.follow != Follow::Free {
-            self.pan.handback = None;
-            return;
-        }
-        h.waited += dt;
-        let moved = self.driver_center() != h.driver_at;
-        if moved || h.waited >= HANDBACK_WAIT {
-            self.main_view.follow = Follow::Driver;
-            self.main_view.hand_focus = None;
-            self.pan.handback = None;
-            log::info!("viewer: A follows the driver's view again ({})", if moved { "it moved there" } else { "it did not move" });
-        } else {
-            self.pan.handback = Some(h);
+    fn follow_driver(&mut self) {
+        let Some(anchor) = self.pan.manual_driver else { return };
+        if self.main_view.follow != Follow::Driver {
+            self.pan.manual_driver = None;
+        } else if self.driver_center().is_some_and(|center| center != anchor) {
+            // Only a new native camera position resumes following. An idle
+            // frame or a quantized copy of the old position must not undo
+            // the user's sub-tile pan. Cancel any old fling as well.
+            self.pan.manual_driver = None;
+            self.pan.coast = self.pan.coast.filter(|c| c.hit != Hit::Main);
+            log::info!("viewer: A follows the driver's new camera position");
         }
     }
 
+    /// A semantic engine camera request takes priority over a previous
+    /// manual pan or fling, including a repeat request for the same tile.
+    pub(super) fn resume_game_focus(&mut self) {
+        self.pan.manual_driver = None;
+        self.main_view.hand_focus = None;
+        self.main_view.scale_rest = (0.0, 0.0);
+        self.pan.coast = self.pan.coast.filter(|c| c.hit != Hit::Main);
+        self.pan.grab = self.pan.grab.filter(|g| g.hit != Hit::Main);
+        self.pan.press = self.pan.press.filter(|p| p.hit != Hit::Main);
+    }
+
+    pub(super) fn pan_rescale_world(&mut self, ratio: f64) {
+        let point = |p: (i32, i32)| ((p.0 as f64 * ratio).round() as i32, (p.1 as f64 * ratio).round() as i32);
+        let scaled = |p: (f64, f64)| (p.0 * ratio, p.1 * ratio);
+        self.pan.manual_driver = self.pan.manual_driver.map(point);
+        self.pan.edge_rest = scaled(self.pan.edge_rest);
+        if let Some(g) = &mut self.pan.grab {
+            g.at = scaled(g.at);
+            g.start = g.at;
+            g.from = self.pointer;
+        }
+        if let Some(c) = &mut self.pan.coast {
+            c.pos = scaled(c.pos);
+        }
+    }
+
+    pub(super) fn main_panned_by_hand(&self) -> bool {
+        self.pan.manual_driver.is_some() && self.main_view.follow == Follow::Driver
+    }
+
     fn edge_scroll(&mut self, dt: f64, fitted: Option<Hit>) {
-        let active = self.pan.mode == MapMovement::EdgeScroll && self.pan.inside && !self.locked && !self.snapping && self.drag.is_none() && self.pan.grab.is_none();
+        // A held right-button unit preview can reach beyond this pane in
+        // Drag mode. Its pending destination stops scrolling on release.
+        let enabled = self.pan.mode == MapMovement::EdgeScroll || self.unit_order_dragging();
+        let active = enabled && self.pan.inside && !self.locked && !self.snapping && self.drag.is_none() && self.pan.grab.is_none();
         let target = self
             .view_edge(self.pointer)
-            .filter(|&(hit, e)| active && e != (0, 0) && fitted != Some(hit) && !(hit == Hit::Main && self.driver_scrolls_main()));
+            .filter(|&(hit, e)| active && e != (0, 0) && fitted != Some(hit));
         let sign = |(h, e): (Hit, (i32, i32))| (h, (e.0.signum(), e.1.signum()));
         if target.map(sign) != self.pan.edge_view {
             match target {
@@ -779,18 +807,17 @@ mod tests {
         tick(&mut l, 100);
         assert_eq!(b(&l), (start.0 + 135, start.1));
         assert_eq!(l.split.unwrap().view.follow, Follow::Free);
-        // A (the driver's view): the driver scrolls it, at its left, top and
-        // bottom edges and corners; the viewer leaves it be.
+        // A uses the same viewer integrator, without starting the native
+        // game's independent tile-based edge scrolling.
         let a = l.main_view;
         mv(&mut l, (300, 300));
-        assert_eq!(edges(&mv(&mut l, (0, 300))), [(-1, 0)]);
-        assert_eq!(edges(&mv(&mut l, (0, 0))), [(-1, -1)]);
-        assert_eq!(edges(&mv(&mut l, (3, 599))), [(-4, 1)]);
-        assert_eq!(edges(&mv(&mut l, (200, 599))), [(0, 1)]);
+        for at in [(0, 300), (0, 0), (3, 599), (200, 599)] {
+            assert!(edges(&mv(&mut l, at)).is_empty());
+        }
         tick(&mut l, 100);
-        assert_eq!((l.main_view.center, l.main_view.follow), (a.center, Follow::Driver));
+        assert_eq!((l.main_view.center, l.main_view.follow), ((a.center.0, a.center.1 + 60), Follow::Driver));
         // Its right side is the divider's, open in the middle: no edge.
-        assert_eq!(edges(&mv(&mut l, (399, 300))), [(0, 0)]);
+        assert!(edges(&mv(&mut l, (399, 300))).is_empty());
         // Gone from the window: nothing scrolls.
         mv(&mut l, (799, 300));
         l.pointer_gone();
@@ -820,13 +847,15 @@ mod tests {
     }
 
     #[test]
-    fn a_zoomed_view_following_the_driver_is_scrolled_by_the_driver() {
+    fn a_zoomed_view_following_the_driver_scrolls_locally() {
         let mut l = Layout::default();
         l.main_view.zoom = super::super::ONE + 2;
         frame(&mut l);
         frame(&mut l);
-        assert_eq!(edges(&mv(&mut l, (790, 595))), [(10, 5)]);
+        let start = l.main_view.center;
+        assert!(edges(&mv(&mut l, (790, 595))).is_empty());
         tick(&mut l, 100);
+        assert_eq!(l.main_view.center, (start.0 + 16, start.1 + 24));
         assert_eq!(l.main_view.follow, Follow::Driver);
     }
 
@@ -954,50 +983,234 @@ mod tests {
             mv(&mut l, (799, 300));
             tick(&mut l, 100);
             assert_eq!(b(&l), (start.0 + (60.0 * world_per_pixel).round() as i32, start.1), "{scale:?}");
-            // The driver receives edge distances in window pixels even
-            // when its world is shown at a different scale. Cross the
-            // divider through its open middle before entering A's corner.
+            // A converts that same window-pixel speed through its zoom.
+            // Cross the divider through its open middle before A's corner.
+            let start = l.main_view.center;
             mv(&mut l, (100, 300));
-            assert_eq!(edges(&mv(&mut l, (3, 0))), [(-4, -1)], "{scale:?}");
+            assert!(edges(&mv(&mut l, (3, 0))).is_empty(), "{scale:?}");
+            tick(&mut l, 100);
+            assert_eq!(l.main_view.center, (start.0 - (51.0 * world_per_pixel).trunc() as i32, start.1 - (60.0 * world_per_pixel).trunc() as i32), "{scale:?}");
         }
     }
 
     #[test]
-    fn dragging_the_drivers_view_has_the_driver_look_where_it_comes_to_rest() {
-        let mut l = Layout::default();
-        l.set_map_movement(MapMovement::Drag);
-        frame(&mut l);
-        frame(&mut l);
-        assert_eq!(l.main_view.center, (1400, 800));
-        left(&mut l, true, (400, 300));
-        mv(&mut l, (300, 280));
-        // A moves 1:1, placed by the viewer meanwhile.
-        assert_eq!((l.main_view.center, l.main_view.follow), ((1500, 820), Follow::Free));
-        assert_eq!(left(&mut l, false, (300, 280)), [Input::Look { x: 1500, y: 820 }]);
-        // It stays there until the driver's view moved there, then follows
-        // that again.
-        tick(&mut l, 100);
-        assert_eq!(l.main_view.center, (1500, 820));
-        l.advance(Duration::from_millis(16));
-        l.frame(&scene_at(1128), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(l.main_view.follow, Follow::Driver);
-        l.frame(&scene_at(1128), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(l.main_view.center, (1528, 800));
-        // The driver does not move (e.g. a menu is open): back to its view
-        // after a moment.
-        let mut l = Layout::default();
-        l.set_map_movement(MapMovement::Drag);
-        frame(&mut l);
-        left(&mut l, true, (400, 300));
-        mv(&mut l, (390, 300));
-        left(&mut l, false, (390, 300));
-        for _ in 0..4 {
-            tick(&mut l, 100);
+    fn manual_a_pan_keeps_subtile_pixels_until_the_game_moves_its_camera() {
+        for smooth in [false, true] {
+            let mut l = Layout::default();
+            l.smooth = smooth;
+            l.set_map_movement(MapMovement::Drag);
+            frame(&mut l);
+            frame(&mut l);
+            assert_eq!(l.main_view.center, (1400, 800));
+            left(&mut l, true, (400, 300));
+            mv(&mut l, (393, 297));
+            assert_eq!((l.main_view.center, l.main_view.follow), ((1407, 803), Follow::Driver));
+            assert!(left(&mut l, false, (393, 297)).is_empty());
+            // The unchanged, tile-aligned engine camera cannot pull A
+            // back after release or after the old half-second timeout.
+            for _ in 0..120 {
+                tick(&mut l, 16);
+                assert_eq!(l.main_view.center, (1407, 803), "smooth={smooth}");
+            }
+            assert!(l.main_panned_by_hand());
+            // A real native camera change (minimap click, active-unit
+            // focus, city navigation) resumes normal following.
+            for _ in 0..120 {
+                l.advance(Duration::from_millis(16));
+                l.frame(&scene_at(1128), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            }
+            assert!(!l.main_panned_by_hand());
+            assert_eq!((l.main_view.center, l.main_view.follow), ((1528, 800), Follow::Driver));
         }
-        assert_eq!((l.main_view.center, l.main_view.follow), ((1410, 800), Follow::Free));
-        tick(&mut l, 100);
-        tick(&mut l, 16);
-        assert_eq!((l.main_view.center, l.main_view.follow), ((1400, 800), Follow::Driver));
+    }
+
+    #[test]
+    fn a_and_b_edge_speeds_match_at_every_depth_zoom_and_frame_rate() {
+        // Non-native centres expose accidental tile quantization. Test
+        // asymmetric splits too: pane dimensions do not scale speed.
+        for size in [S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
+            for smooth in [false, true] {
+                for zoom in [super::super::ONE - 1, super::super::ONE, super::super::ONE + 2] {
+                    for scale in [(1, 1), (3, 2), (3, 1)] {
+                        for depth in [1, 8, EDGE_ZONE] {
+                            for ms in [4, 16, 40] {
+                                let make = || {
+                                    let mut l = split(MapMovement::EdgeScroll, Roles::Free);
+                                    l.apply_settings(&viewer_settings::Layout { split: size, smooth_world_movement: smooth, ..Default::default() });
+                                    l.world_scale = scale;
+                                    l.main_view.zoom = zoom;
+                                    l.split.as_mut().unwrap().view.zoom = zoom;
+                                    frame(&mut l);
+                                    frame(&mut l);
+                                    l
+                                };
+                                let (mut a, mut b) = (make(), make());
+                                let vertical = size != S::Horizontal1To1;
+                                let (pa, pb) = if vertical { ((depth - 1, 300), (800 - depth, 300)) } else { ((400, depth - 1), (400, 600 - depth)) };
+                                mv(&mut a, pa);
+                                mv(&mut b, pb);
+                                let (a0, b0) = (a.main_view.center, self::b(&b));
+                                for _ in 0..100 {
+                                    for l in [&mut a, &mut b] {
+                                        l.advance(Duration::from_millis(ms));
+                                        l.frame(&scene_at(1000), (800, 600), (0, 0, 0, 0), vec![], Some(WorldBounds { size: (8000, 4000), wrap: (true, true) }));
+                                    }
+                                }
+                                let (da, db) = ((a0.0 - a.main_view.center.0, a0.1 - a.main_view.center.1), (self::b(&b).0 - b0.0, self::b(&b).1 - b0.1));
+                                assert_eq!(da, db, "{size:?} smooth={smooth} zoom={zoom} scale={scale:?} depth={depth} ms={ms}");
+                                let moved = if vertical { da.0 } else { da.1 };
+                                assert!(moved > 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn game_zoom_art_does_not_change_the_a_b_edge_speed_ratio() {
+        for downscale in [1, 2, 4] {
+            for zoom in [super::super::ONE - 1, super::super::ONE, super::super::ONE + 2] {
+                let mut scene = scene_at(1000);
+                scene.views[0].view.downscale = downscale;
+                let mut a = split(MapMovement::EdgeScroll, Roles::Free);
+                let mut b = split(MapMovement::EdgeScroll, Roles::Free);
+                for l in [&mut a, &mut b] {
+                    l.main_view.zoom = zoom;
+                    l.split.as_mut().unwrap().view.zoom = zoom;
+                    l.frame(&scene, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    l.frame(&scene, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                }
+                let (a0, b0) = (a.main_view.center, self::b(&b));
+                mv(&mut a, (0, 300));
+                mv(&mut b, (799, 300));
+                for _ in 0..20 {
+                    for l in [&mut a, &mut b] {
+                        l.advance(Duration::from_millis(16));
+                        l.frame(&scene, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    }
+                }
+                assert_eq!(a0.0 - a.main_view.center.0, self::b(&b).0 - b0.0, "game downscale {downscale}, zoom {zoom}");
+                assert!(a.main_panned_by_hand());
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_game_focus_moves_only_a_and_repeat_requests_override_manual_pans() {
+        for roles in [Roles::Free, Roles::UnitMouse] {
+            for smooth in [false, true] {
+                let mut l = Layout::default();
+                l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles, smooth_world_movement: smooth, ..Default::default() });
+                l.set_map_movement(MapMovement::Drag);
+                let mut scene = scene_at(0);
+                scene.views[0].view.camera_y = 0;
+                scene.camera_focus = Some(scene::CameraFocus { serial: 1, center: (3000, 2000) });
+                for _ in 0..2 {
+                    l.frame(&scene, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                }
+                assert_eq!((l.main_view.center, b(&l)), ((3000, 2000), (3000, 2000)));
+                let b0 = b(&l);
+                left(&mut l, true, (200, 300));
+                mv(&mut l, (193, 297));
+                left(&mut l, false, (193, 297));
+                assert_eq!(l.main_view.center, (3007, 2003));
+                // The physical engine camera may be parked, resized or
+                // quantized. None of those coordinates can move local A.
+                scene.views[0].view.camera_x = 128;
+                for _ in 0..120 {
+                    l.advance(Duration::from_millis(16));
+                    l.frame(&scene, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    assert_eq!((l.main_view.center, b(&l)), ((3007, 2003), b0));
+                }
+                // AI combat/movement emits a semantic request even if the
+                // engine believes the tile is already in its own view.
+                scene.camera_focus = Some(scene::CameraFocus { serial: 2, center: (5000, 2500) });
+                for _ in 0..120 {
+                    l.advance(Duration::from_millis(16));
+                    l.frame(&scene, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    assert_eq!(b(&l), b0, "AI focus must leave B independent");
+                }
+                assert_eq!(l.main_view.center, (5000, 2500));
+                left(&mut l, true, (200, 300));
+                mv(&mut l, (193, 297));
+                left(&mut l, false, (193, 297));
+                assert_eq!(l.main_view.center, (5007, 2503));
+                scene.camera_focus = Some(scene::CameraFocus { serial: 3, center: (5000, 2500) });
+                for _ in 0..120 {
+                    l.advance(Duration::from_millis(16));
+                    l.frame(&scene, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                }
+                assert_eq!((l.main_view.center, b(&l)), ((5000, 2500), b0));
+            }
+        }
+    }
+
+    #[test]
+    fn native_wheel_pans_the_hovered_view_far_from_the_parked_engine_camera() {
+        for zoom in [super::super::ONE, super::super::ONE + 2] {
+            for step in [(64, 32), (128, 64), (256, 128)] {
+                let mut l = Layout::default();
+                l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles: Roles::Free, ..Default::default() });
+                l.main_view.zoom = zoom;
+                l.split.as_mut().unwrap().view.zoom = zoom;
+                let mut s = scene_at(0);
+                s.views[0].view.camera_y = 0;
+                s.camera_focus = Some(scene::CameraFocus { serial: 1, center: (3000, 2000) });
+                s.map_wheel_step = step;
+                l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                let native = l.main.unwrap();
+                let out = l.route(Input::Wheel { delta: 120, x: 100, y: 300 });
+                assert!(out.iter().all(|i| matches!(i, Input::WorldMove { .. })));
+                assert_eq!((l.main_view.center, b(&l)), ((3000, 2000 - step.1), (3000, 2000)));
+                l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                assert_eq!(l.main, Some(native));
+                let a = l.main_view.center;
+                let out = l.route(Input::Wheel { delta: -240, x: 600, y: 300 });
+                assert!(out.iter().all(|i| matches!(i, Input::WorldMove { .. })));
+                assert_eq!((l.main_view.center, b(&l)), (a, (3000, 2000 + 2 * step.1)));
+                l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                l.route(Input::Key { vk: 0x10, down: true, text: None });
+                l.route(Input::Wheel { delta: 120, x: 100, y: 300 });
+                assert_eq!(l.main_view.center, (3000 - step.0, a.1));
+                l.route(Input::Key { vk: 0x10, down: false, text: None });
+                s.views[0].view.downscale = 2;
+                s.camera_focus.as_mut().unwrap().center = (1500, 1000);
+                s.map_wheel_step = (step.0 / 2, step.1 / 2);
+                let bounds = Some(WorldBounds { size: (4000, 2000), wrap: (true, false) });
+                l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], bounds);
+                let a = l.main_view.center;
+                let b0 = b(&l);
+                l.route(Input::Wheel { delta: 120, x: 100, y: 300 });
+                assert_eq!((l.main_view.center, b(&l)), ((a.0, a.1 - step.1 / 2), b0));
+                // Native wheel input truncates partial notches. It does
+                // not change zoom or replay a parked-camera wheel event.
+                for delta in [-119, 0, 119] {
+                    let at = l.main_view.center;
+                    assert!(l.route(Input::Wheel { delta, x: 100, y: 300 }).is_empty());
+                    assert_eq!(l.main_view.center, at);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_map_wheel_with_capture_moves_b_cursor_and_leaves_a_in_place() {
+        let mut l = Layout::default();
+        l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles: Roles::UnitMouse, ..Default::default() });
+        let mut s = scene_at(0);
+        s.camera_focus = Some(scene::CameraFocus { serial: 1, center: (3000, 2000) });
+        s.map_wheel_step = (128, 64);
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(l.capture_at((600, 300)));
+        let a = l.main_view.center;
+        let out = l.route(Input::Wheel { delta: 120, x: 200, y: 300 });
+        assert_eq!(out, [Input::WorldMove { x: 3000, y: 1936 }]);
+        assert_eq!(l.main_view.center, a);
+        assert_eq!(l.cursor, (3000, 1936));
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!((l.main_view.center, b(&l)), (a, (3000, 1936)));
     }
 
     #[test]

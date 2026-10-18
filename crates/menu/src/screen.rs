@@ -325,6 +325,7 @@ pub fn sprites(elements: &[Element], compiled: &Compiled, after_pass: u32) -> Ve
                 not_in_view: None,
                 glyph: None,
                 palette: palette,
+                category: 0,
             })
         })
         .collect()

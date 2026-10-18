@@ -15,9 +15,9 @@
 //!   here.
 //! - But while the view following the world cursor is held at the edge of
 //!   a world that does not wrap (the cursor off its middle), the system
-//!   pointer shows at the world cursor and moves it, kept inside the
-//!   window; once the view can centre the cursor again, the pointer is
-//!   captured and hidden again ([`Machine`]: the system pointer is put
+//!   pointer shows at the world cursor and moves it, kept inside its
+//!   view along the axes held at the edge; once the view can centre the
+//!   cursor again, the pointer is captured and hidden again ([`Machine`]: the system pointer is put
 //!   where the drawn cursor was and shows only after the frame that
 //!   applies that, so it never jumps).
 //! - While the mouse is free, every other view showing the world pixel
@@ -225,6 +225,9 @@ pub struct Facts {
     /// cursor is in it, whether it is held at the world's edge
     /// (`Layout::world_cursor_view`).
     pub cursor_view: Option<([i32; 4], (i32, i32), bool)>,
+    /// Which camera axes are held at a world edge. Only those axes use
+    /// the visible pointer; the others retain relative capture motion.
+    pub cursor_axes: (bool, bool),
     /// The system pointer (window pixels), whether it is in the window,
     /// and the world pixel under it (while free).
     pub pointer: (i32, i32),
@@ -262,6 +265,8 @@ pub struct Plan {
 #[derive(Clone, Debug, Default)]
 pub struct Machine {
     edge: bool,
+    /// Active view, or its one-pixel line when only one axis is unlocked.
+    edge_rect: Option<[i32; 4]>,
     /// No edge mode before this time (the pointer left the view while in
     /// it).
     edge_after: f64,
@@ -278,26 +283,40 @@ impl Machine {
         self.edge
     }
 
+    /// A deliberate capture/release supersedes any edge fallback before
+    /// the next frame, including a release waiting to be presented.
+    pub fn cancel_edge(&mut self) {
+        self.edge = false;
+        self.edge_rect = None;
+        self.edge_after = 0.0;
+    }
+
     /// Takes the facts of a frame: how the cursor shows.
     pub fn step(&mut self, f: &Facts) -> Plan {
         let mut plan = Plan::default();
         let active = f.captured && !f.snap_mode;
         match f.cursor_view.filter(|_| active) {
             Some((rect, at, held)) => {
+                let mut edge_rect = rect;
+                if !f.cursor_axes.0 { edge_rect[0] = at.0; edge_rect[2] = 1; }
+                if !f.cursor_axes.1 { edge_rect[1] = at.1; edge_rect[3] = 1; }
                 let inside = |(x, y): (i32, i32)| x >= rect[0] && y >= rect[1] && x < rect[0] + rect[2] && y < rect[1] + rect[3];
                 if self.edge && !f.unlocking && (!held || !inside(f.pointer)) {
                     self.edge = false;
+                    self.edge_rect = None;
                     plan.leave_edge = true;
                     if !inside(f.pointer) {
                         self.edge_after = f.now + EDGE_PAUSE;
                     }
-                } else if !self.edge && held && !f.unlocking && f.now >= self.edge_after {
+                } else if held && !f.unlocking && ((!self.edge && f.now >= self.edge_after) || (self.edge && self.edge_rect != Some(edge_rect))) {
                     self.edge = true;
+                    self.edge_rect = Some(edge_rect);
                     plan.enter_edge = Some(at);
                 }
             }
             None if self.edge => {
                 self.edge = false;
+                self.edge_rect = None;
                 // (Still captured, snapping: hidden again.)
                 plan.leave_edge = f.captured;
             }
@@ -511,7 +530,7 @@ mod tests {
     }
 
     fn captured(cursor: (i32, i32), at: (i32, i32), held: bool, pointer: (i32, i32), now: f64) -> Facts {
-        Facts { captured: true, world_cursor: vec![cursor], cursor_view: Some(([400, 0, 400, 300], at, held)), pointer, pointer_inside: true, now, ..Default::default() }
+        Facts { captured: true, world_cursor: vec![cursor], cursor_view: Some(([400, 0, 400, 300], at, held)), cursor_axes: (held, held), pointer, pointer_inside: true, now, ..Default::default() }
     }
 
     #[test]
@@ -613,4 +632,53 @@ mod tests {
         assert_eq!(Latency::summary(&mut v), Some((3.0, 5.0, 5.0, 5)));
         assert_eq!(Latency::summary(&mut []), None);
     }
+
+    #[test]
+    fn edge_axis_changes_reposition_before_showing_the_pointer_and_recapture_when_centred() {
+        let mut m = Machine::default();
+        let mut f = captured((20, 120), (420, 150), true, (420, 150), 1.0);
+        f.cursor_axes = (true, false);
+        assert_eq!(m.step(&f).enter_edge, Some((420, 150)));
+        assert_eq!(m.edge_rect, Some([400, 150, 400, 1]));
+        assert_eq!(m.step(&f).enter_edge, None);
+        // Reaching a corner unlocks the second dimension. Hint the new
+        // drawn cursor position while hidden before releasing into it.
+        f.cursor_axes = (true, true);
+        f.cursor_view = Some(([400, 0, 400, 300], (420, 20), true));
+        let corner = m.step(&f);
+        assert!(corner.hidden && m.edge());
+        assert_eq!(corner.enter_edge, Some((420, 20)));
+        assert_eq!(m.edge_rect, Some([400, 0, 400, 300]));
+        f.unlocking = true;
+        assert!(m.step(&f).hidden);
+        f.unlocking = false;
+        f.pointer = (420, 20);
+        assert!(!m.step(&f).hidden);
+        // Leaving that corner becomes a vertical line, not a full-window
+        // winit grab, and changing the view updates that line too.
+        f.cursor_axes = (false, true);
+        assert_eq!(m.step(&f).enter_edge, Some((420, 20)));
+        assert_eq!(m.edge_rect, Some([420, 0, 1, 300]));
+        f.cursor_view = Some(([300, 0, 500, 300], (550, 20), true));
+        assert_eq!(m.step(&f).enter_edge, Some((550, 20)));
+        f.cursor_axes = (false, false);
+        f.cursor_view = Some(([300, 0, 500, 300], (550, 150), false));
+        let centred = m.step(&f);
+        assert!(centred.leave_edge && centred.hidden && !m.edge());
+        assert_eq!(m.edge_rect, None);
+    }
+
+    #[test]
+    fn intentional_release_cancels_pending_edge_state_before_the_next_frame() {
+        let mut m = Machine::default();
+        let f = captured((20, 120), (420, 150), true, (420, 150), 1.0);
+        assert!(m.step(&f).enter_edge.is_some());
+        m.cancel_edge();
+        assert!(!m.edge());
+        assert_eq!(m.edge_rect, None);
+        let p = m.step(&free((250, 100), Some((250, 100))));
+        assert!(!p.hidden && !p.leave_edge);
+        assert_eq!(p.marks.system, Some((250, 100)));
+    }
+
 }
