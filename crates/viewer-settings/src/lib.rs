@@ -9,7 +9,6 @@
 //! [`controls`]: the settings as named controls (choices, switches,
 //! numbers with their ranges), as a preferences screen shows and sets them.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -32,15 +31,35 @@ pub enum SettingsError {
 #[serde(default)]
 pub struct Settings {
     pub resolution: Resolution,
+    #[serde(deserialize_with = "Layout::migrating")]
     pub layout: Layout,
     pub input: Input,
+    pub animation: Animation,
     pub display: Display,
     pub clean_map: clean_map::CleanMap,
 }
 
-/// The "Resolution" tab.
+/// Visual combat timing, independent of simulation and audio clocks.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct Animation {
+    #[serde(deserialize_with = "combat_speed_setting")]
+    pub combat_speed: f32,
+}
+fn combat_speed_setting<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    let combat_speed = f32::deserialize(deserializer)?;
+    Ok(Animation { combat_speed }.effective_combat_speed())
+}
+impl Default for Animation { fn default() -> Self { Self { combat_speed: 1.0 } } }
+impl Animation {
+    pub fn effective_combat_speed(&self) -> f32 {
+        if !self.combat_speed.is_finite() { return 1.0; }
+        (self.combat_speed.clamp(1.0, 4.0) * 4.0).round() / 4.0
+    }
+}
+
+/// The "Resolution" tab.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Resolution {
     /// Every rendered pixel shown as an n×n box of window pixels (1..=6,
     /// whole numbers only): the viewer renders at the window size divided
@@ -49,22 +68,85 @@ pub struct Resolution {
     /// (0, the default): n is the desktop's scale rounded down (2 at 200 %,
     /// 1 at 150 %).
     pub pixel_scale: u32,
-    /// Fractional scale of menus (full-screen and floating screens).
-    pub menu_scale: f32,
+    /// Size menus relative to the visible canvas. When false menus use
+    /// their native size; the title and Preferences still fit the canvas.
+    pub scale_menus: bool,
+    /// Standard menu height as a percentage of the canvas height, 25..=100.
+    /// Only used when `scale_menus` is true.
+    pub menu_scale_percent: f32,
     /// Fractional scale of the game's frame (the interface around the world:
     /// buttons, unit box, minimap).
     pub frame_scale: f32,
     /// Fractional scale of the world map.
     pub world_scale: f32,
+    /// How menu background art is sampled when a menu is drawn larger or
+    /// smaller than its art. Text, controls, borders and world art keep
+    /// their existing sharp rendering.
+    pub background_sampling: BackgroundSampling,
+}
+
+/// [`Resolution::background_sampling`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackgroundSampling {
+    /// One source pixel picked by a fixed spatial pattern, from the pixel
+    /// footprint when shrinking or weighted neighbours when magnifying.
+    /// Keeps the art's grain without blur.
+    #[default]
+    Dither,
+    /// Area averaging when shrinking and bilinear colour when magnifying.
+    /// Only background colour is smoothed; alpha masks stay sharp.
+    Interpolate,
+    /// The nearest source pixel, as everything else (may alias).
+    Nearest,
 }
 
 impl Default for Resolution {
     fn default() -> Self {
-        Self { pixel_scale: Self::AUTO, menu_scale: 1.0, frame_scale: 1.0, world_scale: 1.0 }
+        Self { pixel_scale: Self::AUTO, scale_menus: false, menu_scale_percent: 100.0, frame_scale: 1.0, world_scale: 1.0, background_sampling: BackgroundSampling::Dither }
+    }
+}
+
+impl<'de> Deserialize<'de> for Resolution {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // The old menu_scale was an arbitrary native-pixel multiplier. It
+        // has no screen-relative meaning: consume it without turning 1.5
+        // into 150% or 0.5 into 50%. Old files start with scaling off.
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Saved {
+            pixel_scale: u32,
+            scale_menus: bool,
+            menu_scale_percent: f32,
+            menu_scale: Option<f32>,
+            frame_scale: f32,
+            world_scale: f32,
+            background_sampling: BackgroundSampling,
+        }
+        impl Default for Saved {
+            fn default() -> Self {
+                let r = Resolution::default();
+                Self { pixel_scale: r.pixel_scale, scale_menus: r.scale_menus, menu_scale_percent: r.menu_scale_percent,
+                    menu_scale: None, frame_scale: r.frame_scale, world_scale: r.world_scale, background_sampling: r.background_sampling }
+            }
+        }
+        let saved = Saved::deserialize(deserializer)?;
+        let _legacy_multiplier = saved.menu_scale;
+        let mut resolution = Self { pixel_scale: saved.pixel_scale, scale_menus: saved.scale_menus,
+            menu_scale_percent: saved.menu_scale_percent, frame_scale: saved.frame_scale, world_scale: saved.world_scale,
+            background_sampling: saved.background_sampling };
+        resolution.menu_scale_percent = resolution.effective_menu_scale_percent();
+        Ok(resolution)
     }
 }
 
 impl Resolution {
+    /// A finite screen-relative menu percentage, including settings made
+    /// programmatically rather than through a preferences control. Whole
+    /// percents, as the control's steps: a hand-edited 60.758 is 61.
+    pub fn effective_menu_scale_percent(&self) -> f32 {
+        if self.menu_scale_percent.is_finite() { self.menu_scale_percent.clamp(25.0, 100.0).round() } else { 100.0 }
+    }
+
     /// Most pixels per rendered pixel.
     pub const MAX_PIXEL_SCALE: u32 = 6;
     /// `pixel_scale`: the desktop's scale.
@@ -214,11 +296,13 @@ pub struct Layout {
     /// Hold the pointer outside floating zoom boxes instead of moving the
     /// box clear of it. Top strips always hold the pointer below them.
     pub zoom_box_block_pointer: bool,
-    /// Open generic menus and popups in the view that held the mouse when
-    /// they opened. Named advisors and City keep their own screen placement.
+    /// With a floating [`Layout::screen_place`]: open the generic menu and
+    /// popups in the view that held the mouse when they opened.
     pub menu_follows_pointer: bool,
-    /// Where each screen goes.
-    pub screens: BTreeMap<ScreenKind, ScreenPlace>,
+    /// Where every screen, advisor, dialog and popup goes (one place per
+    /// split orientation). Context menus and the tile information box open
+    /// at their click instead.
+    pub screen_place: ScreenPlace,
     /// The world moves smoothly (by pixels, easing) instead of snapping to
     /// tiles.
     pub smooth_world_movement: bool,
@@ -235,7 +319,7 @@ impl Default for Layout {
             zoom_box_height: 0.0,
             zoom_box_block_pointer: false,
             menu_follows_pointer: true,
-            screens: BTreeMap::new(),
+            screen_place: ScreenPlace::default(),
             smooth_world_movement: false,
             roles: Roles::Free,
         }
@@ -243,12 +327,49 @@ impl Default for Layout {
 }
 
 impl Layout {
-    /// The screens the layout tab lists, in its order.
+    /// The screens older settings files placed one by one, in the order
+    /// their places are migrated ([`Layout::migrated_place`]).
     pub const SCREENS: [&'static str; 13] = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "City", "Palace", "Spy", "Menu", "Help"];
 
-    /// Where screen `kind` goes now.
-    pub fn place_of(&self, kind: &str) -> Place {
-        self.screens.get(kind).map_or(Place::Floating, |p| p.for_split(self.split))
+    /// Where screen `kind` goes now: every kind shares [`Layout::screen_place`].
+    pub fn place_of(&self, _kind: &str) -> Place {
+        self.screen_place.for_split(self.split)
+    }
+
+    /// The single place for older per-screen places: per orientation the
+    /// most common one, ties going to the first in [`Layout::SCREENS`]
+    /// order (other names after them). Entries that do not parse are left
+    /// out.
+    pub fn migrated_place(old: &toml::Table) -> ScreenPlace {
+        let mut names: Vec<&String> = old.keys().collect();
+        let rank = |n: &str| Layout::SCREENS.iter().position(|s| *s == n).unwrap_or(Layout::SCREENS.len());
+        names.sort_by_key(|n| rank(n));
+        let places: Vec<ScreenPlace> = names.iter().filter_map(|n| old[n.as_str()].clone().try_into().ok()).collect();
+        let common = |of: fn(&ScreenPlace) -> Place| {
+            let mut best: Option<(Place, usize)> = None;
+            for p in places.iter().map(of) {
+                let n = places.iter().filter(|q| of(q) == p).count();
+                if best.is_none_or(|(_, m)| n > m) {
+                    best = Some((p, n));
+                }
+            }
+            best.map_or(Place::Floating, |(p, _)| p)
+        };
+        ScreenPlace { vertical: common(|p| p.vertical), horizontal: common(|p| p.horizontal) }
+    }
+
+    /// Reads the layout table, migrating an older file's per-screen
+    /// `screens` table to [`Layout::screen_place`] (an explicit
+    /// `screen_place` wins). Unknown keys are ignored.
+    fn migrating<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Layout, D::Error> {
+        let mut table = toml::Table::deserialize(d)?;
+        let old = table.remove("screens");
+        let explicit = table.contains_key("screen_place");
+        let mut layout: Layout = toml::Value::Table(table).try_into().map_err(serde::de::Error::custom)?;
+        if let (false, Some(toml::Value::Table(old))) = (explicit, old) {
+            layout.screen_place = Layout::migrated_place(&old);
+        }
+        Ok(layout)
     }
 }
 
@@ -292,19 +413,50 @@ impl Default for Input {
 }
 
 /// What the viewer shows besides the picture (on the "Resolution" tab).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Display {
     /// A frame counter in the window's top-right corner: frames per second,
     /// the frame time, and with a software renderer the share of frames it
     /// skipped (unchanged).
     pub show_fps: bool,
+    /// Add CPU frame-build wall time and delayed GPU timestamp metrics.
+    pub fps_detailed: bool,
     /// How frames reach the screen (`TILE_VIEWER_PRESENT` overrides it).
     pub present: Present,
     /// The most frames per second the viewer draws; 0: as many as the
     /// display shows (its refresh rate) with `Vsync`, with the others as
     /// many as it can (`TILE_VIEWER_MAX_FPS` overrides it).
     pub max_fps: u32,
+    /// Remembered slider value while the explicit frame limiter is off.
+    /// Existing nonzero `max_fps` remains authoritative when enabled.
+    pub fps_limit: u32,
+    /// The mouse cursor's size in window pixels, the system pointer made
+    /// from the game's art and the cursor the viewer draws alike;
+    /// [`Display::SYSTEM_CURSOR_SIZE`] (0, the default): the operating
+    /// system's cursor size (its accessibility size and display scale).
+    pub cursor_size: u32,
+}
+
+impl Default for Display {
+    fn default() -> Self {
+        Self { show_fps: false, fps_detailed: false, present: Present::Vsync, max_fps: 0, fps_limit: 120, cursor_size: Self::SYSTEM_CURSOR_SIZE }
+    }
+}
+
+impl Display {
+    /// `cursor_size`: the operating system's.
+    pub const SYSTEM_CURSOR_SIZE: u32 = 0;
+    /// The sizes the preferences offer besides the system's.
+    pub const CURSOR_SIZES: [u32; 7] = [24, 32, 48, 64, 96, 128, 192];
+
+    /// The cursor size in window pixels, given the system's (`system`).
+    pub fn effective_cursor_size(&self, system: u32) -> u32 {
+        match self.cursor_size {
+            Self::SYSTEM_CURSOR_SIZE => system.clamp(8, 512),
+            n => n.clamp(8, 512),
+        }
+    }
 }
 
 /// How the viewer's frames reach the screen.
@@ -385,7 +537,7 @@ mod tests {
         let mut s = Settings::default();
         s.resolution.pixel_scale = 3;
         s.layout.split = Split::Vertical2To1;
-        s.layout.screens.insert("F1".into(), ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::LeftOrBottom });
+        s.layout.screen_place = ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::LeftOrBottom };
         let back: Settings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
         assert_eq!(back, s);
         assert_eq!(back.layout.place_of("F1"), Place::RightOrTop);
@@ -412,10 +564,35 @@ mod tests {
     fn menus_follow_the_mouse_in_older_configs_and_the_setting_round_trips() {
         let old: Settings = toml::from_str("[layout]\nsplit = 'Vertical1To1'\n[layout.screens.Menu]\nvertical = 'LeftOrBottom'\n").unwrap();
         assert!(old.layout.menu_follows_pointer);
-        assert_eq!(old.layout.screens["Menu"].vertical, Place::LeftOrBottom);
+        assert_eq!(old.layout.screen_place.vertical, Place::LeftOrBottom);
         let explicit: Settings = toml::from_str("[layout]\nmenu_follows_pointer = false\n").unwrap();
         assert!(!explicit.layout.menu_follows_pointer);
         assert_eq!(toml::from_str::<Settings>(&toml::to_string(&explicit).unwrap()).unwrap(), explicit);
+    }
+
+    #[test]
+    fn older_per_screen_places_become_the_one_place_for_every_screen() {
+        // Most common per orientation; the first in the old list on a tie.
+        let old = "[layout]\nsplit = 'Horizontal1To1'\nlost_setting = 3\n\
+            [layout.screens.City]\nvertical = 'RightOrTop'\nhorizontal = 'LeftOrBottom'\n\
+            [layout.screens.F1]\nvertical = 'LeftOrBottom'\nhorizontal = 'RightOrTop'\n\
+            [layout.screens.F2]\nvertical = 'RightOrTop'\n\
+            [layout.screens.Bogus]\nvertical = 'Sideways'\n";
+        let s: Settings = toml::from_str(old).unwrap();
+        assert_eq!(s.layout.screen_place, ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::RightOrTop });
+        for kind in Layout::SCREENS.iter().chain(&["Diplomacy", "Popup"]) {
+            assert_eq!(s.layout.place_of(kind), Place::RightOrTop, "{kind}");
+        }
+        // Saved without the per-screen keys, and read back the same.
+        let saved = toml::to_string_pretty(&s).unwrap();
+        assert!(!saved.contains("screens"), "{saved}");
+        assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), s);
+        // An explicit new place wins over leftovers; no old places: floating.
+        let both: Settings = toml::from_str("[layout.screen_place]\nvertical = 'LeftOrBottom'\n[layout.screens.F1]\nvertical = 'RightOrTop'\n").unwrap();
+        assert_eq!(both.layout.screen_place.vertical, Place::LeftOrBottom);
+        let first: Settings = toml::from_str("[layout.screens.Help]\nvertical = 'RightOrTop'\n[layout.screens.F4]\nvertical = 'LeftOrBottom'\n").unwrap();
+        assert_eq!(first.layout.screen_place.vertical, Place::LeftOrBottom);
+        assert_eq!(toml::from_str::<Settings>("[layout]\nzoom = 'Off'\n").unwrap().layout.screen_place, ScreenPlace::default());
     }
 
     #[test]
@@ -509,11 +686,81 @@ mod tests {
     }
 
     #[test]
+    fn menu_scaling_migrates_the_old_multiplier_without_reinterpreting_it() {
+        for multiplier in [0.5, 1.0, 1.5, 3.0] {
+            let s: Settings = toml::from_str(&format!("[resolution]\nmenu_scale = {multiplier}\nframe_scale = 1.25\n")).unwrap();
+            assert!(!s.resolution.scale_menus);
+            assert_eq!(s.resolution.menu_scale_percent, 100.0);
+            assert_eq!(s.resolution.frame_scale, 1.25);
+            let saved = toml::to_string(&s).unwrap();
+            assert!(saved.contains("scale_menus = false"));
+            assert!(saved.contains("menu_scale_percent = 100.0"));
+            assert!(!saved.lines().any(|line| line.starts_with("menu_scale =")));
+        }
+        assert_eq!(toml::from_str::<Settings>("").unwrap().resolution, Resolution::default());
+    }
+
+    #[test]
+    fn menu_percent_roundtrips_and_loaded_values_are_bounded() {
+        let mut s = Settings::default();
+        s.resolution.scale_menus = true;
+        s.resolution.menu_scale_percent = 37.0;
+        assert_eq!(toml::from_str::<Settings>(&toml::to_string(&s).unwrap()).unwrap(), s);
+        let mixed: Settings = toml::from_str("[resolution]\nmenu_scale = 3.0\nscale_menus = true\nmenu_scale_percent = 37.0\n").unwrap();
+        assert_eq!(mixed.resolution, s.resolution);
+        for (value, expected) in [("-4", 25.0), ("150", 100.0), ("nan", 100.0), ("inf", 100.0), ("60.758", 61.0), ("37.49", 37.0), ("25.2", 25.0), ("99.5", 100.0)] {
+            let s: Settings = toml::from_str(&format!("[resolution]\nscale_menus = true\nmenu_scale_percent = {value}\n")).unwrap();
+            assert!(s.resolution.scale_menus);
+            assert_eq!(s.resolution.menu_scale_percent, expected);
+        }
+    }
+
+    #[test]
     fn a_saved_pixel_scale_stays_what_it_was() {
         // Files from before Auto: their number; without one: Auto.
         let one: Settings = toml::from_str("[resolution]\npixel_scale = 1\n").unwrap();
         assert_eq!(one.resolution.pixel_scale, 1);
         let none: Settings = toml::from_str("[resolution]\nmenu_scale = 1.5\n").unwrap();
         assert_eq!(none.resolution.pixel_scale, Resolution::AUTO);
+    }
+
+    #[test]
+    fn background_sampling_defaults_to_dither_and_roundtrips() {
+        let old: Settings = toml::from_str("[resolution]\nworld_scale = 2.0\n").unwrap();
+        assert_eq!(old.resolution.background_sampling, BackgroundSampling::Dither);
+        for mode in [BackgroundSampling::Dither, BackgroundSampling::Interpolate, BackgroundSampling::Nearest] {
+            let mut s = Settings::default();
+            s.resolution.background_sampling = mode;
+            let text = toml::to_string(&s).unwrap();
+            assert_eq!(toml::from_str::<Settings>(&text).unwrap(), s, "{text}");
+        }
+        let smooth: Settings = toml::from_str("[resolution]\nbackground_sampling = \"Interpolate\"\n").unwrap();
+        assert_eq!(smooth.resolution.background_sampling, BackgroundSampling::Interpolate);
+        assert!(toml::from_str::<Settings>("[resolution]\nbackground_sampling = \"Blur\"\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod combat_speed_settings_tests {
+    use super::*;
+    #[test]
+    fn old_files_default_and_saved_speed_round_trips_with_sane_steps() {
+        for text in ["", "[display]\nshow_fps=true\n", "[animation]\n"] {
+            assert_eq!(toml::from_str::<Settings>(text).unwrap().animation.combat_speed, 1.0);
+        }
+        for (raw, expected) in [("0", 1.0), ("1.38", 1.5), ("2.13", 2.25), ("9", 4.0), ("nan", 1.0)] {
+            let setting: Settings = toml::from_str(&format!("[animation]\ncombat_speed={raw}\n")).unwrap();
+            assert_eq!(setting.animation.combat_speed, expected);
+            assert_eq!(toml::from_str::<Settings>(&toml::to_string(&setting).unwrap()).unwrap(), setting);
+        }
+    }
+    #[test]
+    fn combat_slider_changes_only_its_committed_setting() {
+        let mut settings = Settings::default(); let original = settings.clone();
+        assert!(settings.set_control("animation.combat_speed", &controls::ControlValue::Number(2.13)));
+        assert_eq!(settings.animation.combat_speed, 2.25);
+        assert!(settings.set_control("animation.combat_speed", &controls::ControlValue::Number(f32::NAN)));
+        assert_eq!(settings.animation.combat_speed, 1.0);
+        settings.animation = original.animation.clone(); assert_eq!(settings, original);
     }
 }

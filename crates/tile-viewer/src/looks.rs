@@ -47,6 +47,17 @@ impl LookScene {
         LookScene { interactables: scene.interactables.clone(), looks: scene.looks.clone() }
     }
 
+    /// Replaces immutable routing metadata only when its contents change.
+    /// Active and pending frame mappings can share it without copying the
+    /// nested look-state sprites during every transaction capture.
+    pub fn refresh_shared(cached: &mut std::sync::Arc<Self>, scene: &Scene) -> bool {
+        if cached.interactables == scene.interactables && cached.looks == scene.looks {
+            return false;
+        }
+        *cached = std::sync::Arc::new(Self::of(scene));
+        true
+    }
+
     /// Refreshes interaction metadata independently of world or sprite edits.
     pub fn refresh(&mut self, scene: &Scene) -> bool {
         if self.interactables == scene.interactables && self.looks == scene.looks {
@@ -100,6 +111,8 @@ pub struct Feedback {
     drawn: Vec<(u64, LookState)>,
     /// When what the pointer is over or presses last changed (seconds).
     changed_at: f64,
+    /// The slider arrow keys step (shown hovered).
+    keyboard: Option<u64>,
 }
 
 /// The interactable at `p` that has looks (topmost first, lists being
@@ -170,6 +183,17 @@ impl Feedback {
         }
     }
 
+    /// The slider arrow keys step (`SnapInput::selected_slider`), drawn
+    /// hovered; whether that changed.
+    pub fn keyboard_slider(&mut self, id: Option<u64>, now: f64) -> bool {
+        if self.keyboard == id {
+            return false;
+        }
+        self.keyboard = id;
+        self.changed_at = now;
+        true
+    }
+
     /// The left button went up without the driver getting it.
     pub fn released(&mut self, now: f64) {
         if self.left.take().is_some() {
@@ -209,6 +233,8 @@ impl Feedback {
             // Pressed elsewhere: the driver's pointer is someone else's.
             (true, Some(_)) => PointerState::Normal,
         };
+        // The slider arrow keys step is shown hovered wherever the pointer is.
+        let pointer = if pointer == PointerState::Normal && self.keyboard == Some(looks.id) { PointerState::Hover } else { pointer };
         let selected = self.predictions.iter().find(|p| p.id == looks.id).map_or(looks.shown.selected, |p| p.selected);
         LookState { pointer, selected }
     }
@@ -364,7 +390,7 @@ mod tests {
     /// overlay, with art for normal (set 10), hover (11) and pressed (12).
     fn scene() -> LookScene {
         let mut s = LookScene::default();
-        s.interactables = vec![Interactable { anchor: None, rect: [10, 10, 20, 20], kind: InteractableKind::Button, id: 7 }];
+        s.interactables = vec![Interactable { alt_right_click: false, anchor: None, rect: [10, 10, 20, 20], kind: InteractableKind::Button, id: 7 }];
         let states = vec![(NORMAL, vec![sprite(10)]), (HOVER, vec![sprite(11)]), (PRESSED, vec![sprite(12)])];
         s.looks = vec![Looks { id: 7, select: Select::None, shown: NORMAL, views: vec![ViewLooks { view: 5, sprites: (1, 3), states }] }];
         s
@@ -488,6 +514,19 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_focus_keeps_hover_after_pointer_leaves_and_clears_on_deselection() {
+        let scene = scene();
+        let mut feedback = Feedback::default();
+        feedback.sent(&Input::MouseMove { x: 15, y: 15 }, &scene, 0.0);
+        assert!(feedback.keyboard_slider(Some(7), 0.1));
+        feedback.pointer_gone(0.2);
+        assert_eq!(sets(&feedback.replacements(&scene, 0.3)), vec![(5, (1, 3), vec![11])]);
+        assert!(!feedback.keyboard_slider(Some(7), 0.4));
+        assert!(feedback.keyboard_slider(None, 0.5));
+        assert!(feedback.replacements(&scene, 0.6).is_empty());
+    }
+
+    #[test]
     fn hover_pressed_and_back_on_leave_until_the_driver_shows_them() {
         let mut s = scene();
         let mut f = Feedback::default();
@@ -541,9 +580,9 @@ mod tests {
             }],
         };
         s.interactables = vec![
-            Interactable { anchor: None, rect: [0, 0, 100, 10], kind: InteractableKind::ListItem, id: 1 },
-            Interactable { anchor: None, rect: [0, 10, 100, 10], kind: InteractableKind::ListItem, id: 2 },
-            Interactable { anchor: None, rect: [0, 0, 100, 20], kind: InteractableKind::List { scroll: [0, 0, 100, 20], step: 10 }, id: 3 },
+            Interactable { alt_right_click: false, anchor: None, rect: [0, 0, 100, 10], kind: InteractableKind::ListItem, id: 1 },
+            Interactable { alt_right_click: false, anchor: None, rect: [0, 10, 100, 10], kind: InteractableKind::ListItem, id: 2 },
+            Interactable { alt_right_click: false, anchor: None, rect: [0, 0, 100, 20], kind: InteractableKind::List { scroll: [0, 0, 100, 20], step: 10 }, id: 3 },
         ];
         s.looks = vec![entry(1, 0, sel), entry(2, 1, NORMAL)];
         let mut f = Feedback::default();

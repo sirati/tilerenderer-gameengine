@@ -117,7 +117,7 @@
 //! `name` (on, or a text that is not empty), `!name`; several joined by `&`.
 //! Art names may hold `{name}` too (e.g. `icon = "panes_{split}"`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use scene::{Button, Input};
 use serde::Deserialize;
@@ -553,6 +553,7 @@ pub struct Panel {
     size: (u32, u32),
     anchor: Anchor,
     items: Vec<Item>,
+    content_controls: BTreeSet<String>,
 }
 
 impl Panel {
@@ -785,7 +786,9 @@ impl Panels {
                     enable_if: cond(&d.enable_if)?,
                 });
             }
-            panels.insert(name.clone(), Panel { name: name.clone(), size: (p.size[0], p.size[1]), anchor: p.anchor, items });
+            let content_controls = items.iter().flat_map(|item| [&item.show_if, &item.enable_if])
+                .flatten().flat_map(|condition| condition.0.iter().map(|test| test.key.clone())).collect();
+            panels.insert(name.clone(), Panel { name: name.clone(), size: (p.size[0], p.size[1]), anchor: p.anchor, items, content_controls });
         }
         Ok(Self { styles: desc.styles.clone(), art, generated, panels })
     }
@@ -944,6 +947,16 @@ impl Panels {
                             state.slider_edit = Some((id, index, original));
                             state.hover = Some(index);
                         }
+                    } else if action == SliderAction::Step {
+                        // A keyboard step: inside an Alt edit when one is
+                        // open on it (its Cancel restores), else on its own.
+                        if state.slider_edit.is_some_and(|edit| edit.0 != id) {
+                            events.extend(state.cancel_slider(panel));
+                        }
+                        let item = &panel.items[index];
+                        if Self::visible(item, state) && Self::enabled(item, state) {
+                            events.extend(step_slider(item, state, value));
+                        }
                     } else if state.slider_edit.is_some_and(|edit| edit.0 == id) {
                         match action {
                             SliderAction::Cancel => events.extend(state.cancel_slider(panel)),
@@ -957,7 +970,7 @@ impl Panels {
                                     }
                                 }
                             }
-                            SliderAction::Begin => unreachable!(),
+                            SliderAction::Begin | SliderAction::Step => unreachable!(),
                         }
                     }
                     true
@@ -1015,18 +1028,7 @@ impl Panels {
             Input::Wheel { delta, x, y } => {
                 let ours = state.theirs == 0 && self.covers(panel, state, area, x, y);
                 if let Some(i) = self.hit(panel, state, area, x, y).filter(|_| ours) {
-                    if let Kind::Slider { control, min, max, step, .. } = &panel.items[i].kind {
-                        let by = if *step > 0.0 { *step } else { (max - min) / 20.0 };
-                        let now = match state.values.get(control) {
-                            Some(Value::Number(n)) => *n,
-                            _ => *min,
-                        };
-                        let v = snap(now + by * delta.signum() as f32, *min, *max, *step);
-                        if v != now {
-                            state.values.insert(control.clone(), Value::Number(v));
-                            events.push(PanelEvent::Slid { control: control.clone(), value: v });
-                        }
-                    }
+                    events.extend(step_slider(&panel.items[i], state, delta.signum()));
                 }
                 ours
             }
@@ -1121,7 +1123,15 @@ impl Panels {
                 }
                 _ => scene::InteractableKind::Button,
             };
+            // A control that changes other commands or enabled controls is
+            // committed with those commands. Predicting only its selection
+            // would show the new tab over the previous tab's body. Keep all
+            // hover/pressed art and both committed selection variants.
+            let select = if matches!(select, scene::Select::Pick { .. } | scene::Select::Toggle) && item.control().is_some_and(|key| panel.content_controls.contains(key)) {
+                scene::Select::None
+            } else { select };
             out.push(ControlLooks { id: id_hash(&panel.name, &n.to_string()), rect, kind, select, shown, draws, states });
+
         }
         out
     }
@@ -1409,6 +1419,21 @@ fn snap(v: f32, min: f32, max: f32, step: f32) -> f32 {
     ((v * 10_000.0).round() / 10_000.0).clamp(min, max)
 }
 
+/// Slider `item` moved `steps` of its own step (a twentieth of its range
+/// without one), clamped to its range: a wheel notch or an arrow key.
+fn step_slider(item: &Item, state: &mut PanelState, steps: i32) -> Option<PanelEvent> {
+    let Kind::Slider { control, min, max, step, .. } = &item.kind else { return None };
+    let by = if *step > 0.0 { *step } else { (max - min) / 20.0 };
+    let now = match state.values.get(control) {
+        Some(Value::Number(n)) => *n,
+        _ => *min,
+    };
+    let v = snap(now + by * steps as f32, *min, *max, *step);
+    if v == now { return None; }
+    state.values.insert(control.clone(), Value::Number(v));
+    Some(PanelEvent::Slid { control: control.clone(), value: v })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1642,7 +1667,7 @@ mod tests {
         // The two tabs only (the rest is hidden), topmost first.
         assert_eq!(looks.iter().map(|l| l.rect).collect::<Vec<_>>(), [[260, 100, 50, 20], [200, 100, 50, 20]]);
         let (one, two) = (&looks[1], &looks[0]);
-        assert_eq!(one.select, Select::Pick { group: two.select_group() });
+        assert_eq!((one.select, two.select), (Select::None, Select::None), "content-switching tabs commit with the body");
         assert_eq!(one.shown, LookState { pointer: PointerState::Normal, selected: true });
         assert_eq!(two.shown, LookState { pointer: PointerState::Hover, selected: false });
         assert_eq!(one.draws, panels.draw_item(p, &s, AREA, &measure, 0, &p.items[0]));
@@ -1655,6 +1680,10 @@ mod tests {
         assert_eq!(two.states.len(), 3);
         // Ids stay with the item.
         assert_eq!(panels.looks(p, &state("one"), AREA, &measure)[0].id, two.id);
+        let independent_index = p.items.iter().position(|item| matches!(&item.kind, Kind::Choice { control, .. } if control == "pick.x")).unwrap();
+        let independent_id = id_hash(&p.name, &independent_index.to_string());
+        let expanded = panels.looks(p, &state("two"), AREA, &measure);
+        assert!(matches!(expanded.iter().find(|l| l.id == independent_id).unwrap().select, Select::Pick { .. }), "independent choices keep immediate selection feedback");
     }
 
     #[test]
@@ -1798,6 +1827,32 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_steps_use_the_slider_step_clamp_and_join_an_open_alt_edit() {
+        use scene::SliderAction;
+        let panels = Panels::parse(PANELS).unwrap();
+        let panel = panels.panel("p").unwrap();
+        let mut state = state("two");
+        state.values.insert("scale".into(), Value::Number(1.0));
+        let slider = panels.looks(panel, &state, AREA, &estimate).into_iter().find(|c| matches!(c.kind, scene::InteractableKind::Slider { .. })).unwrap();
+        let edit = |state: &mut PanelState, action, value| panels.input(panel, state, AREA, &Input::Slider { id: slider.id, action, value });
+        let slid = |value| vec![PanelEvent::Slid { control: "scale".into(), value }];
+        assert_eq!(edit(&mut state, SliderAction::Step, 1).events, slid(1.25));
+        assert_eq!(edit(&mut state, SliderAction::Step, -2).events, slid(0.75));
+        // Clamped at both ends; nothing at an end.
+        assert_eq!(edit(&mut state, SliderAction::Step, -10).events, slid(0.5));
+        assert!(edit(&mut state, SliderAction::Step, -1).events.is_empty());
+        assert_eq!(edit(&mut state, SliderAction::Step, 100).events, slid(3.0));
+        assert!(edit(&mut state, SliderAction::Step, 1).events.is_empty());
+        // Within an Alt edit, Cancel undoes the steps too.
+        edit(&mut state, SliderAction::Begin, 1_000_000);
+        assert_eq!(edit(&mut state, SliderAction::Step, -1).events, slid(2.75));
+        assert_eq!(edit(&mut state, SliderAction::Cancel, 0).events, slid(3.0));
+        // A hidden slider takes no step.
+        state.values.insert("tab".into(), Value::Text("one".into()));
+        assert!(edit(&mut state, SliderAction::Step, -1).events.is_empty());
+    }
+
+    #[test]
     fn alt_slider_restores_before_tabs_or_controls_hide_and_ignores_inactive_requests() {
         use scene::SliderAction;
         let panels = Panels::parse(PANELS).unwrap();
@@ -1841,6 +1896,21 @@ mod tests {
         assert!(!panels.looks(panel, &state, AREA, &estimate).iter().any(|c| c.id == slider.id));
         assert!(panels.input(panel, &mut state, AREA, &Input::Slider { id: slider.id, action: SliderAction::Begin, value: 0 }).events.is_empty());
         assert!(state.slider_edit.is_none());
+    }
+
+    #[test]
+    fn dependent_checkboxes_commit_with_enabled_controls_but_independent_toggles_predict() {
+        let measure = |style: &TextStyle, text: &str| estimate(style, text);
+        let dependent = Panels::parse(&PANELS.replace("mode=a|b & !locked", "smooth")).unwrap();
+        let panel = dependent.panel("p").unwrap();
+        let checkbox_id = id_hash(&panel.name, &panel.items.iter().position(|item| matches!(&item.kind, Kind::Checkbox { control } if control == "smooth")).unwrap().to_string());
+        let looks = dependent.looks(panel, &state("two"), AREA, &measure);
+        let checkbox = looks.iter().find(|look| look.id == checkbox_id).unwrap();
+        assert_eq!(checkbox.select, scene::Select::None, "dependent checkbox selection belongs to the same command group as its enabled controls");
+        assert!(checkbox.states.iter().any(|(state, _)| state.pointer == scene::PointerState::Hover));
+        let independent = Panels::parse(PANELS).unwrap();
+        let panel = independent.panel("p").unwrap();
+        assert_eq!(independent.looks(panel, &state("two"), AREA, &measure).iter().find(|look| look.id == checkbox_id).unwrap().select, scene::Select::Toggle);
     }
 
 }

@@ -6,6 +6,8 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+application-icon = { path = "../application-icon" }
+civ3r-sync = { path = "../civ3r-sync" }
 tile-render.workspace = true
 render-desc = { path = "../render-desc" }
 scene = { path = "../scene" }
@@ -15,12 +17,12 @@ winit.workspace = true
 pollster.workspace = true
 log.workspace = true
 thiserror.workspace = true
+pointer-control = { path = "../pointer-control" }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-wl-pointer = { path = "../wl-pointer" }
-
-[target.'cfg(windows)'.dependencies]
-inproc = { path = "../inproc" }
+[target.'cfg(target_os = "macos")'.dependencies]
+softbuffer = { version = "0.4.8", default-features = false }
+# Scheduling the window onto the main thread of a host application.
+dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 toml = "0.9"

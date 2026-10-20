@@ -8,15 +8,15 @@ const TICK: f64 = 1.0 / 120.0;
 const D: f64 = 4.0 / 9.0;
 
 fn button(id: u64, rect: [i32; 4]) -> Interactable {
-    Interactable { anchor: None, rect, kind: InteractableKind::Button, id }
+    Interactable { alt_right_click: false, anchor: None, rect, kind: InteractableKind::Button, id }
 }
 
 fn item(id: u64, rect: [i32; 4]) -> Interactable {
-    Interactable { anchor: None, rect, kind: InteractableKind::ListItem, id }
+    Interactable { alt_right_click: false, anchor: None, rect, kind: InteractableKind::ListItem, id }
 }
 
 fn list(id: u64, rect: [i32; 4], step: i32) -> Interactable {
-    Interactable { anchor: None, rect, kind: InteractableKind::List { scroll: rect, step }, id }
+    Interactable { alt_right_click: false, anchor: None, rect, kind: InteractableKind::List { scroll: rect, step }, id }
 }
 
 /// A 20×20 button with its middle at (x, y).
@@ -345,6 +345,32 @@ fn a_click_clicks_the_element_snapped_to() {
 }
 
 #[test]
+fn an_alt_left_click_on_a_right_click_only_target_is_a_right_click_there() {
+    // B (the F1 production cell) acts only on the right button.
+    let t = targets(&[button(1, [100, 100, 40, 20]), Interactable { alt_right_click: true, ..button(2, [300, 100, 40, 20]) }], IDENTITY, WINDOW);
+    let mut s = Snapper::default();
+    s.enter(0.0, (120.0, 110.0), &t, Rates::default());
+    run(&mut s, &t, 0.0, 0.2, (4.0, 0.0), |t| t < 0.05);
+    let at = (320.0, 110.0);
+    assert_eq!(s.click(Button::Left, true), Some(vec![Action::Move(at), Action::Button { button: Button::Right, down: true, at }]));
+    assert_eq!(s.click(Button::Left, false), Some(vec![Action::Button { button: Button::Right, down: false, at }]));
+    // Its own right button stays the right button.
+    assert_eq!(s.click(Button::Right, true), Some(vec![Action::Move(at), Action::Button { button: Button::Right, down: true, at }]));
+    assert_eq!(s.click(Button::Right, false), Some(vec![Action::Button { button: Button::Right, down: false, at }]));
+    // On A, without the flag, a left click is a left click.
+    let mut s = Snapper::default();
+    s.enter(0.0, (120.0, 110.0), &t, Rates::default());
+    run(&mut s, &t, 0.0, 0.6, (0.0, 0.0), |_| false);
+    let a = (120.0, 110.0);
+    assert_eq!(s.click(Button::Left, true), Some(vec![Action::Move(a), Action::Button { button: Button::Left, down: true, at: a }]));
+    assert_eq!(s.click(Button::Left, false), Some(vec![Action::Button { button: Button::Left, down: false, at: a }]));
+    // Without the mode the snapper does not take ordinary clicks at all.
+    let mut off = Snapper::default();
+    assert_eq!(off.click(Button::Left, true), None);
+    assert_eq!(off.click(Button::Left, false), None);
+}
+
+#[test]
 fn with_nothing_snapped_to_a_click_goes_nowhere() {
     let mut s = Snapper::default();
     s.enter(0.0, (500.0, 400.0), &[], Rates::default());
@@ -432,11 +458,12 @@ fn when_its_element_goes_the_pointer_goes_on_to_the_nearest() {
     s.enter(0.0, (600.0, 150.0), &l, Rates::default());
     run(&mut s, &screen, 0.0, 1.0, (0.0, 0.0), |_| false);
     assert_eq!(s.target(), Some((500.0, 600.0)));
-    // Nothing at all for a moment (the scene in between): it stays.
+    // An empty transition preserves the visible pointer, but no old hit target.
     let mut s = Snapper::default();
     s.enter(0.0, (120.0, 110.0), &t, Rates::default());
     run(&mut s, &[], 0.0, 0.5, (0.0, 0.0), |_| false);
-    assert_eq!(s.target(), Some((120.0, 110.0)));
+    assert_eq!(s.pointer(), Some((120.0, 110.0)));
+    assert_eq!(s.target(), None);
 }
 
 #[test]
@@ -804,6 +831,23 @@ fn another_key_with_alt_held_is_a_shortcut_for_the_driver() {
 }
 
 #[test]
+fn focus_loss_releases_alt_if_a_native_shortcut_received_its_press() {
+    let (mut l, s) = captured();
+    let mut snap = SnapInput::default();
+    snap.route(key(ALT, true), &mut l, &s, 0.0, Rates::default());
+    snap.route(key(0x41, true), &mut l, &s, 0.1, Rates::default());
+    assert!(snap.alt_sent);
+    let out = snap.focus_lost(&mut l);
+    let alt_releases = out.iter().filter(|input| matches!(input,
+        Input::Key { vk: ALT, down: false, .. } | Input::WorldKey { vk: ALT, down: false, .. }
+    )).count();
+    assert_eq!(alt_releases, 1);
+    assert!(!snap.active());
+    assert!(snap.route(key(ALT, false), &mut l, &s, 0.2, Rates::default()).is_empty());
+    assert!(snap.focus_lost(&mut l).is_empty());
+}
+
+#[test]
 fn turned_on_again_it_resumes_on_the_last_element() {
     let (mut l, s) = captured();
     let mut snap = SnapInput::default();
@@ -1042,4 +1086,157 @@ fn capture_sensitivity_does_not_change_menu_snapping_motion_or_gestures() {
     assert_eq!(a.route(click.clone(), &mut slow, &scene, 1.0, Rates::default()), b.route(click, &mut fast, &scene, 1.0, Rates::default()));
     let wheel = Input::Wheel { delta: 120, x: 400, y: 300 };
     assert_eq!(a.route(wheel.clone(), &mut slow, &scene, 1.0, Rates::default()), b.route(wheel, &mut fast, &scene, 1.0, Rates::default()));
+}
+
+
+#[test]
+fn alt_targets_on_title_and_setup_keep_their_full_window_positions_with_saved_game_views() {
+    for name in [None, Some("Play New Game"), Some("Menu")] {
+        let mut s = scene();
+        s.shape = Default::default();
+        s.interface.screen = name.map(str::to_owned);
+        s.interactables = vec![button(44, [650, 400, 120, 40])];
+        let mut l = Layout::default();
+        l.configure("split=vertical,pane=pointer,magnifier=world,ui=pane").unwrap();
+        frame(&mut l, &s);
+        l.route(Input::MouseMove { x: 700, y: 420 });
+        let targets = SnapInput::targets(&s, &l);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].rect, [650.0, 400.0, 120.0, 40.0]);
+        let mut snap = SnapInput::default();
+        snap.route(key(ALT, true), &mut l, &s, 0.0, Rates::default());
+        snap.route(key(ALT, false), &mut l, &s, 0.0, Rates::default());
+        ticks(&mut snap, &mut l, &s, 0.0, 1.0);
+        assert!(snap.active());
+        assert_eq!(snap.snapper.target_id(), Some(44));
+        assert_eq!(snap.snapper.target(), Some((710.0, 420.0)));
+        assert_eq!(click(&mut snap, &mut l, &s, 1.0), [
+            Input::MouseMove { x: 710, y: 420 },
+            Input::MouseButton { button: Button::Left, down: true, x: 710, y: 420 },
+            Input::MouseButton { button: Button::Left, down: false, x: 710, y: 420 },
+        ]);
+        assert!(!l.captured());
+    }
+}
+
+#[test]
+fn alt_targets_keep_the_preview_menu_mapping_while_the_optional_world_loads_or_fails() {
+    let source = [1125, 640, 1024, 768];
+    let control = [2025, 660, 16, 12];
+    let plan = crate::scaling::plan((2946, 1844), 2.0, (3274, 2048), &viewer_settings::Resolution::default());
+    let mut l = Layout::default();
+    l.configure("split=vertical,pane=pointer,magnifier=world,ui=pane").unwrap();
+    l.driver_screen = Some(plan.screen);
+    l.menu_scale = plan.menu.zoom;
+    let mut s = scene();
+    s.views[1].view.menu = true;
+    s.views[1].overlay = vec![scene::FreeSprite { x: control[0], y: control[1], screen: true, ..Default::default() }];
+    s.interactables = vec![button(77, control)];
+    s.interface.beside = Some(scene::Beside { screen: source, edge: scene::Edge::Left, world: None });
+    for ready in [false, true, false] {
+        s.shape = if ready { scene().shape } else { Default::default() };
+        s.interface.beside.as_mut().unwrap().world = ready.then_some([0, 0, 8000, 4000]);
+        let mut f = l.frame(&s, plan.canvas(), (0, 0, 0, 0), vec![], Some(crate::layout::WorldBounds { size: (8000, 4000), wrap: (true, false) }));
+        let shown = crate::scaling::arrange_panned(&plan, &s, &mut f, &mut l.menu_pan, |sprite| Some([sprite.x, sprite.y, 16, 12]));
+        l.set_interface_shown(shown.shown);
+        let targets = SnapInput::targets(&s, &l);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].rect, [900.0, 174.0, 16.0, 12.0]);
+        l.route(Input::MouseMove { x: 908, y: 180 });
+        let mut snap = SnapInput::default();
+        snap.route(key(ALT, true), &mut l, &s, 0.0, Rates::default());
+        snap.route(key(ALT, false), &mut l, &s, 0.0, Rates::default());
+        ticks(&mut snap, &mut l, &s, 0.0, 1.0);
+        assert_eq!(snap.snapper.target_id(), Some(77));
+        assert_eq!(click(&mut snap, &mut l, &s, 1.0), [
+            Input::MouseMove { x: 2033, y: 666 },
+            Input::MouseButton { button: Button::Left, down: true, x: 2033, y: 666 },
+            Input::MouseButton { button: Button::Left, down: false, x: 2033, y: 666 },
+        ]);
+        snap.focus_lost(&mut l);
+        assert!(!l.captured());
+    }
+}
+
+#[test]
+fn an_empty_menu_transition_retires_the_alt_target_and_reentry_uses_new_controls() {
+    let mut snap = Snapper::default();
+    let before = row();
+    snap.enter(0.0, before[0].center(), &before, Rates::default());
+    snap.tick(1.0, &before, Rates::default());
+    assert_eq!(snap.target_id(), Some(1));
+    snap.tick(1.1, &[], Rates::default());
+    assert_eq!(snap.target_id(), None, "an empty/modal transition cannot keep an old actionable button");
+    assert_eq!(snap.click(Button::Left, true), Some(vec![]));
+    let after = targets(&[button(7, [500, 200, 80, 30])], IDENTITY, WINDOW);
+    snap.tick(1.2, &after, Rates::default());
+    assert_eq!(snap.target_id(), Some(7), "new menu controls become actionable without additional motion");
+}
+
+#[test]
+fn an_alt_click_before_the_next_tick_follows_the_current_menu_not_its_previous_button() {
+    let mut scene = scene();
+    let mut layout = Layout::default();
+    frame(&mut layout, &scene);
+    let mut snap = SnapInput::default();
+    snap.route(key(ALT, true), &mut layout, &scene, 0.0, Rates::default());
+    snap.route(key(ALT, false), &mut layout, &scene, 0.1, Rates::default());
+    snap.tick(&mut layout, &scene, 1.0, Rates::default());
+    scene.interactables = vec![button(7, [500, 520, 80, 30])];
+    let out = click(&mut snap, &mut layout, &scene, 1.1);
+    let downs: Vec<_> = out.iter().filter_map(|i| match i {
+        Input::MouseButton { down: true, x, y, .. } => Some((*x, *y)), _ => None,
+    }).collect();
+    assert_eq!(downs, vec![(540, 535)], "the old main/menu button must not receive a transition click: {out:?}");
+}
+
+#[test]
+fn same_id_control_motion_during_alt_flight_uses_its_current_hit_rectangle() {
+    for now in [0.15, 1.1] {
+        let mut scene = scene();
+        let mut layout = Layout::default();
+        frame(&mut layout, &scene);
+        let mut snap = SnapInput::default();
+        snap.route(key(ALT, true), &mut layout, &scene, 0.0, Rates::default());
+        snap.route(key(ALT, false), &mut layout, &scene, 0.1, Rates::default());
+        let id = snap.snapper.target_id().unwrap();
+        scene.interactables = vec![button(id, [500, 520, 80, 30])];
+        let out = click(&mut snap, &mut layout, &scene, now);
+        assert!(out.iter().any(|i| matches!(i, Input::MouseButton { down: true, x: 540, y: 535, .. })), "{now}: {out:?}");
+        assert_eq!(snap.snapper.target_id(), Some(id));
+        assert!(snap.snapper.snapping());
+    }
+}
+
+#[test]
+fn menu_replacement_keeps_a_held_alt_click_release_with_its_original_press() {
+    let mut scene = scene();
+    let mut layout = Layout::default();
+    frame(&mut layout, &scene);
+    let mut snap = SnapInput::default();
+    snap.route(key(ALT, true), &mut layout, &scene, 0.0, Rates::default());
+    snap.route(key(ALT, false), &mut layout, &scene, 0.1, Rates::default());
+    snap.tick(&mut layout, &scene, 1.0, Rates::default());
+    let input = |down| Input::MouseButton { button: Button::Left, down, x: 0, y: 0 };
+    let down = snap.route(input(true), &mut layout, &scene, 1.1, Rates::default());
+    let at = down.iter().find_map(|i| match i { Input::MouseButton { down: true, x, y, .. } => Some((*x, *y)), _ => None }).unwrap();
+    scene.interactables = vec![button(7, [500, 520, 80, 30])];
+    let up = snap.route(input(false), &mut layout, &scene, 1.2, Rates::default());
+    assert_eq!(up, vec![Input::MouseButton { button: Button::Left, down: false, x: at.0, y: at.1 }]);
+    let next = click(&mut snap, &mut layout, &scene, 1.3);
+    assert!(next.contains(&Input::MouseButton { button: Button::Left, down: true, x: 540, y: 535 }), "{next:?}");
+}
+
+#[test]
+fn alt_wheel_after_menu_replacement_uses_the_current_target_before_tick() {
+    let mut scene = scene();
+    let mut layout = Layout::default();
+    frame(&mut layout, &scene);
+    let mut snap = SnapInput::default();
+    snap.route(key(ALT, true), &mut layout, &scene, 0.0, Rates::default());
+    snap.route(key(ALT, false), &mut layout, &scene, 0.1, Rates::default());
+    snap.tick(&mut layout, &scene, 1.0, Rates::default());
+    scene.interactables = vec![button(7, [500, 520, 80, 30])];
+    assert_eq!(snap.route(Input::Wheel { delta: -120, x: 0, y: 0 }, &mut layout, &scene, 1.1, Rates::default()),
+        vec![Input::Wheel { delta: -120, x: 540, y: 535 }]);
 }

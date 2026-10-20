@@ -10,6 +10,7 @@
 //! [`connect`] links the two sides, each on its own thread.
 
 pub mod wire;
+pub mod loading_cursor;
 
 
 use std::sync::mpsc;
@@ -45,6 +46,35 @@ pub struct View {
     pub downscale: u32,
     /// Category bits hidden in this view. Category zero is always visible.
     pub hidden_categories: u32,
+    /// Which data slots the view draws its layers from ([`Scene::bindings`]):
+    /// 0, or a binding the scene does not have, draws every layer from its
+    /// own cells ([`Scene::layers`]); views of one binding share its slots
+    /// (see docs/per-view-layers.md).
+    pub binding: u32,
+}
+
+/// Cells of a layer kept apart from its own ([`Scene::layers`]), which the
+/// views of a binding listing it draw instead: e.g. one view's fog of war
+/// while the others keep the player's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LayerSlot {
+    /// Chosen by the driver.
+    pub id: u32,
+    /// The layer whose cells these are (in the description's layer order).
+    pub layer: u32,
+    /// As many as the layer's, with phases and offsets where it has them.
+    pub cells: LayerCells,
+}
+
+/// What a binding's views draw from slots: per layer listed, the slot (its
+/// id) holding the cells they draw it from; the rest from the layers' own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Binding {
+    /// Chosen by the driver, not 0 (every view's binding unless it names
+    /// another).
+    pub id: u32,
+    /// (layer, slot id), by layer.
+    pub slots: Vec<(u32, u32)>,
 }
 
 /// Shape of the cell grid (layout and spacing come from the description).
@@ -68,6 +98,15 @@ pub struct LayerCells {
     pub offsets: Option<Vec<(i16, i16)>>,
 }
 
+/// Explicit destination-dependent native composition for free sprites.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum SpriteBlend {
+    #[default]
+    Alpha,
+    /// RGB8 source and raw alpha byte composed over RGB555 with a / 256.
+    PaletteAlpha256,
+}
+
 /// A sprite not tied to a cell (units, effects, UI).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FreeSprite {
@@ -84,6 +123,8 @@ pub struct FreeSprite {
     pub ticks_per_frame: u32,
     /// 0: alpha blending; otherwise darkens like a scale layer.
     pub scale_den: u32,
+    /// Native palette composition overrides the legacy scale/tint blend.
+    pub blend: SpriteBlend,
     /// The colour of ClearType-like text (`scale_den` = the renderer's
     /// `SCALE_SUBPIXEL`), 0xRRGGBB.
     /// With ordinary alpha blending: the high byte is inverse opacity.
@@ -106,11 +147,22 @@ pub struct FreeSprite {
     /// (`zoom_art` 2, `zoom` (0, 0)), its pen at the sprite's position on
     /// the baseline.
     pub glyph: Option<Glyph>,
+    /// An atlas-independent solid rectangle, anchored at x,y.
+    pub solid: Option<SolidRect>,
     /// The named palette its indexed sprites are drawn with (an index into
     /// the render description's palettes; 0: none).
     pub palette: u32,
     /// Visibility category bit for per-camera clean-map filtering.
     pub category: u32,
+}
+
+/// A procedural rectangle with unpremultiplied RGBA. Like UI sprite art,
+/// its dimensions stay fixed under world downscale; camera zoom still applies.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SolidRect {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: [u8; 4],
 }
 
 /// A glyph drawn from a font's outline (see [`FreeSprite::glyph`]).
@@ -144,6 +196,17 @@ pub struct ViewState {
     pub overlay: Vec<FreeSprite>,
 }
 
+/// A range of world sprites with a lifetime on the viewer's monotonic clock.
+/// A nonzero serial identifies one telling; resending it must not restart
+/// its timer. Drivers allocate serials in increasing order across the session.
+/// `sprites` is a half-open range in [`Scene::sprites`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpriteLifetime {
+    pub serial: u64,
+    pub sprites: (u32, u32),
+    pub duration_ms: u32,
+}
+
 /// What the renderer knows: the whole world and the views of it. Drivers
 /// send [`Update`]s; the renderer applies them ([`Scene::apply`]) and draws
 /// every view.
@@ -156,9 +219,16 @@ pub struct Scene {
     pub shape: WorldShape,
     /// In the description's layer order.
     pub layers: Vec<LayerCells>,
+    /// Cells of layers that some views draw instead of the layers' own
+    /// (by id; see [`View::binding`]), and which views draw which:
+    /// [`Binding`]s by id. A slot costs a layer's cells; views drawing the
+    /// same cells share one, and one no view differs by is not sent.
+    pub slots: Vec<LayerSlot>,
+    pub bindings: Vec<Binding>,
     /// World-space sprites (units, effects), drawn in every view, in
     /// drawing order (within the pass each follows).
     pub sprites: Vec<FreeSprite>,
+    pub sprite_lifetimes: Vec<SpriteLifetime>,
     /// By id.
     pub views: Vec<ViewState>,
     /// The zooms the scene has zoomed art for (see `FreeSprite::zoom_art`);
@@ -175,6 +245,8 @@ pub struct Scene {
     /// A new serial repeats a request even when its destination is unchanged.
     /// None retains the driver-camera behavior of older drivers.
     pub camera_focus: Option<CameraFocus>,
+    /// Complete visible combat bounds requiring a presented camera receipt.
+    pub camera_arrival: Option<CameraArrival>,
     /// Map displacement for one wheel notch in current game-pixel units.
     /// Positive magnitudes; Shift selects X, otherwise Y. Zero preserves
     /// ordinary driver wheel routing for drivers without this metadata.
@@ -185,6 +257,8 @@ pub struct Scene {
     /// keeps them, e.g. edited on a preferences screen; `None`: none sent,
     /// the renderer goes by its own copy).
     pub settings: Option<viewer_settings::Settings>,
+    /// Temporary render multiplier awaiting viewer-clock confirmation.
+    pub settings_preview: Option<SettingsPreview>,
     /// What the driver's interface shows that a renderer may arrange.
     pub interface: Interface,
     /// What the user can point at and act on in the driver's interface
@@ -212,6 +286,9 @@ pub struct CameraFocus {
     /// Center in the driver's current zoom-world pixels.
     pub center: (i32, i32),
 }
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CameraArrival { pub serial: u64, pub bounds: [i32; 4] }
 
 /// A mouse pointer.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -272,12 +349,26 @@ impl SystemCursor {
 /// Parts of the driver's interface a renderer may arrange (all in window
 /// pixels; views by id). A renderer that does not arrange anything draws
 /// every view where the driver put it, as always.
+/// The visible modal overlays in paint order, excluding the named screen.
+/// Civ III's dialog machinery permits at most four open forms.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModalStack(pub [Option<u32>; 4]);
+
+impl ModalStack {
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ { self.0.iter().flatten().copied() }
+    pub fn contains(&self, id: u32) -> bool { self.iter().any(|view| view == id) }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Interface {
     /// The screen the interface shows, named by the driver (e.g. "F1",
     /// "City", "Menu"); none: its usual screen over the world. A renderer
     /// may place a named screen in one of its own views.
     pub screen: Option<String>,
+    /// Keep the complete menu inside the visible canvas or assigned menu
+    /// region, even when user menu scaling is disabled. Set for the title
+    /// and Preferences using the driver's screen state, not rendered text.
+    pub menu_fit: bool,
     /// An interface-only view holding controls that belong with whichever
     /// of the renderer's views the pointer is in (e.g. a game's menu buttons
     /// in the top-left corner, with the tooltip they show; the view's
@@ -296,6 +387,8 @@ pub struct Interface {
     /// not have it). A renderer may draw it elsewhere (and map pointer input
     /// there back to where the driver put it).
     pub popup: Option<u32>,
+    /// Independently placed modal views, bottom to top. `popup` is the top.
+    pub modal_stack: ModalStack,
     /// An interface-only view holding the named screen (`screen`) where it
     /// lies over the window, smaller than it, and what is drawn over it
     /// (its `origin` and `viewport` are its rectangle; the other interface
@@ -313,6 +406,43 @@ pub struct Interface {
     /// The driver asks for its screen and its world side by side (e.g. a
     /// menu with a preview of the world it picks).
     pub beside: Option<Beside>,
+    /// The open popup belongs at a place of the world a click picked (a
+    /// context menu, a tile's information box): a renderer places it there
+    /// in the view the click was made in, not with the screens.
+    pub popup_anchor: Option<PopupAnchor>,
+    /// A command of the driver's waits for the player to pick a place of
+    /// the world (e.g. a unit's go-to destination, a bombard target): the
+    /// next click that matters is one on the world (a renderer may give
+    /// the world the pointer for it).
+    pub targeting: bool,
+    /// The command waiting for its tile is a move (a unit's or a stack's
+    /// go-to, whose target shows the turns it takes): a renderer may show
+    /// the cursor tile by tile. Other commands (bombard, rebase, airlift,
+    /// ...) keep the cursor at the pointer.
+    pub snap_to_tiles: bool,
+}
+
+impl Interface {
+    pub fn is_popup_view(&self, id: u32) -> bool { self.popup == Some(id) || self.modal_stack.contains(id) }
+    pub fn popup_views(&self) -> impl Iterator<Item = u32> + '_ {
+        self.modal_stack.iter().chain(self.popup.filter(|id| !self.modal_stack.contains(*id)))
+    }
+}
+
+
+/// Where a click-opened popup goes (`Interface::popup_anchor`): its top-left
+/// corner `offset` (the popup's own pixels, scaled with it) from world
+/// pixel `world` (as `Scene::focus`: the driver's view pixels).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PopupAnchor {
+    pub world: (i32, i32),
+    pub offset: (i32, i32),
+    /// The popup shows a piece of the world at the game's own size (the
+    /// tile information box's picture of the tile): a renderer draws it at
+    /// the scale the world has in the view the click was made in, so that
+    /// its picture matches the tiles there as in the game at 1:1 (not at
+    /// the menus' scale).
+    pub world_scaled: bool,
 }
 
 /// The driver's screen and its world side by side (`Interface::beside`):
@@ -360,6 +490,11 @@ pub struct Interactable {
     /// address of a game's control object): a renderer may keep pointing at
     /// the same element across updates.
     pub id: u64,
+    /// In button snapping only, a left click on it reaches the driver as a
+    /// right click at the same point: for elements whose only action is
+    /// on the right button (the F1 advisor's production cells). Ordinary
+    /// mouse input is never changed.
+    pub alt_right_click: bool,
 }
 
 /// What an [`Interactable`] is.
@@ -461,6 +596,19 @@ pub struct Patch {
     pub rgba: Vec<u8>,
 }
 
+/// Whether the driver's host answers (e.g. a game's thread): sent now and
+/// then (a few times a second) by a driver that knows, also while nothing
+/// else changes, so that a renderer can tell it is busy or stuck (see
+/// [`Display::host`]). Not part of the [`Scene`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostStatus {
+    /// For how long the host has not answered when this was sent, in
+    /// milliseconds (0: it answers; waiting for input counts as answering).
+    pub stale_ms: u32,
+    /// Counts the statuses sent.
+    pub serial: u32,
+}
+
 /// One change of a [`Scene`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Update {
@@ -472,8 +620,16 @@ pub enum Update {
     Phases(Vec<(u32, u32, u8)>),
     /// Some cells' offsets changed: (layer, cell index, offset).
     Offsets(Vec<(u32, u32, (i16, i16))>),
+    /// Slot `id` added or replaced (layer, cells), or removed (`None`).
+    Slot { id: u32, slot: Option<(u32, LayerCells)> },
+    /// Some cells of slots changed: (slot id, cell index, value).
+    SlotCells(Vec<(u32, u32, u32)>),
+    /// See [`Scene::bindings`] (replaced).
+    Bindings(Vec<Binding>),
     /// The world-space sprites (replaced).
     Sprites(Vec<FreeSprite>),
+    /// Replaces the lifetimes of world sprite ranges.
+    SpriteLifetimes(Vec<SpriteLifetime>),
     /// View `id` added or changed (its overlay kept), or removed (`None`).
     View { id: u32, view: Option<View> },
     /// The screen-space sprites over view `id` (replaced).
@@ -485,6 +641,7 @@ pub enum Update {
     Focus(Option<(i32, i32)>),
     /// See [`Scene::camera_focus`].
     CameraFocus(Option<CameraFocus>),
+    CameraArrival(Option<CameraArrival>),
     /// See [`Scene::map_wheel_step`].
     MapWheelStep((i32, i32)),
     /// The scene now refers to art generation `n` (see [`Scene::assets`]).
@@ -494,6 +651,7 @@ pub enum Update {
     /// The renderer's settings changed (see [`Scene::settings`]): it takes them
     /// in place of its own.
     Settings(viewer_settings::Settings),
+    SettingsPreview(Option<SettingsPreview>),
     /// See [`Scene::interface`].
     Interface(Interface),
     /// See [`Scene::interactables`] (replaced).
@@ -504,6 +662,9 @@ pub enum Update {
     ScreenSize((u32, u32)),
     /// See [`Scene::looks`] (replaced).
     Looks(Vec<Looks>),
+    /// The host's [`HostStatus`]; kept by the [`Display`], not the scene
+    /// (a batch of these alone is no new scene).
+    Host(HostStatus),
 }
 
 impl Scene {
@@ -597,7 +758,26 @@ impl Scene {
                     }
                 }
             }
+            Update::Slot { id, slot } => {
+                let at = self.slots.binary_search_by_key(&id, |s| s.id);
+                match (at, slot) {
+                    (Ok(i), Some((layer, cells))) => self.slots[i] = LayerSlot { id, layer, cells },
+                    (Err(i), Some((layer, cells))) => self.slots.insert(i, LayerSlot { id, layer, cells }),
+                    (Ok(i), None) => drop(self.slots.remove(i)),
+                    (Err(_), None) => {}
+                }
+            }
+            Update::SlotCells(changes) => {
+                for (slot, cell, value) in changes {
+                    let Ok(i) = self.slots.binary_search_by_key(&slot, |s| s.id) else { continue };
+                    if let Some(v) = self.slots[i].cells.values.get_mut(cell as usize) {
+                        *v = value;
+                    }
+                }
+            }
+            Update::Bindings(b) => self.bindings = b,
             Update::Sprites(sprites) => self.sprites = sprites,
+            Update::SpriteLifetimes(lifetimes) => self.sprite_lifetimes = lifetimes,
             Update::View { id, view: Some(view) } => self.view_mut(id).view = view,
             Update::View { id, view: None } => self.views.retain(|v| v.id != id),
             Update::Overlay { view, sprites } => self.view_mut(view).overlay = sprites,
@@ -612,15 +792,19 @@ impl Scene {
             Update::Tick(tick) => self.tick = tick,
             Update::Focus(focus) => self.focus = focus,
             Update::CameraFocus(focus) => self.camera_focus = focus,
+            Update::CameraArrival(arrival) => self.camera_arrival = arrival,
             Update::MapWheelStep(step) => self.map_wheel_step = step,
             Update::Assets(n) => self.assets = n,
             Update::Zooms(z) => self.zooms = z,
             Update::Settings(s) => self.settings = Some(s),
+            Update::SettingsPreview(p) => self.settings_preview = p,
             Update::Interface(i) => self.interface = i,
             Update::Interactables(i) => self.interactables = i,
             Update::Cursor(c) => self.cursor = c,
             Update::ScreenSize(s) => self.screen_size = s,
             Update::Looks(l) => self.looks = l,
+            // (Not the scene's: see `Display::host`.)
+            Update::Host(_) => {}
         }
     }
 
@@ -661,8 +845,34 @@ impl Scene {
                 out.push(Update::Offsets(offsets));
             }
         }
+        // Slots: their changed values where only those changed, else whole.
+        let mut slot_cells = Vec::new();
+        for s in &old.slots {
+            if self.slots.binary_search_by_key(&s.id, |n| n.id).is_err() {
+                out.push(Update::Slot { id: s.id, slot: None });
+            }
+        }
+        for s in &self.slots {
+            let before = old.slots.binary_search_by_key(&s.id, |o| o.id).ok().map(|i| &old.slots[i]);
+            match before {
+                Some(b) if b == s => {}
+                Some(b) if b.layer == s.layer && b.cells.values.len() == s.cells.values.len() && b.cells.phases == s.cells.phases && b.cells.offsets == s.cells.offsets => {
+                    slot_cells.extend(s.cells.values.iter().zip(&b.cells.values).enumerate().filter(|(_, (a, b))| a != b).map(|(i, (a, _))| (s.id, i as u32, *a)));
+                }
+                _ => out.push(Update::Slot { id: s.id, slot: Some((s.layer, s.cells.clone())) }),
+            }
+        }
+        if !slot_cells.is_empty() {
+            out.push(Update::SlotCells(slot_cells));
+        }
+        if self.bindings != old.bindings {
+            out.push(Update::Bindings(self.bindings.clone()));
+        }
         if self.sprites != old.sprites {
             out.push(Update::Sprites(self.sprites.clone()));
+        }
+        if self.sprite_lifetimes != old.sprite_lifetimes {
+            out.push(Update::SpriteLifetimes(self.sprite_lifetimes.clone()));
         }
         for v in &old.views {
             if self.view(v.id).is_none() {
@@ -688,6 +898,9 @@ impl Scene {
         if self.camera_focus != old.camera_focus {
             out.push(Update::CameraFocus(self.camera_focus));
         }
+        if self.camera_arrival != old.camera_arrival {
+            out.push(Update::CameraArrival(self.camera_arrival));
+        }
         if self.map_wheel_step != old.map_wheel_step {
             out.push(Update::MapWheelStep(self.map_wheel_step));
         }
@@ -702,6 +915,9 @@ impl Scene {
         }
         if let Some(s) = self.settings.as_ref().filter(|s| old.settings.as_ref() != Some(s)) {
             out.push(Update::Settings(s.clone()));
+        }
+        if self.settings_preview != old.settings_preview {
+            out.push(Update::SettingsPreview(self.settings_preview));
         }
         if self.interface != old.interface {
             out.push(Update::Interface(self.interface.clone()));
@@ -742,17 +958,38 @@ pub enum UnitOrderAction {
 /// An Alt slider edit is a transaction. Begin must preserve the current
 /// value, Preview updates it, Commit accepts it, and Cancel restores the
 /// exact value from Begin. A driver ignores unknown or inactive controls.
+///
+/// Step is a keyboard step (an arrow key on the selected slider): its value
+/// is a signed count of the control's own steps (the native arrow step, or
+/// the menu slider's step), clamped by the driver. Inside a transaction it
+/// belongs to the edit (Cancel undoes it); outside one it is a whole edit.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SliderAction {
     Begin,
     Preview,
     Commit,
     Cancel,
+    Step,
+}
+
+/// Stable identity and rollback value for a temporary render multiplier.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SettingsPreview {
+    pub session: u64,
+    pub id: u64,
+    pub pixel_scale: u32,
+    pub previous_pixel_scale: u32,
 }
 
 /// User input captured by the renderer, in viewport pixels.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
+    /// The matching combat area is fully visible in an accepted presented mapping.
+    CameraArrived { serial: u64 },
+    /// No eligible camera can show the complete combat area, or the device failed.
+    CameraUnavailable { serial: u64 },
+    /// Viewer-local confirmation, scoped to one Preferences session/change.
+    SettingsPreviewDecision { session: u64, id: u64, keep: bool },
     /// Edit a driver's slider without pressing or moving its pointer. The
     /// value is a fraction of its range in millionths, clamped by the driver.
     Slider { id: u64, action: SliderAction, value: i32 },
@@ -821,6 +1058,11 @@ pub enum Input {
     /// window may also send it while the pointer pushes against a divider
     /// from such a view (its edge there, at the outermost pixel).
     Edge { x: i32, y: i32 },
+    /// Close the popup the driver opened at a world click (`Interface::
+    /// popup_anchor`: a context menu, a tile's information box) the way
+    /// the driver's own user dismisses it, if it is still open; nothing
+    /// else (the click outside it that asked for this acts on nothing).
+    DismissPopup,
 }
 
 /// How near the window's edge the pointer counts as at it ([`Input::Edge`]).
@@ -828,15 +1070,16 @@ pub const EDGE_ZONE: i32 = 16;
 
 /// Connects a driver (the game side) and a renderer, each on its own
 /// thread: updates flow to the renderer, input flows back, both through
-/// multiple-producer single-consumer queues ([`std::sync::mpsc`]).
+/// multiple-producer single-consumer queues ([`std::sync::mpsc`]; input
+/// through a `crossbeam_channel`, so that a [`Driver`] may be shared).
 pub fn connect() -> (Driver, Display) {
     let (updates_tx, updates_rx) = mpsc::channel();
-    let (input_tx, input_rx) = mpsc::channel();
+    let (input_tx, input_rx) = crossbeam_channel::unbounded();
     let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let wake = Waker::default();
     (
         Driver { updates: updates_tx, input: input_rx, in_flight: in_flight.clone(), wake: wake.clone() },
-        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() } },
+        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() }, changes_from_seq: 0, host: None },
     )
 }
 
@@ -844,16 +1087,25 @@ pub fn connect() -> (Driver, Display) {
 pub type Updater = mpsc::Sender<Vec<Update>>;
 /// A sender of input (any number of views or windows may report to one
 /// driver).
-pub type InputSender = mpsc::Sender<Input>;
+pub type InputSender = crossbeam_channel::Sender<Input>;
 
 /// What the driver's end calls after each batch it sends (see
 /// [`Display::set_wake`]).
 #[derive(Clone, Default)]
-struct Waker(std::sync::Arc<std::sync::Mutex<Option<Box<dyn Fn() + Send>>>>);
+struct Waker {
+    call: std::sync::Arc<civ3r_sync::Latest<Box<dyn Fn() + Send + Sync>>>,
+    /// The thread waiting in [`Display::receive`], unparked by each batch.
+    /// The renderer parks rather than waiting in the channel, so a send
+    /// never touches the channel's waiter list (a lock).
+    parked: std::sync::Arc<civ3r_sync::Latest<std::thread::Thread>>,
+}
 
 impl Waker {
     fn wake(&self) {
-        if let Some(f) = &*self.0.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(t) = self.parked.load() {
+            t.unpark();
+        }
+        if let Some(f) = self.call.load() {
             f();
         }
     }
@@ -862,7 +1114,7 @@ impl Waker {
 /// The driver's end: sends updates, takes input.
 pub struct Driver {
     updates: Updater,
-    input: mpsc::Receiver<Input>,
+    input: crossbeam_channel::Receiver<Input>,
     /// Batches sent but not yet taken by the renderer.
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     wake: Waker,
@@ -897,6 +1149,20 @@ impl Driver {
     pub fn take_input(&self) -> Vec<Input> {
         self.input.try_iter().collect()
     }
+
+    /// All input queued, waiting at most `timeout` for some when there is
+    /// none (on a thread of the driver's own that hands it on).
+    pub fn wait_input(&self, timeout: std::time::Duration) -> Vec<Input> {
+        match self.input.recv_timeout(timeout) {
+            Ok(first) => std::iter::once(first).chain(self.input.try_iter()).collect(),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Vec::new(),
+            // (No renderer any more: no input ever, waited for all the same.)
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(timeout);
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// The renderer's end: owns the [`Scene`] the updates build.
@@ -910,6 +1176,11 @@ pub struct Display {
     wake: Waker,
     /// What changed since [`Display::take_changes`] last took it.
     changes: Changes,
+    /// The source sequence the accumulated cell/sprite/view deltas start
+    /// from. A rejected preparation can restore an older drawing snapshot.
+    changes_from_seq: u64,
+    /// The host's status last received, and when (see [`Display::host`]).
+    host: Option<(HostStatus, std::time::Instant)>,
 }
 
 /// What of a [`Scene`] changed (see [`Display::take_changes`]), for a
@@ -925,6 +1196,12 @@ pub struct Changes {
     pub sprites: bool,
     /// A view (added, changed, removed) or the sprites over one.
     pub views: bool,
+    /// Which slots there are, or which bindings draw them (a slot added,
+    /// replaced or removed; the bindings changed): `slot_cells` is then
+    /// empty.
+    pub slots: bool,
+    /// The cells of slots whose value changed: (slot id, cell index).
+    pub slot_cells: Vec<(u32, u32)>,
 }
 
 /// More changed cells than this are a new world to a renderer (see
@@ -951,8 +1228,19 @@ impl Changes {
             Update::Cells(c) => cells(&mut c.iter().map(|&(l, i, _)| (l, i))),
             Update::Phases(c) => cells(&mut c.iter().map(|&(l, i, _)| (l, i))),
             Update::Offsets(c) => cells(&mut c.iter().map(|&(l, i, _)| (l, i))),
-            Update::Sprites(_) => self.sprites = true,
+            Update::Sprites(_) | Update::SpriteLifetimes(_) => self.sprites = true,
             Update::View { .. } | Update::Overlay { .. } => self.views = true,
+            Update::Slot { .. } | Update::Bindings(_) => {
+                self.slots = true;
+                self.slot_cells = Vec::new();
+            }
+            Update::SlotCells(c) if !self.slots => {
+                self.slot_cells.extend(c.iter().map(|&(s, i, _)| (s, i)));
+                if self.slot_cells.len() > MOST_CHANGED_CELLS {
+                    self.slots = true;
+                    self.slot_cells = Vec::new();
+                }
+            }
             _ => {}
         }
     }
@@ -968,26 +1256,46 @@ impl Display {
     /// [`Driver::send`]; not through other [`Updater`]s), on the driver's
     /// thread: a renderer that waits for its window's events rather than
     /// for updates ([`Display::receive`]) learns of them at once.
-    pub fn set_wake(&self, wake: impl Fn() + Send + 'static) {
-        *self.wake.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(wake));
+    pub fn set_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        self.wake.call.publish(Box::new(wake));
     }
 
     /// Applies every batch received so far, waiting up to `timeout` for the
     /// first if none is there; whether anything changed.
     pub fn receive(&mut self, timeout: Duration) -> bool {
         let mut changed = false;
-        if let Ok(batch) = self.updates.recv_timeout(timeout) {
-            self.apply(batch);
-            changed = true;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            while let Ok(batch) = self.updates.try_recv() {
+                changed |= self.apply(batch);
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if changed || left.is_zero() {
+                return changed;
+            }
+            // Batches from other `Updater`s wake no one: they wait for the
+            // timeout or the next driver batch.
+            let me = std::thread::current();
+            if self.wake.parked.load().is_none_or(|t| t.id() != me.id()) {
+                self.wake.parked.publish(me);
+                // Look again: a batch sent before this was seen unparks no one.
+                continue;
+            }
+            std::thread::park_timeout(left);
         }
-        while let Ok(batch) = self.updates.try_recv() {
-            self.apply(batch);
-            changed = true;
-        }
-        changed
     }
 
-    fn apply(&mut self, batch: Vec<Update>) {
+    /// Applies a batch; whether it changed the scene (a batch of host
+    /// statuses alone does not: no new scene for the renderer to take).
+    fn apply(&mut self, batch: Vec<Update>) -> bool {
+        let _ = self.in_flight.try_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
+        let (host, batch): (Vec<Update>, Vec<Update>) = batch.into_iter().partition(|u| matches!(u, Update::Host(_)));
+        if let Some(Update::Host(h)) = host.last() {
+            self.host = Some((*h, std::time::Instant::now()));
+        }
+        if batch.is_empty() {
+            return false;
+        }
         for u in batch {
             if let Update::Settings(s) = &u {
                 self.new_settings = Some(s.clone());
@@ -996,7 +1304,15 @@ impl Display {
             self.scene.apply(u);
         }
         self.scene.seq += 1;
-        let _ = self.in_flight.try_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
+        true
+    }
+
+    /// The host's status last received and when it came (the renderer's
+    /// clock), if the driver sends any: how long the host has not answered
+    /// is its `stale_ms` plus the time since (no status for a while is the
+    /// driver or the connection gone silent).
+    pub fn host(&self) -> Option<(HostStatus, std::time::Instant)> {
+        self.host
     }
 
     pub fn scene(&self) -> &Scene {
@@ -1006,7 +1322,19 @@ impl Display {
     /// What changed in the scene since the last call (at first: the
     /// world), and the scene.
     pub fn take_changes(&mut self) -> (Changes, &Scene) {
+        self.changes_from_seq = self.scene.seq;
         (std::mem::take(&mut self.changes), &self.scene)
+    }
+
+    /// Takes the deltas only when `previous` is their actual predecessor.
+    /// A consumer restored after a rejected preparation may be older than
+    /// the last consumed batch. Rebuild every source-dependent collection
+    /// in that case, even if no later update has arrived.
+    pub fn take_changes_from(&mut self, previous: u64) -> (Changes, &Scene) {
+        let matches = previous == self.changes_from_seq;
+        let (changes, scene) = self.take_changes();
+        if matches { (changes, scene) }
+        else { (Changes { world: true, sprites: true, views: true, slots: true, ..Default::default() }, scene) }
     }
 
     /// What changed in the scene since [`Display::take_changes`] was last
@@ -1040,6 +1368,50 @@ impl Display {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_driver_may_be_shared_without_a_lock() {
+        fn shared<T: Send + Sync>() {}
+        shared::<Driver>();
+    }
+
+    #[test]
+    fn a_waiting_renderer_wakes_for_each_batch_at_once() {
+        let (driver, mut display) = connect();
+        let sender = std::thread::spawn(move || {
+            for tick in 1..=50 {
+                std::thread::sleep(Duration::from_micros(200));
+                driver.send(vec![Update::Tick(tick)]);
+            }
+            driver
+        });
+        let started = std::time::Instant::now();
+        let mut ticks = 0;
+        while display.scene().tick != 50 {
+            assert!(display.receive(Duration::from_secs(10)) || display.scene().tick == 50);
+            ticks += 1;
+        }
+        assert!(ticks <= 50 && started.elapsed() < Duration::from_secs(5));
+        let _driver = sender.join().unwrap();
+        // Nothing sent: the wait ends at its timeout.
+        assert!(!display.receive(Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn host_statuses_are_kept_by_the_display_and_alone_are_no_new_scene() {
+        let (driver, mut display) = connect();
+        assert_eq!(display.host(), None);
+        driver.send(vec![Update::Host(HostStatus { stale_ms: 700, serial: 1 })]);
+        assert!(!display.receive(Duration::ZERO));
+        assert_eq!(display.scene().seq, 0);
+        assert_eq!(display.host().map(|h| h.0), Some(HostStatus { stale_ms: 700, serial: 1 }));
+        assert!(!driver.busy(), "taken");
+        // With other updates: a new scene, the latest status kept.
+        driver.send(vec![Update::Tick(3), Update::Host(HostStatus { stale_ms: 0, serial: 2 })]);
+        assert!(display.receive(Duration::ZERO));
+        assert_eq!((display.scene().seq, display.scene().tick), (1, 3));
+        assert_eq!(display.host().map(|h| h.0.serial), Some(2));
+    }
 
     #[test]
     fn updates_and_input_cross_threads() {
@@ -1097,8 +1469,49 @@ mod tests {
         driver.send(s.updates_since(&before));
         assert!(display.receive(Duration::from_secs(5)));
         let (changes, scene) = display.take_changes();
-        assert_eq!(changes, Changes { world: false, cells: vec![(1, 5), (0, 3)], sprites: false, views: true });
+        assert_eq!(changes, Changes { world: false, cells: vec![(1, 5), (0, 3)], sprites: false, views: true, ..Default::default() });
         assert_eq!(scene.layers[1].values[5], 7);
+    }
+
+    #[test]
+    fn slots_and_bindings_travel_incrementally() {
+        let (driver, mut display) = connect();
+        let shape = WorldShape { cols: 3, rows: 2, ..Default::default() };
+        let base = Scene::empty_with(shape, [(false, false), (false, true)]);
+        driver.send(base.updates_since(&Scene::default()));
+        assert!(display.receive(Duration::from_secs(5)));
+        let _ = display.take_changes();
+        // A screen opens in view 1: its own fog (a slot of layer 1) bound.
+        let mut s = base.clone();
+        let fog = LayerCells { values: vec![2, 2, 0, 2, 2, 2], phases: None, offsets: Some(vec![(0, 0); 6]) };
+        s.slots.push(LayerSlot { id: 4, layer: 1, cells: fog });
+        s.bindings.push(Binding { id: 1, slots: vec![(1, 4)] });
+        s.view_mut(1).view.binding = 1;
+        let opened = s.updates_since(&base);
+        assert!(opened.contains(&Update::Bindings(s.bindings.clone())));
+        driver.send(opened);
+        assert!(display.receive(Duration::from_secs(5)));
+        let (changes, scene) = display.take_changes();
+        assert!(changes.slots && changes.slot_cells.is_empty() && changes.cells.is_empty() && !changes.world);
+        assert_eq!((scene.slots.clone(), scene.bindings.clone(), scene.view(1).unwrap().view.binding), (s.slots.clone(), s.bindings.clone(), 1));
+        // Its city moves: only the slot's changed values travel.
+        let before = s.clone();
+        s.slots[0].cells.values[2] = 2;
+        s.slots[0].cells.values[0] = 1;
+        assert_eq!(s.updates_since(&before), vec![Update::SlotCells(vec![(4, 0, 1), (4, 2, 2)])]);
+        driver.send(s.updates_since(&before));
+        assert!(display.receive(Duration::from_secs(5)));
+        let (changes, scene) = display.take_changes();
+        assert_eq!((changes.slots, changes.slot_cells), (false, vec![(4, 0), (4, 2)]));
+        assert_eq!(scene.slots, s.slots);
+        // It closes: the slot and the binding go.
+        let before = s.clone();
+        let closed = base.clone();
+        let updates = closed.updates_since(&before);
+        assert!(updates.contains(&Update::Slot { id: 4, slot: None }) && updates.contains(&Update::Bindings(Vec::new())));
+        let mut applied = before.clone();
+        updates.into_iter().for_each(|u| applied.apply(u));
+        assert_eq!((applied.slots.len(), applied.bindings.len()), (0, 0));
     }
 
     #[test]
@@ -1142,5 +1555,62 @@ mod tests {
         assert_eq!(display.take_settings(), Some(settings.clone()));
         assert_eq!(display.take_settings(), None);
         assert_eq!(display.scene().settings, Some(settings));
+    }
+    #[test]
+    fn settings_preview_metadata_repeats_neither_lease_nor_settings_and_clears_explicitly() {
+        let mut active = Scene::default();
+        active.settings = Some(viewer_settings::Settings::default());
+        active.settings_preview = Some(SettingsPreview {session:1,id:2,pixel_scale:3,previous_pixel_scale:1});
+        assert!(active.updates_since(&active).is_empty());
+        let mut cleared = active.clone();
+        cleared.settings_preview = None;
+        let updates = cleared.updates_since(&active);
+        assert_eq!(updates,vec![Update::SettingsPreview(None)]);
+        for update in updates { active.apply(update); }
+        assert_eq!(active,cleared);
+    }
+
+}
+
+#[cfg(test)]
+mod delta_predecessor_tests {
+    use super::*;
+    fn display() -> (Driver, Display) {
+        let (driver, mut display) = connect();
+        assert!(driver.send(vec![Update::World { shape: WorldShape { cols: 2, rows: 1, ..Default::default() }, layers: vec![LayerCells { values: vec![1; 2], ..Default::default() }] }]));
+        display.receive(Duration::ZERO);
+        display.take_changes_from(0);
+        (driver, display)
+    }
+    fn assert_full(changes: Changes) {
+        assert!(changes.world && changes.sprites && changes.views && changes.slots);
+        assert!(changes.cells.is_empty() && changes.slot_cells.is_empty());
+    }
+    #[test]
+    fn consumed_batch_requires_full_recovery_from_an_older_predecessor() {
+        let (driver, mut display) = display();
+        assert!(driver.send(vec![Update::Cells(vec![(0, 0, 9)])]));display.receive(Duration::ZERO);
+        let changes = display.take_changes_from(1).0;
+        assert!(!changes.world);
+        assert_eq!(changes.cells, [(0, 0)]);
+        assert_full(display.take_changes_from(1).0);
+        assert_eq!(display.scene().layers[0].values, [9, 1]);
+    }
+    #[test]
+    fn legacy_take_changes_also_advances_the_delta_predecessor() {
+        let (driver, mut display) = display();
+        assert!(driver.send(vec![Update::Cells(vec![(0, 0, 9)])]));display.receive(Duration::ZERO);
+        display.take_changes();
+        assert!(driver.send(vec![Update::Cells(vec![(0, 1, 7)])]));display.receive(Duration::ZERO);
+        assert_full(display.take_changes_from(1).0);
+        assert_eq!(display.scene().layers[0].values, [9, 7]);
+    }
+    #[test]
+    fn matching_control_only_and_empty_batches_keep_incremental_invalidation() {
+        let (driver, mut display) = display();
+        assert!(driver.send(vec![Update::Tick(17)]));display.receive(Duration::ZERO);
+        assert!(display.take_changes_from(1).0.is_empty());
+        assert_eq!(display.scene().tick, 17);
+        assert!(display.take_changes_from(2).0.is_empty());
     }
 }

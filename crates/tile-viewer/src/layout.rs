@@ -102,7 +102,6 @@
 //! the pointer then shows that a click captures it again
 //! ([`Layout::take_pointer_icon`]).
 
-use std::collections::BTreeMap;
 
 use scene::{Button, Input, Scene};
 
@@ -114,11 +113,19 @@ mod world_rescale;
 mod unit_orders;
 #[path = "world_pointer.rs"]
 mod world_pointer;
+#[cfg(test)]
+#[path = "city_screen_tests.rs"]
+mod city_screen_tests;
+#[cfg(test)]
+#[path = "cursor_screen_tests.rs"]
+mod cursor_screen_tests;
 pub use pan::{DRAG_THRESHOLD, Momentum, Tracker};
 use tile_render::{Camera, ScreenCopy};
 use viewer_settings::{Place, Roles, ScreenPlace};
 
 /// Zoom steps, screen pixels per world pixel.
+mod arrival;
+
 pub const ZOOMS: [(u32, u32); 11] = [(1, 4), (1, 3), (1, 2), (2, 3), (1, 1), (3, 2), (2, 1), (3, 1), (4, 1), (6, 1), (8, 1)];
 const ONE: usize = 4;
 /// Most insets at a time.
@@ -299,6 +306,29 @@ impl FreeView {
         ((rect[2].max(1) as u32 * zoom.1).div_ceil(zoom.0) as i32, (rect[3].max(1) as u32 * zoom.1).div_ceil(zoom.0) as i32)
     }
 
+    /// Smallest pan that exposes the complete tile, including its diamond
+    /// extrema. Use the camera's raster span, rather than its rounded-up
+    /// source size, so a fractional last source pixel cannot hide an edge.
+    fn expose_tile(&self, tile: (i32, i32), half: (i32, i32), rect: [i32; 4], bounds: Option<WorldBounds>, scale: (u32, u32)) -> (i32, i32) {
+        if self.center == UNPLACED { return tile; }
+        let camera = self.camera(rect, (0, 0, 0, 0), bounds, scale);
+        let source = self.source(rect, scale);
+        let axis = |center: i32, start: i32, source: i32, tile: i32, half: i32, pixels: u32, axis: usize| {
+            let span = (pixels as i64 * camera.zoom.1 as i64 / camera.zoom.0 as i64) as i32;
+            if span < 2 * half { return tile; }
+            let tile = match bounds.map(|b| b.axis(axis)) {
+                Some((period, true)) if period > 0 => center + (tile - center + period / 2).rem_euclid(period) - period / 2,
+                _ => tile,
+            };
+            let shift = if tile - half < start { tile - half - start }
+                else if tile + half > start + span { tile + half - start - span }
+                else { 0 };
+            if shift == 0 { center } else { start + source / 2 + shift }
+        };
+        (axis(self.center.0, camera.x, source.0, tile.0, half.0, camera.viewport.0, 0),
+         axis(self.center.1, camera.y, source.1, tile.1, half.1, camera.viewport.1, 1))
+    }
+
     /// Its camera in `rect`: centred, but not past an edge of the world
     /// that does not wrap; the world `scale` times larger besides.
     fn camera(&self, rect: [i32; 4], overhang: (u32, u32, u32, u32), bounds: Option<WorldBounds>, scale: (u32, u32)) -> Camera {
@@ -423,17 +453,42 @@ pub enum Marker {
     Focus((i32, i32)),
 }
 
+/// A driver's menu placed beside its optional world preview. The menu's
+/// transform is final; interface scaling must not centre it a second time.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BesideScreen {
+    pub source: [i32; 4],
+    pub mapping: crate::scaling::Affine,
+    pub region: [i32; 4],
+}
+
+/// A press on a world pixel the driver's window does not take (it gets the
+/// tile, not the pixel): where in the window, the world pixel, the view.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct WorldPress {
+    at: (i32, i32),
+    world: (i32, i32),
+    hit: Hit,
+    clock: f64,
+}
+
 /// What one frame draws: cameras in drawing order, for each scene view the
 /// camera that shows its overlay, screen copies and markers on top.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Frame {
     pub cameras: Vec<Camera>,
+    pub beside_screen: Option<BesideScreen>,
     /// Named-screen cameras already placed in canvas pixels. Interface
     /// scaling leaves these cameras and their stacked group unchanged.
     pub placed: Vec<u32>,
     pub view_cameras: Vec<Option<u32>>,
     /// Canvas region belonging to the view that opened a generic popup.
     pub popup_region: Option<[i32; 4]>,
+    /// A click-anchored popup's top-left corner on the canvas and its zoom
+    /// (canvas pixels per driver pixel): placed there exactly, unclipped.
+    pub popup_at: Option<((i32, i32), (u32, u32))>,
+    /// World-anchored lower modal views retain their own place under a child.
+    pub popup_places: Vec<(u32, ((i32, i32), (u32, u32)))>,
     /// Generic menus retain their requested scale in their opening view.
     pub menu_region: Option<[i32; 4]>,
     pub copies: Vec<ScreenCopy>,
@@ -443,6 +498,16 @@ pub struct Frame {
     /// (x, y, w, h), and whether the split is side by side. A light core in
     /// a dark gap, seen on any background (`crate::DIVIDER_SPRITE`).
     pub divider: Vec<(u32, [i32; 4], bool)>,
+    /// Where the cursor drawn in a view the pointer is not in (the world
+    /// cursor mirrored there) goes in the drawing order: before this camera,
+    /// the first of the driver's interface over the world views, so that
+    /// menus, screens, popups and the frame cover it (`crate::cursor`).
+    /// `None`: no such place (no world arranged by the layout).
+    pub cursor_layer: Option<u32>,
+    /// Empty cameras at `cursor_layer` that `scaling::arrange` reserves for
+    /// those cursors (one a world view drawn below it), for the window to
+    /// fill (`crate::cursor::compose`).
+    pub cursor_slots: Vec<u32>,
 }
 
 /// Where a point of the window shows the world.
@@ -553,9 +618,11 @@ pub struct Layout {
     pub smooth: bool,
     /// What the views follow (from the settings).
     pub roles: Roles,
-    /// Where the driver's named screens go (from the settings).
-    pub screen_places: BTreeMap<String, ScreenPlace>,
-    /// Generic menus follow the mouse at opening; named screens keep their settings.
+    /// Where every screen and popup goes (from the settings; click-anchored
+    /// popups excepted).
+    pub screen_place: ScreenPlace,
+    /// With a floating `screen_place`: the generic menu and popups open in
+    /// the view that held the mouse.
     pub menu_follows_pointer: bool,
     menu_side: Option<Side>,
     popup_side: Option<Side>,
@@ -588,6 +655,10 @@ pub struct Layout {
     screen: Option<String>,
     /// Whether the last frame had a popup (for the log).
     popup_shown: bool,
+    /// The current popup body in driver pixels.
+    popup_body: Option<[i32; 4]>,
+    popup_view: Option<u32>,
+    anchored_popup_layers: Vec<(u32, scene::PopupAnchor, WorldPress)>,
     /// Seconds of frames so far (when presses were made).
     clock: f64,
     /// The last press that went to the driver: where it was made in the
@@ -595,6 +666,25 @@ pub struct Layout {
     last_press: Option<((i32, i32), (i32, i32), f64)>,
     /// How far the open popup moves, when it opened at a click.
     popup_anchor: Option<(i32, i32)>,
+    /// The last press on a world pixel (`Input::WorldButton`).
+    world_press: Option<WorldPress>,
+    /// The open popup the driver anchors at a world click
+    /// (`scene::Interface::popup_anchor`), and that click.
+    anchored: Option<(scene::PopupAnchor, WorldPress)>,
+    /// The driver's anchor for the open popup as last taken in.
+    popup_anchor_seen: Option<scene::PopupAnchor>,
+    /// The world click the last anchored popup belonged to, and when that
+    /// popup closed: a popup an entry of it opens (a city menu's "Terrain
+    /// details") belongs to the same click, however long ago it was made.
+    chain_press: Option<(WorldPress, f64)>,
+    /// Buttons whose press only dismissed a popup anchored at a world click
+    /// (their release goes nowhere either).
+    dismissed: [bool; 3],
+    /// How far (world pixels) the anchored popup's view was moved for it
+    /// to fit the window, while that view follows the pointer or driver.
+    popup_pan: Option<(Hit, (i32, i32))>,
+    /// The world's period where it wraps (world pixels; 0: no wrap).
+    world_period: (i32, i32),
     /// The world cursor to capture the mouse at again once the popup that
     /// let it go closes; the screen likewise.
     recapture: Option<(i32, i32)>,
@@ -620,6 +710,7 @@ pub struct Layout {
     /// From the last frame: the driver's screen and its world side by side
     /// (`scene::Interface::beside`): the world's rectangle.
     beside: Option<[i32; 4]>,
+    beside_mapping: Option<crate::scaling::Affine>,
     /// From the last frame: the focus of interest.
     focus: Option<(i32, i32)>,
     /// Last semantic camera request consumed from a driver that parks its
@@ -710,6 +801,11 @@ pub struct Layout {
     /// interface on its own, `crate::scaling`): its views filling its
     /// screen are as large as that.
     pub driver_screen: Option<(u32, u32)>,
+    /// Canvas pixels per menu pixel for a driver-arranged preview screen.
+    pub menu_scale: (u32, u32),
+    /// Canvas pixels per driver pixel of the game's frame (its HUD:
+    /// `scaling::Plan::frame`).
+    pub hud_scale: (u32, u32),
     /// Edge scrolling and dragging the map (`pan`).
     pan: pan::Pan,
     unit_orders: unit_orders::UnitOrders,
@@ -756,7 +852,7 @@ impl Default for Layout {
             screen_content: None,
             smooth: false,
             roles: Roles::Free,
-            screen_places: BTreeMap::new(),
+            screen_place: ScreenPlace::default(),
             menu_follows_pointer: true,
             menu_side: None,
             popup_side: None,
@@ -773,9 +869,19 @@ impl Default for Layout {
             reachable: None,
             screen: None,
             popup_shown: false,
+            popup_body: None,
+            popup_view: None,
+            anchored_popup_layers: Vec::new(),
             clock: 0.0,
             last_press: None,
             popup_anchor: None,
+            world_press: None,
+            anchored: None,
+            popup_anchor_seen: None,
+            chain_press: None,
+            dismissed: [false; 3],
+            popup_pan: None,
+            world_period: (0, 0),
             recapture: None,
             recapture_screen: None,
             pointer_to_screen: false,
@@ -787,6 +893,7 @@ impl Default for Layout {
             world_shown: true,
             magnifier_center: None,
             beside: None,
+            beside_mapping: None,
             focus: None,
             camera_focus_serial: None,
             semantic_focus_active: false,
@@ -814,6 +921,8 @@ impl Default for Layout {
             interface_shown: None,
             menu_pan: crate::scaling::MenuPan::default(),
             driver_screen: None,
+            menu_scale: (1, 1),
+            hud_scale: (1, 1),
             pan: pan::Pan::default(),
             unit_orders: unit_orders::UnitOrders::default(),
             explore: None,
@@ -830,9 +939,10 @@ const VK_CONTROL: u32 = 0x11;
 const VK_ESCAPE: u32 = 0x1B;
 
 /// Exploring the world beside the driver's screen (`scene::Beside`) up
-/// close: a double-click on it shows it [`EXPLORE_ZOOM`] times bigger
-/// (by nearest pixel, of the world as the driver shows it) around the
-/// point clicked, the mouse captured: the view follows the world cursor,
+/// close: a double-click on it shows it as the game's zoomed-out view
+/// does (the Z key: the world at half size, [`EXPLORE_DOWNSCALE`], at the
+/// zoom of the game's own view, `Layout::world_scale`) around the point
+/// clicked, the mouse captured: the view follows the world cursor,
 /// and nothing reaches the driver. Ctrl on its own lets the mouse go (a
 /// click on the world captures it again); a double-click or Esc goes back
 /// to the world fitted beside the screen, as does another world beside it
@@ -842,12 +952,17 @@ struct Explore {
     /// The world explored: the scene's world and the part the driver
     /// asked to fit (`scene::Beside::world`).
     of: (scene::WorldShape, Option<[i32; 4]>),
-    /// The world pixel in the middle (in the pixels of the driver's view).
+    /// The world pixel in the middle (in the pixels of the half-size
+    /// world, [`EXPLORE_DOWNSCALE`]).
     center: (i32, i32),
 }
 
-/// The zoom ([`ZOOMS`] index) a world beside a screen is explored at: 2.
-const EXPLORE_ZOOM: usize = 6;
+/// How many times smaller a world beside a screen is explored: the game's
+/// zoomed-out view (Z), whose game view shows the world at downscale 2.
+const EXPLORE_DOWNSCALE: u32 = 2;
+/// Its zoom ([`ZOOMS`] index): 1:1, as the game's own view (before the
+/// world scale).
+const EXPLORE_ZOOM: usize = ONE;
 /// Two presses at most this far apart in time (seconds) and space (window
 /// pixels) are a double-click.
 const DOUBLE_CLICK_SECONDS: f64 = 0.5;
@@ -999,11 +1114,37 @@ fn fit_world(camera: &Camera, area: [i32; 4], rect: [i32; 4], step: (u32, u32)) 
     }
 }
 
+/// `bounds` of a world shown `shown` times smaller as the half-size world
+/// explored beside a screen ([`EXPLORE_DOWNSCALE`]) has them.
+fn explore_bounds(bounds: WorldBounds, shown: u32) -> WorldBounds {
+    let at_half = |v: i32| (v as i64 * shown.max(1) as i64 / EXPLORE_DOWNSCALE as i64) as i32;
+    WorldBounds { size: (at_half(bounds.size.0), at_half(bounds.size.1)), ..bounds }
+}
+
 /// All of a world of `bounds` for [`fit_world`] (in the pixels of a view
 /// showing it `shown` times smaller): staggered rows reach a step (`step`,
 /// at full size) further right than the columns.
 fn whole_world(bounds: WorldBounds, step: (u32, u32), shown: u32) -> [i32; 4] {
     [0, 0, bounds.size.0 + (step.0 / shown.max(1)) as i32, bounds.size.1]
+}
+
+/// `v` driver pixels at `zoom`, rounded up.
+fn scaled_up(v: i32, zoom: (u32, u32)) -> i32 {
+    (v.max(0) as u64 * zoom.0 as u64).div_ceil(zoom.1.max(1) as u64) as i32
+}
+
+/// How far something `len` long at `at` must move back (positive: towards
+/// the start) to lie within `0..room`; its start at 0 if it is longer.
+fn fit_pan(at: i32, len: i32, room: i32) -> i32 {
+    if at < 0 || len > room { at } else { (at + len - room).max(0) }
+}
+
+/// Canvas pixels `v` as world pixels at camera `zoom` (canvas pixels per
+/// world pixel), rounded away from zero (moving at least that far).
+fn world_steps(v: i32, zoom: (u32, u32)) -> i32 {
+    let (n, d) = (zoom.0.max(1) as i64, zoom.1.max(1) as i64);
+    let w = v.unsigned_abs() as u64 * d as u64;
+    (w.div_ceil(n as u64) as i32) * v.signum()
 }
 
 fn gcd(a: u32, b: u32) -> u32 {
@@ -1135,7 +1276,7 @@ impl Layout {
         };
         self.magnifier = place.map(|place| Magnifier { mode: MagnifierMode::World, zoom, place, region: s.zoom_place, ..Self::MAGNIFIER });
         self.zoom_box_block_pointer = s.zoom_box_block_pointer;
-        self.screen_places = s.screens.clone();
+        self.screen_place = s.screen_place;
         self.menu_follows_pointer = s.menu_follows_pointer;
         self.smooth = s.smooth_world_movement;
         self.roles = s.roles;
@@ -1341,7 +1482,7 @@ impl Layout {
     /// text).
     pub fn take_zooms_change(&mut self) -> Option<[(u8, u8); 8]> {
         let mut zooms = [(0, 0); 8];
-        if self.sharp_text {
+        if self.sharp_text && self.world_shown && self.beside.is_none() {
             let views = std::iter::once(self.main_view).chain(self.split.map(|s| s.view)).chain(self.insets.iter().map(|i| i.view));
             let scale = self.world_scale;
             let magnifier_downscale = self.shown.iter().find(|(h, _)| *h == Hit::Magnifier)
@@ -1368,7 +1509,7 @@ impl Layout {
     /// w 0: all of it), when it changed since last asked.
     pub fn take_main_view_change(&mut self) -> Option<(i32, i32, i32, i32)> {
         let world_rect = |c: &Camera| {
-            let (w, h) = c.source_size();
+            let (w, h) = c.world_size();
             (c.x, c.y, w as i32, h as i32)
         };
         let rect = match self.shown.iter().find(|(h, _)| *h == Hit::Main) {
@@ -1398,7 +1539,7 @@ impl Layout {
             Some(*h) != fitted && (matches!(h, Hit::Pane | Hit::Inset(_)) || (*h == Hit::Main && fitted == Some(Hit::Pane)))
         });
         for (slot, (_, c)) in views.iter_mut().zip(own) {
-            let (w, h) = c.source_size();
+            let (w, h) = c.world_size();
             *slot = (c.x, c.y, w as i32, h as i32);
         }
         (views != self.reported_views).then(|| {
@@ -1412,17 +1553,20 @@ impl Layout {
     /// driver names (`screen`; a vertical split's left or right view, a
     /// horizontal one's bottom or top view).
     fn fit_target(&self, screen: Option<&str>) -> Option<Hit> {
+        if !self.world_shown { return None; }
         let split = self.split?;
         if self.ui_in_pane {
             return Some(Hit::Main);
         }
-        let screen = screen?;
-        if screen == "Menu" && self.menu_follows_pointer {
-            return None;
-        }
-        let place = self.screen_places.get(screen)?;
+        screen?;
+        self.shared_hit(split)
+    }
+
+    /// The pane the one screen place setting names for `split` (`None`:
+    /// floating).
+    fn shared_hit(&self, split: Split) -> Option<Hit> {
         let vertical = split.axis == Axis::Vertical;
-        match (if vertical { place.vertical } else { place.horizontal }, vertical) {
+        match (if vertical { self.screen_place.vertical } else { self.screen_place.horizontal }, vertical) {
             (Place::Floating, _) => None,
             (Place::LeftOrBottom, true) | (Place::RightOrTop, false) => Some(Hit::Main),
             (Place::LeftOrBottom, false) | (Place::RightOrTop, true) => Some(Hit::Pane),
@@ -1466,7 +1610,7 @@ impl Layout {
     }
 
     /// Whether a view at `zoom` shows the driver's zoomed art.
-    fn zoomed_art(&self, zoom: (u32, u32)) -> bool {
+    pub fn zoomed_art(&self, zoom: (u32, u32)) -> bool {
         self.sharp_text && zoom.0 != zoom.1 && self.art_zooms.iter().any(|&z| z == zoom || z == (0, 0))
     }
 
@@ -1493,7 +1637,7 @@ impl Layout {
         // is (where it was when the mouse was let go), the view staying
         // put; nothing goes to the driver.
         if let Some((_, camera)) = self.shown.iter().find(|(h, _)| *h == hit) {
-            let (w, h) = camera.source_size();
+            let (w, h) = camera.world_size();
             self.cursor = (camera.x + w as i32 / 2, camera.y + h as i32 / 2);
         }
         self.locked = true;
@@ -1597,7 +1741,7 @@ impl Layout {
 
     /// The main pane's rectangle, and the second pane's if split (below the
     /// zoom strip, if there is one).
-    fn panes(&self) -> ([i32; 4], Option<[i32; 4]>) {
+    pub(crate) fn panes(&self) -> ([i32; 4], Option<[i32; 4]>) {
         let (w, h) = (self.window.0 as i32, self.window.1 as i32);
         let below = |r: [i32; 4], s: [i32; 4]| [r[0], s[1] + s[3] + GAP, r[2], (r[3] - s[3] - GAP).max(1)];
         match self.strip() {
@@ -1616,6 +1760,7 @@ impl Layout {
 
     /// The panes in `area`.
     fn panes_in(&self, [x, y, w, h]: [i32; 4]) -> ([i32; 4], Option<[i32; 4]>) {
+        if !self.world_shown { return ([x, y, w, h], None); }
         match self.split {
             None => ([x, y, w, h], None),
             Some(s) => match s.axis {
@@ -1934,14 +2079,19 @@ impl Layout {
         self.window = window;
         self.bounds = bounds;
         self.focus_after_scale = None;
-        // (No zoom box or strip without a world: e.g. on a title screen.)
-        self.world_shown = scene.shape.cols > 0 && scene.shape.rows > 0;
+        // The driver publishes an empty world outside a game. Keep its
+        // title and setup screens independent of the configured map views.
+        let had_world = std::mem::replace(&mut self.world_shown, scene.shape.cols > 0 && scene.shape.rows > 0);
         if let Some(beside) = scene.interface.beside {
             return self.frame_beside(scene, overhang, beside, bounds);
         }
         self.beside = None;
+        self.beside_mapping = None;
         self.beside_of = None;
         self.leave_explore("the screen beside its world closed");
+        if !self.world_shown {
+            return self.frame_without_world(scene, overhang, interface, had_world);
+        }
         let dt = std::mem::take(&mut self.step).min(MAX_STEP);
         // (The driver's views filling its screen: as large as that.)
         let base = crate::scene_cameras(scene, self.driver_screen(), overhang);
@@ -1960,7 +2110,9 @@ impl Layout {
             self.menu_side = None;
         }
         // The driver's main view: its first world view filling the window.
-        let following_menu = !self.ui_in_pane && self.menu_follows_pointer && self.split.is_some() && scene.interface.screen.as_deref() == Some("Menu");
+        // (Not Preferences, `menu_fit`: it is fitted as at the title, the
+        // window or the pane the screen place setting names.)
+        let following_menu = !self.ui_in_pane && self.menu_follows_pointer && !scene.interface.menu_fit && self.split.is_some_and(|s| self.shared_hit(s).is_none()) && scene.interface.screen.as_deref() == Some("Menu");
         let named_target = (!self.ui_in_pane).then(|| self.fit_target(scene.interface.screen.as_deref())).flatten().or(following_menu.then_some(Hit::Main));
         let main = scene.views.iter().position(|v| !v.view.interface_only && (v.view.viewport.0 == 0 || v.view.viewport.1 == 0))
             .or_else(|| (named_target.is_some() && self.world_shown).then(|| scene.views.iter().position(|v| v.view.viewport.0 == 0 || v.view.viewport.1 == 0)).flatten());
@@ -1969,6 +2121,7 @@ impl Layout {
         let parts = &scene.interface;
         let part = |id: Option<u32>| id.and_then(|id| scene.views.iter().position(|v| v.id == id && v.view.interface_only));
         let (roaming, popup, screen_part, hint) = (part(parts.roaming), part(parts.popup), part(parts.screen_view), part(parts.capture_hint));
+        let popup_layers: Vec<usize> = parts.popup_views().filter_map(|id| part(Some(id))).collect();
         // While the mouse is captured the corner's buttons cannot be used:
         // the hint how to let it go shows in their place, in the view
         // following the world cursor (the active view). While snapping (it
@@ -2003,12 +2156,40 @@ impl Layout {
             }
         }
         self.clock += dt;
+        // A popup over a menu (a screen part or the menus): placed over that
+        // menu (`scaling::MODAL_TOP`), never at a click nor in a pane.
+        let over_menu = parts.screen.is_some() || screen_part.is_some() || scene.views.iter().any(|v| v.view.interface_only && v.view.menu && !v.overlay.is_empty());
+        let previous_popup = self.popup_view;
+        if let (Some(id), Some((anchor, press))) = (previous_popup, self.anchored) {
+            if Some(id) != parts.popup && parts.modal_stack.contains(id) {
+                self.anchored_popup_layers.retain(|(view, _, _)| *view != id);
+                self.anchored_popup_layers.push((id, anchor, press));
+            }
+        }
+        self.anchored_popup_layers.retain(|(id, _, _)| parts.is_popup_view(*id));
+        self.popup_view = parts.popup;
+        self.popup_body = popup.map(|i| rect_of(&base[i]));
         if popup.is_some() != self.popup_shown {
             self.popup_shown = popup.is_some();
             log::info!("viewer: popup {}", if self.popup_shown { "open, a view of its own" } else { "closed" });
             match popup {
-                Some(i) => { self.cancel_unit_order(); self.popup_opened(rect_of(&base[i])); }
+                Some(i) => { self.cancel_unit_order(); self.popup_opened(rect_of(&base[i]), scene.interface.popup_anchor, over_menu); }
                 None => self.popup_closed(),
+            }
+        }
+        // Another popup in its place (e.g. a dialog a menu's entry opened):
+        // anchored at a click only if the driver says so for it.
+        if let Some(i) = popup.filter(|_| self.popup_anchor_seen != scene.interface.popup_anchor) {
+            if self.anchored_popup_layers.is_empty() { self.popup_pan = None; }
+            match scene.interface.popup_anchor {
+                Some(a) => self.popup_opened(rect_of(&base[i]), Some(a), over_menu),
+                None => (self.anchored, self.popup_anchor_seen) = (None, None),
+            }
+        }
+        if previous_popup != parts.popup && self.anchored.is_none() {
+            if let Some(index) = self.anchored_popup_layers.iter().position(|(id, _, _)| Some(*id) == parts.popup) {
+                let (_, anchor, press) = self.anchored_popup_layers.remove(index);
+                self.anchored = Some((anchor, press));
             }
         }
         self.screen = parts.screen.clone();
@@ -2070,6 +2251,19 @@ impl Layout {
         let period = bounds.map_or((0, 0), |b| (if b.wrap.0 { b.size.0 } else { 0 }, if b.wrap.1 { b.size.1 } else { 0 }));
         let smooth = self.smooth;
         let main_panned_by_hand = self.main_panned_by_hand();
+        self.world_period = period;
+        let popup_pan = self.popup_pan.and_then(|(hit, by)| match hit {
+            Hit::Main => Some((0, by)),
+            Hit::Pane => Some((1, by)),
+            Hit::Inset(i) => Some((2 + i, by)),
+            _ => None,
+        });
+        let capture_focus = self.locked && self.semantic_focus_active;
+        let combat_focus = self.semantic_focus_active && scene.camera_arrival.is_some_and(|a| scene.camera_focus.is_some_and(|f| f.serial == a.serial));
+        let arrival_area = scene.camera_arrival.filter(|a| scene.camera_focus.is_some_and(|f| f.serial == a.serial)).map(|a| a.bounds);
+        let focus_scale = self.world_scale;
+        let tile_half = (self.grid_step.0.div_ceil(downscale) as i32, self.grid_step.1.div_ceil(downscale) as i32);
+        let focus_rects: Vec<_> = if capture_focus { std::iter::once(main_rect).chain(pane_rect.filter(|_| self.split.is_some())).chain(self.insets.iter().map(|i| i.rect)).collect() } else { Vec::new() };
         for (k, v) in self.views_mut().enumerate() {
             let target = match v.follow {
                 Follow::Driver if k == 0 && main_panned_by_hand => None,
@@ -2077,10 +2271,10 @@ impl Layout {
                 Follow::Driver => driver,
                 Follow::Focus => match v.hand_focus {
                     // Moved by hand: there until the focus moves.
-                    Some(h) if focus.unwrap_or(UNPLACED) == h => None,
+                    Some(h) if !capture_focus && !combat_focus && focus.unwrap_or(UNPLACED) == h => None,
                     _ => {
                         v.hand_focus = None;
-                        if k == 0 { main_focus } else { focus.or(driver) }
+                        if k == 0 || capture_focus || combat_focus { main_focus } else { focus.or(driver) }
                     }
                 },
                 Follow::Pointer => Some(cursor),
@@ -2101,7 +2295,20 @@ impl Layout {
                 }
                 Follow::Free => None,
             };
+            let keep_tile = capture_focus && (v.follow == Follow::Focus || (k == 0 && v.follow == Follow::Driver));
+            let target = if keep_tile {
+                target.map(|t| {
+                    let (point, half) = arrival_area.map(|[l, top, r, bottom]| ((l + (r-l) / 2, top + (bottom-top) / 2), ((r-l+1) / 2, (bottom-top+1) / 2))).unwrap_or((t, tile_half));
+                    v.expose_tile(point, half, focus_rects[k], bounds, focus_scale)
+                })
+            } else { target };
+            // (Moved for a popup opened at a click to fit the window.)
+            let target = match popup_pan {
+                Some((j, by)) if j == k && v.follow == Follow::Pointer => target.map(|t| (t.0 + by.0, t.1 + by.1)),
+                _ => target,
+            };
             match target {
+                Some(t) if keep_tile && t == v.center => v.glide.snap(t),
                 // Gliding there (the world cursor's view keeps it in its
                 // middle, a free view is moved by hand).
                 Some(t) if smooth && matches!(v.follow, Follow::Driver | Follow::Focus) => {
@@ -2122,7 +2329,11 @@ impl Layout {
         self.driver_rects.clear();
         self.moved.clear();
         let menu_region = following_menu.then(|| if self.menu_side == Some(Side::B) { pane_rect.unwrap_or(main_rect) } else { main_rect });
-        let mut frame = Frame { view_cameras: vec![None; scene.views.len()], popup_region: popup.and_then(|_| self.popup_region()), menu_region, ..Default::default() };
+        let mut frame = Frame { view_cameras: vec![None; scene.views.len()], popup_region: popup.filter(|_| !over_menu).and_then(|_| self.popup_region()), menu_region, ..Default::default() };
+        // A modal popup over the menu (`over_menu`) keeps out of the screen
+        // fitted into a pane: that screen's fit stays as without it, the
+        // popup goes over it in that pane (`scaling::MODAL_TOP`).
+        let modal = popup.filter(|_| over_menu && self.anchored.is_none());
         let push = |frame: &mut Frame, camera: Camera| {
             frame.cameras.push(camera);
             frame.cameras.len() as u32 - 1
@@ -2137,7 +2348,7 @@ impl Layout {
         let head = main.or_else(|| scene.views.iter().position(|v| v.view.viewport.0 == 0 || v.view.viewport.1 == 0)).or((!scene.views.is_empty()).then_some(0));
         let placement = fit_target.filter(|_| head.is_some()).and_then(|hit| {
             let rect = if hit == Hit::Main { main_rect } else { pane_rect? };
-            let source = self.fitted_source(scene, &base, screen_part, popup);
+            let source = self.fitted_source(scene, &base, screen_part, popup.filter(|_| modal.is_none()));
             let zoom = Self::screen_fit(source, rect);
             let size = ((source[2] as u32 * zoom.0).div_ceil(zoom.1), (source[3] as u32 * zoom.0).div_ceil(zoom.1));
             // A named panel fills its pane as far as its aspect ratio allows,
@@ -2152,16 +2363,21 @@ impl Layout {
         let named: Vec<usize> = if self.placed_screen.is_some() {
             let dedicated = screen_part.is_some() || popup.is_some() || scene.views.iter().any(|v| v.view.interface_only && v.view.menu);
             scene.views.iter().enumerate().filter_map(|(i, v)| {
-                if Some(i) == main || Some(i) == roaming || Some(i) == hint { return None; }
+                if Some(i) == main || Some(i) == roaming || Some(i) == hint || (popup_layers.contains(&i) && modal.is_some()) { return None; }
                 let city_map = self.screen.as_deref() == Some("City") && !v.view.interface_only && v.view.viewport.0 > 0 && v.view.viewport.1 > 0;
-                let ui = v.view.interface_only && (self.screen.as_deref() == Some("City") || (!dedicated && screen_part.is_none()) || (screen_part.is_none() && v.view.menu) || Some(i) == screen_part || Some(i) == popup);
+                let ui = v.view.interface_only && (self.screen.as_deref() == Some("City") || (!dedicated && screen_part.is_none()) || (screen_part.is_none() && v.view.menu) || Some(i) == screen_part || (Some(i) == popup && modal.is_none()));
                 (ui || city_map).then_some(i)
             }).collect()
         } else { Vec::new() };
         if let Some(fit) = self.placed_screen {
             self.interface.retain(|r| !overlap(*r, fit.source));
+            if modal.is_some() {
+                frame.menu_region = Some(if fit.hit == Hit::Main { main_rect } else { pane_rect.unwrap_or(main_rect) });
+            }
         }
         let mut over: Vec<(usize, Camera)> = Vec::new();
+        // (Drawn over the screen fitted into a pane.)
+        let mut on_top: Vec<(usize, Camera)> = Vec::new();
         if let (Some(fit), Some(m)) = (fit, head) {
             let zoom = fit.zoom;
             let [sx, sy, sw, sh] = fit.source;
@@ -2180,7 +2396,11 @@ impl Layout {
                 self.shown.push((fit.hit, head));
             }
             // (The roaming controls too, where the driver put them.)
-            for (i, camera) in base.iter().enumerate().filter(|&(i, _)| i != m && Some(i) != hint) {
+            let layers: Vec<_> = parts.popup_views().collect();
+            let mut order: Vec<_> = (0..base.len()).filter(|&index| index != m && Some(index) != hint).collect();
+            order.sort_by_key(|&index| layers.iter().position(|&id| id == scene.views[index].id).map_or(0, |layer| layer + 1));
+            for i in order {
+                let camera = &base[i];
                 let stacked = Camera {
                     origin: (camera.origin.0 - sx, camera.origin.1 - sy),
                     screen_shift: (camera.screen_shift.0 - sx, camera.screen_shift.1 - sy),
@@ -2190,6 +2410,16 @@ impl Layout {
                     ..*camera
                 };
                 frame.view_cameras[i] = Some(push(&mut frame, stacked));
+            }
+            // The world beside the screen may have the mouse captured (the
+            // map is played there meanwhile): the hint how to let it go at
+            // that pane's top-left, where its corner buttons would be.
+            if let Some(i) = hint.filter(|_| hinting) {
+                let world_rect = if fit.hit == Hit::Main { pane_rect } else { Some(main_rect) };
+                if let Some(r) = world_rect.filter(|_| self.split.is_some()) {
+                    let (d, camera) = ((r[0], r[1]), base[i]);
+                    over.push((i, Camera { origin: (camera.origin.0 + d.0, camera.origin.1 + d.1), screen_shift: d, ..camera }));
+                }
             }
             // The screen in the second pane: the main pane shows the world.
             if fit.hit == Hit::Pane {
@@ -2202,7 +2432,8 @@ impl Layout {
             }
         } else {
             let roaming_shift = self.roaming_shift(pane_rect);
-            let popup_shift = popup.map(|i| self.popup_shift(rect_of(&base[i]), main_rect));
+            // (A modal one is placed over its menu: `scaling::MODAL_TOP`.)
+            let popup_shift = popup.map(|i| if modal.is_some() { (0, 0) } else { self.popup_shift(rect_of(&base[i]), main_rect) });
             let screen_shift = screen_part.map(|i| Some(self.screen_shift(rect_of(&base[i]))));
             for (i, (v, camera)) in scene.views.iter().zip(&base).enumerate() {
                 let inactive_menu = screen_part.is_some() && v.view.interface_only && v.view.menu;
@@ -2212,8 +2443,8 @@ impl Layout {
                     Some(roaming_shift.filter(|_| !hinting))
                 } else if Some(i) == hint {
                     Some(roaming_shift.filter(|_| hinting))
-                } else if Some(i) == popup {
-                    Some(popup_shift)
+                } else if popup_layers.contains(&i) {
+                    Some(if modal.is_some() { Some((0, 0)) } else if Some(i) == popup { popup_shift } else { Some(self.popup_shift(rect_of(camera), main_rect)) })
                 } else if Some(i) == screen_part {
                     screen_shift
                 } else {
@@ -2228,7 +2459,8 @@ impl Layout {
                     let Some(d) = shift else { continue };
                     let r = rect_of(camera);
                     self.moved.push(([r[0] + d.0, r[1] + d.1, r[2], r[3]], d));
-                    over.push((i, Camera { origin: (camera.origin.0 + d.0, camera.origin.1 + d.1), screen_shift: d, ..*camera }));
+                    let moved = Camera { origin: (camera.origin.0 + d.0, camera.origin.1 + d.1), screen_shift: d, ..*camera };
+                    if popup_layers.contains(&i) && modal.is_some() { on_top.push((i, moved)) } else { over.push((i, moved)) }
                 } else {
                     over.push((i, *camera));
                     if !v.view.interface_only {
@@ -2241,7 +2473,7 @@ impl Layout {
         // pane first, then the magnifier, then the insets in order, then
         // what fills the open stretches of the divider).
         let named_cost = named.len() + usize::from(!named.is_empty());
-        let mut room = tile_render::MAX_VIEWS.saturating_sub(frame.cameras.len() + over.len() + named_cost);
+        let mut room = tile_render::MAX_VIEWS.saturating_sub(frame.cameras.len() + over.len() + on_top.len() + named_cost);
         let mut take = |n: usize| {
             let fits = n <= room;
             if fits {
@@ -2322,7 +2554,8 @@ impl Layout {
             self.shown.push((Hit::Magnifier, camera));
         }
         // The driver's other views and its interface on top, as it placed
-        // them (unless they are in a pane).
+        // them (unless they are in a pane). Mirrored cursors go under them.
+        frame.cursor_layer = Some(frame.cameras.len() as u32);
         for (i, camera) in over {
             frame.view_cameras[i] = Some(push(&mut frame, camera));
         }
@@ -2358,6 +2591,9 @@ impl Layout {
                 frame.view_cameras[i] = Some(at);
                 frame.placed.push(at);
             }
+        }
+        for (i, camera) in on_top {
+            frame.view_cameras[i] = Some(push(&mut frame, camera));
         }
         if let Some(m) = magnifier.filter(|_| zoom_box.is_none()) {
             let (rect, source) = self.magnifier_geometry(&m);
@@ -2444,7 +2680,93 @@ impl Layout {
             };
             camera.hidden_categories = setting.mask(inherited);
         }
+        // A popup the driver anchors at a world click: at that click in the
+        // view it was made in, as that view shows the world now.
+        if let (Some((a, press)), Some(i)) = (self.anchored, popup) {
+            let [_, _, w, h] = rect_of(&base[i]);
+            frame.popup_at = self.anchored_place(a, press, (w, h)).map(|(at, zoom, _)| (at, zoom));
+        }
+        for &(id, anchor, press) in &self.anchored_popup_layers {
+            if let Some(view) = scene.view(id) {
+                let size = (view.view.viewport.0 as i32, view.view.viewport.1 as i32);
+                if let Some((at, zoom, _)) = self.anchored_place(anchor, press, size) {
+                    frame.popup_places.push((id, (at, zoom)));
+                }
+            }
+        }
         frame
+    }
+
+    /// Title and setup screens keep the driver's full screen. Their cameras
+    /// also remain the input and Alt-target coordinate system after scaling.
+    /// Configured map views stay saved until the driver publishes a world.
+    fn frame_without_world(&mut self, scene: &Scene, overhang: (u32, u32, u32, u32), interface: Vec<[i32; 4]>, had_world: bool) -> Frame {
+        self.clock += std::mem::take(&mut self.step).min(MAX_STEP);
+        if had_world {
+            self.cancel_unit_order();
+            self.clear_world_motion();
+            self.menu_pan.cancel_drag();
+            self.drag = None;
+            self.last_press = None;
+            self.warp = None;
+            if self.locked { self.release("the world closed"); }
+            for view in self.views_mut() {
+                *view = FreeView::new(UNPLACED, view.zoom, view.follow);
+            }
+        }
+        self.bounds = None;
+        self.main = None;
+        self.fit = None;
+        self.placed_screen = None;
+        self.shown.clear();
+        self.driver_rects.clear();
+        self.moved.clear();
+        self.interface = interface;
+        self.interface_shown = None;
+        self.insets_shown = 0;
+        self.left_out = 0;
+        self.magnifier_shown = false;
+        self.magnifier_center = None;
+        self.reachable = None;
+        self.screen = scene.interface.screen.clone();
+        self.popup_shown = scene.interface.popup.is_some();
+        self.popup_body = None;
+        self.popup_view = None;
+        self.anchored_popup_layers.clear();
+        self.menu_side = None;
+        self.popup_side = None;
+        self.popup_anchor = None;
+        self.anchored = None;
+        self.popup_anchor_seen = None;
+        self.chain_press = None;
+        self.popup_pan = None;
+        self.recapture = None;
+        self.recapture_screen = None;
+        self.pointer_to_screen = false;
+        self.pointer_to_popup = false;
+        self.against = None;
+        self.side = None;
+        self.focus = None;
+        self.camera_focus_serial = None;
+        self.semantic_focus_active = false;
+        self.last_world_pointer = None;
+        self.cursor_placed = false;
+        self.world_downscale = None;
+        self.map_wheel_step = (0, 0);
+        self.world_frames = 0;
+        self.art_zooms = scene.zooms.clone();
+        let base = crate::scene_cameras(scene, self.driver_screen(), overhang);
+        // Scene views are keyed by ID, not paint order. In particular the
+        // traditional popup257 sorts before the screen258 it overlays.
+        let layers: Vec<_> = scene.interface.popup_views().collect();
+        let mut order: Vec<_> = (0..scene.views.len()).collect();
+        order.sort_by_key(|&index| layers.iter().position(|&id| id == scene.views[index].id).map_or(0, |layer| layer + 1));
+        let mut view_cameras = vec![None; base.len()];
+        let cameras = order.iter().enumerate().map(|(camera, &view)| {
+            view_cameras[view] = Some(camera as u32);
+            base[view]
+        }).collect();
+        Frame { cameras, view_cameras, ..Default::default() }
     }
 
     /// The frame for a driver asking for its screen and its world side by
@@ -2453,7 +2775,14 @@ impl Layout {
     /// whole world fitted into the rest of the window (`fit_world`). None of
     /// the viewer's own views: the arrangement is the driver's.
     fn frame_beside(&mut self, scene: &Scene, overhang: (u32, u32, u32, u32), beside: scene::Beside, bounds: Option<WorldBounds>) -> Frame {
-        let base = crate::scene_cameras(scene, self.window, overhang);
+        if self.beside.is_none() {
+            self.cancel_unit_order();
+            self.clear_world_motion();
+            self.drag = None;
+            self.last_press = None;
+            self.warp = None;
+        }
+        let base = crate::scene_cameras(scene, self.driver_screen(), overhang);
         self.clock += std::mem::take(&mut self.step).min(MAX_STEP);
         // Another world beside the screen: back to it fitted.
         let of = (scene.shape, beside.world);
@@ -2472,15 +2801,34 @@ impl Layout {
         self.screen = None;
         self.art_zooms = scene.zooms.clone();
         self.focus = None;
-        let (shift, world) = beside_geometry(beside, self.window);
-        // Everything but the world is the driver's screen, moved.
-        self.moved = vec![([0, 0, self.window.0 as i32, self.window.1 as i32], shift)];
+        self.magnifier_shown = false;
+        self.menu_side = None;
+        self.recapture = None;
+        self.recapture_screen = None;
+        if self.locked && self.explore.is_none() { self.release("a preview screen opened"); }
+        let [sx, sy, sw, sh] = beside.screen;
+        let scaled = |v: i32| (v as i64 * self.menu_scale.0.max(1) as i64).div_euclid(self.menu_scale.1.max(1) as i64) as i32;
+        let scaled_screen = [scaled(sx), scaled(sy), scaled(sw).max(1), scaled(sh).max(1)];
+        let (shift, world) = beside_geometry(scene::Beside { screen: scaled_screen, ..beside }, self.window);
+        let mapping = crate::scaling::Affine { from: (sx, sy), to: (scaled_screen[0] + shift.0, scaled_screen[1] + shift.1), zoom: self.menu_scale };
+        let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
+        let region = match beside.edge {
+            scene::Edge::Left => [0, 0, scaled_screen[2].min(ww), wh],
+            scene::Edge::Right => [(ww - scaled_screen[2]).max(0), 0, scaled_screen[2].min(ww), wh],
+            scene::Edge::Top => [0, 0, ww, scaled_screen[3].min(wh)],
+            scene::Edge::Bottom => [0, (wh - scaled_screen[3]).max(0), ww, scaled_screen[3].min(wh)],
+        };
+        // Keep the driver's coordinate system for every menu camera and
+        // apply its final placement once, including the requested UI scale.
+        self.interface_shown = None;
+        self.beside_mapping = Some(mapping);
+        self.moved = vec![([0, 0, ww, wh], (mapping.to.0 - sx, mapping.to.1 - sy))];
         self.beside = Some(world);
-        let mut frame = Frame { view_cameras: vec![None; scene.views.len()], ..Default::default() };
+        let mut frame = Frame { view_cameras: vec![None; scene.views.len()], beside_screen: Some(BesideScreen { source: beside.screen, mapping, region }), ..Default::default() };
         // The world: the driver's first world view, all of it (or the part
         // asked for) fitted, or explored up close.
         let main = scene.views.iter().position(|v| !v.view.interface_only);
-        if let (Some(m), Some(b)) = (main, bounds.filter(|_| world[2] > 0 && world[3] > 0)) {
+        if let (Some(m), Some(b)) = (main, bounds.filter(|_| self.world_shown && world[2] > 0 && world[3] > 0)) {
             self.beside_view_downscale = base[m].downscale.max(1);
             let camera = match self.explore {
                 Some(e) => self.explore_camera(&base[m], e, world, overhang, b),
@@ -2505,15 +2853,23 @@ impl Layout {
         // shift; the view's rectangle clips them).
         let [sx, sy, sw, sh] = beside.screen;
         let hint = scene.interface.capture_hint.and_then(|id| scene.views.iter().position(|v| v.id == id && v.view.interface_only));
-        for (i, (_, c)) in scene.views.iter().zip(&base).enumerate().filter(|(i, (v, _))| v.view.interface_only && Some(*i) != hint) {
+        for (i, (_, c)) in scene.views.iter().zip(&base).enumerate().filter(|(i, (v, _))| v.view.interface_only && Some(*i) != hint && !scene.interface.is_popup_view(v.id)) {
             let (x0, y0) = (c.origin.0.max(sx), c.origin.1.max(sy));
             let (x1, y1) = ((c.origin.0 + c.viewport.0 as i32).min(sx + sw), (c.origin.1 + c.viewport.1 as i32).min(sy + sh));
             if x1 <= x0 || y1 <= y0 {
                 continue;
             }
-            let origin = (x0 + shift.0, y0 + shift.1);
-            frame.cameras.push(Camera { origin, viewport: ((x1 - x0) as u32, (y1 - y0) as u32), screen_shift: shift, ..*c });
+            let camera = Camera { origin: (x0, y0), viewport: ((x1 - x0) as u32, (y1 - y0) as u32), ..*c };
+            frame.cameras.push(mapping.camera(&camera));
             frame.view_cameras[i] = Some(frame.cameras.len() as u32 - 1);
+        }
+        // Modal canvases overlay the preview menu without changing/cropping
+        // its fixed rectangle or the world alongside it.
+        for id in scene.interface.popup_views() {
+            if let Some(index) = scene.views.iter().position(|view| view.id == id) {
+                frame.view_cameras[index] = Some(frame.cameras.len() as u32);
+                frame.cameras.push(base[index]);
+            }
         }
         // Exploring with the mouse captured: the world cursor, and the hint
         // how to let it go at the world's top-left (where the driver put it
@@ -2531,33 +2887,40 @@ impl Layout {
     }
 
     /// The camera exploring the world beside the screen (`Explore`): the
-    /// world as the driver's view `base` shows it, zoomed [`EXPLORE_ZOOM`]
-    /// around the world cursor while the mouse is captured (else where it
-    /// was), not past an edge of a world that does not wrap (`bounds`).
+    /// world as the game's zoomed-out view shows it (half size,
+    /// [`EXPLORE_DOWNSCALE`], at the game view's zoom [`EXPLORE_ZOOM`] and
+    /// the world scale), whatever scale the driver's view `base` shows it
+    /// at, around the world cursor while the mouse is captured (else where
+    /// it was), not past an edge of a world that does not wrap (`bounds`,
+    /// at the scale of `base`). The world cursor keeps to the world at
+    /// that size meanwhile.
     fn explore_camera(&mut self, base: &Camera, e: Explore, rect: [i32; 4], overhang: (u32, u32, u32, u32), bounds: WorldBounds) -> Camera {
+        let bounds = explore_bounds(bounds, base.downscale);
+        self.bounds = Some(bounds);
         let center = if self.locked { self.cursor } else { e.center };
         if let Some(e) = &mut self.explore {
             e.center = center;
         }
         let c = FreeView::new(center, EXPLORE_ZOOM, Follow::Pointer).camera(rect, overhang, Some(bounds), self.world_scale);
-        Camera { x: c.x, y: c.y, zoom: c.zoom, viewport: c.viewport, origin: c.origin, cull: None, screen_shift: (0, 0), downscale: base.downscale.max(1), ..*base }
+        Camera { x: c.x, y: c.y, zoom: c.zoom, viewport: c.viewport, origin: c.origin, cull: None, screen_shift: (0, 0), downscale: EXPLORE_DOWNSCALE, ..*base }
     }
 
     /// Explores the world beside the screen around window pixel `p` (on
     /// it), the mouse captured there.
     fn start_explore(&mut self, p: (i32, i32)) {
         let (Some(of), Some((_, c))) = (self.beside_of, self.shown.iter().find(|(h, _)| *h == Hit::Beside).copied()) else { return };
-        // (The fitted view may show the world smaller than the driver's
-        // view does: in that view's pixels.)
-        let (q, n) = (world_at(&c, p), (c.downscale / self.beside_view_downscale.max(1)).max(1) as i32);
-        let center = (q.0 * n, q.1 * n);
+        // (The fitted view shows the world `c.downscale` times smaller: in
+        // the pixels of the half-size world.)
+        let q = world_at(&c, p);
+        let to_half = |v: i32| (v as i64 * c.downscale.max(1) as i64 / EXPLORE_DOWNSCALE as i64) as i32;
+        let center = (to_half(q.0), to_half(q.1));
         self.explore = Some(Explore { of, center });
         self.cursor = center;
         self.motion_rest = (0.0, 0.0);
         self.locked = true;
         self.grab = Some(true);
         self.against = None;
-        log::info!("viewer: exploring the world beside the screen at {center:?}, zoomed {:?} (Ctrl on its own lets the mouse go; a double-click or Esc goes back)", ZOOMS[EXPLORE_ZOOM]);
+        log::info!("viewer: exploring the world beside the screen at {center:?}, as the game zoomed out (half size, zoom {:?}; Ctrl on its own lets the mouse go; a double-click or Esc goes back)", times(ZOOMS[EXPLORE_ZOOM], self.world_scale));
     }
 
     /// Back to the world fitted beside the screen (the mouse let go).
@@ -2597,10 +2960,39 @@ impl Layout {
     /// (a context menu: its corner at the click) goes where that click was
     /// made in the window (e.g. at the world cursor in B), inside the
     /// window. While it is open the mouse is let go, so that the pointer can
-    /// reach it (captured again once it closes).
-    fn popup_opened(&mut self, [x, y, w, h]: [i32; 4]) {
+    /// reach it (captured again once it closes). One over a menu
+    /// (`over_menu`) is a modal of that menu's: never moved to a click.
+    fn popup_opened(&mut self, [x, y, w, h]: [i32; 4], anchor: Option<scene::PopupAnchor>, over_menu: bool) {
         self.popup_side = Some(self.active_side());
-        self.popup_anchor = self.last_press.filter(|&(_, (qx, qy), t)| self.clock - t < 2.0 && (x - qx).abs() <= 40 && (y - qy).abs() <= 40).map(|((px, py), (qx, qy), _)| {
+        // The driver anchors it at the world click just made: there, in
+        // that view (its camera moved as little as it takes for the popup
+        // to fit the window), whatever the screen place setting says.
+        self.popup_anchor_seen = anchor;
+        let fresh = self.world_press.filter(|p| self.clock - p.clock < 2.0);
+        // (Opened from an entry of the popup at a click, the one in its
+        // place or one just closed: that click's.)
+        let chained = self.anchored.map(|(_, p)| p).or(self.chain_press.filter(|&(_, t)| self.clock - t < 2.0).map(|(p, _)| p));
+        self.anchored = anchor.zip(fresh.or(chained));
+        if let Some((a, press)) = self.anchored {
+            self.popup_anchor = None;
+            if let Some(((tx, ty), zoom, camera)) = self.anchored_place(a, press, (w, h)) {
+                let size = (scaled_up(w, zoom), scaled_up(h, zoom));
+                let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
+                let pan = (fit_pan(tx, size.0, ww), fit_pan(ty, size.1, wh));
+                if pan != (0, 0) {
+                    let world = (world_steps(pan.0, camera.zoom), world_steps(pan.1, camera.zoom));
+                    self.pan_for_popup(press.hit, world);
+                    log::info!("viewer: the popup at the click needs {pan:?} more room: its view moved by {world:?}");
+                }
+            }
+            log::info!("viewer: the popup opened at the world click {:?} ({:?})", press.world, press.hit);
+            if self.locked {
+                self.recapture = Some(self.cursor);
+                self.release_here("a popup is open");
+            }
+            return;
+        }
+        self.popup_anchor = self.last_press.filter(|&(_, (qx, qy), t)| !over_menu && self.clock - t < 2.0 && (x - qx).abs() <= 40 && (y - qy).abs() <= 40).map(|((px, py), (qx, qy), _)| {
             let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
             ((x + px - qx).clamp(0, (ww - w).max(0)) - x, (y + py - qy).clamp(0, (wh - h).max(0)) - y)
         });
@@ -2619,6 +3011,11 @@ impl Layout {
     /// in the screen fitted into a pane, in a part drawn elsewhere (by the
     /// viewer, or the layout), or where the driver has it.
     fn driver_to_window(&self, (x, y): (i32, i32)) -> (i32, i32) {
+        if let Some(mapping) = self.beside_mapping.filter(|_| self.interface_shown.is_none()) { return mapping.apply((x, y)); }
+        if let Some(m) = self.modal_shown().filter(|m| inside(m.driver, (x, y))) {
+            let [x, y, _, _] = m.to_canvas([x, y, 0, 0]);
+            return (x.round() as i32, y.round() as i32);
+        }
         let fit = self.fit.or_else(|| self.placed_screen.filter(|f| inside(f.source, (x, y))));
         if let Some(Fit { source: [sx, sy, ..], origin: (ox, oy), zoom: (n, d), .. }) = fit {
             let (n, d) = (n as i32, d.max(1) as i32);
@@ -2637,6 +3034,10 @@ impl Layout {
     /// The popup closed: a mouse let go for it is captured again.
     fn popup_closed(&mut self) {
         self.popup_anchor = None;
+        self.chain_press = self.anchored.map(|(_, p)| (p, self.clock));
+        self.anchored = None;
+        self.popup_anchor_seen = None;
+        self.popup_pan = None;
         self.popup_side = None;
         if let Some(cursor) = self.recapture.take().filter(|_| self.follows_pointer() && !self.locked) {
             self.cursor = cursor;
@@ -2648,16 +3049,85 @@ impl Layout {
     }
 
     /// The opening view's current bounds, retained while the popup is open.
+    /// Popups opened at a click have none: they may cross the divider.
+    /// The screen place setting names one; floating, the opening view's
+    /// with `menu_follows_pointer`.
     fn popup_region(&self) -> Option<[i32; 4]> {
-        if !self.menu_follows_pointer || self.split.is_none() { return None; }
+        if self.anchored.is_some() || self.popup_anchor.is_some() { return None; }
+        let split = self.split?;
         let (a, b) = self.panes();
-        Some(if self.popup_side == Some(Side::B) { b.unwrap_or(a) } else { a })
+        match self.shared_hit(split) {
+            Some(Hit::Pane) => b,
+            Some(_) => Some(a),
+            None if self.menu_follows_pointer => Some(if self.popup_side == Some(Side::B) { b.unwrap_or(a) } else { a }),
+            None => None,
+        }
+    }
+
+    /// Where the anchored popup (`size`: its driver pixels) goes now: its
+    /// top-left canvas pixel, its zoom, and the camera of the view the
+    /// click was made in. The anchor's world pixel is taken in the wrap
+    /// image nearest the click.
+    fn anchored_place(&self, a: scene::PopupAnchor, press: WorldPress, (w, h): (i32, i32)) -> Option<((i32, i32), (u32, u32), Camera)> {
+        let (_, camera) = *self.shown.iter().find(|(hit, _)| *hit == press.hit)?;
+        let (n, d) = (camera.zoom.0.max(1) as i64, camera.zoom.1.max(1) as i64);
+        let near = |world: i32, cam: i32, origin: i32, at: i32, period: i32| {
+            let mut rel = (world - cam) as i64;
+            if period > 0 {
+                let want = (at - origin) as i64 * d / n;
+                rel += (want - rel + period as i64 / 2).div_euclid(period as i64) * period as i64;
+            }
+            origin + (rel * n).div_euclid(d) as i32
+        };
+        let p = (near(a.world.0, camera.x, camera.origin.0, press.at.0, self.world_period.0), near(a.world.1, camera.y, camera.origin.1, press.at.1, self.world_period.1));
+        let zoom = self.popup_zoom((w, h), a.world_scaled.then_some(camera.zoom));
+        let offset = |v: i32| (v as i64 * zoom.0 as i64).div_euclid(zoom.1.max(1) as i64) as i32;
+        Some(((p.0 + offset(a.offset.0), p.1 + offset(a.offset.1)), zoom, camera))
+    }
+
+    /// The anchored popup's zoom: the menus', smaller only where the popup
+    /// would not fit the window at it. One showing a piece of the world
+    /// (`world`: the zoom of the world in its view) is drawn at that zoom,
+    /// as the game draws it beside its map at 1:1 (its picture of a tile
+    /// as large as the tiles there, its frame and text with it), never
+    /// smaller than the game's frame (the HUD) so that it stays readable.
+    fn popup_zoom(&self, (w, h): (i32, i32), world: Option<(u32, u32)>) -> (u32, u32) {
+        let z = match world {
+            Some(c) => {
+                let (c, f) = ((c.0.max(1), c.1.max(1)), (self.hud_scale.0.max(1), self.hud_scale.1.max(1)));
+                let z = if c.0 as u64 * f.1 as u64 >= f.0 as u64 * c.1 as u64 { c } else { f };
+                let g = gcd(z.0, z.1);
+                (z.0 / g, z.1 / g)
+            }
+            None => (self.menu_scale.0.max(1), self.menu_scale.1.max(1)),
+        };
+        let (ww, wh) = (self.window.0.max(1) as u64, self.window.1.max(1) as u64);
+        let (w, h) = (w.max(1) as u64, h.max(1) as u64);
+        if w * z.0 as u64 <= ww * z.1 as u64 && h * z.0 as u64 <= wh * z.1 as u64 { return z; }
+        let (n, d) = if ww * h <= wh * w { (ww, w) } else { (wh, h) };
+        let g = gcd(n as u32, d as u32);
+        (n as u32 / g, d as u32 / g)
+    }
+
+    /// Moves the view at `hit` by `by` world pixels for an anchored popup,
+    /// as a pan by hand would (it stays there); one following the world
+    /// cursor only while the popup is open (the cursor stays on the click).
+    fn pan_for_popup(&mut self, hit: Hit, by: (i32, i32)) {
+        let Some(center) = self.free_view(hit).map(|v| v.center) else { return };
+        match self.follow_of(hit) {
+            Some(Follow::Pointer) => self.popup_pan = Some((hit, by)),
+            Some(_) => self.place_view(hit, (center.0 + by.0, center.1 + by.1)),
+            None => {}
+        }
     }
 
     /// Keep click-opened popups near their click and hotkey popups inside
     /// the view that held the mouse at opening. Interface scaling applies
     /// the same region after scaling so driver-window margins cannot move it.
     fn popup_shift(&self, [x, y, w, h]: [i32; 4], a: [i32; 4]) -> (i32, i32) {
+        // (One anchored at a world click is placed once this frame's
+        // cameras are: `Frame::popup_at`.)
+        if self.anchored.is_some() { return (0, 0); }
         let anchored = self.popup_anchor.unwrap_or((0, 0));
         if let Some(r) = self.popup_region() {
             let keep = |at: i32, len: i32, origin: i32, span: i32| {
@@ -2778,6 +3248,10 @@ impl Layout {
     /// The driver's interface (and its other views) at `p`, where it lies
     /// over the window (not in a pane), the parts drawn elsewhere on top.
     fn interface_at(&self, p: (i32, i32)) -> Option<Hit> {
+        // (A modal popup over the screen fitted into a pane: on top.)
+        if self.modal_shown().is_some_and(|_| self.interface_shown.iter().flatten().any(|s| s.is_modal() && inside(s.rect, p))) {
+            return Some(Hit::Interface);
+        }
         if self.placed_screen.is_some_and(|f| {
             let size = ((f.source[2] as u32 * f.zoom.0).div_ceil(f.zoom.1), (f.source[3] as u32 * f.zoom.0).div_ceil(f.zoom.1));
             inside([f.origin.0, f.origin.1, size.0 as i32, size.1 as i32], p)
@@ -2999,8 +3473,8 @@ impl Layout {
     /// window pixel `origin + s · zoom.0 / zoom.1` (1:1 at the window's
     /// corner unless it is fitted into a pane or moved beside its world).
     pub fn screen_mapping(&self) -> ((i32, i32), (u32, u32)) {
-        if self.beside.is_some() {
-            return (self.moved.first().map_or((0, 0), |m| m.1), (1, 1));
+        if let Some(mapping) = self.beside_mapping {
+            return (mapping.apply((0, 0)), mapping.zoom);
         }
         self.fit.map_or(((0, 0), (1, 1)), |f| {
             let (n, d) = (f.zoom.0 as i32, f.zoom.1.max(1) as i32);
@@ -3039,18 +3513,72 @@ impl Layout {
     }
 
     /// The view a click captures the mouse in (as of the last frame): its
-    /// window rectangle and the point to click (where the world cursor is
-    /// in it, else its middle), if a click there does capture it (not under
-    /// the driver's interface).
+    /// window rectangle and the point to click, its middle (where a capture
+    /// puts the world cursor; else where the world cursor is in it, should
+    /// the driver's interface cover the middle), if a click there does
+    /// capture it (not under the driver's interface).
     pub fn capture_view(&self) -> Option<([i32; 4], (i32, i32))> {
         self.shown.iter().filter(|(h, _)| matches!(h, Hit::Main | Hit::Pane | Hit::Inset(_))).find_map(|(h, c)| {
             if self.follow_of(*h) != Some(Follow::Pointer) {
                 return None;
             }
             let rect = [c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32];
-            let at = self.cursor_on_window().filter(|&p| inside(rect, p)).unwrap_or((rect[0] + rect[2] / 2, rect[1] + rect[3] / 2));
-            (self.capture_hit(at) == Some(*h)).then_some((rect, at))
+            let middle = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2);
+            let cursor = self.cursor_on_window().filter(|&p| inside(rect, p));
+            [Some(middle), cursor].into_iter().flatten().find(|&at| self.capture_hit(at) == Some(*h)).map(|at| (rect, at))
         })
+    }
+
+    /// A command of the driver's waits for a place of the world (button
+    /// snapping ends for it, `crate::snap`): the mouse is captured again in
+    /// the view following the world cursor, which stays where it is, the
+    /// view too (the place looked at is the one the command is likely
+    /// for). The system pointer goes back to the view's middle, a move that
+    /// is not the mouse's: the world cursor does not follow it. What goes
+    /// to the driver: the world cursor's place as the pointer's, so that
+    /// the tile under it is the command's target at once (its path and
+    /// turns shown; nothing is clicked). `None`: no such view.
+    pub fn capture_for_target(&mut self) -> Option<Vec<Input>> {
+        let (hit, camera) = self.shown.iter().find(|(h, _)| matches!(h, Hit::Main | Hit::Pane | Hit::Inset(_)) && self.follow_of(*h) == Some(Follow::Pointer)).copied()?;
+        if !self.locked {
+            let middle = (camera.origin.0 + camera.viewport.0 as i32 / 2, camera.origin.1 + camera.viewport.1 as i32 / 2);
+            self.pointer = middle;
+            self.raw_pointer = middle;
+            self.warp = Some(middle);
+            self.side = self.side_of(middle);
+            // (`capture` without moving the world cursor to the middle.)
+            self.locked = true;
+            self.grab = Some(true);
+            self.against = None;
+            log::info!("viewer: a command waits for a place of the world: mouse captured again in {hit:?}, the world cursor stays at {:?}", self.cursor);
+        }
+        let out = match self.route_world(self.cursor) {
+            Ok((x, y)) => vec![Input::MouseMove { x, y }],
+            Err(Some((x, y))) if self.explore.is_none() => vec![Input::WorldMove { x, y }],
+            Err(_) => vec![],
+        };
+        self.remember_world_inputs(&out);
+        Some(out)
+    }
+
+    /// The player asked the driver to centre on its point of interest (the
+    /// game's C: centre on the active unit), `focus` (a world pixel): the
+    /// view following the world cursor centres on it too (the world cursor
+    /// goes there), and the views following the driver or the focus that
+    /// were moved by hand follow it again. Not while a popup or a named
+    /// screen takes the keys. Whether the world cursor moved.
+    pub fn centre_on_focus(&mut self, focus: Option<(i32, i32)>) -> bool {
+        let Some(f) = focus.filter(|_| !self.popup_shown && self.screen.is_none()) else { return false };
+        self.resume_game_focus();
+        for v in self.views_mut() {
+            v.hand_focus = None;
+        }
+        if !self.follows_pointer() {
+            return false;
+        }
+        self.cursor = self.bounds.map_or(f, |b| b.clamp_point(f));
+        log::info!("viewer: centred on the driver's focus: the world cursor at {:?}", self.cursor);
+        true
     }
 
     /// Lets go of a captured mouse, the system pointer showing at window
@@ -3067,6 +3595,9 @@ impl Layout {
         self.pointer = p;
         self.raw_pointer = p;
         self.capture(hit, p);
+        if self.click_popup_open() {
+            self.unit_order_events_push(Input::DismissPopup);
+        }
         true
     }
 
@@ -3126,6 +3657,8 @@ impl Layout {
                 let Fit { source: [sx, sy, sw, sh], origin: (ox, oy), zoom: (n, d), .. } = self.placed_screen.ok_or(None)?;
                 let (n, d) = (n as i32, d as i32);
                 let q = (sx + ((p.0 - ox) * d).div_euclid(n), sy + ((p.1 - oy) * d).div_euclid(n));
+                // (Never onto a modal popup over it shown elsewhere.)
+                let q = self.modal_shown().map_or(q, |m| crate::scaling::ShownPiece::beside_modal(q, m.driver));
                 inside([sx, sy, sw, sh], q).then_some(q).ok_or(None)
             }
             Hit::Interface => Ok(self.to_driver(p)),
@@ -3134,6 +3667,9 @@ impl Layout {
             Hit::Beside => Err(None),
             // Drawn elsewhere: where the driver put it.
             Hit::Moved(k) => {
+                if let Some(mapping) = self.beside_mapping {
+                    return Ok(if self.interface_shown.is_some() { self.to_driver(p) } else { mapping.invert(p) });
+                }
                 let (_, (dx, dy)) = *self.moved.get(k).ok_or(None)?;
                 Ok((p.0 - dx, p.1 - dy))
             }
@@ -3190,7 +3726,14 @@ impl Layout {
     /// the interface piece holding it is shown (`interface_shown`), else
     /// where the driver put it.
     pub fn driver_rect_to_window(&self, r: [i32; 4]) -> [f64; 4] {
+        if let Some(mapping) = self.beside_mapping.filter(|_| self.interface_shown.is_none()) {
+            let [x, y, w, h] = mapping.rect(r);
+            return [x as f64, y as f64, w as f64, h as f64];
+        }
         let middle = (r[0] + r[2] / 2, r[1] + r[3] / 2);
+        if let Some(m) = self.modal_shown().filter(|m| inside(m.driver, middle)) {
+            return m.to_canvas(r);
+        }
         let fit = self.fit.or_else(|| self.placed_screen.filter(|f| inside(f.source, middle)));
         if let Some(Fit { source: [sx, sy, ..], origin: (ox, oy), zoom: (n, d), .. }) = fit {
             let s = n.max(1) as f64 / d.max(1) as f64;
@@ -3214,6 +3757,10 @@ impl Layout {
             (right > l && bottom > t).then_some([l,t,right-l,bottom-t])
         };
         let middle = (r[0] + r[2]/2, r[1] + r[3]/2);
+        if let Some(m) = self.modal_shown().filter(|m| inside(m.driver, middle)) {
+            let [x, y, w, h] = m.clip;
+            return clipped([x as f64, y as f64, w as f64, h as f64]);
+        }
         if let Some(fit) = self.fit.or_else(|| self.placed_screen.filter(|f| inside(f.source,middle))) {
             let (a,b) = self.panes();
             let pane = if fit.hit == Hit::Main { a } else { b.unwrap_or(a) };
@@ -3225,17 +3772,27 @@ impl Layout {
         }
         if let Some(shown) = self.interface_shown.as_deref() {
             return shown.iter().rev().find(|piece| inside(piece.driver,middle))
-                .and_then(|piece| { let [x,y,w,h] = piece.rect; clipped([x as f64,y as f64,w as f64,h as f64]) });
+                .and_then(|piece| { let [x,y,w,h] = piece.clip; clipped([x as f64,y as f64,w as f64,h as f64]) });
         }
         clipped(window)
     }
 
     /// The driver's pixel for window pixel `p` on its interface: where the
     /// piece shown there is in the driver's window, if the viewer shows it
-    /// elsewhere ([`Layout::interface_shown`]).
+    /// elsewhere ([`Layout::interface_shown`]); never onto a modal popup
+    /// shown elsewhere from under it.
     fn to_driver(&self, p: (i32, i32)) -> (i32, i32) {
         let shown = self.interface_shown.as_deref().unwrap_or_default();
-        shown.iter().rev().find(|s| inside(s.rect, p)).map_or(p, |s| s.to_driver(p))
+        let modal = self.modal_shown().and_then(|_| shown.iter().find(|s| s.is_modal() && inside(s.rect, p)));
+        modal.or_else(|| shown.iter().rev().find(|s| inside(s.rect, p))).map_or(p, |s| s.pointer_to_driver(p))
+    }
+
+    /// The modal popup over the screen fitted into a pane, as shown (its
+    /// body): it is over that screen, and placed elsewhere than the game
+    /// has it.
+    fn modal_shown(&self) -> Option<&crate::scaling::ShownPiece> {
+        self.placed_screen?;
+        self.interface_shown.as_deref()?.iter().find(|s| s.is_modal())
     }
 
     /// Sets the extra sensitivity of captured relative motion. Other pointer
@@ -3248,7 +3805,7 @@ impl Layout {
     /// Relative mouse motion while the mouse is captured: moves the world
     /// cursor (in the pixels of the view following it).
     pub fn motion(&mut self, (dx, dy): (f64, f64)) -> Vec<Input> {
-        if !self.locked {
+        if !self.locked || self.click_popup_open() {
             return vec![];
         }
         // (Ctrl held while the mouse moves is no tap: it does not let go.)
@@ -3408,7 +3965,11 @@ impl Layout {
             }
             Input::Wheel { delta, x, y } => {
                 let (x, y) = self.held_back((x, y));
-                if self.ctrl {
+                // (The map stays put under a popup opened at a world click.)
+                if self.click_popup_open() && (self.ctrl || self.locked || matches!(self.hit((x, y)), Hit::Main | Hit::Pane | Hit::Inset(_) | Hit::Magnifier | Hit::Beside)) {
+                    return vec![];
+                }
+                if self.ctrl && self.world_shown {
                     self.zoom_at((x, y), delta.signum());
                     return vec![];
                 }
@@ -3428,7 +3989,51 @@ impl Layout {
         if p == self.raw_pointer { self.pointer } else { p }
     }
 
+    /// Whether a popup the driver opened at a world click (a context menu,
+    /// a tile's information box: `scene::Interface::popup_anchor`) is open.
+    /// While it is the map stays where it is (no edge scrolling, dragging,
+    /// wheel or captured motion), and a press outside its body, or
+    /// capturing the mouse, dismisses it (`Input::DismissPopup`) and does
+    /// nothing else.
+    pub fn click_popup_open(&self) -> bool {
+        self.popup_shown && (self.popup_anchor_seen.is_some() || self.anchored.is_some() || !self.anchored_popup_layers.is_empty())
+    }
+
+    /// A press at `p` while a popup anchored at a world click is open: if it
+    /// is outside its body (or the mouse is captured), it dismisses
+    /// the popup, capturing the mouse where a left click into a view
+    /// following the world cursor would; `None`: a press like any other
+    /// (on the popup).
+    fn dismissing_press(&mut self, button: Button, p: (i32, i32)) -> Option<Vec<Input>> {
+        if !self.locked {
+            let on_popup = if let Some(shown) = self.interface_shown.as_deref() {
+                shown.iter().any(|s| (s.is_modal() || Some(s.driver) == self.popup_body) && inside(s.rect, p))
+            } else if let (Some((anchor, press)), Some([_, _, w, h])) = (self.anchored, self.popup_body) {
+                self.anchored_place(anchor, press, (w, h)).is_some_and(|((x, y), zoom, _)| {
+                    inside([x, y, scaled_up(w, zoom), scaled_up(h, zoom)], p)
+                })
+            } else {
+                self.popup_body.is_some_and(|r| inside(r, self.to_driver(p)))
+            };
+            if on_popup { return None; }
+        }
+        self.dismissed[button_index(button)] = true;
+        if button == Button::Left && !self.locked {
+            if let Some(into) = self.capture_hit(p) {
+                self.capture(into, p);
+            }
+        }
+        log::info!("viewer: a press beside the popup opened at a world click dismisses it");
+        Some(vec![Input::DismissPopup])
+    }
+
     fn button(&mut self, button: Button, down: bool, p: (i32, i32)) -> Vec<Input> {
+        if !down && std::mem::take(&mut self.dismissed[button_index(button)]) {
+            return vec![];
+        }
+        if down && self.click_popup_open() {
+            if let Some(out) = self.dismissing_press(button, p) { return out; }
+        }
         if let Some(out) = self.unit_order_button(button, down, p) { return out; }
         // Grabbing a view, or a press that may become a drag (`pan`).
         if let Some(out) = self.pan_button(button, down, p) {
@@ -3497,6 +4102,11 @@ impl Layout {
             // the driver may look there (left button) and act on it.
             Err(Some(w)) => {
                 self.world_pressed[b] = Some(w);
+                // (Where it was made and in which view: the world cursor's
+                // while the mouse is captured.)
+                let hit = if self.locked { self.shown.iter().find(|(h, _)| self.follow_of(*h) == Some(Follow::Pointer)).map(|(h, _)| *h) } else { Some(self.hit(p)) };
+                let at = if self.locked { self.cursor_on_window().unwrap_or(p) } else { p };
+                self.world_press = hit.map(|hit| WorldPress { at, world: w, hit, clock: self.clock });
                 let press = Input::WorldButton { button, down, x: w.0, y: w.1 };
                 if button == Button::Left { vec![Input::Look { x: w.0, y: w.1 }, press] } else { vec![press] }
             }
@@ -3682,6 +4292,9 @@ impl Layout {
                     self.release_here("Ctrl+Shift+Space");
                 } else if let Some(into) = self.capture_hit(p) {
                     self.capture(into, p);
+                    if self.click_popup_open() {
+                        self.unit_order_events_push(Input::DismissPopup);
+                    }
                 } else {
                     log::info!("viewer: mouse stays free (no view under the pointer follows the world cursor)");
                 }
@@ -3715,8 +4328,8 @@ impl Layout {
             // Arrows: pan what is under the pointer by an eighth of it.
             0x25..=0x28 => {
                 let hit = if hit == Hit::Interface { Hit::Main } else { hit };
-                let size = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| c.source_size());
-                let center = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| (c.x + c.source_size().0 as i32 / 2, c.y + c.source_size().1 as i32 / 2));
+                let size = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| c.world_size());
+                let center = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| (c.x + c.world_size().0 as i32 / 2, c.y + c.world_size().1 as i32 / 2));
                 let focus = self.focus;
                 if let (Some(v), Some((w, h)), Some(center)) = (self.free_view(hit), size, center) {
                     let (dx, dy) = match vk {
@@ -3736,6 +4349,7 @@ impl Layout {
 
 #[cfg(test)]
 mod tests {
+    include!("layout/capture_focus_tests.rs");
     use super::*;
     use scene::{View, ViewState};
 
@@ -3929,7 +4543,7 @@ mod tests {
         l.configure("split=vertical,main=focus,pane=pointer").unwrap();
         frame(&mut l, vec![]);
         let f = frame(&mut l, vec![]);
-        let (sw, sh) = f.cameras[0].source_size();
+        let (sw, sh) = f.cameras[0].world_size();
         assert_eq!((f.cameras[0].x + sw as i32 / 2, f.cameras[0].y + sh as i32 / 2), (3000, 2000));
         // Click into the right half: the mouse is captured there.
         assert!(click(&mut l, (600, 300)).is_empty());
@@ -4001,7 +4615,7 @@ mod tests {
         assert_eq!(world.downscale, 8);
         assert!(world.zoom.0 < world.zoom.1);
         let shown = |c: &Camera| {
-            let (sw, sh) = c.source_size();
+            let (sw, sh) = c.world_size();
             [c.x, c.y, c.x + sw as i32, c.y + sh as i32]
         };
         let [x0, y0, x1, y1] = shown(&world);
@@ -4018,11 +4632,35 @@ mod tests {
     }
 
     #[test]
+    fn a_preview_already_downscaled_by_the_driver_keeps_its_full_extent() {
+        let driver = Camera { downscale: 2, ..Camera::new((3274, 2048)) };
+        let fitted = fit_world(&driver, [-64, -64, 9152, 4384], [1375, 0, 254, 952], (64, 32));
+        let (w, h) = fitted.world_size();
+        assert_eq!(fitted.downscale, 2);
+        assert!(h > 4096);
+        // The area and camera both use the driver's downscaled pixels.
+        assert!(fitted.x <= -64 && fitted.y <= -64);
+        assert!(fitted.x + w as i32 >= 9152 - 64 - 1);
+        assert!(fitted.y + h as i32 >= 4384 - 64 - 1);
+    }
+
+    #[test]
+    fn large_world_extents_reach_the_driver_and_capture_center() {
+        let camera = Camera { x: 100, y: 200, zoom: (1, 12), ..Camera::new((100, 400)) };
+        let mut l = Layout::default();
+        l.shown = vec![(Hit::Main, camera), (Hit::Pane, camera)];
+        assert_eq!(l.take_main_view_change(), Some((100, 200, 1200, 4800)));
+        assert_eq!(l.take_views_change().unwrap()[0], (100, 200, 1200, 4800));
+        l.capture(Hit::Main, (0, 0));
+        assert_eq!(l.cursor, (700, 2600));
+    }
+
+    #[test]
     fn a_world_of_any_size_fits() {
         for (size, rect) in [((100, 50), [0, 0, 892, 1080]), ((20_000, 30_000), [10, 20, 300, 200]), ((8960, 4544), [1028, 0, 892, 1080])] {
             let c = fit_world(&Camera::new((1, 1)), whole_world(WorldBounds { size, wrap: (false, false) }, (64, 32), 1), rect, (64, 32));
             assert!(64 % c.downscale == 0 && 32 % c.downscale == 0, "{size:?}: {c:?}");
-            let (sw, sh) = c.source_size();
+            let (sw, sh) = c.world_size();
             let n = c.downscale as i32;
             assert!(c.x <= 0 && c.y <= 0, "{size:?}: {c:?}");
             assert!(c.x + sw as i32 >= (size.0 + 64) / n - 1 && c.y + sh as i32 >= size.1 / n - 1, "{size:?}: {c:?}");
@@ -4058,7 +4696,7 @@ mod tests {
     }
 
     fn centre(c: &Camera) -> (i32, i32) {
-        let (sw, sh) = c.source_size();
+        let (sw, sh) = c.world_size();
         (c.x + sw as i32 / 2, c.y + sh as i32 / 2)
     }
 
@@ -4082,19 +4720,21 @@ mod tests {
         let mut l = Layout::default();
         let s = beside_scene(62);
         let fitted = beside_frame(&mut l, &s).cameras[0];
-        // The point double-clicked, in the pixels of the driver's view.
+        // The point double-clicked, in the pixels of the half-size world
+        // (the game's zoomed-out view).
         let q = world_at(&fitted, (1500, 300));
-        let n = fitted.downscale as i32 / 4;
+        let n = fitted.downscale as i32 / 2;
         let at = (q.0 * n, q.1 * n);
         assert!(click(&mut l, (1500, 300)).is_empty());
         assert!(!l.captured());
         assert!(click(&mut l, (1500, 300)).is_empty());
         assert!(l.captured());
-        // Twice as big as the driver shows it, by nearest pixel, around it;
+        // As the game's Z shows it (half size, 1:1, whatever the scale the
+        // driver fits it at), around it;
         // the world cursor there, the hint at the world's top-left.
         let f = beside_frame(&mut l, &s);
         let c = f.cameras[0];
-        assert_eq!((c.zoom, c.downscale, c.origin, c.viewport), ((2, 1), 4, (1028, 0), (892, 1080)));
+        assert_eq!((c.zoom, c.downscale, c.origin, c.viewport), ((1, 1), 2, (1028, 0), (892, 1080)));
         assert_eq!(centre(&c), at);
         assert_eq!(f.markers, [Marker::Cursor(at)]);
         assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (1028 + 8, 8));
@@ -4104,21 +4744,21 @@ mod tests {
         assert!(l.route(Input::Wheel { delta: 1, x: 300, y: 400 }).is_empty());
         assert!(l.motion((20.0, 0.0)).is_empty());
         let f = beside_frame(&mut l, &s);
-        assert_eq!(centre(&f.cameras[0]), (at.0 + 10, at.1));
+        assert_eq!(centre(&f.cameras[0]), (at.0 + 20, at.1));
         // Ctrl on its own lets the mouse go: still explored, no hint; the
         // dialog takes clicks again.
         key(&mut l, VK_CONTROL, true);
         key(&mut l, VK_CONTROL, false);
         assert!(!l.captured());
         let f = beside_frame(&mut l, &s);
-        assert_eq!((f.cameras[0].zoom, centre(&f.cameras[0])), ((2, 1), (at.0 + 10, at.1)));
+        assert_eq!((f.cameras[0].zoom, centre(&f.cameras[0])), ((1, 1), (at.0 + 20, at.1)));
         assert!(f.markers.is_empty() && f.view_cameras[2].is_none());
         assert_eq!(click(&mut l, (100, 400))[0], Input::MouseButton { button: Button::Left, down: true, x: 548, y: 400 });
         // A click on the world captures the mouse again, the view put.
         wait(&mut l, &s);
         assert!(click(&mut l, (1500, 300)).is_empty());
         assert!(l.captured());
-        assert_eq!(centre(&beside_frame(&mut l, &s).cameras[0]), (at.0 + 10, at.1));
+        assert_eq!(centre(&beside_frame(&mut l, &s).cameras[0]), (at.0 + 20, at.1));
         // Esc goes back to the world fitted (and does not reach the driver).
         assert!(key(&mut l, VK_ESCAPE, true).is_empty() && key(&mut l, VK_ESCAPE, false).is_empty());
         assert!(!l.captured());
@@ -4139,6 +4779,34 @@ mod tests {
         assert!(!l.captured());
     }
 
+    /// A double-click on a preview fitted very small (the driver's view at
+    /// downscale 8) goes to the game's Z view: downscale 2 and the game
+    /// view's zoom with the world scale (here x2), not the fitted zoom
+    /// doubled; the world cursor keeps to the half-size world.
+    #[test]
+    fn a_double_click_goes_to_the_games_zoomed_out_view() {
+        let mut l = Layout { world_scale: (2, 1), ..Layout::default() };
+        let mut s = beside_scene(62);
+        s.views[0].view.downscale = 8;
+        let bounds = Some(WorldBounds { size: (2000, 1000), wrap: (false, false) });
+        let frame = |l: &mut Layout| l.frame(&s, (1920, 1080), (0, 0, 0, 0), vec![[448, 156, 1024, 768]], bounds);
+        let fitted = frame(&mut l).cameras[0];
+        assert_eq!(fitted.downscale, 8);
+        let q = world_at(&fitted, (1500, 300));
+        let at = (q.0 * fitted.downscale as i32 / 2, q.1 * fitted.downscale as i32 / 2);
+        click(&mut l, (1500, 300));
+        click(&mut l, (1500, 300));
+        assert!(l.captured());
+        let c = frame(&mut l).cameras[0];
+        assert_eq!((c.zoom, c.downscale), ((2, 1), 2));
+        assert_eq!(centre(&c), at);
+        // Moved far right: held at the half-size world's edge (8000 wide).
+        l.motion((100_000.0, 0.0));
+        let c = frame(&mut l).cameras[0];
+        let (sw, _) = c.world_size();
+        assert_eq!(c.x + sw as i32, 8000);
+    }
+
     #[test]
     fn another_world_beside_the_screen_is_shown_fitted() {
         let mut l = Layout::default();
@@ -4151,7 +4819,7 @@ mod tests {
         let other = beside_scene(80);
         let f = beside_frame(&mut l, &other);
         assert!(!l.captured());
-        assert_ne!(f.cameras[0].zoom, (2, 1));
+        assert_ne!((f.cameras[0].zoom, f.cameras[0].downscale), ((1, 1), 2));
         assert!(f.markers.is_empty());
         // The screen closing ends it too.
         beside_frame(&mut l, &other);
@@ -4371,6 +5039,7 @@ mod tests {
         let ui = View { interface_only: true, ..Default::default() };
         Scene {
             views: vec![ViewState { id: 0, view: game, overlay: vec![] }, ViewState { id: 1, view: city, overlay: vec![] }, ViewState { id: 255, view: ui, overlay: vec![] }],
+            shape: scene().shape,
             ..Default::default()
         }
     }
@@ -4383,7 +5052,7 @@ mod tests {
                 for zoom in [Zoom::Off, Zoom::TopStrip] {
                     for downscale in [1, 2] {
                         let mut settings = settings(|s| (s.split, s.zoom) = (split, zoom));
-                        settings.screens.insert("City".into(), ScreenPlace { vertical: place, horizontal: place });
+                        settings.screen_place = ScreenPlace { vertical: place, horizontal: place };
                         let mut l = Layout::default();
                         l.apply_settings(&settings);
                         l.clean_map.a = Detail { mode: Mode::Custom, hidden: UNITS };
@@ -4670,7 +5339,7 @@ mod tests {
             l.world_scale = scale;
             let f = l.frame(&scene(), window, (0, 0, 0, 0), vec![], BOUNDS);
             let c = f.cameras[0];
-            let (w, h) = c.source_size();
+            let (w, h) = c.world_size();
             assert_eq!(l.take_main_view_change(), Some((c.x, c.y, w as i32, h as i32)), "window {window:?}, scale {scale:?}");
             assert_eq!(l.take_main_view_change(), None);
             // Returning to exactly the full driver's view restores its mark.
@@ -4743,7 +5412,7 @@ mod tests {
         assert!(l.smooth);
         // A follows the active unit (scene focus (3000, 2000)).
         let f = frame(&mut l, vec![]);
-        let (sw, sh) = f.cameras[0].source_size();
+        let (sw, sh) = f.cameras[0].world_size();
         assert_eq!((f.cameras[0].x + sw as i32 / 2, f.cameras[0].y + sh as i32 / 2), (3000, 2000));
         // Back to free: the captured mouse goes free, the panes keep where
         // they look.
@@ -4925,7 +5594,7 @@ mod tests {
         let r = l.magnifier_geometry(&l.magnifier.unwrap()).0;
         assert!(!inside(r, l.pointer));
         let c = camera_at(&f, (r[0], r[1]));
-        let (w, h) = c.source_size();
+        let (w, h) = c.world_size();
         assert_eq!((c.x + w as i32 / 2, c.y + h as i32 / 2), (1400, 800));
         assert_eq!(click(&mut l, (400, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 400, y: 300 });
     }
@@ -4947,12 +5616,118 @@ mod tests {
         }
         // Not over the driver's screen fitted into the view it is in.
         let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, Zoom::Floating131, Place::RightOrTop)));
-        l.screen_places.insert("F1".into(), ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating });
+        l.screen_place = ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating };
         let mut s = scene();
         s.interface.screen = Some("F1".into());
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert!(!f.cameras.iter().any(|c| c.cells && c.zoom == (2, 1) && c.origin == (483, 120)), "{:?}", f.cameras);
         assert_eq!(l.hit((600, 300)), Hit::Magnifier);
+    }
+
+    #[test]
+    fn title_and_setup_screens_ignore_saved_map_views_and_keep_full_window_input() {
+        for split in [S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
+            for zoom in [Zoom::Floating131, Zoom::TopStrip, Zoom::Mouse111] {
+                for ui_in_pane in [false, true] {
+                    let mut l = Layout::default();
+                    l.apply_settings(&settings(|s| (s.split, s.zoom) = (split, zoom)));
+                    l.ui_in_pane = ui_in_pane;
+                    for name in [None, Some("Play New Game"), Some("Menu")] {
+                        let mut menu = scene();
+                        menu.shape = Default::default();
+                        menu.interface.screen = name.map(str::to_owned);
+                        let saved = (l.split, l.magnifier, l.ui_in_pane);
+                        let f = l.frame(&menu, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                        assert_eq!(f.cameras, crate::scene_cameras(&menu, (800, 600), (0, 0, 0, 0)));
+                        assert_eq!(f.view_cameras, [Some(0), Some(1)]);
+                        assert!(f.markers.is_empty() && f.copies.is_empty() && f.placed.is_empty());
+                        assert_eq!(f.menu_region, None);
+                        assert_eq!(l.panes(), ([0, 0, 800, 600], None));
+                        assert_eq!(l.pointer_walls(), None);
+                        assert_eq!(l.capture_view(), None);
+                        assert_eq!(l.screen_mapping(), ((0, 0), (1, 1)));
+                        for p in [(400, 20), (401, 100), (700, 500)] {
+                            assert_eq!(mv(&mut l, p), [Input::MouseMove { x: p.0, y: p.1 }]);
+                            assert_eq!(l.route_window(p), Some(p));
+                            assert_eq!(click(&mut l, p), [
+                                Input::MouseButton { button: Button::Left, down: true, x: p.0, y: p.1 },
+                                Input::MouseButton { button: Button::Left, down: false, x: p.0, y: p.1 },
+                            ]);
+                        }
+                        assert_eq!((l.split, l.magnifier, l.ui_in_pane), saved);
+                        assert_eq!(l.take_zooms_change(), None);
+                        assert_eq!(l.take_views_change(), None);
+                        assert_eq!(l.take_main_view_change(), None);
+                    }
+                    let game = frame(&mut l, vec![]);
+                    assert!(game.cameras.len() > 2);
+                    assert!(l.panes().1.is_some());
+                    if !ui_in_pane { assert!(l.magnifier_shown); }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn returning_to_title_releases_game_capture_and_clears_view_reports() {
+        let mut l = Layout::default();
+        l.configure("split=vertical,pane=pointer,magnifier=world,ui=pane").unwrap();
+        frame(&mut l, vec![]);
+        l.route(Input::MouseMove { x: 600, y: 300 });
+        click(&mut l, (600, 300));
+        assert!(l.captured());
+        assert_eq!(l.take_grab(), Some(true));
+        l.take_main_view_change();
+        assert!(l.take_views_change().is_some());
+        assert!(l.take_zooms_change().is_some());
+        let title = Scene { shape: Default::default(), ..scene() };
+        let f = l.frame(&title, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(f.cameras.len(), title.views.len());
+        assert!(!l.captured());
+        assert_eq!(l.take_grab(), Some(false));
+        assert_eq!(l.take_warp(), None);
+        assert_eq!(l.pointer_walls(), None);
+        assert_eq!(l.take_views_change(), Some([(0, 0, 0, 0); 4]));
+        assert_eq!(l.take_zooms_change(), Some([(0, 0); 8]));
+        assert_eq!(l.route_window((600, 300)), Some((600, 300)));
+        assert_eq!(click(&mut l, (600, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 600, y: 300 });
+        // Opening another game restores views without reviving capture.
+        frame(&mut l, vec![]);
+        assert!(l.panes().1.is_some());
+        assert!(!l.captured());
+        assert_eq!(l.take_grab(), None);
+    }
+
+    #[test]
+    fn entering_an_optional_preview_releases_game_capture_and_gameplay_view_feedback() {
+        for ready in [false, true] {
+            let mut l = Layout::default();
+            l.configure("split=vertical,pane=pointer,magnifier=world").unwrap();
+            frame(&mut l, vec![]);
+            click(&mut l, (600, 300));
+            assert!(l.captured());
+            l.take_grab();
+            assert!(l.take_main_view_change().is_some());
+            assert!(l.take_views_change().is_some());
+            assert!(l.take_zooms_change().is_some());
+            let mut preview = beside_scene(62);
+            if !ready { preview.shape = Default::default(); }
+            l.frame(&preview, (1920, 1080), (0, 0, 0, 0), vec![], BOUNDS);
+            assert!(!l.captured());
+            assert_eq!(l.take_grab(), Some(false));
+            assert_eq!(l.take_warp(), None);
+            assert_eq!(l.take_main_view_change(), Some((0, 0, 0, 0)));
+            assert_eq!(l.take_views_change(), Some([(0, 0, 0, 0); 4]));
+            assert_eq!(l.take_zooms_change(), Some([(0, 0); 8]));
+            assert_eq!(l.pointer_walls(), None);
+            let title = Scene { shape: Default::default(), ..scene() };
+            l.frame(&title, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert_eq!(l.route_window((600, 300)), Some((600, 300)));
+            assert_eq!(l.take_grab(), None);
+            assert_eq!(l.take_views_change(), None);
+            assert_eq!(l.take_zooms_change(), None);
+            assert!(!l.captured());
+        }
     }
 
     #[test]
@@ -4964,7 +5739,7 @@ mod tests {
             assert!(!f.cameras.iter().any(|c| c.zoom == (2, 1)), "{zoom:?}: {:?}", f.cameras);
             // The window is the driver's as without a zoom box.
             assert_eq!(l.panes().0, [0, 0, 800, 600]);
-            assert_eq!(l.hit((400, 300)), Hit::Main);
+            assert_eq!(l.hit((400, 300)), Hit::Interface);
             // Once a world shows: there.
             let f = frame(&mut l, vec![]);
             assert!(f.cameras.iter().any(|c| c.zoom == (2, 1)), "{zoom:?}");
@@ -5062,9 +5837,7 @@ mod tests {
     fn named_screens_go_where_the_settings_put_them() {
         let place = |vertical, horizontal| ScreenPlace { vertical, horizontal };
         let mut s = settings(|s| s.split = S::Vertical1To1);
-        s.screens.insert("F1".into(), place(Place::LeftOrBottom, Place::LeftOrBottom));
-        s.screens.insert("City".into(), place(Place::RightOrTop, Place::RightOrTop));
-        s.screens.insert("Help".into(), place(Place::Floating, Place::Floating));
+        s.screen_place = place(Place::LeftOrBottom, Place::RightOrTop);
         let fitted = |s: &Settings, kind: &str| {
             let mut l = Layout::default();
             l.apply_settings(s);
@@ -5082,15 +5855,25 @@ mod tests {
         assert_eq!((rect(&a), a.zoom, a.x, a.y), ([0, 0, 400, 600], (1, 1), 1200, 500));
         assert_eq!((rect(&b), b.zoom), ([404, 0, 396, 600], (1, 1)));
         assert!(f.placed.iter().all(|&i| !f.cameras[i as usize].cells));
-        let (fit, f) = fitted(&s, "City");
+        // One setting for every screen the driver names (Menu included while
+        // the place is not floating).
+        for kind in ["F1", "F7", "City", "Palace", "Spy", "Help", "Menu", "Diplomacy"] {
+            assert_eq!(fitted(&s, kind).0.map(|f| f.hit), Some(Hit::Main), "{kind}");
+        }
+        let right = Settings { screen_place: place(Place::RightOrTop, Place::Floating), ..s.clone() };
+        let (fit, f) = fitted(&right, "City");
         assert_eq!(fit, Some(Fit { hit: Hit::Pane, source: [0, 0, 800, 600], origin: (404, 0), zoom: (99, 200) }));
         assert_eq!(camera_at(&f, (0, 0)), a);
         assert_eq!(camera_at(&f, (404, 0)), b);
-        assert_eq!(fitted(&s, "Help").0, None);
-        assert_eq!(fitted(&s, "F7").0, None);
+        let floating = Settings { screen_place: place(Place::Floating, Place::Floating), ..s.clone() };
+        assert_eq!(fitted(&floating, "Help").0, None);
+        assert_eq!(fitted(&floating, "City").0, None);
+        // The horizontal split uses the other orientation's place.
         let h = Settings { split: S::Horizontal1To1, ..s.clone() };
-        assert_eq!(fitted(&h, "F1").0.map(|f| f.hit), Some(Hit::Pane));
+        assert_eq!(fitted(&h, "F1").0.map(|f| f.hit), Some(Hit::Main));
         assert_eq!(fitted(&h, "City").0.map(|f| f.hit), Some(Hit::Main));
+        let h = Settings { split: S::Horizontal1To1, screen_place: place(Place::Floating, Place::LeftOrBottom), ..s.clone() };
+        assert_eq!(fitted(&h, "F5").0.map(|f| f.hit), Some(Hit::Pane));
         let one = Settings { split: S::Standard, ..s };
         assert_eq!(fitted(&one, "F1").0, None);
     }
@@ -5098,7 +5881,7 @@ mod tests {
     #[test]
     fn a_screen_placed_over_b_takes_its_clicks_without_replacing_either_world_camera() {
         let mut s = settings(|s| s.split = S::Vertical1To1);
-        s.screens.insert("F4".into(), ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating });
+        s.screen_place = ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating };
         let mut l = Layout::default();
         l.apply_settings(&s);
         let before = l.frame(&scene(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
@@ -5122,12 +5905,52 @@ mod tests {
     }
 
     #[test]
+    fn a_cursor_mirrored_in_b_is_drawn_under_its_menu_and_the_pointer_in_a_on_top() {
+        use viewer_settings::Resolution;
+        let mut s = settings(|s| s.split = S::Vertical1To1);
+        s.screen_place = ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating };
+        let mut l = Layout::default();
+        l.apply_settings(&s);
+        let plan = crate::scaling::plan((800, 600), 1.0, (800, 600), &Resolution::default());
+        let menu = with_screen("F4");
+        l.frame(&scene(), plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
+        let mut f = l.frame(&menu, plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
+        crate::scaling::arrange_panned(&plan, &menu, &mut f, &mut l.menu_pan, |_| Some([0, 0, 800, 600]));
+        let a = f.cameras.iter().position(|c| c.cells && !c.stacked && c.origin == (0, 0)).unwrap();
+        let b = f.cameras.iter().position(|c| c.cells && !c.stacked && c.origin.0 >= 400).unwrap();
+        // The cursor's places: after both worlds, before the interface.
+        assert_eq!(f.cursor_slots.len(), 2, "one each for A and B: {:?}", f.cameras);
+        let (first, last) = (f.cursor_slots[0] as usize, *f.cursor_slots.last().unwrap() as usize);
+        assert!(a < first && b < first);
+        let ui: Vec<usize> = f.view_cameras.iter().zip(&menu.views).filter(|(_, v)| v.view.interface_only)
+            .filter_map(|(c, _)| c.map(|c| c as usize)).chain(f.placed.iter().map(|&c| c as usize)).collect();
+        assert!(!ui.is_empty() && ui.iter().all(|&c| c > last), "interface {ui:?}, slots {:?}", f.cursor_slots);
+        // The world cursor drawn where the captured pointer is (A, on top)
+        // and mirrored in B (in a slot under the menu).
+        // (Both panes show about the same stretch of the world here.)
+        let (ca, cb) = (f.cameras[a], f.cameras[b]);
+        assert!((cb.x..cb.x + cb.viewport.0 as i32).contains(&(ca.x + 100)));
+        let marks = crate::cursor::Marks { world: vec![(ca.x + 100, ca.y + 100)], input: Some((100, 100)), ..Default::default() };
+        let art = crate::cursor::SetArt { set: tile_render::SpriteSetId::from_raw(1), size: (32, 32), hotspot: (1, 1), anchor: (-1, -1) };
+        let overlay = f.cameras.len() as u32;
+        for scale in [crate::cursor::Scale::default(), crate::cursor::Scale::new(48, 1)] {
+            let c = crate::cursor::compose(art, &marks, &f.cameras, &f.cursor_slots, scale, plan.canvas(), overlay, (0, 0));
+            let views: Vec<usize> = c.sprites.iter().map(|s| s.view.unwrap() as usize).collect();
+            assert_eq!(views.len(), 2, "{scale:?} {:?}", c.sprites);
+            assert!(views.iter().any(|v| f.cursor_slots.contains(&(*v as u32))), "mirror under the menu: {views:?}");
+            assert!(views.iter().any(|&v| v >= overlay as usize), "pointer on top: {views:?}");
+            assert!(c.slots.iter().all(|(slot, _)| (*slot as usize) > b && ui.iter().all(|&u| u > *slot as usize)));
+        }
+    }
+
+    #[test]
     fn hotkey_menus_keep_the_opening_mouse_view_and_requested_size_until_closed() {
         use viewer_settings::Resolution;
         for pixel_scale in 1..=6 {
             for split in [S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
                 for side in [Side::A, Side::B] {
-                    let plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &Resolution { pixel_scale, menu_scale: 1.5, ..Default::default() });
+                    let mut plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &Resolution { pixel_scale, ..Default::default() });
+                    plan.menu.zoom = crate::scaling::ratio(1.5);
                     assert_eq!(plan.present.zoom, (pixel_scale, 1));
                     let mut l = Layout::default();
                     l.apply_settings(&settings(|s| s.split = split));
@@ -5208,7 +6031,8 @@ mod tests {
         for pixel_scale in [1, 3, 6] {
             for menu_scale in [0.75, 1.0, 3.0] {
                 for split in [S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
-                    let plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &Resolution { pixel_scale, menu_scale, ..Default::default() });
+                    let mut plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &Resolution { pixel_scale, ..Default::default() });
+                    plan.menu.zoom = crate::scaling::ratio(menu_scale);
                     let mut l = Layout::default();
                     l.apply_settings(&settings(|s| (s.split, s.roles) = (split, Roles::UnitMouse)));
                     l.driver_screen = Some(plan.screen);
@@ -5264,7 +6088,8 @@ mod tests {
         for pixel_scale in 1..=6 {
             // The separate matrix uses real 4K canvases. This pixel oracle
             // uses a smaller equivalent viewport to compare every pixel.
-            let mut plan = crate::scaling::plan((3840, 2160), 2.0, (192, 108), &Resolution { pixel_scale, menu_scale: 1.5, ..Default::default() });
+            let mut plan = crate::scaling::plan((3840, 2160), 2.0, (192, 108), &Resolution { pixel_scale, ..Default::default() });
+            plan.menu.zoom = crate::scaling::ratio(1.5);
             plan.present.canvas = (384 / pixel_scale, 216 / pixel_scale);
             let mut l = Layout::default();
             l.apply_settings(&settings(|s| s.split = S::Vertical1To1));
@@ -5320,7 +6145,7 @@ mod tests {
     fn a_menu_over_city_moves_only_the_active_menu_panel() {
         let mut settings = settings(|s| s.split = S::Vertical1To1);
         settings.menu_follows_pointer = false;
-        settings.screens.insert("Menu".into(), ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating });
+        settings.screen_place = ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating };
         let mut l = Layout::default();
         l.apply_settings(&settings);
         l.driver_screen = Some((1920, 1080));
@@ -5360,7 +6185,8 @@ mod tests {
         assert_eq!(f.menu_region, l.panes().1);
         assert_eq!(l.shown.iter().filter(|(hit, _)| matches!(hit, Hit::Main | Hit::Pane)).count(), 2);
         assert!(f.placed.is_empty());
-        let plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &viewer_settings::Resolution { pixel_scale: 3, menu_scale: 1.25, ..Default::default() });
+        let mut plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &viewer_settings::Resolution { pixel_scale: 3, ..Default::default() });
+        plan.menu.zoom = crate::scaling::ratio(1.25);
         let arranged = crate::scaling::arrange_panned(&plan, &s, &mut f, &mut l.menu_pan, |_| Some([448, 156, 1024, 768]));
         let ui = f.cameras[f.view_cameras[3].unwrap() as usize];
         assert_eq!(ui.zoom, (5, 4));
@@ -5392,7 +6218,7 @@ mod tests {
             world.add_layer(LayerSpec::new("ground", vec![green]));
             let name = if city { "City" } else { "F1" };
             let mut settings = settings(|s| s.split = S::Vertical1To1);
-            settings.screens.insert(name.into(), ScreenPlace { vertical: Place::LeftOrBottom, horizontal: Place::Floating });
+            settings.screen_place = ScreenPlace { vertical: Place::LeftOrBottom, horizontal: Place::Floating };
             let mut l = Layout::default();
             l.apply_settings(&settings);
             l.driver_screen = Some((80, 60));
@@ -5436,8 +6262,9 @@ mod tests {
                     for city in [false, true] {
                         let name = if city { "City" } else { "F1" };
                         let mut settings = settings(|s| s.split = split);
-                        settings.screens.insert(name.into(), ScreenPlace { vertical: place, horizontal: place });
-                        let plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &Resolution { pixel_scale, menu_scale: 3.0, ..Default::default() });
+                        settings.screen_place = ScreenPlace { vertical: place, horizontal: place };
+                        let mut plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &Resolution { pixel_scale, ..Default::default() });
+                        plan.menu.zoom = crate::scaling::ratio(3.0);
                         let mut l = Layout::default();
                         l.apply_settings(&settings);
                         l.driver_screen = Some(plan.screen);
@@ -6070,6 +6897,89 @@ mod tests {
         assert!(f.view_cameras[2].is_some() && f.view_cameras[3].is_none());
     }
 
+    /// A full screen open (`kind`), with the hint view the driver sends
+    /// meanwhile (259: its corner buttons are not there).
+    fn screen_with_hint(kind: &str) -> Scene {
+        let mut s = with_screen(kind);
+        s.views.push(ViewState { id: 259, view: View { interface_only: true, origin: (8, 8), viewport: (133, 38), ..Default::default() }, overlay: vec![] });
+        s.interface.capture_hint = Some(259);
+        // (The game's semantic camera focus: every map point is a world one.)
+        s.camera_focus = Some(scene::CameraFocus { serial: 1, center: (3000, 2000) });
+        s
+    }
+
+    fn screen_layout(place: Place, roles: Roles, ui_in_pane: bool) -> Layout {
+        let mut settings = settings(|s| (s.split, s.roles) = (S::Vertical1To1, roles));
+        settings.screen_place = ScreenPlace { vertical: place, horizontal: Place::Floating };
+        let mut l = Layout::default();
+        l.apply_settings(&settings);
+        if ui_in_pane {
+            l.configure("ui=pane").unwrap();
+        }
+        frame(&mut l, vec![]);
+        l
+    }
+
+    fn hint_at(l: &mut Layout, s: &Scene) -> Option<(i32, i32)> {
+        let f = l.frame(s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let i = s.views.iter().position(|v| v.id == 259).unwrap();
+        f.view_cameras[i].map(|c| f.cameras[c as usize].origin)
+    }
+
+    #[test]
+    fn beside_a_screen_the_world_takes_world_input_and_the_screen_its_own() {
+        for (place, screen_at, world_at) in [(Place::LeftOrBottom, (200, 150), (600, 300)), (Place::RightOrTop, (600, 150), (200, 300))] {
+            for kind in ["F1", "City", "Civilopedia"] {
+                let mut l = screen_layout(place, Roles::Free, false);
+                let s = screen_with_hint(kind);
+                l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                // The other view: hover, presses and keys on the world (the
+                // driver plays them on its map while the screen stays open).
+                let out = mv(&mut l, world_at);
+                assert!(out.iter().any(|i| matches!(i, Input::WorldMove { .. })), "{place:?} {kind}: {out:?}");
+                let out = click(&mut l, world_at);
+                assert!(out.iter().any(|i| matches!(i, Input::WorldButton { button: Button::Left, down: true, .. })), "{place:?} {kind}: {out:?}");
+                assert!(!out.iter().any(|i| matches!(i, Input::MouseButton { .. })), "{place:?} {kind}: {out:?}");
+                assert!(matches!(key(&mut l, 0x47, true)[..], [Input::WorldKey { vk: 0x47, down: true, .. }]), "{place:?} {kind}");
+                key(&mut l, 0x47, false);
+                // The screen: its own clicks, at its window pixels.
+                mv(&mut l, screen_at);
+                let out = click(&mut l, screen_at);
+                assert!(matches!(out[..], [Input::MouseButton { button: Button::Left, down: true, .. }, ..]), "{place:?} {kind}: {out:?}");
+                assert!(!out.iter().any(|i| matches!(i, Input::WorldButton { .. })), "{place:?} {kind}: {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn beside_a_screen_a_captured_mouse_shows_how_to_let_it_go() {
+        // The screen in A (the placement setting) or the whole window
+        // fitted into A (ui=pane); the mouse captured in B beside it (the
+        // view following the pointer).
+        for (place, ui_in_pane, world_at, hint) in [
+            (Place::LeftOrBottom, false, (600, 300), (412, 8)),
+            (Place::LeftOrBottom, true, (600, 300), (412, 8)),
+        ] {
+            for kind in ["F1", "City"] {
+                let what = format!("{place:?}, ui in pane {ui_in_pane}, {kind}");
+                let mut l = screen_layout(place, Roles::UnitMouse, ui_in_pane);
+                let s = screen_with_hint(kind);
+                l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                assert_eq!(hint_at(&mut l, &s), None, "{what}: free, no hint");
+                mv(&mut l, world_at);
+                click(&mut l, world_at);
+                assert!(l.captured(), "{what}");
+                assert_eq!(hint_at(&mut l, &s), Some(hint), "{what}: the hint at the captured world's top-left");
+                // Let go: no hint.
+                key(&mut l, VK_CONTROL, true);
+                key(&mut l, VK_CONTROL, false);
+                assert!(!l.captured(), "{what}");
+                assert_eq!(hint_at(&mut l, &s), None, "{what}");
+            }
+        }
+    }
+
     #[test]
     fn a_popup_opening_while_the_mouse_is_captured_gets_the_pointer() {
         let mut l = arranged(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse)));
@@ -6171,7 +7081,7 @@ mod tests {
         assert_eq!((l.take_grab(), l.take_warp(), l.pointer), (Some(false), Some((500, 400)), (500, 400)));
         // Fitted into A (the settings place it there): where it shows.
         let mut l2 = arranged(&unit_mouse);
-        l2.screen_places.insert("City".into(), ScreenPlace { vertical: Place::LeftOrBottom, horizontal: Place::Floating });
+        l2.screen_place = ScreenPlace { vertical: Place::LeftOrBottom, horizontal: Place::Floating };
         mv(&mut l2, (600, 300));
         frame(&mut l2, vec![]);
         click(&mut l2, (600, 300));
@@ -6205,7 +7115,7 @@ mod tests {
         assert!(l.captured());
         let after = frame(&mut l, vec![]);
         assert_eq!(camera_at(&after, (404, 0)), b);
-        let (w, h) = b.source_size();
+        let (w, h) = b.world_size();
         assert_eq!(l.cursor, (b.x + w as i32 / 2, b.y + h as i32 / 2));
     }
 
@@ -6424,7 +7334,7 @@ mod tests {
         let f = frame(&mut l, vec![]);
         assert!(f.markers.contains(&Marker::Cursor((3000, 2000))));
         let b = camera_at(&f, (404, 0));
-        let (sw, sh) = b.source_size();
+        let (sw, sh) = b.world_size();
         assert_eq!((b.x + sw as i32 / 2, b.y + sh as i32 / 2), (3000, 2000));
         assert!(inside([f.cameras[0].x, f.cameras[0].y, 400, 600], (3000, 2000)));
         // At the edge of the world that does not wrap it moves off the
@@ -6688,4 +7598,643 @@ mod tests {
         assert!(l.pointer_walls().unwrap().iter().any(|&r| inside(r, (x, strip[1]))));
     }
 
+
+    // ---- Popups opened at a world click --------------------------------
+
+    /// The parked game camera's scene (every map click a world click) and
+    /// the same with a popup of `size` (driver pixels) the driver anchors
+    /// at `anchor`.
+    fn parked() -> Scene {
+        let mut s = scene();
+        s.camera_focus = Some(scene::CameraFocus { serial: 1, center: (3000, 2000) });
+        s
+    }
+
+    fn with_anchored_popup(anchor: scene::PopupAnchor, size: (u32, u32)) -> Scene {
+        let mut s = parked();
+        s.interface.popup = Some(257);
+        s.interface.popup_anchor = Some(anchor);
+        s.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (40, 30), viewport: size, ..Default::default() }, overlay: vec![] });
+        s
+    }
+
+    fn world_press(l: &mut Layout, button: Button, p: (i32, i32)) -> (i32, i32) {
+        let out = l.route(Input::MouseButton { button, down: true, x: p.0, y: p.1 });
+        let w = out.iter().find_map(|i| match *i { Input::WorldButton { x, y, down: true, .. } => Some((x, y)), _ => None }).unwrap_or_else(|| panic!("no world press at {p:?}: {out:?}"));
+        l.route(Input::MouseButton { button, down: false, x: p.0, y: p.1 });
+        w
+    }
+
+    /// The canvas pixel `camera` shows world pixel `w` at (in the wrap image
+    /// nearest `near`).
+    fn shown_at(camera: &Camera, w: (i32, i32), near: (i32, i32), period: (i32, i32)) -> (i32, i32) {
+        let (n, d) = (camera.zoom.0 as i32, camera.zoom.1 as i32);
+        let axis = |w: i32, c: i32, o: i32, near: i32, period: i32| {
+            let mut rel = w - c;
+            if period > 0 {
+                let want = (near - o) * d / n;
+                rel += (want - rel + period / 2).div_euclid(period) * period;
+            }
+            o + (rel * n).div_euclid(d)
+        };
+        (axis(w.0, camera.x, camera.origin.0, near.0, period.0), axis(w.1, camera.y, camera.origin.1, near.1, period.1))
+    }
+
+    #[test]
+    fn a_menu_opened_at_a_world_click_has_its_corner_there_in_that_view() {
+        let menu = (160, 120);
+        for split in [S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
+            for roles in [Roles::Free, Roles::UnitMouse] {
+                for zoom in [ONE, ONE + 2, ONE - 2] {
+                    for menu_scale in [(1, 1), (2, 1), (3, 2)] {
+                        for side in [Side::A, Side::B] {
+                            let what = format!("{split:?} {roles:?} zoom {:?} menu {menu_scale:?} {side:?}", ZOOMS[zoom]);
+                            let mut l = Layout::default();
+                            l.apply_settings(&settings(|s| (s.split, s.roles) = (split, roles)));
+                            l.main_view.zoom = zoom;
+                            l.split.as_mut().unwrap().view.zoom = zoom;
+                            l.menu_scale = menu_scale;
+                            let s = parked();
+                            for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                            let (a, b) = l.panes();
+                            let pane = if side == Side::A { a } else { b.unwrap() };
+                            // Near the pane's top-left: the menu fits.
+                            let p = (pane[0] + 37, pane[1] + 23);
+                            let captures = roles == Roles::UnitMouse && side == Side::B;
+                            let (at, w) = if captures {
+                                // A click into B captures the mouse; the next goes
+                                // to the world cursor (the middle of B).
+                                click(&mut l, p);
+                                assert!(l.captured(), "{what}");
+                                l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                                let at = l.cursor_on_window().unwrap();
+                                (at, world_press(&mut l, Button::Right, at))
+                            } else {
+                                (p, world_press(&mut l, Button::Left, p))
+                            };
+                            let before = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                            let open = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, menu);
+                            let f = l.frame(&open, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                            let (corner, z) = f.popup_at.unwrap_or_else(|| panic!("{what}: not anchored"));
+                            assert_eq!(z, menu_scale, "{what}");
+                            let step = |v: i32| (v * z.0 as i32).div_euclid(z.1 as i32);
+                            let (n, d) = ZOOMS[zoom];
+                            let slack = (n / d).max(1) as i32;
+                            // The clicked world pixel as its view shows it now, the
+                            // menu one menu pixel past it.
+                            let now = camera_at(&f, (pane[0], pane[1]));
+                            let q = shown_at(&now, w, at, (8000, 0));
+                            assert_eq!(corner, (q.0 + step(1), q.1 + step(1)), "{what}");
+                            // Not kept out of the other view, nor anywhere else.
+                            assert_eq!(f.popup_region, None, "{what}");
+                            let fits = at.0 + step(1) + scaled_up(menu.0 as i32, z) <= 800 && at.1 + step(1) + scaled_up(menu.1 as i32, z) <= 600;
+                            if fits {
+                                // There: where the click was (to the art pixel).
+                                assert!((q.0 - at.0).abs() < slack && (q.1 - at.1).abs() < slack, "{what}: {corner:?} for a click at {at:?}");
+                            }
+                            // Fitting, no view moved for it; else only the clicked one.
+                            for origin in [(a[0], a[1]), (b.unwrap()[0], b.unwrap()[1])] {
+                                let (x, y) = (camera_at(&before, origin), camera_at(&f, origin));
+                                if fits || origin != (pane[0], pane[1]) {
+                                    assert_eq!((x.x, x.y), (y.x, y.y), "{what}: the view at {origin:?} moved");
+                                }
+                            }
+                            assert!(corner.0 + scaled_up(menu.0 as i32, z) <= 800 && corner.1 + scaled_up(menu.1 as i32, z) <= 600, "{what}: {corner:?}");
+                            if captures {
+                                assert!(!l.captured(), "{what}: the mouse is let go for the menu");
+                                assert_eq!(l.pointer, at, "{what}: the pointer stays at the click, the menu's corner");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_tile_box_is_placed_from_its_tiles_world_pixel_across_the_wrap_seam() {
+        // A world pixel just past the seam (the game anchors the box half a
+        // tile left of its tile): drawn next to the click, not a world away.
+        let mut l = Layout::default();
+        l.apply_settings(&settings(|s| s.split = S::Vertical1To1));
+        let s = parked();
+        for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        let p = (100, 100);
+        let w = world_press(&mut l, Button::Right, p);
+        let anchor = (w.0 - 8000 - 64, w.1 - 20);
+        let f = l.frame(&with_anchored_popup(scene::PopupAnchor { world: anchor, offset: (0, 0), world_scaled: false }, (256, 173)), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(f.popup_at, Some(((p.0 - 64, p.1 - 20), (1, 1))));
+    }
+
+    #[test]
+    fn a_menu_past_the_windows_edge_moves_its_view_just_enough() {
+        let menu = (200, 150);
+        for roles in [Roles::Free, Roles::UnitMouse] {
+            for side in [Side::A, Side::B] {
+                for zoom in [ONE, ONE + 2] {
+                    let what = format!("{roles:?} {side:?} zoom {:?}", ZOOMS[zoom]);
+                    let mut l = Layout::default();
+                    l.apply_settings(&settings(|s| (s.split, s.roles) = (S::Horizontal1To1, roles)));
+                    l.main_view.zoom = zoom;
+                    l.split.as_mut().unwrap().view.zoom = zoom;
+                    let s = parked();
+                    for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                    let (a, b) = l.panes();
+                    let pane = if side == Side::A { a } else { b.unwrap() };
+                    // Near the window's bottom-right corner.
+                    let p = (pane[0] + pane[2] - 30, pane[1] + pane[3] - 20);
+                    let captures = roles == Roles::UnitMouse && side == Side::B;
+                    let (at, w) = if captures {
+                        click(&mut l, p);
+                        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                        let at = l.cursor_on_window().unwrap();
+                        (at, world_press(&mut l, Button::Left, at))
+                    } else {
+                        (p, world_press(&mut l, Button::Left, p))
+                    };
+                    let before = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    let other = if side == Side::A { (b.unwrap()[0], b.unwrap()[1]) } else { (a[0], a[1]) };
+                    let mine = (pane[0], pane[1]);
+                    let open = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, menu);
+                    let f = l.frame(&open, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    let ((x, y), _) = f.popup_at.unwrap();
+                    // Whole in the window, its corner still at the clicked pixel.
+                    let need = ((at.0 + 1 + menu.0 as i32 - 800).max(0), (at.1 + 1 + menu.1 as i32 - 600).max(0));
+                    let (n, d) = ZOOMS[zoom];
+                    let world = (world_steps(need.0, (n, d)), world_steps(need.1, (n, d)));
+                    let (c0, c1) = (camera_at(&before, mine), camera_at(&f, mine));
+                    if captures {
+                        // (The pointer's view keeps the world cursor in its middle:
+                        // the move is the popup's, gone once it closes.)
+                        assert_eq!((c1.x - c0.x, c1.y - c0.y), world, "{what}");
+                    } else {
+                        assert_eq!((c1.x - c0.x, c1.y - c0.y), world, "{what}: moved by the least that fits");
+                    }
+                    assert!(x + menu.0 as i32 <= 800 && y + menu.1 as i32 <= 600 && x >= 0 && y >= 0, "{what}: {:?}", (x, y));
+                    assert_eq!((x, y), { let q = shown_at(&c1, w, at, (8000, 0)); (q.0 + 1, q.1 + 1) }, "{what}");
+                    assert!(x + menu.0 as i32 > 800 - 2 * (n / d) as i32 || y + menu.1 as i32 > 600 - 2 * (n / d) as i32, "{what}: no further than needed");
+                    // The other view stays.
+                    let (o0, o1) = (camera_at(&before, other), camera_at(&f, other));
+                    assert_eq!((o0.x, o0.y), (o1.x, o1.y), "{what}");
+                    // Closed: a view following the pointer is back on the cursor,
+                    // a free or focus view stays where it was moved.
+                    let after = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    let c2 = camera_at(&after, mine);
+                    if captures { assert_eq!((c2.x, c2.y), (c0.x, c0.y), "{what}"); } else { assert_eq!((c2.x, c2.y), (c1.x, c1.y), "{what}: a view moved for the menu stays moved"); }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn opening_any_popup_leaves_every_view_where_it_was() {
+        // A generic popup (no anchor) and one at a click: the views do not
+        // follow anything to it.
+        for roles in [Roles::Free, Roles::UnitMouse] {
+            for anchored in [false, true] {
+                let mut l = Layout::default();
+                l.apply_settings(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, roles)));
+                let s = parked();
+                for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                let w = world_press(&mut l, Button::Right, (100, 100));
+                let before = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                let mut open = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, (120, 90));
+                if !anchored { open.interface.popup_anchor = None; }
+                for _ in 0..3 {
+                    let f = l.frame(&open, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    for origin in [(0, 0), (404, 0)] {
+                        let (x, y) = (camera_at(&before, origin), camera_at(&f, origin));
+                        assert_eq!((x.x, x.y, x.zoom), (y.x, y.y, y.zoom), "{roles:?} anchored {anchored}: {origin:?}");
+                    }
+                    assert_eq!(f.popup_at.is_some(), anchored);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_dialog_replacing_a_click_menu_is_not_anchored() {
+        let mut l = Layout::default();
+        l.apply_settings(&settings(|s| s.split = S::Vertical1To1));
+        let s = parked();
+        for _ in 0..2 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        let w = world_press(&mut l, Button::Right, (100, 100));
+        let menu = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, (120, 90));
+        assert_eq!(l.frame(&menu, (800, 600), (0, 0, 0, 0), vec![], BOUNDS).popup_at, Some(((101, 101), (1, 1))));
+        // An entry chosen: the game's dialog in the same popup view.
+        let mut dialog = menu.clone();
+        dialog.interface.popup_anchor = None;
+        for _ in 0..2 {
+            let f = l.frame(&dialog, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert_eq!((f.popup_at, f.popup_region), (None, Some(l.panes().0)));
+        }
+        // An anchor the driver gives with no recent click is not taken.
+        for _ in 0..200 { l.advance(std::time::Duration::from_millis(20)); l.frame(&dialog, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        assert_eq!(l.frame(&menu, (800, 600), (0, 0, 0, 0), vec![], BOUNDS).popup_at, None);
+    }
+
+    #[test]
+    fn a_tile_box_is_drawn_at_its_views_world_scale_and_a_menu_at_the_menus() {
+        // The game draws the box's picture of a tile as large as its map's
+        // tiles (1:1). The box opened in a view goes at that view's world
+        // zoom (picture, frame and text alike), never below the frame's
+        // (HUD) scale; a context menu stays at the menus' scale.
+        for side in [Side::A, Side::B] {
+            for (world_scale, zoom) in [((3, 2), ONE), ((3, 2), ONE + 2), ((1, 1), ONE - 2)] {
+                let what = format!("{side:?} world {world_scale:?} zoom {:?}", ZOOMS[zoom]);
+                let mut l = Layout::default();
+                l.apply_settings(&settings(|s| s.split = S::Vertical1To1));
+                l.world_scale = world_scale;
+                l.main_view.zoom = zoom;
+                l.split.as_mut().unwrap().view.zoom = zoom;
+                (l.menu_scale, l.hud_scale) = ((8, 3), (1, 1));
+                let s = parked();
+                for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                let (a, b) = l.panes();
+                let pane = if side == Side::A { a } else { b.unwrap() };
+                let p = (pane[0] + 40, pane[1] + 30);
+                let w = world_press(&mut l, Button::Right, p);
+                let tile_box = with_anchored_popup(scene::PopupAnchor { world: (w.0 - 64, w.1 - 23), offset: (0, 0), world_scaled: true }, (256, 173));
+                let f = l.frame(&tile_box, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                let (_, z) = f.popup_at.unwrap_or_else(|| panic!("{what}: not anchored"));
+                let view = camera_at(&f, (pane[0], pane[1])).zoom;
+                let want = if view.0 >= view.1 { view } else { l.hud_scale };
+                assert_eq!(z.0 as u64 * want.1 as u64, want.0 as u64 * z.1 as u64, "{what}: {z:?}, the view's {view:?}");
+                l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                let w = world_press(&mut l, Button::Right, p);
+                let menu = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, (120, 90));
+                assert_eq!(l.frame(&menu, (800, 600), (0, 0, 0, 0), vec![], BOUNDS).popup_at.map(|p| p.1), Some((8, 3)), "{what}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_world_scaled_popup_fits_the_window_even_when_the_hud_is_larger() {
+        let mut l = Layout::default();
+        l.window = (400, 200);
+        l.hud_scale = (3, 1);
+        assert_eq!(l.popup_zoom((256, 173), Some((3, 2))), (200, 173));
+        assert_eq!(l.popup_zoom((500, 100), Some((3, 2))), (4, 5));
+    }
+
+    #[test]
+    fn a_popup_opened_at_a_world_click_holds_every_view_still() {
+        // No edge scrolling, wheel, drag or captured motion moves a view
+        // while a context menu or the tile box is open; closed, they do.
+        let cams = |f: &Frame| [(0, 0), (404, 0)].map(|o| { let c = camera_at(f, o); (c.x, c.y, c.zoom) });
+        for movement in [viewer_settings::MapMovement::EdgeScroll, viewer_settings::MapMovement::Drag] {
+            for world_scaled in [false, true] {
+                let what = format!("{movement:?} tile box {world_scaled}");
+                let mut l = Layout::default();
+                l.apply_settings(&settings(|s| s.split = S::Vertical1To1));
+                l.set_map_movement(movement);
+                let s = parked();
+                for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                // (A right press waits for its release: it may be a go-to drag.)
+                let mut out = l.route(Input::MouseButton { button: Button::Right, down: true, x: 200, y: 200 });
+                out.extend(l.route(Input::MouseButton { button: Button::Right, down: false, x: 200, y: 200 }));
+                let w = out.iter().find_map(|i| match *i { Input::WorldButton { x, y, down: true, .. } => Some((x, y)), _ => None }).expect("a world press");
+                let open = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled }, (120, 90));
+                let before = l.frame(&open, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                assert!(l.click_popup_open(), "{what}");
+                // At the window's left edge.
+                mv(&mut l, (1, 300));
+                for _ in 0..30 { l.advance(std::time::Duration::from_millis(20)); l.frame(&open, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                assert!(l.route(Input::Wheel { delta: -120, x: 300, y: 300 }).is_empty(), "{what}");
+                // A middle or left drag on the world grabs nothing: it dismisses.
+                for button in [Button::Middle, Button::Left] {
+                    assert_eq!(l.route(Input::MouseButton { button, down: true, x: 300, y: 300 }), vec![Input::DismissPopup], "{what} {button:?}");
+                    mv(&mut l, (500, 450));
+                    assert!(l.route(Input::MouseButton { button, down: false, x: 500, y: 450 }).is_empty(), "{what} {button:?}");
+                }
+                let c = l.cursor;
+                assert!(l.motion((60.0, 40.0)).is_empty() && l.cursor == c, "{what}");
+                let after = l.frame(&open, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                assert_eq!(cams(&before), cams(&after), "{what}");
+                if movement == viewer_settings::MapMovement::EdgeScroll {
+                    // Closed: the edge scrolls A again.
+                    l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    mv(&mut l, (1, 300));
+                    for _ in 0..30 { l.advance(std::time::Duration::from_millis(20)); l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                    let moved = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    assert_ne!(cams(&moved)[0], cams(&after)[0], "{what}: the edge scrolls once it is closed");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_scaled_world_popup_body_accepts_clicks_after_the_final_interface_map_is_installed() {
+        let mut layout = Layout::default();
+        let base = parked();
+        for _ in 0..3 { layout.frame(&base, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        let world = world_press(&mut layout, Button::Right, (120, 140));
+        let parent = with_anchored_popup(scene::PopupAnchor { world, offset: (1, 1), world_scaled: false }, (120, 90));
+        let mut frame = layout.frame(&parent, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let (at, _) = frame.popup_at.unwrap();
+        let plan = crate::scaling::plan((800, 600), 1.0, (800, 600), &viewer_settings::Resolution::default());
+        let arranged = crate::scaling::arrange(&plan, &parent, &mut frame, |_| None);
+        layout.set_interface_shown(arranged.shown);
+        let out = click(&mut layout, (at.0 + 30, at.1 + 30));
+        assert!(!out.contains(&Input::DismissPopup), "the body's final hit map is not an outside click: {out:?}");
+        assert!(out.iter().any(|i| matches!(i, Input::MouseButton { down: true, .. })), "{out:?}");
+    }
+
+    #[test]
+    fn a_world_anchored_parent_popup_keeps_its_place_and_world_under_a_nested_prompt() {
+        let mut layout = Layout::default();
+        let base = parked();
+        for _ in 0..3 { layout.frame(&base, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        let world = world_press(&mut layout, Button::Right, (120, 140));
+        let parent = with_anchored_popup(scene::PopupAnchor { world, offset: (1, 1), world_scaled: false }, (120, 90));
+        let before = layout.frame(&parent, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let place = before.popup_at.unwrap();
+        let world_cameras: Vec<_> = layout.shown.iter().map(|(hit, camera)| (*hit, *camera)).collect();
+        let mut nested = parent.clone();
+        nested.interface.popup_anchor = None;
+        nested.interface.popup = Some(259);
+        nested.interface.modal_stack = scene::ModalStack([Some(257), Some(259), None, None]);
+        nested.views.push(scene::ViewState { id: 259, view: scene::View { interface_only: true, origin: (500, 10), viewport: (240, 120), ..Default::default() }, overlay: vec![scene::FreeSprite::default()] });
+        let frame = layout.frame(&nested, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(frame.popup_places.contains(&(257, place)), "the old click remains the parent's anchor");
+        assert_eq!(layout.shown, world_cameras, "pushing a child never moves the world");
+        let mut exposed = parent.clone();
+        exposed.interface.popup_anchor = None; // The click may now be arbitrarily old.
+        let frame = layout.frame(&exposed, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(frame.popup_at, Some(place), "popping the child keeps the original parent placement");
+        assert_eq!(layout.shown, world_cameras);
+    }
+
+    #[test]
+    fn a_press_on_the_hud_outside_a_click_popup_only_dismisses_it() {
+        let mut l = Layout::default();
+        let s = parked();
+        for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        let w = world_press(&mut l, Button::Right, (100, 100));
+        let open = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, (120, 90));
+        l.frame(&open, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        l.moved.push(([600, 400, 100, 100], (0, 0)));
+        assert_eq!(l.hit((620, 420)), Hit::Moved(l.moved.len() - 1));
+        let zoom = l.main_view.zoom;
+        l.ctrl = true;
+        assert!(l.route(Input::Wheel { delta: 120, x: 620, y: 420 }).is_empty());
+        assert_eq!(l.main_view.zoom, zoom);
+        l.ctrl = false;
+        assert_eq!(click(&mut l, (620, 420)), vec![Input::DismissPopup]);
+        assert!(!click(&mut l, (130, 130)).contains(&Input::DismissPopup));
+    }
+
+    #[test]
+    fn a_press_beside_a_popup_opened_at_a_world_click_only_dismisses_it() {
+        let mut l = Layout::default();
+        l.apply_settings(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse)));
+        let s = parked();
+        for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        let open_at_cursor = |l: &mut Layout| {
+            // Captured in B, a right press at the world cursor opens it there.
+            if !l.captured() { click(l, (600, 300)); }
+            assert!(l.captured());
+            l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            let at = l.cursor_on_window().unwrap();
+            let w = world_press(l, Button::Right, at);
+            let open = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, (120, 90));
+            l.frame(&open, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert!(!l.captured() && l.click_popup_open(), "the mouse is let go for it");
+            open
+        };
+        let open = open_at_cursor(&mut l);
+        // A right press on A's world: it is dismissed, nothing else (no
+        // world press, no look), its release goes nowhere.
+        assert_eq!(l.route(Input::MouseButton { button: Button::Right, down: true, x: 100, y: 300 }), vec![Input::DismissPopup]);
+        assert!(l.route(Input::MouseButton { button: Button::Right, down: false, x: 100, y: 300 }).is_empty());
+        // Recapturing (a left click into B) dismisses it as well.
+        assert_eq!(click(&mut l, (600, 420)), vec![Input::DismissPopup]);
+        assert!(l.captured());
+        // Until it is gone the captured mouse does not move the world cursor.
+        let c = l.cursor;
+        assert!(l.motion((40.0, 0.0)).is_empty());
+        assert_eq!(l.cursor, c);
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(!l.click_popup_open());
+        l.motion((40.0, 0.0));
+        assert_ne!(l.cursor, c, "closed: the mouse plays again");
+        // Ctrl+Shift+Space capturing it again dismisses it too.
+        let _ = open;
+        open_at_cursor(&mut l);
+        mv(&mut l, (600, 300));
+        let out = ctrl_shift(&mut l, 0x20);
+        assert!(l.captured());
+        assert_eq!(out.iter().filter(|i| **i == Input::DismissPopup).count(), 1, "{out:?}");
+        // A dialog the driver does not anchor is no such popup.
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let mut dialog = open_at_cursor(&mut l);
+        dialog.interface.popup_anchor = None;
+        l.frame(&dialog, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(!l.click_popup_open());
+        assert!(!l.route(Input::MouseButton { button: Button::Right, down: true, x: 100, y: 300 }).contains(&Input::DismissPopup));
+    }
+
+    #[test]
+    fn terrain_details_from_a_city_menu_open_at_the_menus_tile_however_long_it_was_open() {
+        // The city's menu opened at a right click, read for five seconds;
+        // its "Terrain details" opens the tile box the driver anchors at the
+        // city's tile: there, in the view the menu was opened in (whether
+        // the menu closed a frame before or the box took its place).
+        for side in [Side::A, Side::B] {
+            for zoom in [ONE, ONE - 2, ONE + 2] {
+                for gap in [false, true] {
+                    let what = format!("{side:?} zoom {:?} gap {gap}", ZOOMS[zoom]);
+                    let mut l = Layout::default();
+                    l.apply_settings(&settings(|s| s.split = S::Vertical1To1));
+                    l.main_view.zoom = zoom;
+                    l.split.as_mut().unwrap().view.zoom = zoom;
+                    let s = parked();
+                    for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                    let (a, b) = l.panes();
+                    let pane = if side == Side::A { a } else { b.unwrap() };
+                    let p = (pane[0] + 90, pane[1] + 70);
+                    let w = world_press(&mut l, Button::Right, p);
+                    let menu = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, (120, 90));
+                    for _ in 0..250 { l.advance(std::time::Duration::from_millis(20)); l.frame(&menu, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                    if gap { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                    let city = (w.0 - 50, w.1 - 20);
+                    let tile_box = with_anchored_popup(scene::PopupAnchor { world: city, offset: (0, 0), world_scaled: true }, (256, 173));
+                    let f = l.frame(&tile_box, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                    let (corner, _) = f.popup_at.unwrap_or_else(|| panic!("{what}: not at the menu's tile"));
+                    assert_eq!(corner, shown_at(&camera_at(&f, (pane[0], pane[1])), city, p, (8000, 0)), "{what}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn popups_follow_the_one_screen_place_unless_opened_at_a_click() {
+        for (place, menu_follows_pointer, want) in [
+            (Place::LeftOrBottom, true, Some(Side::A)),
+            (Place::RightOrTop, true, Some(Side::B)),
+            (Place::RightOrTop, false, Some(Side::B)),
+            (Place::Floating, true, Some(Side::B)),
+            (Place::Floating, false, None),
+        ] {
+            let mut l = Layout::default();
+            l.apply_settings(&settings(|s| {
+                s.split = S::Vertical1To1;
+                s.screen_place = ScreenPlace { vertical: place, horizontal: Place::Floating };
+                s.menu_follows_pointer = menu_follows_pointer;
+            }));
+            let s = parked();
+            for _ in 0..2 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+            // The mouse in B when it opens.
+            mv(&mut l, (600, 300));
+            let w = world_press(&mut l, Button::Right, (600, 300));
+            let mut dialog = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, (120, 90));
+            dialog.interface.popup_anchor = None;
+            let f = l.frame(&dialog, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            let (a, b) = l.panes();
+            assert_eq!(f.popup_region, want.map(|s| if s == Side::A { a } else { b.unwrap() }), "{place:?} {menu_follows_pointer}");
+            l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            // A context menu: at its click, whatever the setting.
+            let w = world_press(&mut l, Button::Right, (600, 300));
+            let f = l.frame(&with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, (120, 90)), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert_eq!((f.popup_region, f.popup_at), (None, Some(((601, 301), (1, 1)))), "{place:?}");
+            l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        }
+    }
+
+    /// A popup placed in either view of either split takes every click on
+    /// it (also between its sprites, e.g. on its body around the OK
+    /// button), never capturing the mouse; the capturing view's world not
+    /// under it still captures.
+    #[test]
+    fn clicks_on_a_popup_in_either_view_reach_it_and_never_capture() {
+        use viewer_settings::Resolution;
+        // The popup's two sprites: a title strip and an OK button, a gap
+        // of its plain body between them.
+        let rect_of = |s: &scene::FreeSprite| Some(if s.x == 0 { [760, 440, 400, 40] } else { [900, 600, 120, 30] });
+        for split in [S::Vertical1To1, S::Horizontal1To1] {
+            let mut sides = Vec::new();
+            for place in [Place::LeftOrBottom, Place::RightOrTop] {
+                let plan = crate::scaling::plan((1920, 1080), 1.0, (1920, 1080), &Resolution::default());
+                let mut l = Layout::default();
+                l.apply_settings(&settings(|s| {
+                    (s.split, s.roles) = (split, Roles::UnitMouse);
+                    s.screen_place = ScreenPlace { vertical: place, horizontal: place };
+                }));
+                l.driver_screen = Some(plan.screen);
+                l.set_walls(Walls::Open);
+                l.frame(&scene(), plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
+                let (a, b) = l.panes();
+                let b = b.unwrap();
+                // Captured in B when the popup opens.
+                mv(&mut l, (b[0] + b[2] / 2, b[1] + b[3] / 2));
+                click(&mut l, (b[0] + b[2] / 2, b[1] + b[3] / 2));
+                assert!(l.captured());
+                let mut popup = scene();
+                popup.interface.popup = Some(257);
+                let sprite = |x| scene::FreeSprite { x, ..Default::default() };
+                popup.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (760, 440), viewport: (400, 200), ..Default::default() }, overlay: vec![sprite(0), sprite(1)] });
+                let mut f = l.frame(&popup, plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
+                let region = f.popup_region.expect("placed in a view");
+                let side = if region == a { Side::A } else { assert_eq!(region, b); Side::B };
+                sides.push(side);
+                let arranged = crate::scaling::arrange_panned(&plan, &popup, &mut f, &mut l.menu_pan, rect_of);
+                l.set_interface_shown(arranged.shown);
+                let c = f.cameras[f.view_cameras[2].unwrap() as usize];
+                let at = |dx: i32, dy: i32| (c.origin.0 + dx * c.viewport.0 as i32 / 400, c.origin.1 + dy * c.viewport.1 as i32 / 200);
+                let what = format!("{split:?}, popup in {side:?}");
+                assert!(!l.captured(), "{what}: opening the popup let go of the mouse");
+                // The body between its sprites, then the OK button.
+                for (p, driver) in [(at(20, 120), (780, 560)), (at(200, 175), (960, 615))] {
+                    assert!(inside(region, p), "{what}: {p:?}");
+                    mv(&mut l, p);
+                    let out = click(&mut l, p);
+                    assert!(!l.captured(), "{what}: a click on the popup at {p:?} captured the mouse");
+                    match out.first() {
+                        Some(&Input::MouseButton { button: Button::Left, down: true, x, y }) => {
+                            assert!((x - driver.0).abs() <= 2 && (y - driver.1).abs() <= 2, "{what}: ({x}, {y}) vs {driver:?}");
+                        }
+                        other => panic!("{what}: the click on the popup went to {other:?}"),
+                    }
+                }
+                // B's world beside the popup: captured.
+                let world = (b[0] + 8, b[1] + b[3] - 8);
+                assert!(!overlap([c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32], [world.0, world.1, 1, 1]), "{what}");
+                mv(&mut l, world);
+                assert!(click(&mut l, world).is_empty(), "{what}");
+                assert!(l.captured(), "{what}: a click on B's uncovered world captures");
+            }
+            sides.sort_by_key(|s| *s == Side::B);
+            assert_eq!(sides, [Side::A, Side::B], "{split:?}");
+        }
+    }
+}
+
+impl Layout {
+    /// Adopt only the routing geometry of the frame just presented. Live
+    /// pointer, keys, gestures and desired camera changes may have advanced
+    /// while its immutable GPU packet was in flight.
+    pub(crate) fn adopt_presented_mapping(&mut self, frame: Self) {
+        self.fit = frame.fit;
+        self.placed_screen = frame.placed_screen;
+        self.screen_content = frame.screen_content;
+        self.menu_side = frame.menu_side;
+        self.popup_side = frame.popup_side;
+        self.walls = frame.walls;
+        self.reachable = frame.reachable;
+        self.screen = frame.screen;
+        self.popup_shown = frame.popup_shown;
+        self.popup_body = frame.popup_body;
+        self.popup_view = frame.popup_view;
+        self.anchored_popup_layers = frame.anchored_popup_layers;
+        self.popup_anchor = frame.popup_anchor;
+        self.anchored = frame.anchored;
+        self.popup_anchor_seen = frame.popup_anchor_seen;
+        self.chain_press = frame.chain_press;
+        self.popup_pan = frame.popup_pan;
+        self.world_period = frame.world_period;
+        self.magnifier_shown = frame.magnifier_shown;
+        self.world_shown = frame.world_shown;
+        self.beside = frame.beside;
+        self.beside_mapping = frame.beside_mapping;
+        self.focus = frame.focus;
+        self.world_downscale = frame.world_downscale;
+        self.map_wheel_step = frame.map_wheel_step;
+        self.window = frame.window;
+        self.main = frame.main;
+        self.shown = frame.shown;
+        self.interface = frame.interface;
+        self.driver_rects = frame.driver_rects;
+        self.insets_shown = frame.insets_shown;
+        self.left_out = frame.left_out;
+        self.bounds = frame.bounds;
+        self.interface_shown = frame.interface_shown;
+        self.driver_screen = frame.driver_screen;
+        self.menu_scale = frame.menu_scale;
+        self.hud_scale = frame.hud_scale;
+        self.art_zooms = frame.art_zooms;
+    }
+}
+
+#[cfg(test)]
+mod presented_mapping_tests {
+    use super::*;
+    #[test]
+    fn presenting_an_older_packet_keeps_newer_pointer_and_keys_but_installs_its_geometry() {
+        let mut active = Layout::default();
+        active.pointer = (77, 88);
+        active.raw_pointer = (79, 90);
+        active.keys_down = vec![17, 65];
+        let mut submitted = active.clone();
+        submitted.pointer = (10, 20);
+        submitted.raw_pointer = (10, 20);
+        submitted.keys_down.clear();
+        submitted.window = (640, 480);
+        submitted.interface = vec![[50, 60, 70, 80]];
+        active.adopt_presented_mapping(submitted);
+        assert_eq!(active.pointer, (77, 88));
+        assert_eq!(active.raw_pointer, (79, 90));
+        assert_eq!(active.keys_down, [17, 65]);
+        assert_eq!(active.window, (640, 480));
+        assert_eq!(active.interface, [[50, 60, 70, 80]]);
+    }
 }

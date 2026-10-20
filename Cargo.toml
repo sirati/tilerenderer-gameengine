@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/application-icon",
+    "crates/application-icon-macos",
+    "crates/pointer-x11",
+    "crates/pointer-wayland",
+    "crates/pointer-windows",
+    "crates/pointer-macos",
+    "crates/pointer-fallback",
+    "crates/pointer-control",
+    "crates/pointer-api",
     "crates/tile-render-shared",
     "crates/tile-render",
     "crates/civ3-assets",
@@ -14,6 +23,11 @@ members = [
     "crates/civ3r-native",
     "crates/tile-viewer",
     "crates/viewer-settings",
+    "crates/viewer-transport",
+    "crates/civ3r-viewer",
+    "crates/civ3r-launcher",
+    "crates/civ3r-process",
+    "crates/civ3r-sync",
     "crates/inproc",
     "crates/civ3-sys",
     "crates/civ3-bridge",
@@ -33,7 +47,7 @@ tile-render = { path = "crates/tile-render" }
 gpu-text = { path = "crates/gpu-text" }
 bytemuck = { version = "1.24", features = ["derive", "min_const_generics"] }
 glam = "0.30"
-wgpu = { version = "30", features = ["spirv"] }
+wgpu = { version = "30", features = ["spirv", "vulkan-portability"] }
 winit = "0.30"
 pollster = "0.4"
 log = { version = "0.4", features = ["std"] }

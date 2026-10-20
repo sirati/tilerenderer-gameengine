@@ -90,6 +90,79 @@ pub fn text(stats: &Stats, software: bool) -> String {
     out
 }
 
+/// Recent wall-time build samples and asynchronously returned GPU samples.
+/// Host frame intervals are never subtracted to guess CPU starvation.
+#[derive(Default)]
+pub struct Timings {
+    cpu: VecDeque<(f64, f64)>,
+    gpu: VecDeque<(f64, f64)>,
+    gaps: VecDeque<(f64, f64)>,
+    previous: Option<tile_render::timing::FrameStamp>,
+    minimum_frame: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TimingStats {
+    pub cpu_build_ms: Option<f64>,
+    pub gpu_ms: Option<f64>,
+    pub gpu_gap_ms: Option<f64>,
+}
+
+impl Timings {
+    /// Reset at a timing/device epoch boundary. Results from older queued
+    /// packets must not become samples of the newly enabled counter.
+    pub fn reset_from(&mut self, minimum_frame: u64) {
+        *self = Self { minimum_frame: Some(minimum_frame), ..Self::default() };
+    }
+
+    fn accepts(&self, frame: Option<u64>) -> bool {
+        self.minimum_frame.is_none_or(|minimum| frame.is_some_and(|frame| frame >= minimum))
+    }
+
+    pub fn cpu_frame(&mut self, frame: u64, now: f64, ms: f64) {
+        if self.accepts(Some(frame)) { self.cpu_build(now, ms); }
+    }
+
+    fn note(queue: &mut VecDeque<(f64, f64)>, now: f64, ms: f64) {
+        if ms.is_finite() && ms >= 0.0 { queue.push_back((now, ms)); }
+        while queue.front().is_some_and(|&(at, _)| at <= now - SPAN) { queue.pop_front(); }
+    }
+
+    pub fn cpu_build(&mut self, now: f64, ms: f64) {
+        Self::note(&mut self.cpu, now, ms);
+    }
+
+    pub fn gpu_frame(&mut self, now: f64, frame: &tile_render::timing::FrameTimes) {
+        if !self.accepts(frame.frame_token) { return; }
+        let stamp = frame.stamp;
+        // Never move the anchor backwards if a backend returns late results.
+        if self.previous.is_some_and(|old| stamp.frame_id <= old.frame_id) { return; }
+        Self::note(&mut self.gpu, now, frame.span);
+        if let Some(gap) = self.previous.and_then(|old| stamp.gap_after(old)) {
+            Self::note(&mut self.gaps, now, gap);
+        } else {
+            // A missing instrumented frame cannot contribute an idle gap.
+            self.gaps.clear();
+        }
+        self.previous = Some(stamp);
+    }
+
+    pub fn stats(&self, now: f64) -> TimingStats {
+        let mean = |queue: &VecDeque<(f64, f64)>| {
+            let (sum, count) = queue.iter().filter(|&&(at, _)| at > now - SPAN && at <= now)
+                .fold((0.0, 0), |(sum, count), &(_, ms)| (sum + ms, count + 1));
+            (count > 0).then(|| sum / count as f64)
+        };
+        TimingStats { cpu_build_ms: mean(&self.cpu), gpu_ms: mean(&self.gpu), gpu_gap_ms: mean(&self.gaps) }
+    }
+}
+
+pub fn detailed_text(stats: &Stats, software: bool, timings: TimingStats) -> String {
+    let value = |ms: Option<f64>| ms.map_or_else(|| "n/a".to_owned(), |ms| format!("{ms:.1} ms"));
+    let gap = timings.gpu_gap_ms.map_or_else(|| "n/a".to_owned(), |ms| format!("~{ms:.1} ms"));
+    format!("{}\nCPU build {}\nGPU {}\nGPU gap {gap}", text(stats, software), value(timings.cpu_build_ms), value(timings.gpu_ms))
+}
+
 /// How many times their 5 × 7 size the glyphs are drawn in a window of
 /// `window`: about one glyph pixel per 540 window rows (1 at 720 rows, 2
 /// at 1080, 4 at 2160), smaller where a line of `chars` characters would
@@ -129,10 +202,24 @@ pub fn line_sprites(compiled: &Compiled, line: &str, window: (u32, u32), n: u32,
         .collect()
 }
 
+fn rows_sprites(compiled: &Compiled, text: &str, window: (u32, u32), n: u32, camera: u32) -> Vec<PlacedSprite> {
+    // Use the actual available scale for row spacing, just as line_sprites does.
+    let Some(n) = (1..=n.max(1)).rev().find(|n| compiled.set(&format!("Viewer@glyphs{n}/0")).is_some()) else { return vec![] };
+    let height = render_desc::glyph_cell(n).1 as i32;
+    text.lines().enumerate().flat_map(|(row, line)| {
+        line_sprites(compiled, line, window, n, camera).into_iter().map(move |mut sprite| {
+            sprite.y += row as i32 * height;
+            sprite
+        })
+    }).filter(|sprite| sprite.y < window.1 as i32).collect()
+}
+
 /// The counter and its sprites as last made.
 #[derive(Default)]
 pub struct Overlay {
     pub counter: FrameCounter,
+    pub timings: Timings,
+    detailed: bool,
     /// The line shown and when it was made.
     line: Option<(f64, String)>,
     /// What the sprites were made for: line, window, art version, camera.
@@ -144,16 +231,19 @@ impl Overlay {
     /// The counter's sprites at `now` (seconds; the line changes every
     /// [`TEXT_EVERY`]) for a window of `window` drawn with art `version` of
     /// `compiled`, by camera `camera`.
-    pub fn sprites(&mut self, compiled: &Compiled, version: u64, now: f64, window: (u32, u32), camera: u32, software: bool) -> &[PlacedSprite] {
+    pub fn sprites(&mut self, compiled: &Compiled, version: u64, now: f64, window: (u32, u32), camera: u32, software: bool, detailed: bool) -> &[PlacedSprite] {
+        if self.detailed != detailed { self.line = None; self.detailed = detailed; }
         let stale = self.line.as_ref().is_none_or(|(at, _)| now - at >= TEXT_EVERY || now < *at);
         if stale {
-            self.line = Some((now, text(&self.counter.stats(now), software)));
+            let stats = self.counter.stats(now);
+            let text = if detailed { detailed_text(&stats, software, self.timings.stats(now)) } else { text(&stats, software) };
+            self.line = Some((now, text));
         }
         let line = &self.line.as_ref().expect("made above").1;
         let key = (line.clone(), window, version, camera);
         if self.made_for.as_ref() != Some(&key) {
-            let n = scale(window, line.chars().count() + 2);
-            self.sprites = line_sprites(compiled, line, window, n, camera);
+            let n = scale(window, line.lines().map(|row| row.chars().count() + 2).max().unwrap_or(0));
+            self.sprites = rows_sprites(compiled, line, window, n, camera);
             self.made_for = Some(key);
         }
         &self.sprites
@@ -166,6 +256,54 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn timing_reset_rejects_old_or_unidentified_worker_packets() {
+        use tile_render::timing::{FrameStamp, FrameTimes};
+        let mut timings = Timings::default();
+        timings.reset_from(100);
+        timings.cpu_frame(99, 0.0, 50.0);
+        timings.gpu_frame(0.0, &FrameTimes { span: 50.0, frame_token: Some(99), ..Default::default() });
+        timings.gpu_frame(0.0, &FrameTimes { span: 50.0, ..Default::default() });
+        assert_eq!(timings.stats(0.0), TimingStats::default());
+        timings.cpu_frame(100, 0.0, 3.0);
+        timings.gpu_frame(0.0, &FrameTimes { span: 4.0, frame_token: Some(100), stamp: FrameStamp { frame_id: 1, start: 10, end: 14, period_ns: 1_000_000.0 }, ..Default::default() });
+        assert_eq!(timings.stats(0.0), TimingStats { cpu_build_ms: Some(3.0), gpu_ms: Some(4.0), gpu_gap_ms: None });
+    }
+
+    #[test]
+    fn delayed_gpu_samples_use_timestamp_gaps_and_expire() {
+        use tile_render::timing::{FrameStamp, FrameTimes};
+        let mut timings = Timings::default();
+        let sample = |frame_id, start, end| FrameTimes { span: (end - start) as f64,
+            stamp: FrameStamp { frame_id, start, end, period_ns: 1_000_000.0 }, ..Default::default() };
+        timings.cpu_build(0.0, 2.0);
+        timings.gpu_frame(0.1, &sample(1, 10, 14));
+        assert_eq!(timings.stats(0.1).gpu_gap_ms, None);
+        timings.gpu_frame(0.2, &sample(2, 20, 26));
+        assert_eq!(timings.stats(0.2), TimingStats { cpu_build_ms: Some(2.0), gpu_ms: Some(5.0), gpu_gap_ms: Some(6.0) });
+        timings.gpu_frame(0.3, &sample(4, 80, 90));
+        assert_eq!(timings.stats(0.3).gpu_gap_ms, None, "untimed frame 3 is not idle GPU time");
+        timings.gpu_frame(0.4, &sample(3, 40, 50));
+        assert_eq!(timings.stats(0.4).gpu_gap_ms, None, "late result cannot move the anchor backwards");
+        assert_eq!(timings.stats(1.5), TimingStats::default());
+        let reset = Timings::default();
+        assert_eq!(reset.stats(0.0), TimingStats::default());
+    }
+
+    #[test]
+    fn detailed_metrics_label_build_gap_estimates_and_unavailable_values() {
+        let stats = Stats { fps: 60.0, frame_ms: Some(16.7), skipped: 0.0 };
+        let missing = detailed_text(&stats, false, TimingStats::default());
+        assert_eq!(missing, "60 fps 16.7 ms\nCPU build n/a\nGPU n/a\nGPU gap n/a");
+        let present = detailed_text(&stats, false, TimingStats { cpu_build_ms: Some(2.0), gpu_ms: Some(8.0), gpu_gap_ms: Some(6.7) });
+        assert!(present.contains("GPU gap ~6.7 ms"));
+        assert!(present.chars().filter(|&c| c != '\n').all(|c| render_desc::GLYPHS.contains(c)));
+        let compiled = compiled();
+        let sprites = rows_sprites(&compiled, &present, (1920, 1080), 2, 5);
+        assert!(sprites.iter().all(|sprite| sprite.view == Some(5) && sprite.x >= 960));
+        for row in 0..4 { assert!(sprites.iter().any(|sprite| sprite.y == 4 + row * 18)); }
     }
 
     #[test]
@@ -257,7 +395,7 @@ mod tests {
         for n in 1..=2 {
             let (w, h) = render_desc::glyph_cell(n);
             desc += &format!(
-                "[images.g{n}]\nsource = \"glyphs:255,255,255,255:0,0,0,176:{n}\"\n[sheets.g{n}]\nimage = \"g{n}\"\ncell = [{w}, {h}]\ngrid = [19, 1]\ngroup = \"Viewer@glyphs{n}\"\n"
+                "[images.g{n}]\nsource = \"glyphs:255,255,255,255:0,0,0,176:{n}\"\n[sheets.g{n}]\nimage = \"g{n}\"\ncell = [{w}, {h}]\ngrid = [34, 1]\ngroup = \"Viewer@glyphs{n}\"\n"
             );
         }
         let d = render_desc::Description::parse(&desc).unwrap();
@@ -295,7 +433,7 @@ mod tests {
         let mut last = Vec::new();
         while t < 3.0 {
             o.counter.presented(t);
-            let s = o.sprites(&c, 1, t, (1920, 1080), 3, false).to_vec();
+            let s = o.sprites(&c, 1, t, (1920, 1080), 3, false, false).to_vec();
             if s != last {
                 changes += 1;
                 last = s;
@@ -306,7 +444,7 @@ mod tests {
         // (At most one change every TEXT_EVERY; equal lines are no change.)
         assert!((3..=11).contains(&changes), "{changes} changes in 3 s");
         // A new window or new art: new sprites at once.
-        let moved = o.sprites(&c, 1, t, (1280, 720), 3, false).to_vec();
+        let moved = o.sprites(&c, 1, t, (1280, 720), 3, false, false).to_vec();
         assert!(moved != last && moved.iter().all(|s| s.x >= 640));
     }
 }

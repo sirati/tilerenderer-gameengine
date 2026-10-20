@@ -3,18 +3,31 @@
 //!
 //! Nothing here knows which game it is showing.
 
+mod sprite_lifetimes;
+mod scene_prefix;
+mod scene_snapshot;
+mod ui_submission;
+mod render_worker;
+mod atlas_reservation;
+mod thread_start;
 mod constraints;
 pub mod cursor;
+mod system_cursor;
 pub mod fps;
+mod startup_ready;
+pub mod host_status;
+mod settings_preview;
 mod input;
 pub mod layout;
 pub mod looks;
 pub mod scaling;
 pub mod profile;
+mod presentation;
 pub mod snap;
 pub mod smooth_menus;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
 use cursor::SnapMode;
@@ -29,6 +42,8 @@ use winit::window::{Fullscreen, Window, WindowId};
 #[derive(Clone, Debug)]
 pub struct ViewerConfig {
     pub title: String,
+    /// Window/application icon, including the process-wide Dock icon on macOS.
+    pub application_icon: Option<application_icon::ApplicationIcon>,
     /// Initial inner size in pixels.
     pub size: (u32, u32),
     pub fullscreen: bool,
@@ -40,11 +55,15 @@ pub struct ViewerConfig {
     /// (winit's default). A viewer in someone else's process leaves that
     /// to the process (its thread made aware on its own instead).
     pub process_dpi_aware: bool,
+    /// Host context established first on viewer-owned GPU and cursor threads.
+    /// In-process hosts can supply signal/thread setup without exposing their
+    /// platform details to the renderer. Never called on the event-loop thread.
+    pub native_thread_init: Option<fn()>,
 }
 
 impl Default for ViewerConfig {
     fn default() -> Self {
-        Self { title: "tile-viewer".into(), size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true }
+        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None }
     }
 }
 
@@ -58,6 +77,12 @@ pub enum ViewerError {
     Surface(#[from] wgpu::CreateSurfaceError),
     #[error(transparent)]
     Os(#[from] winit::error::OsError),
+    #[error("software presentation: {0}")]
+    SoftwarePresent(String),
+    #[error("GPU worker: {0}")]
+    RenderWorker(String),
+    #[error("host application: {0}")]
+    Host(String),
 }
 
 /// The compiled description a viewer draws with, replaceable while it runs
@@ -66,91 +91,126 @@ pub enum ViewerError {
 /// generation (what scenes refer to, `Scene::assets`); a growth keeps what
 /// was there, so a scene of an earlier generation of the same whole
 /// description is drawn with a later one.
+///
+/// The producers' end, cloned freely; no call waits for another thread.
+/// The viewer reads it through its [`ArtInbox`].
 #[derive(Clone)]
-pub struct Assets(Arc<std::sync::Mutex<Slot>>);
+pub struct Assets(Arc<Shared>);
 
-struct Slot {
-    /// The latest whole description's generation, and the description
-    /// until the viewer has uploaded it.
-    generation: u64,
-    whole: Option<Arc<Compiled>>,
-    /// Its growths not yet applied by the viewer, in order.
-    growths: std::collections::VecDeque<(u64, Arc<render_desc::Growth>)>,
+/// What producers publish and the viewer takes. Each published whole
+/// description has an epoch; growths and reservations name the epoch they
+/// were made for, so those of a replaced whole are dropped as before.
+struct Shared {
+    /// The latest whole description, until the viewer has uploaded it.
+    whole: civ3r_sync::Latest<Whole>,
+    /// Epochs handed out, and the epoch of the whole last published.
+    epochs: AtomicU64,
+    base: AtomicU64,
+    /// Growths and reservations in the order given.
+    added: civ3r_sync::Mailbox<Added>,
     /// The latest generation given (whole or grown).
-    latest: u64,
+    latest: AtomicU64,
     /// Highest generation committed to the drawing renderer. CPU art
     /// publication and replacement requests do not advance this.
-    uploaded: u64,
-    /// Atlas pages (colour, index) to make room for, if asked (see
-    /// [`Assets::reserve`]).
-    reserve: Option<(u64, u32, u32)>,
+    uploaded: AtomicU64,
+}
+
+#[derive(Clone)]
+struct Whole {
+    epoch: u64,
+    generation: u64,
+    /// CPU cursor pixels survive renderer uploads and are available immediately.
+    cursor_art: Arc<cursor::Art>,
+    /// Dropped once uploaded.
+    compiled: Option<Arc<Compiled>>,
+    /// Atlas pages (colour, index) to make room for, given with it.
+    reserve: (u32, u32),
+}
+
+struct Added {
+    epoch: u64,
+    growth: Option<(u64, Arc<render_desc::Growth>)>,
+    reserve: (u32, u32),
 }
 
 impl Assets {
     pub fn new(compiled: Arc<Compiled>) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Slot { generation: 1, whole: Some(compiled), growths: Default::default(), latest: 1, uploaded: 0, reserve: None })))
+        Self::with_whole(Some(compiled), 1)
     }
 
-    fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    fn with_whole(compiled: Option<Arc<Compiled>>, generation: u64) -> Self {
+        let shared = Shared {
+            whole: civ3r_sync::Latest::new(),
+            epochs: AtomicU64::new(0),
+            base: AtomicU64::new(0),
+            added: civ3r_sync::Mailbox::new(),
+            latest: AtomicU64::new(0),
+            uploaded: AtomicU64::new(0),
+        };
+        let assets = Self(Arc::new(shared));
+        assets.publish(compiled, generation, (0, 0));
+        assets
+    }
+
+    fn publish(&self, compiled: Option<Arc<Compiled>>, generation: u64, reserve: (u32, u32)) {
+        let s = &self.0;
+        let epoch = s.epochs.fetch_add(1, SeqCst) + 1;
+        // The whole first: whatever is sent for its epoch afterwards finds
+        // it published.
+        let cursor_art = Arc::new(compiled.as_deref().map(cursor::Art::of).unwrap_or_default());
+        s.whole.publish(Whole { epoch, generation, compiled, cursor_art, reserve });
+        s.latest.store(generation, SeqCst);
+        s.base.store(epoch, SeqCst);
+    }
+
+    fn add(&self, growth: Option<(u64, Arc<render_desc::Growth>)>, reserve: (u32, u32)) {
+        let s = &self.0;
+        if let Some((generation, _)) = &growth {
+            s.latest.fetch_max(*generation, SeqCst);
+        } else if reserve == (0, 0) {
+            return;
+        }
+        s.added.send(Added { epoch: s.base.load(SeqCst), growth, reserve });
     }
 
     pub fn replace(&self, compiled: Arc<Compiled>) {
-        let generation = self.slot().latest + 1;
+        let generation = self.latest() + 1;
         self.set(compiled, generation);
     }
 
     /// Replaces the description by `compiled` of generation `generation`
     /// (what scenes refer to, `Scene::assets`).
     pub fn set(&self, compiled: Arc<Compiled>, generation: u64) {
-        let mut slot = self.slot();
-        *slot = Slot { generation, whole: Some(compiled), growths: Default::default(), latest: generation, uploaded: slot.uploaded, reserve: None };
+        self.publish(Some(compiled), generation, (0, 0));
     }
 
     /// Grows the latest description by `growth` (made for it as grown so
     /// far), as generation `generation`.
     pub fn grow(&self, growth: Arc<render_desc::Growth>, generation: u64) {
-        let mut slot = self.slot();
-        slot.growths.push_back((generation, growth));
-        slot.latest = slot.latest.max(generation);
+        self.add(Some((generation, growth)), (0, 0));
     }
 
     /// Asks the viewer to make room in its atlas for `pages` colour and
     /// `index_pages` index pages (art expected soon), so that growing it
     /// does not move it again and again (`TileRenderer::reserve_atlas`).
     pub fn reserve(&self, pages: u32, index_pages: u32) {
-        let mut slot = self.slot();
-        reserve_in(&mut slot, pages, index_pages);
+        self.add(None, (pages, index_pages));
     }
 
     /// Publishes whole art and its reservation together. A reservation
     /// from an older whole description never resizes its replacement.
     pub fn set_with_reserve(&self, compiled: Arc<Compiled>, generation: u64, pages: u32, index_pages: u32) {
-        let mut slot = self.slot();
-        *slot = Slot { generation, whole: Some(compiled), growths: Default::default(), latest: generation, uploaded: slot.uploaded, reserve: None };
-        reserve_in(&mut slot, pages, index_pages);
+        self.publish(Some(compiled), generation, (pages, index_pages));
     }
 
     /// Publishes an addition and its reservation in the same update.
     pub fn grow_with_reserve(&self, growth: Arc<render_desc::Growth>, generation: u64, pages: u32, index_pages: u32) {
-        let mut slot = self.slot();
-        slot.growths.push_back((generation, growth));
-        slot.latest = slot.latest.max(generation);
-        reserve_in(&mut slot, pages, index_pages);
-    }
-
-    fn take_reserve(&self, generation: u64) -> Option<(u32, u32)> {
-        let mut slot = self.slot();
-        if slot.reserve.is_some_and(|(base, _, _)| base == generation) {
-            slot.reserve.take().map(|(_, pages, index)| (pages, index))
-        } else {
-            None
-        }
+        self.add(Some((generation, growth)), (pages, index_pages));
     }
 
     /// The latest generation given (whole or grown).
     pub fn latest(&self) -> u64 {
-        self.slot().latest
+        self.0.latest.load(SeqCst)
     }
 
     /// The highest art generation committed to the drawing renderer.
@@ -158,59 +218,122 @@ impl Assets {
     /// preparing CPU art cannot advance this acknowledgment. Replacement
     /// requests preserve it until the replacement is committed.
     pub fn uploaded_generation(&self) -> u64 {
-        self.slot().uploaded
-    }
-
-    /// The latest whole description's generation, and the description if
-    /// the viewer has not uploaded it yet.
-    fn whole(&self) -> (u64, Option<Arc<Compiled>>) {
-        let slot = self.slot();
-        (slot.generation, slot.whole.clone())
+        self.0.uploaded.load(SeqCst)
     }
 
     /// A whole base and its required growth prefix are committed. Release
     /// source pixels only for that base; a newer whole keeps its own pixels.
     fn uploaded(&self, base: u64, through: u64) {
-        let mut slot = self.slot();
-        slot.uploaded = slot.uploaded.max(through);
-        if slot.generation == base {
-            slot.whole = None;
+        self.0.uploaded.fetch_max(through, SeqCst);
+        let held = |w: &Whole| w.generation == base && w.compiled.is_some();
+        if self.0.whole.load().is_some_and(|w| held(&w)) {
+            // Retried against a whole published meanwhile, which is kept.
+            self.0.whole.update(|old| old.map(|w| if held(w) { Whole { compiled: None, ..w.clone() } } else { w.clone() }));
+        }
+    }
+}
+
+/// The viewer's end of [`Assets`]: what it has taken but not applied yet,
+/// owned by the viewer's thread alone.
+struct ArtInbox {
+    assets: Assets,
+    /// The whole description these are for (its epoch and generation).
+    epoch: u64,
+    generation: u64,
+    /// Its growths not yet applied by the viewer, in order.
+    growths: std::collections::VecDeque<(u64, Arc<render_desc::Growth>)>,
+    /// Atlas pages (colour, index) to make room for, if asked (see
+    /// [`Assets::reserve`]), with the generation of their whole.
+    reserve: Option<(u64, u32, u32)>,
+    requested_room: atlas_reservation::Requests,
+}
+
+impl std::ops::Deref for ArtInbox {
+    type Target = Assets;
+    fn deref(&self) -> &Assets {
+        &self.assets
+    }
+}
+
+impl ArtInbox {
+    fn new(assets: Assets) -> Self {
+        Self { assets, epoch: 0, generation: 0, growths: Default::default(), reserve: None, requested_room: Default::default() }
+    }
+
+    /// Takes what was published, and returns the latest whole.
+    fn receive(&mut self) -> Arc<Whole> {
+        // Received before the whole is read: everything received names a
+        // whole published already, so none is for one not seen yet.
+        let added: Vec<Added> = self.assets.0.added.drain().collect();
+        let whole = self.assets.0.whole.load().expect("published on creation");
+        if whole.epoch != self.epoch {
+            self.epoch = whole.epoch;
+            self.generation = whole.generation;
+            self.growths.clear();
+            self.reserve = None;
+            self.requested_room = Default::default();
+            self.reserve_more(whole.reserve);
+        }
+        let epoch = self.epoch;
+        for a in added.into_iter().filter(|a| a.epoch == epoch) {
+            self.growths.extend(a.growth);
+            self.reserve_more(a.reserve);
+        }
+        whole
+    }
+
+    fn reserve_more(&mut self, requested: (u32, u32)) {
+        let Some((pages, index_pages)) = self.requested_room.request(requested) else { return };
+        // A taken request belongs to the transfer until it commits, retries or
+        // fails. Keep its high-water mark even after clearing this mailbox.
+        self.reserve = Some((self.generation, pages, index_pages));
+    }
+
+    /// The latest whole description's generation.
+    fn generation(&mut self) -> u64 {
+        self.receive().generation
+    }
+
+    /// The latest whole description's generation, and the description if
+    /// the viewer has not uploaded it yet.
+    fn whole(&mut self) -> (u64, Option<Arc<Compiled>>) {
+        let whole = self.receive();
+        (whole.generation, whole.compiled.clone())
+    }
+
+    fn take_reserve(&mut self, generation: u64) -> Option<(u32, u32)> {
+        self.receive();
+        if self.reserve.is_some_and(|(base, _, _)| base == generation) {
+            self.reserve.take().map(|(_, pages, index)| (pages, index))
+        } else {
+            None
         }
     }
 
     /// The growths of whole generation `generation` not applied yet.
-    fn take_growth(&self, generation: u64) -> Option<(u64, Arc<render_desc::Growth>)> {
-        let mut slot = self.slot();
-        if slot.generation == generation { slot.growths.pop_front() } else { None }
+    fn take_growth(&mut self, generation: u64) -> Option<(u64, Arc<render_desc::Growth>)> {
+        self.receive();
+        if self.generation == generation { self.growths.pop_front() } else { None }
     }
-}
-
-fn reserve_in(slot: &mut Slot, pages: u32, index_pages: u32) {
-    if pages == 0 && index_pages == 0 {
-        return;
-    }
-    let (old_pages, old_index) = slot.reserve.filter(|(base, _, _)| *base == slot.generation)
-        .map_or((0, 0), |(_, p, i)| (p, i));
-    slot.reserve = Some((slot.generation, pages.max(old_pages), index_pages.max(old_index)));
 }
 
 #[cfg(test)]
 mod art_queue_tests {
-    use super::{Assets, Slot};
-    use std::sync::{Arc, Mutex};
+    use super::{ArtInbox, Assets};
+    use std::sync::Arc;
 
-    fn assets() -> Assets {
-        Assets(Arc::new(Mutex::new(Slot { generation: 7, whole: None, growths: Default::default(), latest: 7, uploaded: 0, reserve: None })))
+    fn assets() -> ArtInbox {
+        ArtInbox::new(Assets::with_whole(None, 7))
     }
 
     #[test]
     fn growths_stay_ordered_while_one_transfer_is_in_flight() {
-        let assets = assets();
+        let mut assets = assets();
         assets.grow_with_reserve(Arc::new(render_desc::Growth::default()), 8, 0, 12);
         assets.grow_with_reserve(Arc::new(render_desc::Growth::default()), 9, 0, 20);
         assert!(assets.take_growth(6).is_none());
         assert_eq!(assets.take_growth(7).map(|(generation, _)| generation), Some(8));
-        assert_eq!(assets.slot().growths.len(), 1);
+        assert_eq!(assets.growths.len(), 1);
         assert_eq!(assets.take_growth(7).map(|(generation, _)| generation), Some(9));
         assert!(assets.take_growth(7).is_none());
         assert_eq!(assets.take_reserve(7), Some((0, 20)));
@@ -230,6 +353,18 @@ mod art_queue_tests {
     }
 
     #[test]
+    fn cpu_cursor_art_is_available_before_upload_and_survives_pixel_release() {
+        let assets = Assets::new(empty_compiled());
+        let before = assets.0.whole.load().unwrap();
+        assert!(before.compiled.is_some());
+        assert_eq!(assets.uploaded_generation(), 0);
+        assets.uploaded(1, 1);
+        let after = assets.0.whole.load().unwrap();
+        assert!(after.compiled.is_none());
+        assert!(Arc::ptr_eq(&before.cursor_art, &after.cursor_art));
+    }
+
+    #[test]
     fn cpu_art_publication_does_not_acknowledge_gpu_upload() {
         let assets = Assets::new(empty_compiled());
         assert_eq!(assets.latest(), 1);
@@ -245,7 +380,7 @@ mod art_queue_tests {
 
     #[test]
     fn replacement_preserves_acknowledgment_until_its_required_prefix_commits() {
-        let assets = assets();
+        let mut assets = assets();
         assets.uploaded(7, 9);
         assets.set(empty_compiled(), 10);
         assert_eq!(assets.uploaded_generation(), 9);
@@ -266,16 +401,86 @@ mod art_queue_tests {
 
     #[test]
     fn reservations_coalesce_only_with_their_whole_atlas() {
-        let assets = assets();
+        let mut assets = assets();
         assets.reserve(3, 12);
         assets.reserve(2, 20);
         assert_eq!(assets.take_reserve(8), None);
         assert_eq!(assets.take_reserve(7), Some((3, 20)));
         assets.reserve(8, 24);
-        assets.slot().generation = 10;
+        assets.publish(None, 10, (0, 0));
         assets.reserve(2, 4);
         assert_eq!(assets.take_reserve(7), None);
         assert_eq!(assets.take_reserve(10), Some((2, 4)));
+    }
+
+    #[test]
+    fn consuming_a_reservation_does_not_make_repeated_snapshots_new_requests() {
+        let mut assets = assets();
+        assets.reserve(1, 147);
+        assert_eq!(assets.take_reserve(7), Some((1, 147)));
+        for _ in 0..100 {
+            assets.reserve(1, 147);
+            assets.reserve(0, 10);
+            assert_eq!(assets.take_reserve(7), None);
+        }
+        assets.reserve(2, 10);
+        assert_eq!(assets.take_reserve(7), Some((2, 147)));
+    }
+
+    #[test]
+    fn a_new_whole_epoch_reuses_capacity_even_at_the_same_generation() {
+        let mut assets = assets();
+        assets.reserve(1, 147);
+        assert_eq!(assets.take_reserve(7), Some((1, 147)));
+        assets.set_with_reserve(empty_compiled(), 7, 1, 147);
+        assert_eq!(assets.take_reserve(7), Some((1, 147)));
+        assets.set_with_reserve(empty_compiled(), 8, 0, 3);
+        assert_eq!(assets.take_reserve(8), Some((0, 3)));
+    }
+
+    #[test]
+    fn a_replacement_drops_growths_and_reservations_of_the_whole_it_replaces() {
+        let mut assets = assets();
+        assets.grow_with_reserve(Arc::new(render_desc::Growth::default()), 8, 4, 4);
+        // Not received yet when replaced, even at the same generation.
+        assets.set_with_reserve(empty_compiled(), 7, 1, 0);
+        assets.grow(Arc::new(render_desc::Growth::default()), 9);
+        assert_eq!(assets.whole().0, 7);
+        assert_eq!(assets.take_growth(7).map(|(generation, _)| generation), Some(9));
+        assert!(assets.take_growth(7).is_none());
+        assert_eq!(assets.take_reserve(7), Some((1, 0)));
+        assert_eq!(assets.latest(), 9);
+    }
+
+    #[test]
+    fn growths_from_another_thread_arrive_in_order_without_waiting() {
+        let mut inbox = assets();
+        let producer = inbox.assets.clone();
+        let sender = std::thread::spawn(move || {
+            for generation in 8..200 {
+                producer.grow(Arc::new(render_desc::Growth::default()), generation);
+                if generation % 50 == 0 {
+                    producer.set(empty_compiled(), generation * 1000);
+                }
+            }
+        });
+        let mut seen = Vec::new();
+        loop {
+            let finished = sender.is_finished();
+            let generation = inbox.generation();
+            while let Some((g, _)) = inbox.take_growth(generation) {
+                seen.push((generation, g));
+            }
+            if finished { break }
+            std::thread::yield_now();
+        }
+        sender.join().unwrap();
+        // Ordered within each whole, and each growth belongs to the whole
+        // published before it.
+        assert!(seen.windows(2).all(|w| w[0].0 != w[1].0 || w[0].1 < w[1].1));
+        assert!(seen.iter().all(|&(whole, g)| whole == if g <= 50 { 7 } else { (g - 1) / 50 * 50_000 }));
+        assert_eq!(inbox.generation(), 150_000);
+        assert_eq!(seen.last().map(|s| s.1), Some(199));
     }
 }
 
@@ -306,26 +511,77 @@ pub fn scene_world_arranged(compiled: &Compiled, scene: &Scene, view_cameras: &[
 pub fn scene_cells(compiled: &Compiled, scene: &Scene) -> TileWorld {
     let s = scene.shape;
     let mut world = compiled.world(s.cols.max(1), s.rows.max(1), s.wrap_x, s.wrap_y);
-    let cells = s.cols * s.rows;
+    let cells = (s.cols * s.rows) as usize;
     for (i, layer) in scene.layers.iter().enumerate().take(compiled.layers.len()) {
-        let id = tile_render::LayerId(i);
-        for (cell, &v) in layer.values.iter().enumerate().take(cells as usize) {
-            if v != 0 {
-                world.set(id, cell as u32 % s.cols, cell as u32 / s.cols, v);
+        let values = &layer.values[..layer.values.len().min(cells)];
+        let phases = layer.phases.as_ref().map(|v| &v[..v.len().min(cells)]);
+        let offsets = layer.offsets.as_ref().map(|v| &v[..v.len().min(cells)]);
+        world.set_layer_cells(tile_render::LayerId(i), values, phases, offsets);
+    }
+    scene_slots(compiled, scene, &mut world);
+    world
+}
+
+/// The scene's slots that `world` holds, in its slot order: (scene slot
+/// index, world slot). Those of layers the description does not have, or
+/// of another number of cells, are left out.
+fn slot_map(compiled: &Compiled, scene: &Scene) -> Vec<(usize, tile_render::SlotId)> {
+    let cells = (scene.shape.cols * scene.shape.rows) as usize;
+    let held = scene.slots.iter().enumerate().filter(|(_, s)| (s.layer as usize) < compiled.layers.len() && s.cells.values.len() == cells);
+    held.enumerate().map(|(k, (i, _))| (i, tile_render::SlotId(k as u32))).collect()
+}
+
+/// Makes `world`'s data slots and bindings the scene's (see
+/// docs/per-view-layers.md): every slot of a world built otherwise freed,
+/// the scene's added in its order (`slot_map`), filled, and bound as its
+/// bindings say. For when which slots there are changes (a screen of a
+/// view's own opens or closes): their cells' changes go cell by cell
+/// ([`scene_slot_cells_changed`]).
+pub fn scene_slots(compiled: &Compiled, scene: &Scene, world: &mut TileWorld) {
+    let old: Vec<_> = world.slots().map(|(s, _)| s).collect();
+    for s in old.into_iter().rev() {
+        world.free_slot(s);
+    }
+    let cols = scene.shape.cols.max(1);
+    let map = slot_map(compiled, scene);
+    for &(i, _) in &map {
+        let slot = &scene.slots[i];
+        let (layer, spec) = (tile_render::LayerId(slot.layer as usize), &compiled.layers[slot.layer as usize]);
+        let id = world.add_slot(layer);
+        for (cell, &v) in slot.cells.values.iter().enumerate().filter(|(_, v)| **v != 0) {
+            world.set_in(id, cell as u32 % cols, cell as u32 / cols, v);
+        }
+        if let (Some(phases), true) = (&slot.cells.phases, spec.per_cell_phase) {
+            for (cell, &p) in phases.iter().enumerate().take(slot.cells.values.len()).filter(|(_, p)| **p != 0) {
+                world.set_phase_in(id, cell as u32 % cols, cell as u32 / cols, p);
             }
         }
-        if let (Some(phases), true) = (&layer.phases, compiled.layers[i].per_cell_phase) {
-            for (cell, &p) in phases.iter().enumerate().take(cells as usize) {
-                world.set_phase(id, cell as u32 % s.cols, cell as u32 / s.cols, p);
-            }
-        }
-        if let (Some(offsets), true) = (&layer.offsets, compiled.layers[i].per_cell_offset) {
-            for (cell, &o) in offsets.iter().enumerate().take(cells as usize).filter(|(_, o)| **o != (0, 0)) {
-                world.set_offset(id, cell as u32 % s.cols, cell as u32 / s.cols, o);
+        if let (Some(offsets), true) = (&slot.cells.offsets, spec.per_cell_offset) {
+            for (cell, &o) in offsets.iter().enumerate().take(slot.cells.values.len()).filter(|(_, o)| **o != (0, 0)) {
+                world.set_offset_in(id, cell as u32 % cols, cell as u32 / cols, o);
             }
         }
     }
-    world
+    for b in &scene.bindings {
+        for &(layer, slot) in &b.slots {
+            let held = map.iter().find(|(i, _)| scene.slots[*i].id == slot).filter(|(i, _)| scene.slots[*i].layer == layer);
+            if let Some(&(_, id)) = held {
+                world.bind(b.id, tile_render::LayerId(layer as usize), Some(id));
+            }
+        }
+    }
+}
+
+/// Writes the values of the scene's slot `cells` (slot id, cell index)
+/// into `world`, whose slots are the scene's ([`scene_slots`]).
+pub fn scene_slot_cells_changed(compiled: &Compiled, scene: &Scene, world: &mut TileWorld, cells: &[(u32, u32)]) {
+    let cols = scene.shape.cols.max(1);
+    let map = slot_map(compiled, scene);
+    for &(slot, cell) in cells {
+        let Some(&(i, id)) = map.iter().find(|(i, _)| scene.slots[*i].id == slot) else { continue };
+        let Some(&v) = scene.slots[i].cells.values.get(cell as usize) else { continue };
+        world.set_in(id, cell % cols, cell / cols, v);
+    }
 }
 
 /// Writes the scene's `cells` (layer, cell index: value, phase, offset)
@@ -400,16 +656,17 @@ pub fn overlay_spans_arranged(scene: &Scene, view_cameras: &[Option<u32>], overl
 /// the one drawn by camera `view` (an overlay's); `not_in`: drawn in every
 /// view but the one of that camera.
 pub fn placed_sprite(compiled: &Compiled, s: &scene::FreeSprite, view: Option<u32>, not_in: Option<u32>) -> tile_render::PlacedSprite {
+    let available = scene_prefix::sprite_available(compiled, s);
     tile_render::PlacedSprite {
-        set: tile_render::SpriteSetId::from_raw(s.set),
+        set: if available { tile_render::SpriteSetId::from_raw(s.set) } else { tile_render::SpriteSetId::EMPTY },
         x: s.x,
         y: s.y,
         screen: s.screen,
         after_pass: s.after_pass as usize,
         phase: s.phase,
         ticks_per_frame: s.ticks_per_frame.max(1),
-        blend: tile_render::Blend::from_scale_den(s.scale_den, s.tint),
-        clip: s.clip,
+        blend: match s.blend { scene::SpriteBlend::Alpha => tile_render::Blend::from_scale_den(s.scale_den, s.tint), scene::SpriteBlend::PaletteAlpha256 => tile_render::Blend::NativePaletteAlpha },
+        clip: if available { s.clip } else { Some([0; 4]) },
         view: view.or(not_in),
         except_view: view.is_none() && not_in.is_some(),
         zoom_art: match s.zoom_art {
@@ -417,9 +674,10 @@ pub fn placed_sprite(compiled: &Compiled, s: &scene::FreeSprite, view: Option<u3
             2 => tile_render::ZoomArt::Zoomed { zoom: (u32::from(s.zoom.0), u32::from(s.zoom.1)), offset: s.zoom_offset },
             _ => tile_render::ZoomArt::Any,
         },
-        text: s.glyph.and_then(|g| outline_glyph(compiled, &g, s.tint)),
-        palette: s.palette,
+        text: (available && s.solid.is_none()).then(|| s.glyph.and_then(|g| outline_glyph(compiled, &g, s.tint))).flatten(),
+        palette: if available { s.palette } else { 0 },
         category: s.category,
+        solid: available.then_some(s.solid).flatten().map(|r| tile_render::SolidRect { width: r.width, height: r.height, rgba: r.rgba }),
     }
 }
 
@@ -470,6 +728,9 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
                 hairline: false,
                 downscale: v.downscale.max(1),
                 hidden_categories: v.hidden_categories,
+                background_sampling: tile_render::BackgroundSampling::Dither,
+                // (Its own fog of war, say: the slots its binding names.)
+                binding: v.binding,
             }
         })
         .collect()
@@ -547,16 +808,20 @@ fn divider_sprites(compiled: &Compiled, pieces: &[(u32, [i32; 4], bool)]) -> Vec
 /// The window rectangle (x, y, w, h) a screen sprite covers: its first
 /// frame (a glyph: its em box), clipped.
 fn sprite_rect(compiled: &Compiled, s: &scene::FreeSprite) -> Option<[i32; 4]> {
-    let (mut x0, mut y0, mut x1, mut y1) = match s.glyph {
-        Some(g) => {
-            let em = (g.em64 as i32 + 63) / 64;
-            (s.x, s.y - em, s.x + g.advance.max(1), s.y + em / 3)
-        }
-        None => {
-            let id = compiled.sets.frame(tile_render::SpriteSetId::from_raw(s.set), 0)?;
-            let sprite = compiled.atlas.sprites.get(id.0 as usize)?;
-            let (x0, y0) = (s.x + sprite.anchor_x, s.y + sprite.anchor_y);
-            (x0, y0, x0 + sprite.width as i32, y0 + sprite.height as i32)
+    let (mut x0, mut y0, mut x1, mut y1) = if let Some(r) = s.solid {
+        (s.x, s.y, s.x.saturating_add(r.width.min(i32::MAX as u32) as i32), s.y.saturating_add(r.height.min(i32::MAX as u32) as i32))
+    } else {
+        match s.glyph {
+            Some(g) => {
+                let em = (g.em64 as i32 + 63) / 64;
+                (s.x, s.y - em, s.x + g.advance.max(1), s.y + em / 3)
+            }
+            None => {
+                let id = compiled.sets.frame(tile_render::SpriteSetId::from_raw(s.set), 0)?;
+                let sprite = compiled.atlas.sprites.get(id.0 as usize)?;
+                let (x0, y0) = (s.x + sprite.anchor_x, s.y + sprite.anchor_y);
+                (x0, y0, x0 + sprite.width as i32, y0 + sprite.height as i32)
+            }
         }
     };
     if let Some([cx0, cy0, cx1, cy1]) = s.clip {
@@ -569,16 +834,20 @@ fn sprite_rect(compiled: &Compiled, s: &scene::FreeSprite) -> Option<[i32; 4]> {
 /// camera's scale and placement. Used to clip list pixels without moving
 /// unrelated controls or the world beneath a production popup.
 fn placed_rect(compiled: &Compiled, s: &tile_render::PlacedSprite) -> Option<[i32; 4]> {
-    let (mut x0, mut y0, mut x1, mut y1) = match s.text {
-        Some(g) => {
-            let em = (g.em64 as i32 + 63) / 64;
-            (s.x, s.y - em, s.x + g.advance.max(1), s.y + em / 3)
-        }
-        None => {
-            let id = compiled.sets.frame(s.set, 0)?;
-            let sprite = compiled.atlas.sprites.get(id.0 as usize)?;
-            let (x0, y0) = (s.x + sprite.anchor_x, s.y + sprite.anchor_y);
-            (x0, y0, x0 + sprite.width as i32, y0 + sprite.height as i32)
+    let (mut x0, mut y0, mut x1, mut y1) = if let Some(r) = s.solid {
+        (s.x, s.y, s.x.saturating_add(r.width.min(i32::MAX as u32) as i32), s.y.saturating_add(r.height.min(i32::MAX as u32) as i32))
+    } else {
+        match s.text {
+            Some(g) => {
+                let em = (g.em64 as i32 + 63) / 64;
+                (s.x, s.y - em, s.x + g.advance.max(1), s.y + em / 3)
+            }
+            None => {
+                let id = compiled.sets.frame(s.set, 0)?;
+                let sprite = compiled.atlas.sprites.get(id.0 as usize)?;
+                let (x0, y0) = (s.x + sprite.anchor_x, s.y + sprite.anchor_y);
+                (x0, y0, x0 + sprite.width as i32, y0 + sprite.height as i32)
+            }
         }
     };
     if let Some([cx0, cy0, cx1, cy1]) = s.clip {
@@ -590,24 +859,33 @@ fn placed_rect(compiled: &Compiled, s: &tile_render::PlacedSprite) -> Option<[i3
 /// The window rectangles (x, y, w, h) the scene's interface-only views
 /// cover: their sprites' first frames, clipped (not the parts the layout
 /// may draw elsewhere, `scene::Interface`, which it knows itself).
+/// Whether a system-pointer move that `routed` became takes the pointer
+/// off the driver's interactables. Not while the mouse is captured, nor
+/// while the snapping pointer is the pointer: the hidden system pointer's
+/// motion is swallowed there, and the driver keeps the pointer on the
+/// element snapped to (its hover look must stay).
+fn motion_leaves_driver(captured: bool, snapping: bool, routed: &[Input]) -> bool {
+    !captured && !snapping && !routed.iter().any(|i| matches!(i, Input::MouseMove { .. }))
+}
+
 fn interface_rects(compiled: &Compiled, scene: &Scene) -> Vec<[i32; 4]> {
     let parts = [scene.interface.roaming, scene.interface.popup, scene.interface.screen_view, scene.interface.capture_hint];
-    let views = scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id)));
+    let views = scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id)) && !scene.interface.is_popup_view(v.id));
     views.flat_map(|v| v.overlay.iter().filter(|s| s.glyph.is_none()).filter_map(|s| sprite_rect(compiled, s))).collect()
 }
 
 /// The active named panel's bounds, without the map's HUD behind it.
 fn named_screen_content(compiled: &Compiled, scene: &Scene) -> Option<[i32; 4]> {
     scene.interface.screen.as_ref()?;
-    if let Some(id) = scene.interface.screen_view.or(scene.interface.popup) {
+    if let Some(id) = scene.interface.screen_view {
         let v = scene.view(id)?.view;
         if v.viewport.0 > 0 && v.viewport.1 > 0 {
             return Some([v.origin.0, v.origin.1, v.viewport.0 as i32, v.viewport.1 as i32]);
         }
     }
     let city = scene.interface.screen.as_deref() == Some("City");
-    let parts = [scene.interface.roaming, scene.interface.capture_hint];
-    let rects = scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id))
+    let parts = [scene.interface.roaming, scene.interface.capture_hint, scene.interface.popup];
+    let rects = scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id)) && !scene.interface.is_popup_view(v.id)
         && if city { v.view.camera_x == 0 && v.view.camera_y == 0 } else { v.view.menu })
         .flat_map(|v| v.overlay.iter().filter(|s| s.glyph.is_none()).filter_map(|s| sprite_rect(compiled, s)));
     let [l, t, r, b] = rects.map(|[x, y, w, h]| [x, y, x + w, y + h])
@@ -697,7 +975,7 @@ async fn show_with(
         present_mode: wgpu::PresentMode::AutoVsync,
         // No frame waits behind another: the cursor drawn here lags as
         // little as it can.
-        desired_maximum_frame_latency: 1,
+        desired_maximum_frame_latency: 2,
         alpha_mode: wgpu::CompositeAlphaMode::Auto,
         view_formats: vec![],
         color_space: wgpu::SurfaceColorSpace::Auto,
@@ -722,6 +1000,12 @@ pub fn arranged_frame(compiled: &Compiled, scene: &Scene, size: (u32, u32), conf
 /// receives. Blocks the calling thread, which need not be the process's
 /// main thread (the viewer usually runs inside someone else's process).
 pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(), ViewerError> {
+    run_until(config, assets, display, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+/// Runs on the calling thread until closed or the host requests shutdown.
+/// macOS callers must use the process main thread.
+pub fn run_until(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<(), ViewerError> {
     let mut builder = EventLoop::builder();
     #[cfg(windows)]
     {
@@ -735,21 +1019,44 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
     // The driver's updates wake the event loop (it waits for its window's
     // events, which are taken at once, the pointer's among them).
     let proxy = event_loop.create_proxy();
+    let cursor_proxy = proxy.clone();
     display.set_wake(move || {
         let _ = proxy.send_event(());
     });
+    let mut app = new_app(config, assets, display, stop);
+    app.cursor_builds.wake = Some(Arc::new(move || { let _ = cursor_proxy.send_event(()); }));
+    event_loop.run_app(&mut app)?;
+    app.error.map_or(Ok(()), Err)
+}
+
+/// A viewer's state before its event loop runs, with the user's settings.
+fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std::sync::atomic::AtomicBool>) -> App {
+    let mut assets = ArtInbox::new(assets);
     let (assets_version, whole) = assets.whole();
     let whole = whole.expect("a new description");
+    let native_thread_init = config.native_thread_init;
     let mut app = App {
+        stop,
         config,
         assets,
         assets_version,
         whole_version: assets_version,
-        compiled: whole.without_pixels(),
+        compiled: Arc::new(whole.without_pixels()),
         upload: Some(whole),
         display,
-        shown_scene: Scene::default(),
+        shown_scene: Arc::new(Scene::default()),
+        camera_arrival_reported: None,
+        sprite_lifetimes: sprite_lifetimes::SpriteLifetimes::default(),
         pending_scene: None,
+        future_metadata: None,
+        drawable_scene: None,
+        world_command_version: 0,
+        pending_ui: None,
+        next_frame_id: 1,
+        worker_world_version: 0,
+        input_revision: 0,
+        preparing_inputs: None,
+        pending_replay: None,
         gpu: None,
         drawn_seq: 0,
         patches: std::collections::BTreeMap::new(),
@@ -759,9 +1066,9 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         world: None,
         world_assets_version: 0,
         drawn_markers: Vec::new(),
-        frame_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         drawn_tick: 0,
         drawn_window: (0, 0),
+        drawn_background: tile_render::BackgroundSampling::Dither,
         plan: None,
         drawn_overlay: Vec::new(),
         built_overlay: Vec::new(),
@@ -778,11 +1085,16 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         error: None,
         snap: snap::SnapInput::default(),
         fps: fps::Overlay::default(),
+        host_status: host_status::Indicator::default(),
+        settings_preview: settings_preview::Preview::default(),
         snap_grabbed: false,
         cursor_art: cursor::Art::default(),
+        os_cursor: system_cursor::SystemCursor::default(),
         pending_cursor_art: None,
         custom_cursors: std::collections::HashMap::new(),
-        cursor_builds: CursorBuilds::default(),
+        system_cursor_size: cursor::NOMINAL,
+        shown_cursor_scale: cursor::Scale::default(),
+        cursor_builds: CursorBuilds { native_thread_init, ..Default::default() },
         shown_pointer: None,
         capture_icon: false,
         pointer_inside: true,
@@ -791,10 +1103,9 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         latency: cursor::Latency::default(),
         latency_logged: Instant::now(),
         frames_presented: 0,
+        diagnostics: profile::env_on("TILE_VIEWER_PROFILE").then(render_worker::AppDiagnostics::new),
         frame_log: frame_times().then(fps::FrameLog::default),
         beside_drawn: None,
-        pending_art: None,
-        preparing_art: None,
         unlock_pending: None,
         machine: cursor::Machine::default(),
         system_pointer: (0, 0),
@@ -812,13 +1123,118 @@ pub fn run(config: ViewerConfig, assets: Assets, display: Display) -> Result<(),
         drawn_looks: Vec::new(),
         base_free: Vec::new(),
         spans: Vec::new(),
-        look_scene: looks::LookScene::default(),
+        look_scene: Arc::new(looks::LookScene::default()),
         menu_scroll: smooth_menus::SmoothMenus::default(),
     };
     // The arrangement to start with: the user's settings.
     app.set_settings(load_settings());
-    event_loop.run_app(&mut app)?;
-    app.error.map_or(Ok(()), Err)
+    app
+}
+
+/// How a viewer started in a host's application ended: closed (`Ok`) or
+/// failed. Called on the main thread, once.
+#[cfg(target_os = "macos")]
+pub type OnExit = Box<dyn FnOnce(Result<(), ViewerError>) + Send>;
+
+/// Opens the window in the `NSApplication` a host already runs on the
+/// process's main thread (Wine's, for a native library in a Wine program)
+/// and returns at once; any thread may call it. The window's events and
+/// frames run on the main thread, scheduled through its dispatch queue: the
+/// host's run loop drives them. Waits up to `wait` for the host to start
+/// its application. `on_exit` reports the end.
+#[cfg(target_os = "macos")]
+pub fn start_in_host_application(config: ViewerConfig, assets: Assets, display: Display, wait: Duration, on_exit: OnExit) {
+    host_app::start(Box::new(move || {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        let mut builder = EventLoop::builder();
+        // (The host's own windows may stay hidden: ours makes the
+        // application a regular one with a Dock icon.)
+        builder.with_attached_application(true).with_activation_policy(ActivationPolicy::Regular);
+        let event_loop = builder.build()?;
+        event_loop.set_control_flow(ControlFlow::Poll);
+        let proxy = event_loop.create_proxy();
+        let cursor_proxy = proxy.clone();
+        display.set_wake(move || {
+            let _ = proxy.send_event(());
+        });
+        let mut app = new_app(config, assets, display, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        app.cursor_builds.wake = Some(Arc::new(move || { let _ = cursor_proxy.send_event(()); }));
+        Ok((event_loop, app))
+    }), wait, on_exit);
+}
+
+#[cfg(target_os = "macos")]
+mod host_app {
+    use super::*;
+
+    /// An [`App`] run by the host's application; reports its end.
+    pub(super) struct Attached {
+        pub app: App,
+        pub on_exit: Option<OnExit>,
+    }
+
+    impl ApplicationHandler for Attached {
+        fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+            self.app.new_events(event_loop, cause)
+        }
+        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+            self.app.resumed(event_loop)
+        }
+        fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+            self.app.window_event(event_loop, id, event)
+        }
+        fn device_event(&mut self, event_loop: &ActiveEventLoop, id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+            self.app.device_event(event_loop, id, event)
+        }
+        fn user_event(&mut self, event_loop: &ActiveEventLoop, (): ()) {
+            self.app.user_event(event_loop, ())
+        }
+        fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            self.app.about_to_wait(event_loop)
+        }
+        fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+            self.app.exiting(event_loop);
+            if let Some(on_exit) = self.on_exit.take() {
+                on_exit(self.app.error.take().map_or(Ok(()), Err));
+            }
+        }
+    }
+
+    type Make = Box<dyn FnOnce() -> Result<(EventLoop<()>, App), ViewerError> + Send>;
+
+    /// Runs `make` on the main thread once the host's application runs
+    /// (checked every `RETRY`, for at most `wait`), then hands the viewer to
+    /// the host's run loop.
+    pub(super) fn start(make: Make, wait: Duration, on_exit: OnExit) {
+        let deadline = Instant::now() + wait;
+        dispatch2::DispatchQueue::main().exec_async(move || attempt(make, deadline, on_exit));
+    }
+
+    const RETRY: Duration = Duration::from_millis(50);
+
+    fn attempt(make: Make, deadline: Instant, on_exit: OnExit) {
+        if !winit::platform::macos::host_application_running() {
+            if Instant::now() >= deadline {
+                on_exit(Err(ViewerError::Host("no NSApplication runs on the main thread".into())));
+                return;
+            }
+            let when = dispatch2::DispatchTime::NOW.time(RETRY.as_nanos() as i64);
+            let _ = dispatch2::DispatchQueue::main().after(when, move || attempt(make, deadline, on_exit));
+            return;
+        }
+        match make() {
+            Ok((event_loop, app)) => {
+                use winit::platform::macos::EventLoopExtMacOSAttached;
+                log::info!("viewer: attached to the host's application on the main thread");
+                // (On failure the handler, with `on_exit`, is dropped: its
+                // owner's guards report the end.)
+                if let Err(e) = event_loop.run_app_attached(Attached { app, on_exit: Some(on_exit) }) {
+                    log::error!("viewer: {e}");
+                }
+            }
+            Err(e) => on_exit(Err(e)),
+        }
+    }
 }
 
 /// The settings saved at `viewer_settings::Settings::default_path()`; the
@@ -831,42 +1247,69 @@ fn load_settings() -> viewer_settings::Settings {
     })
 }
 
-struct Gpu {
-    window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    renderer: TileRenderer,
-    /// A software renderer (e.g. WARP, llvmpipe): a new frame only once the
-    /// last is done (it would pile up frames and their uploads) and only if
-    /// it differs; hardware ones keep the surface's own frame latency.
-    software: bool,
-    /// The surface was configured anew since the last frame (drawn even if
-    /// unchanged: the old picture may be gone).
-    reconfigured: bool,
-    /// The present modes the surface has.
-    present_modes: Vec<wgpu::PresentMode>,
+/// Consuming an empty dirty set is a read-only operation on a published
+/// world. Only real cell changes need ownership of its record storage.
+fn take_world_dirty(world: &mut Arc<TileWorld>) -> tile_render::Dirty {
+    if *world.dirty() == tile_render::Dirty::None { tile_render::Dirty::None }
+    else { Arc::make_mut(world).take_dirty() }
 }
 
+fn worker_wake(event_loop: Option<&Arc<dyn Fn() + Send + Sync>>, redraw: impl Fn() + Send + Sync + 'static) -> Arc<dyn Fn() + Send + Sync> {
+    // Production factories install the event-loop proxy before init. The
+    // redraw fallback is for manually constructed/test Apps only.
+    event_loop.cloned().unwrap_or_else(|| Arc::new(redraw))
+}
+
+fn frame_input(preparing: &mut Option<Vec<Input>>, display: &Display, input: Input) {
+    if let Some(inputs) = preparing { inputs.push(input); } else { display.send_input(input); }
+}
+
+struct Gpu {
+    window: Arc<Window>,
+    config: wgpu::SurfaceConfiguration,
+    worker: render_worker::Worker,
+    ready: bool,
+    config_revision: u64,
+    software: bool,
+    reconfigured: bool,
+    present_modes: Vec<wgpu::PresentMode>,
+    #[cfg(target_os = "macos")]
+    bitmap: Option<presentation::CpuBitmap>,
+}
+
+
 struct App {
+    stop: Arc<std::sync::atomic::AtomicBool>,
     config: ViewerConfig,
-    assets: Assets,
+    assets: ArtInbox,
     /// The generation drawn (the whole description's, or a growth's of
     /// it), and that whole description's.
     assets_version: u64,
     whole_version: u64,
-    /// The description as drawn (without the pixels: those are on the GPU).
-    compiled: Compiled,
+    /// Immutable committed metadata shared directly with the worker's
+    /// publication. Pixel storage remains on the GPU.
+    compiled: Arc<Compiled>,
     /// The first description's pixels, until the GPU is there to take them.
     upload: Option<Arc<Compiled>>,
     display: Display,
     /// Last scene adopted with compatible active art. Kept live for local
     /// cursor, hover, layout and FPS drawing while newer art is prepared.
-    shown_scene: Scene,
+    shown_scene: Arc<Scene>,
+    camera_arrival_reported: Option<u64>,
+    sprite_lifetimes: sprite_lifetimes::SpriteLifetimes,
     /// One immutable future snapshot prevents later optional art generations
     /// from moving the adoption target. Display keeps coalescing newer work.
     pending_scene: Option<PendingScene>,
+    /// Same-epoch command/layout metadata, independent of pixel upload.
+    future_metadata: Option<scene_prefix::Metadata>,
+    drawable_scene: Option<scene_prefix::DrawableScene>,
+    world_command_version: u64,
+    pending_ui: Option<ui_submission::PendingUi>,
+    next_frame_id: u64,
+    worker_world_version: u64,
+    input_revision: u64,
+    preparing_inputs: Option<Vec<Input>>,
+    pending_replay: Option<(u64, u64, Instant, Duration)>,
     gpu: Option<Gpu>,
     /// The scene version the renderer's world was built from.
     drawn_seq: u64,
@@ -879,16 +1322,16 @@ struct App {
     /// Which camera drew each scene view's overlay in the renderer's world.
     drawn_views: Vec<Option<u32>>,
     /// The renderer's world without the markers, and the markers drawn.
-    world: Option<TileWorld>,
+    world: Option<Arc<TileWorld>>,
     /// Art generation paired with the renderer's currently built world.
     /// An intermediate atlas commit may precede its compatible scene.
     world_assets_version: u64,
     drawn_markers: Vec<tile_render::PlacedSprite>,
-    /// Whether the last frame submitted is done (see `Gpu::software`).
-    frame_done: Arc<std::sync::atomic::AtomicBool>,
     /// The animation tick and window size drawn last.
     drawn_tick: u32,
     drawn_window: (u32, u32),
+    /// The background sampling drawn last (`settings.resolution.background_sampling`).
+    drawn_background: tile_render::BackgroundSampling,
     /// How the driver's screen is shown in the window
     /// ([`scaling::plan`]), and its size as last told to the driver
     /// (`Input::Resized`).
@@ -933,14 +1376,23 @@ struct App {
     snap_grabbed: bool,
     /// The frame counter (`settings.display.show_fps`).
     fps: fps::Overlay,
+    /// Whether the driver's host answers, as last shown (`host_status`).
+    host_status: host_status::Indicator,
+    settings_preview: settings_preview::Preview,
     /// The cursor art kept for the system pointer, the system cursors made
     /// of it (by set), what the system pointer shows, and whether it is the
     /// capture pointer (the layout's `PointerIcon::Capture`).
     cursor_art: cursor::Art,
+    os_cursor: system_cursor::SystemCursor,
     /// A committed whole atlas's cursor pixels, activated only when its
     /// scene becomes drawable. Old custom cursors remain usable meanwhile.
     pending_cursor_art: Option<(u64, cursor::Art)>,
-    custom_cursors: std::collections::HashMap<(u32, u32), winit::window::CustomCursor>,
+    custom_cursors: std::collections::HashMap<(u32, cursor::Scale), winit::window::CustomCursor>,
+    /// The operating system's cursor size (window pixels; the cursor size
+    /// setting's default), the scale the system pointer was last shown
+    /// at. Normal uncaptured pointers are always drawn by the OS.
+    system_cursor_size: u32,
+    shown_cursor_scale: cursor::Scale,
     /// System cursors being made (off the event loop: the picture never
     /// waits for one).
     cursor_builds: CursorBuilds,
@@ -955,14 +1407,11 @@ struct App {
     latency: cursor::Latency,
     latency_logged: Instant,
     frames_presented: u32,
+    diagnostics: Option<render_worker::AppDiagnostics>,
     /// Frame times for the log (`TILE_VIEWER_FRAME_TIMES`), and the world
     /// last drawn beside a screen (`scene::Beside`, for the log).
     frame_log: Option<fps::FrameLog>,
     beside_drawn: Option<(scene::WorldShape, Option<[i32; 4]>)>,
-    /// One art transfer, including its source until the GPU is finished.
-    pending_art: Option<PendingArt>,
-    /// Whole art prepared without replacing the renderer that is drawn.
-    preparing_art: Option<PreparingArt>,
     /// What happens to the system pointer after the next frame (see
     /// `unlock_after_frame`).
     unlock_pending: Option<Unlock>,
@@ -991,7 +1440,7 @@ struct App {
     profile: Option<profile::Profile>,
     /// The scene version last received (scenes counted for the profile).
     received_seq: u64,
-    /// The system's pointer constraints (Wayland).
+    /// The display-independent pointer controller.
     constraints: constraints::Constraints,
     /// The interaction looks drawn here (hover, pressed, selected), and
     /// those the last frame drew.
@@ -1002,7 +1451,7 @@ struct App {
     /// the scene it was built from.
     base_free: Vec<tile_render::PlacedSprite>,
     spans: Vec<looks::Span>,
-    look_scene: looks::LookScene,
+    look_scene: Arc<looks::LookScene>,
     /// Pixel transitions and matching pointer maps of scrollable menu lists.
     menu_scroll: smooth_menus::SmoothMenus,
 }
@@ -1029,17 +1478,6 @@ enum Unlock {
     Edge,
 }
 
-/// Captures the mouse again (locked where the system can, else kept in the
-/// window); whether it was locked.
-fn layout_captured_grab(window: &Window) -> bool {
-    use winit::window::CursorGrabMode;
-    if window.set_cursor_grab(CursorGrabMode::Locked).is_ok() {
-        return true;
-    }
-    let _ = window.set_cursor_grab(CursorGrabMode::Confined);
-    false
-}
-
 /// The longest time between frames (the animation clock) where the
 /// display's refresh rate is not known.
 const DEFAULT_FRAME: Duration = Duration::from_millis(16);
@@ -1062,6 +1500,7 @@ impl Default for FrameClock {
 
 impl FrameClock {
     fn configure(&mut self, interval: Duration, capped: bool) {
+        if (self.interval, self.capped) == (interval, capped) { return; }
         self.interval = interval;
         self.capped = capped;
         // Recompute from the last presentation, so changing or disabling a
@@ -1089,7 +1528,12 @@ impl FrameClock {
 
     fn presented(&mut self, now: Instant) {
         self.last_presented = Some(now);
-        self.next_attempt = Some(now + self.interval);
+        // The surface already paces VSync. Completing an uncapped frame
+        // must not add another refresh interval after its preparation and
+        // presentation. Keep the deadline established by the draw attempt.
+        if self.capped || self.next_attempt.is_none() {
+            self.next_attempt = Some(now + self.interval);
+        }
     }
 
     fn deadline(&self) -> Option<Instant> {
@@ -1147,6 +1591,63 @@ mod frame_clock_tests {
         }
         assert!(clock.ready(start + interval, false));
         assert!(clock.request(start + interval));
+    }
+
+    #[test]
+    fn graphics_settings_pace_high_refresh_and_reconfigure_without_stale_deadlines() {
+        let start = Instant::now();
+        let mut clock = FrameClock::default();
+        for fps in [30, 120, 240, 360, 480] {
+            for mode in [wgpu::PresentMode::AutoVsync, wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox] {
+                let interval = super::presentation_interval(fps, mode, Some(60_000));
+                assert!(interval.as_secs_f64() >= 1.0 / f64::from(fps));
+                clock.configure(interval, true);
+                clock.presented(start);
+                assert!(!clock.ready(start + interval - Duration::from_nanos(1), true));
+                assert_eq!(clock.wake_at(start), Some(start + interval));
+                assert!(clock.ready(start + interval, true));
+            }
+        }
+        clock.configure(super::presentation_interval(0, wgpu::PresentMode::Immediate, None), false);
+        assert!(clock.ready(start, true));
+        assert_eq!(clock.wake_at(start), None);
+        clock.configure(super::presentation_interval(0, wgpu::PresentMode::AutoVsync, Some(120_000)), false);
+        assert!(clock.ready(start, true), "uncapped input stays immediate with VSync");
+        assert!(!clock.ready(start, false));
+        assert_eq!(clock.wake_at(start), Some(start + Duration::from_secs_f64(1.0 / 120.0)));
+        assert_eq!(super::presentation_interval(0, wgpu::PresentMode::AutoVsync, Some(0)), super::DEFAULT_FRAME);
+    }
+
+    #[test]
+    fn uncapped_vsync_completion_never_adds_a_second_refresh_interval() {
+        let start = Instant::now();
+        let refresh = Duration::from_millis(16);
+        let mut clock = FrameClock::default();
+        clock.configure(refresh, false);
+        assert!(clock.request(start));
+        clock.presented(start + Duration::from_millis(5));
+        assert_eq!(clock.wake_at(start), Some(start + refresh));
+        // An unrelated settings update must not postpone that deadline.
+        clock.configure(refresh, false);
+        assert_eq!(clock.wake_at(start), Some(start + refresh));
+        assert!(clock.request(start + refresh));
+        // If preparation/presentation crosses the deadline, immediately
+        // request the next redraw and let the compositor pace it.
+        let completed = start + Duration::from_millis(35);
+        clock.presented(completed);
+        assert!(clock.ready(completed, false));
+        assert_eq!(clock.wake_at(completed), Some(start + refresh * 2));
+        // Input may still draw before an animation deadline.
+        assert!(clock.request(completed));
+        clock.presented(completed + Duration::from_millis(1));
+        assert!(clock.ready(completed + Duration::from_millis(2), true));
+        assert!(!clock.ready(completed + Duration::from_millis(2), false));
+        // Enabling an explicit cap restores presentation-based spacing.
+        clock.configure(refresh, true);
+        let capped = completed + refresh;
+        assert!(clock.request(capped + Duration::from_millis(1)));
+        clock.presented(capped + Duration::from_millis(4));
+        assert_eq!(clock.wake_at(capped), Some(capped + Duration::from_millis(4) + refresh));
     }
 
     #[test]
@@ -1218,17 +1719,46 @@ mod frame_clock_tests {
 }
 
 /// The present mode for `asked` among the surface's `modes`, and how many
-/// frames may be in flight: with vsync one (the cursor drawn here lags as
-/// little as it can), else three (the GPU never waits for the next frame,
-/// and a compositor holding a shown and a waiting picture leaves one to
-/// draw into).
+/// frames may be in flight: two with vsync permit CPU preparation to
+/// overlap GPU rendering; mailbox/immediate keep their existing throughput
+/// allowance of three. Acquiring a drawable can still block in the backend.
 fn present_mode(asked: viewer_settings::Present, modes: &[wgpu::PresentMode]) -> (wgpu::PresentMode, u32) {
     use viewer_settings::Present;
     let has = |m| modes.contains(&m);
     match asked {
         Present::Immediate if has(wgpu::PresentMode::Immediate) => (wgpu::PresentMode::Immediate, 3),
         Present::Immediate | Present::Mailbox if has(wgpu::PresentMode::Mailbox) => (wgpu::PresentMode::Mailbox, 3),
-        _ => (wgpu::PresentMode::AutoVsync, 1),
+        _ => (wgpu::PresentMode::AutoVsync, 2),
+    }
+}
+
+/// An explicit cap paces all redraws independently of the surface mode.
+/// Without one, only animations follow the display refresh.
+fn presentation_interval(max_fps: u32, mode: wgpu::PresentMode, refresh_millihertz: Option<u32>) -> Duration {
+    match (max_fps, mode) {
+        (n, _) if n > 0 => Duration::from_nanos(1_000_000_000u64.div_ceil(u64::from(n))),
+        (_, wgpu::PresentMode::Fifo | wgpu::PresentMode::AutoVsync) => refresh_millihertz.filter(|&r| r > 0)
+            .map_or(DEFAULT_FRAME, |mhz| Duration::from_secs_f64(1000.0 / mhz as f64)),
+        _ => Duration::ZERO,
+    }
+}
+
+#[cfg(test)]
+mod present_mode_tests {
+    use super::present_mode;
+    use viewer_settings::Present;
+    use wgpu::PresentMode;
+
+    #[test]
+    fn vsync_allows_overlap_without_changing_explicit_present_modes() {
+        let modes = [PresentMode::Fifo, PresentMode::Mailbox, PresentMode::Immediate];
+        assert_eq!(present_mode(Present::Vsync, &modes), (PresentMode::AutoVsync, 2));
+        assert_eq!(present_mode(Present::Mailbox, &modes), (PresentMode::Mailbox, 3));
+        assert_eq!(present_mode(Present::Immediate, &modes), (PresentMode::Immediate, 3));
+        assert_eq!(present_mode(Present::Immediate, &[PresentMode::Fifo, PresentMode::Mailbox]), (PresentMode::Mailbox, 3));
+        assert_eq!(present_mode(Present::Vsync, &[PresentMode::Fifo, PresentMode::Immediate]), (PresentMode::AutoVsync, 2));
+        assert_eq!(present_mode(Present::Immediate, &[PresentMode::Fifo]), (PresentMode::AutoVsync, 2));
+        assert_eq!(present_mode(Present::Mailbox, &[PresentMode::Fifo]), (PresentMode::AutoVsync, 2));
     }
 }
 
@@ -1296,10 +1826,11 @@ fn adopt_shown_scene(shown: &mut Scene, display: &mut Display, whole: u64, throu
     if latest.seq == 0 || latest.seq == shown.seq || !uses_art(latest.assets, whole, through) {
         return None;
     }
-    let changes = display.take_changes().0;
+    let changes = display.take_changes_from(shown.seq).0;
     let patches = display.take_patches();
-    // Drain patch pixels first so the retained snapshot does not copy them.
-    *shown = display.scene().clone();
+    // Drain patch pixels first. Keep the already owned world arrays and
+    // copy only the records identified by Display's coalesced changes.
+    let _ = scene_snapshot::update(shown, display.scene(), &changes);
     Some(SceneAdoption { changes, patches })
 }
 
@@ -1344,6 +1875,16 @@ fn adopt_available_scene(shown: &mut Scene, pending: &mut Option<PendingScene>, 
     Some(SceneAdoption { changes: scene::Changes { world: true, sprites: true, views: true, ..Default::default() }, patches })
 }
 
+fn adopt_available_shared_scene(shown: &mut Arc<Scene>, pending: &mut Option<PendingScene>, display: &mut Display, whole: u64, through: u64) -> Option<SceneAdoption> {
+    let latest = display.scene();
+    let latest_ready = latest.seq != 0 && latest.seq != shown.seq && uses_art(latest.assets, whole, through);
+    let pending_ready = pending.as_ref().is_some_and(|p| uses_art(p.scene.assets, whole, through));
+    if !latest_ready && !pending_ready { return None; }
+    // Only a real adoption can mutate the owned snapshot. Pinned readers
+    // retain their immutable arrays through Arc's copy-on-write fallback.
+    adopt_available_scene(Arc::make_mut(shown), pending, display, whole, through)
+}
+
 #[cfg(test)]
 mod shown_scene_tests {
     use super::{Display, PendingScene, Scene, adopt_available_scene, adopt_shown_scene, looks, retain_pending_scene, scene_art_target};
@@ -1361,7 +1902,7 @@ mod shown_scene_tests {
             },
             Update::View { id: 5, view: Some(View::default()) },
             Update::Overlay { view: 5, sprites: vec![FreeSprite { set: 10, ..Default::default() }] },
-            Update::Interactables(vec![Interactable { anchor: None, id: 1, rect: [10, 10, 20, 20], kind: InteractableKind::Button }]),
+            Update::Interactables(vec![Interactable { alt_right_click: false, anchor: None, id: 1, rect: [10, 10, 20, 20], kind: InteractableKind::Button }]),
             Update::Looks(vec![Looks {
                 id: 1,
                 views: vec![ViewLooks { view: 5, sprites: (0, 1), states: vec![(hover, vec![FreeSprite { set: 11, ..Default::default() }])] }],
@@ -1616,7 +2157,7 @@ impl PreparingArt {
         self.pending = None;
     }
 
-    fn advance(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, active_renderer: &TileRenderer, assets: &Assets, scene_assets: u64) -> Result<(u64, bool), tile_render::renderer::AtlasTransferError> {
+    fn advance(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, active_renderer: &TileRenderer, assets: &mut ArtInbox, scene_assets: u64) -> Result<(u64, bool), tile_render::renderer::AtlasTransferError> {
         use tile_render::renderer::AtlasTransferError;
         self.renderer.poll_atlas_transfers(device);
         if self.failed || self.obsolete { return Ok((0, false)) }
@@ -1742,7 +2283,7 @@ mod preparation_gpu_tests {
         Arc::new(growth)
     }
 
-    fn drive_base(gpu: &Headless, active: &TileRenderer, assets: &Assets, preparing: &mut PreparingArt, target: u64) {
+    fn drive_base(gpu: &Headless, active: &TileRenderer, assets: &mut ArtInbox, preparing: &mut PreparingArt, target: u64) {
         for _ in 0..64 {
             let (_, ready) = preparing.advance(&gpu.device, &gpu.queue, active, assets, target).unwrap();
             assert!(!ready, "the required growth has not been published");
@@ -1761,12 +2302,12 @@ mod preparation_gpu_tests {
         let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
         active.set_atlas(&gpu.device, &gpu.queue, &whole.atlas);
         let old_room = active.atlas_room();
-        let assets = Assets::new(whole.clone());
+        let mut assets = ArtInbox::new(Assets::new(whole.clone()));
         assets.set(whole.clone(), 7);
         let mut preparing = PreparingArt::new(&active, 7, whole);
-        drive_base(&gpu, &active, &assets, &mut preparing, 9);
+        drive_base(&gpu, &active, &mut assets, &mut preparing, 9);
         for _ in 0..4 {
-            assert!(!preparing.advance(&gpu.device, &gpu.queue, &active, &assets, 9).unwrap().1);
+            assert!(!preparing.advance(&gpu.device, &gpu.queue, &active, &mut assets, 9).unwrap().1);
             assert_eq!(active.atlas_room(), old_room);
             assert_eq!(preparing.through, 7);
         }
@@ -1774,7 +2315,7 @@ mod preparation_gpu_tests {
         assets.grow(growth(2, 4), 9);
         let mut ready = false;
         for _ in 0..64 {
-            ready = preparing.advance(&gpu.device, &gpu.queue, &active, &assets, 9).unwrap().1;
+            ready = preparing.advance(&gpu.device, &gpu.queue, &active, &mut assets, 9).unwrap().1;
             assert_eq!(active.atlas_room(), old_room);
             assert!(active.atlas_resident_bytes() + preparing.renderer.atlas_resident_bytes() <= active.atlas_transfer_limit().get());
             if ready { break }
@@ -1801,18 +2342,18 @@ mod preparation_gpu_tests {
         let final_arrays = 16 * 16 * 2 * 4 + 1;
         let remainder = final_arrays + base_tables + final_tables + tile_render::renderer::ATLAS_TRANSFER_STAGING_RESERVE_BYTES;
         active.set_atlas_transfer_limit(std::num::NonZeroU64::new(old_resident + remainder).unwrap());
-        let assets = Assets::new(whole.clone());
+        let mut assets = ArtInbox::new(Assets::new(whole.clone()));
         assets.set(whole.clone(), 7);
         let mut preparing = PreparingArt::new(&active, 7, whole);
-        drive_base(&gpu, &active, &assets, &mut preparing, 8);
+        drive_base(&gpu, &active, &mut assets, &mut preparing, 8);
         assets.grow(growth(1, 0), 8);
-        assert!(!preparing.advance(&gpu.device, &gpu.queue, &active, &assets, 8).unwrap().1);
+        assert!(!preparing.advance(&gpu.device, &gpu.queue, &active, &mut assets, 8).unwrap().1);
         assert!(!preparing.whole_done, "a resize that exceeds the combined peak must restart preparation");
         assert_eq!(preparing.renderer.atlas_resident_bytes(), 0);
         assert_eq!(preparing.growths.len(), 1, "keep the source for replay");
         let mut ready = false;
         for _ in 0..64 {
-            ready = preparing.advance(&gpu.device, &gpu.queue, &active, &assets, 8).unwrap().1;
+            ready = preparing.advance(&gpu.device, &gpu.queue, &active, &mut assets, 8).unwrap().1;
             assert_eq!(active.atlas_resident_bytes(), old_resident);
             assert!(old_resident + preparing.renderer.atlas_resident_bytes() <= active.atlas_transfer_limit().get());
             if ready { break }
@@ -1831,10 +2372,18 @@ mod preparation_gpu_tests {
 /// when the window resizes. No future scene IDs are needed to present it.
 struct CachedPicture {
     plan: scaling::Plan,
+    /// As drawn (`scaling::Drawn`): the canvas composed `pixel_box` times
+    /// larger each way (1: as the plan's), the copies in its pixels.
     copies: Vec<tile_render::ScreenCopy>,
+    pixel_box: u32,
 }
 
 impl CachedPicture {
+    /// How the kept picture is shown on the window (see `scaling::drawn`).
+    fn present(&self, plan: &scaling::Plan) -> tile_render::Present {
+        if self.pixel_box > 1 { plan.present.at_target() } else { plan.present }
+    }
+
     fn plan_for_target(&self, target: (u32, u32)) -> scaling::Plan {
         let mut plan = self.plan;
         let shift = |at: i32, old: u32, new: u32| {
@@ -1861,7 +2410,18 @@ mod cached_picture_tests {
         CachedPicture {
             plan,
             copies: vec![ScreenCopy { source: [100, 80, 120, 100], at: (300, 180), zoom: (2, 1) }],
+            pixel_box: 1,
         }
+    }
+
+    #[test]
+    fn a_picture_composed_at_the_window_resolution_is_replayed_one_to_one() {
+        let mut picture = picture();
+        assert_eq!(picture.present(&picture.plan), picture.plan.present);
+        picture.pixel_box = 2;
+        let plan = picture.plan_for_target((1300, 1000));
+        let present = picture.present(&plan);
+        assert_eq!((present.canvas, present.zoom, present.at, present.target), ((1280, 960), (1, 1), plan.present.at, (1300, 1000)));
     }
 
     #[test]
@@ -1897,6 +2457,15 @@ fn frame_times() -> bool {
     std::env::var("TILE_VIEWER_FRAME_TIMES").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
+/// The renderer's sampling for the user's menu background setting.
+pub fn background_sampling(setting: viewer_settings::BackgroundSampling) -> tile_render::BackgroundSampling {
+    match setting {
+        viewer_settings::BackgroundSampling::Dither => tile_render::BackgroundSampling::Dither,
+        viewer_settings::BackgroundSampling::Interpolate => tile_render::BackgroundSampling::Interpolate,
+        viewer_settings::BackgroundSampling::Nearest => tile_render::BackgroundSampling::Nearest,
+    }
+}
+
 /// Whether to log the cursor's latency (`TILE_VIEWER_LATENCY=1`).
 fn log_latency() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1908,6 +2477,7 @@ impl App {
     /// `TILE_VIEWER_LAYOUT` (a spec, `layout::Layout::configure`) on top,
     /// for testing.
     fn set_settings(&mut self, settings: viewer_settings::Settings) {
+        self.input_revision = self.input_revision.wrapping_add(1);
         self.layout.apply_settings(&settings.layout);
         self.layout.clean_map = settings.clean_map.clone();
         self.layout.set_map_movement(settings.input.map_movement);
@@ -1918,11 +2488,24 @@ impl App {
             }
         }
         // The counter counts while it shows, afresh each time it is shown.
-        if settings.display.show_fps && !self.settings.display.show_fps {
+        let old_details = self.settings.display.show_fps && self.settings.display.fps_detailed;
+        let new_details = settings.display.show_fps && settings.display.fps_detailed;
+        if settings.display.show_fps != self.settings.display.show_fps || old_details != new_details {
             self.fps = fps::Overlay::default();
+        }
+        if old_details != new_details {
+            self.fps.timings.reset_from(self.next_frame_id);
         }
         self.settings = settings;
         self.configure_present();
+        self.configure_timing();
+    }
+
+    fn configure_timing(&mut self) {
+        let requested = tile_render::timing::requested() || self.profile.is_some()
+            || (self.settings.display.show_fps && self.settings.display.fps_detailed);
+        let Some(gpu) = &mut self.gpu else { return };
+        gpu.worker.timing(requested);
     }
 
     /// The present mode and frame rate the settings ask for
@@ -1937,20 +2520,17 @@ impl App {
         // scene updates. Otherwise the display's refresh only paces the
         // animation clock; input can still request a frame immediately.
         let refresh = gpu.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).filter(|&r| r > 0);
-        let interval = match (max_fps, mode) {
-            (n, _) if n > 0 => Duration::from_nanos(1_000_000_000u64.div_ceil(u64::from(n))),
-            (_, wgpu::PresentMode::Fifo | wgpu::PresentMode::AutoVsync) => refresh.map_or(DEFAULT_FRAME, |mhz| Duration::from_secs_f64(1000.0 / mhz as f64)),
-            _ => Duration::ZERO,
-        };
+        let interval = presentation_interval(max_fps, mode, refresh);
         self.frame_clock.configure(interval, max_fps > 0);
         if (gpu.config.present_mode, gpu.config.desired_maximum_frame_latency) != (mode, latency) {
             gpu.config.present_mode = mode;
             gpu.config.desired_maximum_frame_latency = latency;
-            gpu.surface.configure(&gpu.device, &gpu.config);
+            gpu.config_revision = gpu.config_revision.wrapping_add(1);
+            gpu.worker.configure(render_worker::Config { revision: gpu.config_revision, width: gpu.config.width, height: gpu.config.height, present_mode: mode, latency });
             gpu.reconfigured = true;
         }
         log::info!(
-            "viewer: present {mode:?} (asked {asked:?}; the surface has {:?}), {latency} frame(s) in flight, frames {}",
+            "viewer: present {mode:?} (asked {asked:?}; the surface has {:?}), monitor refresh {refresh:?} mHz, explicit cap {max_fps} FPS, {latency} frame(s) in flight, frames {}",
             gpu.present_modes,
             if interval.is_zero() { "as fast as they are drawn".to_owned() }
             else if max_fps > 0 { format!("at most {max_fps} per second") }
@@ -1960,6 +2540,18 @@ impl App {
 
     /// Input for the driver: also what the interaction looks follow (a
     /// frame is drawn at once when they may change).
+    fn resolve_settings_preview(&mut self, result: Option<(Input, u32)>) {
+        if let Some((input, scale)) = result {
+            self.input.reset_wheel();
+            let mut settings = self.settings.clone();
+            settings.resolution.pixel_scale = scale;
+            self.set_settings(settings);
+            // Confirmation and rollback never wait for a render submission.
+            self.display.send_input(input);
+            if let Some(gpu) = &self.gpu { gpu.window.request_redraw(); }
+        }
+    }
+
     fn send(&mut self, input: Input) {
         let now = self.now();
         let input = if self.snap.snap_mode_active() { input } else {
@@ -1974,7 +2566,22 @@ impl App {
                 gpu.window.request_redraw();
             }
         }
-        self.display.send_input(input);
+        if matches!(input, Input::MouseButton { .. }) {
+            log::debug!("viewer: forwarding {input:?}");
+        }
+        frame_input(&mut self.preparing_inputs, &self.display, input);
+    }
+
+    /// The slider arrow keys step is drawn hovered (a frame at once when
+    /// that changes).
+    fn show_keyboard_slider(&mut self) {
+        if self.settings_preview.active() { return; }
+        let now = self.now();
+        if self.feedback.keyboard_slider(self.snap.selected_slider(), now) {
+            if let Some(gpu) = &self.gpu {
+                gpu.window.request_redraw();
+            }
+        }
     }
 
     /// Retarget only against pixels the user can see. A failed surface
@@ -1984,7 +2591,7 @@ impl App {
         let active = self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus())
             && (self.pointer_inside || self.layout.captured()) && !self.snap.snap_mode_active();
         for input in self.layout.refresh_world_pointer(active) {
-            self.display.send_input(input);
+            frame_input(&mut self.preparing_inputs, &self.display, input);
         }
     }
 
@@ -1999,8 +2606,16 @@ impl App {
         (self.layout.captured() && !self.machine.edge()) || self.snap.snap_mode_active() || self.unlock_pending.is_some() || self.constraints.moving()
     }
 
+    /// The cursor's size in effect (the setting, by default the system's),
+    /// at the pixel scale: the system pointer and the drawn cursor alike.
+    fn cursor_scale(&self) -> cursor::Scale {
+        let present = self.plan.map_or(1, |p| p.present.zoom.0.max(1) / p.present.zoom.1.max(1)).max(1);
+        cursor::Scale::new(self.settings.display.effective_cursor_size(self.system_cursor_size), present)
+    }
+
     fn shown_scene_matches_art(&self) -> bool {
-        self.shown_scene.seq != 0 && uses_art(self.shown_scene.assets, self.whole_version, self.assets_version)
+        self.shown_scene.seq != 0 && (uses_art(self.shown_scene.assets, self.whole_version, self.assets_version)
+            || self.future_metadata.as_ref().is_some_and(|m| m.base == self.whole_version && m.through == self.shown_scene.assets))
     }
 
     fn activate_cursor_art(&mut self) {
@@ -2010,27 +2625,25 @@ impl App {
         if self.pending_cursor_art.as_ref().is_some_and(|(base, _)| *base == self.whole_version) {
             let (_, art) = self.pending_cursor_art.take().expect("checked above");
             self.cursor_art = art;
+        }
+    }
+
+    /// Receive OS cursor metadata independently of GPU upload/presentation.
+    fn refresh_system_cursor(&mut self) {
+        let through = self.assets.latest();
+        let Some(whole) = self.assets.0.whole.load() else { return };
+        if self.os_cursor.refresh(self.display.scene(), whole.generation, through, whole.cursor_art.clone()) {
             self.custom_cursors.clear();
             self.cursor_builds.forget();
             self.shown_pointer = None;
         }
     }
 
-    /// The driver's cursor, as long as its scene refers to the art the
-    /// renderer has (its sprite set ids are that art's), else the last one
-    /// that did.
-    fn driver_cursor(&mut self) -> scene::Cursor {
-        if self.shown_scene_matches_art() {
-            self.activate_cursor_art();
-            self.cursor = self.shown_scene.cursor;
-        }
-        self.cursor
-    }
-
     /// Shows the system pointer as it is to be now (`cursor`): hidden
     /// while the viewer draws the cursor, else the driver's cursor (made
     /// from its art), or the capture pointer.
     fn update_system_pointer(&mut self, event_loop: &ActiveEventLoop) {
+        self.refresh_system_cursor();
         // (Button snapping says when it hides the pointer; whether it is
         // hidden is asked anew every time.)
         let _ = self.snap.take_hide_pointer();
@@ -2039,12 +2652,14 @@ impl App {
             self.custom_cursors.insert(key, event_loop.create_custom_cursor(source));
             self.shown_pointer = None;
         }
-        let shown = cursor::system_pointer(self.driver_cursor(), &self.cursor_art, self.pointer_hidden(), self.capture_icon);
+        let shown = self.os_cursor.shown_at(self.pointer_hidden(), self.capture_icon, self.display.scene().interface.targeting, std::time::Duration::from_secs_f64(self.now().max(0.0)));
+        let scale = self.cursor_scale();
         let Some(gpu) = &self.gpu else { return };
-        if self.shown_pointer == Some(shown) {
+        if self.shown_pointer == Some(shown) && self.shown_cursor_scale == scale {
             return;
         }
         self.shown_pointer = Some(shown);
+        self.shown_cursor_scale = scale;
         log::debug!("viewer: system pointer {shown:?}");
         match shown {
             cursor::Shown::Hidden => gpu.window.set_cursor_visible(false),
@@ -2053,18 +2668,16 @@ impl App {
                 gpu.window.set_cursor_visible(true);
             }
             cursor::Shown::Custom(set) => {
-                // At the pixel scale: each of its pixels an n×n box, as the
-                // picture's (a custom cursor's pixels are the window's
-                // physical ones, on Wayland too). Over menus or the frame
-                // at a scale of their own it stays at the pixel scale.
-                let n = self.plan.map_or(1, |p| p.present.zoom.0.max(1) / p.present.zoom.1.max(1)).clamp(1, 8);
-                match self.custom_cursors.get(&(set, n)) {
+                // At the cursor size, pixel for pixel what the viewer draws
+                // of it on the canvas at the pixel scale (a custom cursor's
+                // pixels are the window's physical ones on every system).
+                match self.custom_cursors.get(&(set, scale)) {
                     Some(c) => gpu.window.set_cursor(c.clone()),
-                    None => match self.cursor_art.get(set) {
+                    None => match self.os_cursor.art().get(set) {
                         // Made on a thread of its own; until it is, the
                         // pointer stays as it is (asked again next frame).
                         Some(image) => {
-                            self.cursor_builds.start((set, n), image.clone());
+                            self.cursor_builds.start((set, scale), image.clone());
                             self.shown_pointer = None;
                         }
                         None => gpu.window.set_cursor(winit::window::CursorIcon::Default),
@@ -2101,20 +2714,18 @@ impl App {
             self.grab(true);
         }
         // (The layout's pixels are the driver's: in the window's.)
-        if let (Some(p), Some(gpu)) = (warp, &self.gpu) {
+        if let (Some(p), Some(_)) = (warp, &self.gpu) {
             let (x, y) = self.plan.map_or(p, |plan| plan.to_window(p));
-            if self.constraints.move_pointer(&gpu.window, (x, y)) {
-                log::debug!("viewer: moving the pointer to {x}, {y} (lock and hint)");
-                // Input follows it after the compositor activates the lock.
-            } else {
-                match gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(x, y)) {
-                    Ok(()) => self.pointer_placed((x, y)),
-                    Err(e) => {
-                        log::debug!("viewer: moving the pointer to {x}, {y}: {e}");
-                        // (The divider cannot hold back what it cannot move.)
-                        self.layout.pointer_cannot_be_moved();
-                        self.pointer_placement_failed();
-                    }
+            match self.constraints.move_pointer((x, y)) {
+                Ok(constraints::Move::Pending) => {
+                    log::debug!("viewer: moving the pointer to {x}, {y} (lock and hint)");
+                    // Input follows it after the compositor activates the lock.
+                }
+                Ok(constraints::Move::Immediate) => self.pointer_placed((x, y)),
+                Err(e) => {
+                    log::debug!("viewer: moving the pointer to {x}, {y}: {e}");
+                    self.layout.pointer_cannot_be_moved();
+                    self.pointer_placement_failed();
                 }
             }
         }
@@ -2205,6 +2816,19 @@ impl App {
                 // winit's region covers the whole window and prevents our
                 // Wayland walls from taking ownership of the pointer.
                 self.grab(false);
+                // Confine the pointer to its line (or area) at once, in the
+                // same request batch as the release: the pointer is at the
+                // drawn cursor now, and any motion before a later frame
+                // would take it off a one-pixel line before the system
+                // holds it there.
+                self.layout.set_pointer_at_edge(self.machine.edge());
+                if let Some(gpu) = &self.gpu {
+                    match self.constraints.update(&gpu.window, &mut self.layout, self.plan.map(|p| p.present), self.pointer_inside) {
+                        Some(constraints::Placement::Hinted(at)) => self.pointer_placed(at),
+                        Some(constraints::Placement::Cancelled) => self.pointer_placement_failed(),
+                        None => {}
+                    }
+                }
             }
             None => {}
         }
@@ -2228,8 +2852,8 @@ impl App {
         let mut size = winit::dpi::PhysicalSize::new(self.config.size.0, self.config.size.1);
         // (Wayland has no primary monitor: the first one.)
         let monitor = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next());
-        if let Some(m) = monitor.map(|m| m.size()).filter(|m| m.width > 0 && m.height > 0) {
-            size = within_screen(m, m);
+        if let Some((_, usable)) = monitor.map(|m| m.work_area()).filter(|(_, size)| size.width > 0 && size.height > 0) {
+            size = within_screen(usable, usable);
         }
         let mut attrs = Window::default_attributes()
             .with_title(self.config.title.clone())
@@ -2242,60 +2866,37 @@ impl App {
         // it first shows, e.g. Wine's on Wayland at a default size, places
         // it for that size.)
         let window = Arc::new(event_loop.create_window(attrs.with_visible(false))?);
-        self.constraints.attach(&window);
-        let instance = wgpu::Instance::new(tile_render::gpu::instance_descriptor());
-        let surface = instance.create_surface(window.clone())?;
-        let size = window.inner_size();
-        // The window's size is in physical pixels (winit follows the
-        // compositor's scale, `wl_output` / fractional scale on Wayland),
-        // and so is the surface: the picture reaches the screen 1:1.
-        log::info!(
-            "viewer: window {}×{} pixels at scale {} ({}×{} logical)",
-            size.width,
-            size.height,
-            window.scale_factor(),
-            (size.width as f64 / window.scale_factor()).round(),
-            (size.height as f64 / window.scale_factor()).round()
-        );
-        // The adapter asked for (`TILE_RENDER_ADAPTER`); if it cannot show
-        // this window after all (e.g. a GPU that does not drive the
-        // display), the default one for it.
-        let shown = pollster::block_on(async {
-            let adapter = tile_render::gpu::select_adapter(&instance, Some(&surface), None).await?;
-            match show_with(&surface, adapter, size).await {
-                Ok(shown) => Ok(shown),
-                Err((adapter, e)) => {
-                    let name = adapter.get_info().name;
-                    log::error!("viewer: {name} cannot show this window ({e}); trying the default adapter for it");
-                    let adapter = tile_render::gpu::default_adapter(&instance, Some(&surface)).await?;
-                    show_with(&surface, adapter, size).await.map_err(|(a, e)| {
-                        log::error!("viewer: {} cannot show this window either ({e})", a.get_info().name);
-                        ViewerError::Gpu(tile_render::gpu::GpuError::NoAdapter(Some(name)))
-                    })
-                }
+        if let Some(icon) = &self.config.application_icon {
+            if let Err(error) = icon.apply(&window) {
+                log::warn!("application icon: {error}");
             }
-        })?;
-        let (adapter, device, queue, config) = shown;
-        log::info!("viewer adapter: {:?}", adapter.get_info());
-        let mut renderer = TileRenderer::new(&device, config.format);
-        if self.profile.is_some() {
-            let timed = renderer.enable_timing(&device, &queue);
-            log::info!("viewer: profiling (TILE_VIEWER_PROFILE), GPU time per pass: {}", if timed { "yes" } else { "no timestamp queries" });
         }
-        if let Some(whole) = self.upload.take() {
-            renderer.set_atlas(&device, &queue, &whole.atlas);
-            self.cursor_art = cursor::Art::of(&whole);
-        }
-        self.assets.uploaded(self.whole_version, self.assets_version);
-        self.display.send_input(Input::Resized { width: config.width, height: config.height });
-        let software = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
-        if software {
-            log::info!("viewer: software renderer, one frame in flight, unchanged frames skipped");
-        }
-        window.set_visible(true);
-        let present_modes = surface.get_capabilities(&adapter).present_modes;
-        self.gpu = Some(Gpu { window, surface, device, queue, config, renderer, software, reconfigured: true, present_modes });
-        self.update_plan();
+        self.constraints.attach(&window);
+        self.system_cursor_size = pointer_control::system_cursor_size(&window);
+        log::info!("viewer: the system's cursor size is {} window pixels", self.system_cursor_size);
+        let size = window.inner_size();
+        let bitmap = std::env::var("TILE_VIEWER_SOFTWARE_PRESENT").is_ok_and(|v| !v.is_empty() && v != "0");
+        #[cfg(not(target_os = "macos"))]
+        if bitmap { return Err(ViewerError::SoftwarePresent("TILE_VIEWER_SOFTWARE_PRESENT is only supported on macOS".into())); }
+        let initial = self.upload.take().expect("initial art retained until worker startup");
+        self.cursor_art = cursor::Art::of(&initial);
+        let wake_window = window.clone();
+        let worker = render_worker::Worker::spawn(render_worker::Init {
+            window: window.clone(),
+            native_thread_init: self.config.native_thread_init, initial, base: self.whole_version, through: self.assets_version,
+            size: (size.width.max(1), size.height.max(1)), profile: self.profile.is_some(), bitmap,
+            wake_main: worker_wake(self.cursor_builds.wake.as_ref(), move || wake_window.request_redraw()),
+        });
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            format: wgpu::TextureFormat::Bgra8Unorm, width: size.width.max(1), height: size.height.max(1),
+            present_mode: wgpu::PresentMode::AutoVsync, desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto, view_formats: vec![], color_space: wgpu::SurfaceColorSpace::Auto,
+        };
+        #[cfg(target_os = "macos")]
+        let bitmap_presenter = if bitmap { Some(presentation::CpuBitmap::new(window.clone())?) } else { None };
+        self.gpu = Some(Gpu { window, config, worker, ready: false, config_revision: 0, software: false, reconfigured: true,
+            present_modes: vec![wgpu::PresentMode::Fifo], #[cfg(target_os = "macos")] bitmap: bitmap_presenter });
         self.configure_present();
         Ok(())
     }
@@ -2323,41 +2924,34 @@ impl App {
         if !self.config.fullscreen && self.sized_to_screen != Some(key) && screen.0 > 0 && screen.1 > 0 {
             self.sized_to_screen = Some(key);
             let mut want = winit::dpi::PhysicalSize::new((screen.0 as f64 * scale).round() as u32, (screen.1 as f64 * scale).round() as u32);
-            // (No larger than the screen it is on, with room for its frame:
-            // nine tenths of it at most, the same shape.)
-            if let Some(m) = gpu.window.current_monitor().map(|m| m.size()).filter(|m| m.width > 0 && m.height > 0) {
-                want = within_screen(want, m);
+            // Keep the title bar and the whole client area inside the
+            // usable desktop. The platform backend supplies reserved areas.
+            let area = gpu.window.current_monitor().map(|m| m.work_area())
+                .filter(|(_, size)| size.width > 0 && size.height > 0);
+            let frame = window_frame(gpu.window.inner_size(), gpu.window.outer_size());
+            if let Some(area) = area {
+                want = within_screen(want, area.1);
+                want = window_placement(want, frame, area).0;
             }
             log::info!("viewer: asking for a {}×{} window (the driver's {}×{} screen at scale {scale})", want.width, want.height, screen.0, screen.1);
             let _ = gpu.window.request_inner_size(want);
-            // In the middle of its screen (where a system lets windows place
-            // themselves; Wayland's compositors place them).
-            if let Some(m) = gpu.window.current_monitor() {
-                let (at, size) = (m.position(), m.size());
-                let x = at.x + (size.width as i32 - want.width as i32) / 2;
-                let y = at.y + (size.height as i32 - want.height as i32) / 2;
-                gpu.window.set_outer_position(winit::dpi::PhysicalPosition::new(x.max(at.x), y.max(at.y)));
+            // Wayland's compositor places windows itself.
+            if let Some(area) = area {
+                gpu.window.set_outer_position(window_placement(want, frame, area).1);
             }
         }
-        // A window the system placed partly off its screen (e.g. Wine's
-        // windows on Wayland, placed at a first size, not moved after): as
-        // large as fits where it is, and moved into the middle where the
-        // system lets it.
+        // A compositor may choose a different initial client size. Check
+        // the actual decorated bounds against the same usable desktop.
         if !self.config.fullscreen && self.fitted_on_screen != Some((window, key)) {
             self.fitted_on_screen = Some((window, key));
             if let (Ok(at), Some(m)) = (gpu.window.outer_position(), gpu.window.current_monitor()) {
-                let (outer, (mp, ms)) = (gpu.window.outer_size(), (m.position(), m.size()));
-                let over = |at: i32, len: u32, from: i32, side: u32| (at + len as i32 - (from + side as i32)).max(0) as u32;
-                let (ox, oy) = (over(at.x, outer.width, mp.x, ms.width), over(at.y, outer.height, mp.y, ms.height));
-                if ox > 0 || oy > 0 {
+                let (outer, area) = (gpu.window.outer_size(), m.work_area());
+                if area.1.width > 0 && area.1.height > 0 && !window_in_work_area(at, outer, area) {
                     let inner = gpu.window.inner_size();
-                    let fits = winit::dpi::PhysicalSize::new(inner.width.saturating_sub(ox).max(160), inner.height.saturating_sub(oy).max(120));
-                    log::info!("viewer: the window is {ox}×{oy} pixels off its screen: {}×{} instead", fits.width, fits.height);
-                    let _ = gpu.window.request_inner_size(fits);
-                    let frame = (outer.width - inner.width, outer.height - inner.height);
-                    let x = mp.x + (ms.width as i32 - (fits.width + frame.0) as i32) / 2;
-                    let y = mp.y + (ms.height as i32 - (fits.height + frame.1) as i32) / 2;
-                    gpu.window.set_outer_position(winit::dpi::PhysicalPosition::new(x.max(mp.x), y.max(mp.y)));
+                    let (fits, position) = window_placement(inner, window_frame(inner, outer), area);
+                    log::info!("viewer: fitting decorated window inside usable desktop {:?}: {}×{} at {position:?}", area, fits.width, fits.height);
+                    if fits != inner { let _ = gpu.window.request_inner_size(fits); }
+                    gpu.window.set_outer_position(position);
                 }
             }
         }
@@ -2370,13 +2964,14 @@ impl App {
         let native = (window.0, window.1, (desktop * 1000.0).round() as u32);
         if native != self.reported_window {
             self.reported_window = native;
-            self.display.send_input(Input::Window { width: native.0, height: native.1, scale_milli: native.2 });
+            frame_input(&mut self.preparing_inputs, &self.display, Input::Window { width: native.0, height: native.1, scale_milli: native.2 });
         }
         let plan = if waiting {
             self.cached_picture.as_ref().map(|picture| picture.plan_for_target(window))
         } else {
             None
-        }.unwrap_or_else(|| scaling::plan(window, desktop, screen, &self.settings.resolution));
+        }.unwrap_or_else(|| scaling::plan(window, desktop, screen, &self.settings.resolution)
+            .for_scene(&self.shown_scene, |s| sprite_rect(self.future_metadata.as_ref().filter(|m| m.base == self.whole_version && m.through == self.shown_scene.assets).map_or(self.compiled.as_ref(), |m| m.layout.as_ref()), s)));
         if Some(plan) != self.plan {
             let p = plan.present;
             log::info!(
@@ -2392,7 +2987,7 @@ impl App {
                 plan.screen.0,
                 plan.screen.1,
                 if plan.menu.zoom != (1, 1) || plan.frame != (1, 1) || plan.world != (1, 1) {
-                    format!("; menus {}/{}, frame {}/{}, world {}/{}", plan.menu.zoom.0, plan.menu.zoom.1, plan.frame.0, plan.frame.1, plan.world.0, plan.world.1)
+                    format!("; menus {}/{} (fitted content {:?}), frame {}/{}, world {}/{}", plan.menu.zoom.0, plan.menu.zoom.1, plan.menu_bounds, plan.frame.0, plan.frame.1, plan.world.0, plan.world.1)
                 } else {
                     String::new()
                 }
@@ -2411,25 +3006,15 @@ impl App {
         }
         if plan.screen != self.reported_size {
             self.reported_size = plan.screen;
-            self.display.send_input(Input::Resized { width: plan.screen.0, height: plan.screen.1 });
+            frame_input(&mut self.preparing_inputs, &self.display, Input::Resized { width: plan.screen.0, height: plan.screen.1 });
         }
     }
 
     /// Captures (holds) or releases the mouse (the pointer is hidden and
     /// shown by `update_system_pointer`).
     fn grab(&mut self, lock: bool) {
-        let Some(gpu) = &self.gpu else { return };
-        // (Before winit's: the pointer takes one constraint at a time.)
-        self.constraints.winit_grab(lock);
-        use winit::window::CursorGrabMode;
-        if lock {
-            // Locked where the system can, else kept inside the window.
-            if gpu.window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
-                let _ = gpu.window.set_cursor_grab(CursorGrabMode::Confined);
-            }
-        } else {
-            let _ = gpu.window.set_cursor_grab(CursorGrabMode::None);
-        }
+        self.input_revision = self.input_revision.wrapping_add(1);
+        if self.gpu.is_some() { self.constraints.grab(lock); }
     }
 
     fn draw(&mut self) {
@@ -2459,162 +3044,218 @@ impl App {
 
     /// Keeps the drawable atlas until a replacement and every growth its
     /// scene needs are ready. Only matching scenes activate prepared art.
+    fn refresh_future_metadata(&mut self) {
+        let whole = self.assets.receive();
+        let target = self.display.scene().assets;
+        // Never reinterpret numeric IDs across a whole replacement.
+        if whole.generation != self.whole_version || target <= self.assets_version {
+            if self.future_metadata.as_ref().is_some_and(|m| m.base != self.whole_version || m.through <= self.assets_version) {
+                self.future_metadata = None;
+            }
+            return;
+        }
+        if self.future_metadata.as_ref().is_some_and(|m| m.base == self.whole_version && m.through == target) { return; }
+        let queued = self.assets.growths.iter().map(|(version, growth)| (*version, growth.as_ref()));
+        let work = scene_prefix::refresh_metadata(&mut self.future_metadata, self.whole_version, &self.compiled, self.assets_version, target, queued);
+        if let Some(profile) = &mut self.profile {
+            profile.count("future metadata copies", work.table_copies);
+            profile.count("future growths applied", work.growths_applied);
+        }
+    }
+
     fn upload_art(&mut self) -> bool {
-        use tile_render::renderer::AtlasTransferError;
-        let Some(gpu) = self.gpu.as_mut() else { return false };
-        gpu.renderer.poll_atlas_transfers(&gpu.device);
-        let (version, whole) = self.assets.whole();
-        if self.pending_art.as_ref().is_some_and(|p| p.payload.base() != version) {
-            gpu.renderer.cancel_atlas_transfer(&gpu.queue);
-            self.pending_art = None;
+        self.receive_worker();
+        let whole = self.assets.receive();
+        let reserve = self.assets.reserve.filter(|(base, _, _)| *base == whole.generation).map_or((0, 0), |(_, w, h)| (w, h));
+        if let Some(gpu) = &self.gpu {
+            gpu.worker.art(render_worker::ArtSnapshot {
+                base: whole.generation, whole: whole.compiled.clone(),
+                growths: self.assets.growths.iter().map(|(version, growth)| (*version, growth.clone())).collect(),
+                reserve, target: scene_art_target(&self.pending_scene, &self.display),
+            });
         }
-        if let Some(preparing) = &mut self.preparing_art {
-            preparing.renderer.poll_atlas_transfers(&gpu.device);
-            if preparing.base != version && !preparing.obsolete { preparing.cancel(&gpu.queue); }
-            if preparing.obsolete {
-                // Dropping an in-flight preparer and immediately allocating
-                // another would conceal abandoned GPU arrays from the cap.
-                if !preparing.renderer.atlas_transfer_idle() { return false }
-                self.preparing_art = None;
+        false
+    }
+
+    fn receive_worker(&mut self) {
+        self.report_latency();
+        let events = self.gpu.as_ref().map_or_else(Vec::new, |gpu| gpu.worker.drain());
+        for event in events {
+            match event {
+                render_worker::Event::SurfaceNeeded { instance } => {
+                    if let Some(gpu) = &self.gpu {
+                        gpu.worker.surface(instance.create_surface(gpu.window.clone()).map_err(|error| error.to_string()));
+                    }
+                }
+                render_worker::Event::Ready { config, software, present_modes, base, through } => {
+                    if let Some(gpu) = &mut self.gpu {
+                        if gpu.config_revision == 0 { gpu.config = config; }
+                        else { gpu.config.format = config.format; gpu.config.alpha_mode = config.alpha_mode; }
+                        gpu.software = software;
+                        gpu.present_modes = present_modes;
+                        gpu.ready = true;
+                        gpu.reconfigured = true;
+                        gpu.window.set_visible(true);
+                    }
+                    self.whole_version = base;
+                    self.assets_version = through;
+                    self.assets.uploaded(base, through);
+                    self.fps.timings.reset_from(self.next_frame_id);
+                    self.configure_present();
+                    self.configure_timing();
+                }
+                render_worker::Event::ArtCommitted { base, through, compiled, cursor_art } => {
+                    let published_base = self.assets.receive().generation;
+                    if base != published_base || base < self.whole_version || (base == self.whole_version && through < self.assets_version) { continue; }
+                    self.compiled = compiled;
+                    if let Some(profile) = &mut self.profile { profile.count("committed metadata snapshots", 1); }
+                    self.whole_version = base;
+                    self.assets_version = through;
+                    self.pending_cursor_art = Some((base, (*cursor_art).clone()));
+                    self.assets.uploaded(base, through);
+                    // The worker now owns these pixels. Keep metadata only
+                    // in main's inbox so future bounds never wait on uploads.
+                    self.assets.growths.retain(|(version, _)| *version > through);
+                }
+                render_worker::Event::Presented { id, worker_prepare, .. } => self.commit_ui(id, worker_prepare),
+                render_worker::Event::Bitmap { id, width, height, pixels, worker_prepare, .. } => {
+                    // A reply queued before resize cannot be retracted by
+                    // the worker. Validate before any OS bitmap mutation.
+                    if !self.reply_matches_configuration(id) { self.commit_ui(id, worker_prepare); continue; }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let result = self.gpu.as_mut().and_then(|gpu| gpu.bitmap.as_mut()).ok_or_else(|| ViewerError::SoftwarePresent("bitmap presenter is absent".into()))
+                            .and_then(|presenter| presenter.present(width, height, &pixels));
+                        if let Err(error) = result { self.error = Some(error); continue; }
+                        self.commit_ui(id, worker_prepare);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    { let _ = (id, width, height, pixels, worker_prepare); self.error = Some(ViewerError::SoftwarePresent("unexpected bitmap frame".into())); }
+                }
+                render_worker::Event::Retry { id } => {
+                    if let Some(d) = &mut self.diagnostics { d.retried += 1; }
+                    self.latency.pending.remove(&id);
+                    if self.pending_ui.as_ref().is_some_and(|pending| pending.id == id) {
+                        self.pending_ui = None;
+                        self.world = None;
+                        self.drawn_seq = 0;
+                        self.world_command_version = 0;
+                    }
+                    if self.pending_replay.is_some_and(|(pending, _, _, _)| pending == id) { self.pending_replay = None; }
+                }
+                render_worker::Event::GpuCompleted { id, at } => {
+                    self.latency.completed(id, at);
+                }
+                render_worker::Event::Timings(frames) => {
+                    if self.settings.display.show_fps && self.settings.display.fps_detailed {
+                        let seconds = self.started.elapsed().as_secs_f64();
+                        for frame in frames { self.fps.timings.gpu_frame(seconds, &frame); }
+                    }
+                }
+                render_worker::Event::Failed(error) => {
+                    if let Some(request) = self.display.scene().camera_arrival.or(self.shown_scene.camera_arrival) {
+                        self.report_camera_receipt(scene::Input::CameraUnavailable { serial: request.serial });
+                    }
+                    self.pending_ui = None;
+                    self.pending_replay = None;
+                    self.error = Some(ViewerError::RenderWorker(error));
+                }
             }
         }
-        if version != self.whole_version {
-            if !gpu.renderer.atlas_transfer_idle() { return false }
-            if self.preparing_art.is_none() {
-                let Some(compiled) = whole else { return false };
-                self.preparing_art = Some(PreparingArt::new(&gpu.renderer, version, compiled));
-            }
-            let preparing = self.preparing_art.as_mut().expect("created above");
-            if preparing.failed {
-                // A failed replacement must not keep an unused intermediate
-                // atlas after its callbacks have released pending work.
-                if preparing.renderer.atlas_transfer_idle() && preparing.renderer.atlas_resident_bytes() > 0 {
-                    preparing.renderer = gpu.renderer.atlas_preparer();
-                }
-                return false;
-            }
-            let target = scene_art_target(&self.pending_scene, &self.display);
-            let ready = match preparing.advance(&gpu.device, &gpu.queue, &gpu.renderer, &self.assets, target) {
-                Ok((bytes, ready)) => {
-                    if let Some(profile) = &mut self.profile { profile.count("art transfer bytes", bytes as usize); }
-                    ready
-                }
-                Err(e) => {
-                    log::error!("viewer: replacement art {} could not be prepared: {e}", preparing.base);
-                    preparing.renderer.cancel_atlas_transfer(&gpu.queue);
-                    preparing.pending = None;
-                    preparing.failed = true;
-                    return false;
-                }
-            };
-            if !ready { return false }
-            let assets = self.assets.clone();
-            let slot = assets.slot();
-            if slot.generation != version {
-                drop(slot);
-                preparing.cancel(&gpu.queue);
-                return false;
-            }
-            match gpu.renderer.adopt_prepared_atlas(&gpu.device, &gpu.queue, &mut preparing.renderer) {
-                Ok(()) => {}
-                Err(AtlasTransferError::Busy) => return false,
-                Err(e) => {
-                    drop(slot);
-                    log::error!("viewer: replacement art {} could not be activated: {e}", preparing.base);
-                    preparing.failed = true;
-                    return false;
-                }
-            }
-            drop(slot);
-            let prepared = self.preparing_art.take().expect("adopted above");
-            self.pending_cursor_art = Some((version, cursor::Art::of(&prepared.whole)));
-            self.compiled = prepared.compiled;
-            self.whole_version = version;
-            self.assets_version = prepared.through;
-            self.assets.uploaded(version, prepared.through);
-            log::info!("viewer: new assets through generation {} ({} sprites, prepared over {} ms in {} frames)", prepared.through, self.compiled.sprite_names.len(), prepared.since.elapsed().as_millis(), prepared.frames);
-            return true;
+    }
+
+    fn report_latency(&mut self) {
+        if !log_latency() || self.latency_logged.elapsed() < Duration::from_secs(10) { return; }
+        let mut done = Vec::new();
+        while let Some(sample) = self.latency.done.try_recv() { done.push(sample); }
+        if self.latency.start.is_empty() && done.is_empty() { return; }
+        log::info!("viewer: cursor latency ms (p50, p95, max, n), motion to frame started: {:?}; to frame presented: {:?}; to GPU completion: {:?}", cursor::Latency::summary(&mut self.latency.start), cursor::Latency::summary(&mut self.latency.present), cursor::Latency::summary(&mut done));
+        self.latency.start.clear();
+        self.latency.present.clear();
+        self.latency_logged = Instant::now();
+    }
+
+    fn reply_matches_configuration(&self, id: u64) -> bool {
+        let Some(gpu) = &self.gpu else { return false; };
+        self.pending_ui.as_ref().is_some_and(|pending| pending.id == id && pending.config_revision == gpu.config_revision)
+            || self.pending_replay.is_some_and(|(pending, revision, _, _)| pending == id && revision == gpu.config_revision)
+    }
+
+    fn report_camera_receipt(&mut self, input: scene::Input) {
+        let serial = match input { scene::Input::CameraArrived { serial } | scene::Input::CameraUnavailable { serial } => serial, _ => return };
+        if self.camera_arrival_reported != Some(serial) {
+            self.camera_arrival_reported = Some(serial);
+            self.display.send_input(input);
         }
-        // Growth of the drawable whole keeps existing ids usable, so it
-        // can continue using the renderer's single-candidate transfer path.
-        if self.pending_art.is_none() {
-            if let Some((generation, growth)) = self.assets.take_growth(version) {
-                let reserve = self.assets.take_reserve(version).unwrap_or_default();
-                self.pending_art = Some(PendingArt::new(PendingArtPayload::Growth { base: version, version: generation, growth }, reserve));
-            } else if let Some(reserve) = self.assets.take_reserve(version) {
-                self.pending_art = Some(PendingArt::new(PendingArtPayload::Reserve { base: version }, reserve));
-            }
+    }
+
+    fn commit_ui(&mut self, id: u64, worker_prepare: Duration) {
+        if self.pending_replay.is_some_and(|(pending, _, _, _)| pending == id) {
+            let (_, revision, started, main_prepare) = self.pending_replay.take().expect("matched above");
+            if self.gpu.as_ref().is_none_or(|gpu| gpu.config_revision != revision) { return; }
+            self.record_presented(id, started, (main_prepare + worker_prepare).as_secs_f64() * 1000.0);
+            return;
         }
-        let Some(p) = self.pending_art.as_mut().filter(|p| !p.failed) else { return false };
-        if !p.started {
-            match gpu.renderer.begin_atlas_transfer(&gpu.device, p.payload.source(), p.reserve) {
-                Ok(()) => p.started = true,
-                Err(AtlasTransferError::Busy) => return false,
-                Err(e) => {
-                    log::error!("viewer: cannot prepare atlas generation {}: {e}", p.payload.base());
-                    p.failed = true;
-                    return false;
-                }
+        let pending = match ui_submission::complete(&mut self.pending_ui, id, self.gpu.as_ref().map(|gpu| gpu.config_revision)) {
+            ui_submission::Completion::Unrelated => return,
+            ui_submission::Completion::Obsolete => {
+                if let Some(d) = &mut self.diagnostics { d.obsolete += 1; }
+                self.world = None;
+                self.drawn_seq = 0;
+                self.world_command_version = 0;
+                return;
             }
-        }
-        p.frames += 1;
-        let ready = match gpu.renderer.advance_atlas_transfer(&gpu.device, &gpu.queue, p.payload.source(), ATLAS_PART) {
-            Ok(progress) => {
-                if let Some(profile) = &mut self.profile { profile.count("art transfer bytes", progress.bytes as usize); }
-                progress.ready
-            }
-            Err(AtlasTransferError::Invalidated) => {
-                gpu.renderer.cancel_atlas_transfer(&gpu.queue);
-                p.started = false;
-                return false;
-            }
-            Err(e) => {
-                log::error!("viewer: atlas generation {} transfer failed: {e}", p.payload.base());
-                gpu.renderer.cancel_atlas_transfer(&gpu.queue);
-                p.failed = true;
-                false
-            }
+            ui_submission::Completion::Presented(pending) => pending,
         };
-        if !ready { return false }
-        let assets = self.assets.clone();
-        let slot = assets.slot();
-        if slot.generation != version {
-            drop(slot);
-            gpu.renderer.cancel_atlas_transfer(&gpu.queue);
-            self.pending_art = None;
-            return false;
+        let camera_receipt = pending.mapping.camera_arrival_receipt(&pending.frame);
+        let unchanged_input = pending.input_revision == self.input_revision;
+        let remapped_pointer = pending.mapping.activate(self, unchanged_input);
+        self.worker_world_version = id;
+        self.cursor_cameras = Some(pending.frame.cameras.clone());
+        self.drawn_frame = Some(pending.frame);
+        self.cached_picture = Some(pending.picture);
+        for input in pending.inputs {
+            if (!unchanged_input || remapped_pointer.is_some()) && matches!(input, Input::MouseMove { .. }) { continue; }
+            frame_input(&mut self.preparing_inputs, &self.display, input);
         }
-        let committed = gpu.renderer.commit_atlas_transfer(&gpu.device, &gpu.queue);
-        drop(slot);
-        if !committed { return false }
-        let p = self.pending_art.take().expect("committed transfer");
-        match p.payload {
-            PendingArtPayload::Growth { version, growth, .. } => {
-                self.compiled.apply(&growth);
-                self.assets_version = version;
-                self.assets.uploaded(self.whole_version, version);
-                log::info!("viewer: grown by {} sprites ({} KiB of pixels) over {} ms in {} frames; {} sprites", growth.atlas.sprites.len(), growth.atlas.bytes() >> 10, p.since.elapsed().as_millis(), p.frames, self.compiled.atlas.sprites.len());
-                true
-            }
-            PendingArtPayload::Reserve { .. } => {
-                let (rgba, index) = gpu.renderer.atlas_room();
-                log::info!("viewer: atlas room for {rgba} colour and {index} index pages prepared over {} ms in {} frames", p.since.elapsed().as_millis(), p.frames);
-                false
-            }
-            PendingArtPayload::Whole { .. } => unreachable!("whole replacements use a separate preparer"),
+        if let Some(input) = remapped_pointer { frame_input(&mut self.preparing_inputs, &self.display, input); }
+        self.feedback.presented(self.started.elapsed().as_secs_f64());
+        if let Some(gpu) = &mut self.gpu { gpu.reconfigured = false; }
+        self.record_presented(id, pending.started, (pending.main_prepare + worker_prepare).as_secs_f64() * 1000.0);
+        self.refresh_presented_world_pointer();
+        if let Some(receipt) = camera_receipt {
+            if self.camera_arrival_reported != self.shown_scene.camera_arrival.map(|r| r.serial) { log::debug!("camera arrival: accepted frame {id}, {receipt:?}"); }
+            self.report_camera_receipt(receipt);
         }
+        let scene = self.shown_scene.as_ref();
+        if !self.map_drawn && scene.shape.cols > 0 && scene.views.iter().any(|view| !view.view.interface_only) {
+            self.map_drawn = true;
+            log::info!("viewer: first map drawn (scene {})", scene.seq);
+        }
+        startup_ready::presented(scene, true, scene.views.iter().filter(|view| view.view.interface_only)
+            .flat_map(|view| &view.overlay).any(|sprite| sprite_rect(&self.compiled, sprite).is_some_and(|[_, _, width, height]| width > 0 && height > 0)));
     }
 
     /// Counts actual presentations, including a replay whose cursor and
     /// counter pixels remain the previous snapshot.
-    fn record_presented(&mut self, started: Instant) {
+    fn record_presented(&mut self, id: u64, started: Instant, cpu_build_ms: f64) {
         let now = Instant::now();
         self.frame_clock.presented(now);
         let seconds = now.duration_since(self.started).as_secs_f64();
         if self.settings.display.show_fps {
             self.fps.counter.presented(seconds);
+            if self.settings.display.fps_detailed { self.fps.timings.cpu_frame(id, seconds, cpu_build_ms); }
         }
         self.frames_presented += 1;
+        if let Some(d) = &mut self.diagnostics {
+            d.presented += 1;
+            let logical = self.cached_picture.as_ref().map(|p| (p.plan.present.canvas, p.pixel_box)).unwrap_or(((0,0),1));
+            d.report_if_due(now.duration_since(self.started), id, logical.0, logical.1);
+        }
+        if let Some(since) = self.latency.pending.get(&id) {
+            self.latency.present.push(now.saturating_duration_since(*since).as_secs_f64() * 1000.0);
+            self.latency.last = Some(now);
+        }
         if let Some(line) = self.frame_log.as_mut().and_then(|l| l.presented(seconds, now.duration_since(started).as_secs_f64() * 1000.0)) {
             log::info!("viewer: {line}");
         }
@@ -2624,76 +3265,57 @@ impl App {
     fn draw_cached_picture(&mut self, started: Instant) {
         let Some(picture) = &self.cached_picture else { return };
         let Some(gpu) = &mut self.gpu else { return };
+        if !gpu.ready || self.pending_ui.is_some() || self.pending_replay.is_some() { return; }
         let plan = picture.plan_for_target((gpu.config.width, gpu.config.height));
-        let mut t = Instant::now();
-        let frame = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                gpu.surface.configure(&gpu.device, &gpu.config);
-                return;
-            }
-            other => {
-                log::warn!("surface: {other:?}");
-                return;
-            }
-        };
-        mark(&mut self.profile, "cached acquire", &mut t);
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        if !gpu.renderer.render_cached_picture(&gpu.device, &gpu.queue, &mut encoder, &frame.texture, &picture.copies, self.config.clear, plan.present) {
-            // Direct rendering has no composed scratch picture. Retain the
-            // compositor's last frame rather than rendering mismatched IDs.
+        let id = self.next_frame_id;
+        self.next_frame_id += 1;
+        gpu.window.pre_present_notify();
+        let accepted = gpu.worker.frame(render_worker::Frame {
+            id, config_revision: gpu.config_revision, base: self.whole_version, through: self.assets_version, world: None,
+            world_version: self.worker_world_version, previous_world_version: self.worker_world_version,
+            replace_world: false, dirty: tile_render::Dirty::All, free_changed: false,
+            markers: Vec::new(), cameras: Vec::new(), copies: picture.copies.clone(), overlay_from: 0,
+            tick: self.shown_scene.tick, host_tick_ms: self.started.elapsed().as_millis() as u32, clear: self.config.clear, present: picture.present(&plan),
+            patches: Vec::new(), background: tile_render::BackgroundSampling::Dither, main_prepare: started.elapsed(),
+        });
+        if let Some(d) = &mut self.diagnostics {
+            if accepted { d.accepted_replay += 1; } else { d.rejected += 1; }
+        }
+        if !accepted {
+            self.error = Some(ViewerError::RenderWorker("rejected a cached frame".into()));
             return;
         }
-        mark(&mut self.profile, "cached output", &mut t);
-        gpu.queue.submit([encoder.finish()]);
-        if gpu.software {
-            self.frame_done.store(false, std::sync::atomic::Ordering::Release);
-            let done = self.frame_done.clone();
-            gpu.queue.on_submitted_work_done(move || done.store(true, std::sync::atomic::Ordering::Release));
-        }
-        mark(&mut self.profile, "submit", &mut t);
-        gpu.window.pre_present_notify();
-        gpu.queue.present(frame);
-        gpu.reconfigured = false;
-        self.record_presented(started);
-        // Retained pixels may predate the pending layout; do not retarget
-        // the game until a matching scene is presented again.
-        mark(&mut self.profile, "present", &mut t);
-        if let Some(profile) = &mut self.profile {
-            profile.event("frames replayed while art waits", 1);
-        }
-        // No new cursor pixels were drawn. Keep pointer_since for the
-        // first compatible render and do not report a latency sample here.
+        self.pending_replay = Some((id, gpu.config_revision, started, started.elapsed()));
+        // A cached replay preserves the active input mapping.
     }
 
     fn draw_frame(&mut self, started: Instant) {
+        self.receive_worker();
+        self.upload_art();
+        if self.pending_ui.is_some() || self.pending_replay.is_some() || self.gpu.as_ref().is_none_or(|gpu| !gpu.ready) { return; }
+        let before = ui_submission::Mapping::capture(self);
+        self.preparing_inputs = Some(Vec::new());
+        self.prepare_frame(started);
+        before.restore(self);
+        self.preparing_inputs = None;
+    }
+
+    fn prepare_frame(&mut self, started: Instant) {
         let mut t = started;
-        let matched_before_upload = self.shown_scene_matches_art();
-        retain_pending_scene(&mut self.pending_scene, &self.shown_scene, &self.display, self.assets.whole().0, self.whole_version, self.assets_version);
-        self.update_plan();
-        if self.plan.is_none() { return; }
-        let Some(gpu) = &mut self.gpu else { return };
-        // A software renderer still at the last frame: no new one yet (the
-        // event loop goes on meanwhile).
-        let done = || self.frame_done.load(std::sync::atomic::Ordering::Acquire);
-        if gpu.software && !done() {
-            let _ = gpu.device.poll(wgpu::PollType::Poll);
-            // The cursor drawn here waits for nothing but that frame.
-            let cursor_waits = matched_before_upload && self.pointer_since.is_some()
-                && (self.layout.captured() || self.snap.snap_mode_active() || !self.drawn_cursor.is_empty());
-            if !done() && cursor_waits {
-                let _ = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(Duration::from_millis(100)) });
-            }
-            if !done() {
-                return;
-            }
-        }
+        // Same-epoch layout tables can make the latest command group ready
+        // immediately. Do not first clone it into a pending whole-world
+        // snapshot that adoption would discard again in this same frame.
+        self.refresh_future_metadata();
+        let commands_through = self.future_metadata.as_ref().filter(|m| m.base == self.whole_version && m.through == self.display.scene().assets).map_or(self.assets_version, |m| m.through.max(self.assets_version));
+        retain_pending_scene(&mut self.pending_scene, &self.shown_scene, &self.display, self.assets.whole().0, self.whole_version, commands_through);
         let art_committed = self.upload_art();
         let new_assets = art_committed || self.world_assets_version != self.assets_version;
         mark(&mut self.profile, "art transfers", &mut t);
-        let adoption = adopt_available_scene(&mut self.shown_scene, &mut self.pending_scene, &mut self.display, self.whole_version, self.assets_version);
-        let adopted = adoption.is_some();
-        let changes = match adoption {
+        self.refresh_future_metadata();
+        let commands_through = self.future_metadata.as_ref().filter(|m| m.base == self.whole_version && m.through == self.display.scene().assets).map_or(self.assets_version, |m| m.through.max(self.assets_version));
+        let previous_scene_sequence = self.shown_scene.seq;
+        let adoption = adopt_available_shared_scene(&mut self.shown_scene, &mut self.pending_scene, &mut self.display, self.whole_version, commands_through);
+        let mut changes = match adoption {
             Some(adoption) => {
                 for patch in adoption.patches {
                     self.patches.insert(patch.sprite.clone(), patch);
@@ -2702,6 +3324,7 @@ impl App {
             }
             None => scene::Changes::default(),
         };
+        changes.sprites |= self.sprite_lifetimes.update(&self.shown_scene, started);
         let matches = self.shown_scene_matches_art();
         if !matches {
             // Normally the retained live scene keeps drawing while art is
@@ -2710,30 +3333,33 @@ impl App {
             return;
         }
         self.activate_cursor_art();
-        if adopted || !matched_before_upload {
-            self.update_plan();
-        }
-        let plan = self.plan.expect("checked above");
-        let gpu = self.gpu.as_mut().expect("checked above");
+        self.update_plan();
+        let Some(plan) = self.plan else { return };
+        let software = self.gpu.as_ref().expect("checked above").software;
         let window = plan.canvas();
-        let scene = &self.shown_scene;
+        let metadata = self.future_metadata.as_ref().filter(|m| m.base == self.whole_version && m.through == self.shown_scene.assets);
+        let future_layout = metadata.map(|m| m.layout.clone());
+        let scene = self.shown_scene.as_ref();
+        let layout_compiled = future_layout.as_deref().unwrap_or(&self.compiled);
         let arranged = {
             let now = std::time::Instant::now();
             if let Some(at) = self.drawn_at.replace(now) {
                 self.layout.advance(now - at);
             }
-            let bounds = world_bounds(&self.compiled, scene);
+            let bounds = world_bounds(layout_compiled, scene);
             self.layout.grid_step = self.compiled.step;
             self.layout.driver_screen = Some(plan.screen);
+            self.layout.menu_scale = plan.menu.zoom;
+            self.layout.hud_scale = plan.frame;
             // (What the interface covers changes with the scene only.)
             let key = (scene.seq, self.assets_version);
             if self.interface.as_ref().is_none_or(|(k, _)| *k != key) {
-                self.interface = Some((key, interface_rects(&self.compiled, scene)));
+                self.interface = Some((key, interface_rects(layout_compiled, scene)));
             }
             let rects = self.interface.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
-            self.layout.screen_content = named_screen_content(&self.compiled, scene);
+            self.layout.screen_content = named_screen_content(layout_compiled, scene);
             let mut arranged = self.layout.frame(scene, window, self.config.overhang, rects, Some(bounds));
-            let compiled = &self.compiled;
+            let compiled = layout_compiled;
             let shown = scaling::arrange_panned(&plan, scene, &mut arranged, &mut self.layout.menu_pan, |s| sprite_rect(compiled, s));
             self.layout.set_interface_shown(shown.shown);
             // A middle drag suppresses hover while the menu moves. Restore
@@ -2743,7 +3369,7 @@ impl App {
                     let now = self.started.elapsed().as_secs_f64();
                     if let Some(input) = self.menu_scroll.route(Input::MouseMove { x, y }, now) {
                         self.feedback.sent(&input, &self.look_scene, now);
-                        self.display.send_input(input);
+                        frame_input(&mut self.preparing_inputs, &self.display, input);
                     } else {
                         self.feedback.pointer_gone(now);
                     }
@@ -2757,41 +3383,63 @@ impl App {
         mark(&mut self.profile, "layout", &mut t);
         // Views following something move without input: tell the driver.
         if let Some((x, y, w, h)) = self.layout.take_main_view_change() {
-            self.display.send_input(Input::MainView { x, y, w, h });
+            log::debug!("viewer: own A now shows ({x}, {y}, {w}, {h})");
+            frame_input(&mut self.preparing_inputs, &self.display, Input::MainView { x, y, w, h });
         }
         if let Some(views) = self.layout.take_views_change() {
             log::debug!("viewer: own views now show {views:?}");
-            self.display.send_input(Input::Views(views));
+            frame_input(&mut self.preparing_inputs, &self.display, Input::Views(views));
         }
+        if future_layout.is_none() { self.drawable_scene = None; }
+        let render_scene = future_layout.as_ref().map(|future| {
+            let (drawable, work) = scene_prefix::refresh_drawable_scene(&mut self.drawable_scene, self.assets_version, &self.compiled, future, scene, previous_scene_sequence, &changes);
+            if let Some(profile) = &mut self.profile {
+                profile.count("prefix full cell copies", work.full_cell_copies);
+                profile.count("prefix changed cell copies", work.changed_cell_copies);
+                profile.count("prefix cell mapping checks", work.cell_mapping_checks);
+            }
+            drawable
+        });
+        let scene = render_scene.as_deref().unwrap_or(scene);
         // Cells and free sprites have independent update paths. Local
         // interaction looks replace only the free sprites they affect.
         let views_moved = arranged.view_cameras != self.drawn_views || self.drawn_overlay != self.built_overlay;
-        let full = new_assets || changes.world || self.world.is_none();
-        let cells_changed = !full && !changes.cells.is_empty();
+        let full = new_assets || changes.world || self.world.is_none() || self.world_command_version != scene.assets;
+        // (A view's own layers: slots the scene added, removed or changed.)
+        let slots_changed = !full && (changes.slots || !changes.slot_cells.is_empty());
+        let cells_changed = !full && (!changes.cells.is_empty() || slots_changed);
         let free_changed = !full && (changes.sprites || changes.views || views_moved);
-        match self.world.as_mut() {
-            Some(world) if !full => {
-                if cells_changed {
-                    scene_cells_changed(&self.compiled, scene, world, &changes.cells);
-                    mark(&mut self.profile, "cells changed", &mut t);
+        if full {
+            // Never clone an old pinned world merely to discard it here.
+            self.world = Some(Arc::new(scene_world_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay)));
+            mark(&mut self.profile, "world build", &mut t);
+        } else if cells_changed || free_changed {
+            let world = Arc::make_mut(self.world.as_mut().expect("existing world"));
+            if cells_changed {
+                scene_cells_changed(&self.compiled, scene, world, &changes.cells);
+                if changes.slots {
+                    scene_slots(&self.compiled, scene, world);
+                } else {
+                    scene_slot_cells_changed(&self.compiled, scene, world, &changes.slot_cells);
                 }
-                if free_changed {
-                    world.free = scene_free_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay);
-                    mark(&mut self.profile, "free sprites build", &mut t);
-                }
+                mark(&mut self.profile, "cells changed", &mut t);
             }
-            _ => {
-                self.world = Some(scene_world_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay));
-                mark(&mut self.profile, "world build", &mut t);
+            if free_changed {
+                world.free = scene_free_arranged(&self.compiled, scene, &arranged.view_cameras, &self.drawn_overlay);
+                mark(&mut self.profile, "free sprites build", &mut t);
             }
         }
         if full || free_changed {
+            for (index, sprite) in Arc::make_mut(self.world.as_mut().expect("built above")).free.iter_mut().enumerate() {
+                sprite.clip = self.sprite_lifetimes.clip(index, sprite.clip);
+            }
             self.base_free = self.world.as_ref().expect("built above").free.clone();
             self.spans = overlay_spans_arranged(scene, &arranged.view_cameras, &self.drawn_overlay);
             self.built_overlay = self.drawn_overlay.clone();
         }
-        let looks_metadata_changed = (full || scene.seq != self.drawn_seq) && self.look_scene.refresh(scene);
+        let looks_metadata_changed = (full || scene.seq != self.drawn_seq) && looks::LookScene::refresh_shared(&mut self.look_scene, scene);
         self.world_assets_version = self.assets_version;
+        self.world_command_version = scene.assets;
         if let Some(p) = &mut self.profile {
             p.count("cells changed", changes.cells.len());
         }
@@ -2802,13 +3450,13 @@ impl App {
             || self.menu_scroll.running();
         if looks_changed {
             let compiled = &self.compiled;
-            self.world.as_mut().expect("built above").free = looks::splice(&self.base_free, &self.spans, &replacements, |s, camera| placed_sprite(compiled, s, Some(camera), None));
+            Arc::make_mut(self.world.as_mut().expect("built above")).free = looks::splice(&self.base_free, &self.spans, &replacements, |s, camera| placed_sprite(compiled, s, Some(camera), None));
         }
         self.drawn_looks = self.feedback.drawn().to_vec();
         drop(replacements);
         if let Some(scrolled) = self.menu_scroll.draw(scene, &self.world.as_ref().expect("built above").free, &self.spans,
             now, self.settings.input.smooth_menu_scrolling && !self.snap.snap_mode_active(), self.whole_version, |s| placed_rect(&self.compiled, s)) {
-            self.world.as_mut().expect("built above").free = scrolled;
+            Arc::make_mut(self.world.as_mut().expect("built above")).free = scrolled;
             looks_changed = true;
         }
         if (menu_was_scrolling || self.menu_scroll.running()) && self.pointer_inside && !self.layout.captured() && !self.snap.snap_mode_active() {
@@ -2817,7 +3465,7 @@ impl App {
                     smooth_menus::PointerRefresh::Move { x, y } => {
                         let input = Input::MouseMove { x, y };
                         self.feedback.sent(&input, &self.look_scene, now);
-                        self.display.send_input(input);
+                        frame_input(&mut self.preparing_inputs, &self.display, input);
                     }
                     smooth_menus::PointerRefresh::Gone => self.feedback.pointer_gone(now),
                     smooth_menus::PointerRefresh::Unchanged => {}
@@ -2840,23 +3488,34 @@ impl App {
             pointer: if captured { self.system_pointer } else { self.layout.pointer_in_window() },
             pointer_inside: self.pointer_inside,
             pointer_world: self.layout.pointer_world(),
+            interface_open: cursor::interface_open(scene),
             now: self.started.elapsed().as_secs_f64(),
         };
         let steps = self.machine.step(&facts);
         if steps.enter_edge.is_some() { self.layout.set_pointer_at_edge(false); }
         self.layout.set_pointer_at_edge(self.machine.edge());
-        let marks = steps.marks;
+        // A captured virtual cursor may show at its target tile. The normal
+        // uncaptured pointer stays OS-rendered at its physical position;
+        // logical tile targeting does not move or hide it.
+        let snapping = captured && cursor::snaps_to_tiles(&scene.interface, &facts);
+        let marks = if snapping {
+            let n = world_downscale(scene);
+            let step = (self.compiled.step.0 / n, self.compiled.step.1 / n);
+            let staggered = self.compiled.layout == tile_render::Layout::Staggered;
+            cursor::snap_to_tiles(steps.marks, &facts, |p| cursor::tile_centre(p, step, staggered))
+        } else {
+            steps.marks
+        };
         if let Some(q) = steps.enter_edge {
             // A change from a line to a corner, or to another line, may
             // need a new Wayland position hint. Own the lock before it.
-            self.constraints.winit_grab(true);
-            layout_captured_grab(&gpu.window);
+            self.constraints.grab(true);
             // The view following the world cursor is held at the world's
             // edge: the system pointer goes where the drawn cursor is and
             // shows there once this frame is out (`unlock_after_frame`).
             let w = plan.to_window(q);
-            match gpu.window.set_cursor_position(winit::dpi::PhysicalPosition::new(w.0, w.1)) {
-                Ok(()) => {
+            match self.constraints.move_pointer(w) {
+                Ok(_) => {
                     // Like pointer_placed, without borrowing the whole App
                     // while this frame still holds the GPU mutably.
                     let at = (w.0 as f64, w.1 as f64);
@@ -2875,25 +3534,60 @@ impl App {
         if steps.leave_edge {
             // Centred again: captured and hidden (at once; this frame
             // draws the cursor where the pointer is).
-            self.constraints.winit_grab(true);
-            let locked = layout_captured_grab(&gpu.window);
+            let locked = self.constraints.grab(true);
             log::info!("viewer: world cursor centred again: drawn, the system pointer captured (locked: {locked})");
         }
         let mut cameras = arranged.cameras.clone();
+        // Only UI background sprites drawn smaller than their art use it.
+        let background = background_sampling(self.settings.resolution.background_sampling);
+        for camera in &mut cameras {
+            camera.background_sampling = background;
+        }
         self.cursor = scene.cursor;
-        let cursor_sprites = match cursor::sprite_set(&self.compiled, self.cursor) {
-            Some(set) if cameras.len() < tile_render::MAX_VIEWS => {
+        // The cursor at its size: where it mirrors the pointer in another
+        // view, in the cameras kept for it under the driver's interface;
+        // the pointer itself on top.
+        let overlay = cameras.len() as u32;
+        // (As `cursor_scale`, with the GPU borrowed.)
+        let cursor_scale = cursor::Scale::new(self.settings.display.effective_cursor_size(self.system_cursor_size), (plan.present.zoom.0.max(1) / plan.present.zoom.1.max(1)).max(1));
+        let composed = match cursor::sprite_set(&self.compiled, self.cursor_art.shown(self.cursor)).and_then(|set| cursor::SetArt::of(&self.compiled, set)) {
+            Some(art) if cameras.len() < tile_render::MAX_VIEWS => {
                 let bounds = world_bounds(&self.compiled, scene);
                 let period = (if bounds.wrap.0 { bounds.size.0 } else { 0 }, if bounds.wrap.1 { bounds.size.1 } else { 0 });
-                cursor::sprites(set, &marks, &cameras, cameras.len() as u32, period)
+                cursor::compose(art, &marks, &cameras, &arranged.cursor_slots, cursor_scale, window, overlay, period)
             }
-            _ => Vec::new(),
+            _ => cursor::Composed::default(),
         };
+        for (slot, camera) in &composed.slots {
+            cameras[*slot as usize] = *camera;
+        }
+        let cursor_sprites = composed.sprites;
         // The snapping pointer and its ghost (while snapping, the only
         // cursor), in the same camera on top, in window pixels.
-        let snap_sprites = if cameras.len() < tile_render::MAX_VIEWS { self.snap.sprites(&self.compiled, cameras.len() as u32) } else { Vec::new() };
-        if !cursor_sprites.is_empty() || !snap_sprites.is_empty() {
+        // (At the cursor's size, as the cursor: its cameras after the
+        // cursor's own.) Once it parked, only until the system pointer
+        // shows there (as `pointer_hidden`): never both.
+        let system_hidden = (captured && !self.machine.edge()) || facts.snap_mode || self.unlock_pending.is_some() || self.constraints.moving() || snapping;
+        let snap = if cameras.len() < tile_render::MAX_VIEWS && system_hidden {
+            self.snap.compose(&self.compiled, overlay, overlay + 1 + composed.top.len() as u32, cursor_scale, window)
+        } else {
+            cursor::Composed::default()
+        };
+        let mut snap_sprites = snap.sprites;
+        if overlay < tile_render::MAX_VIEWS as u32 {
+            if let Some([x, y, w, h]) = self.snap.keyboard_focus_rect(scene, &self.layout) {
+                snap_sprites.extend(divider_sprites(&self.compiled, &[
+                    (overlay, [x, y, w, 2], false),
+                    (overlay, [x, y + h - 2, w, 2], false),
+                    (overlay, [x, y, 2, h], true),
+                    (overlay, [x + w - 2, y, 2, h], true),
+                ]));
+            }
+        }
+        if cursor_sprites.iter().any(|s| s.view == Some(overlay)) || !snap_sprites.is_empty() || !composed.top.is_empty() {
             cameras.push(cursor::overlay_camera(window));
+            cameras.extend(composed.top);
+            cameras.extend(snap.top);
         }
         // The frame counter over everything (the cursor too), by a camera of
         // its own showing the whole window 1:1 (whatever the split and
@@ -2902,165 +3596,81 @@ impl App {
         let seconds = self.started.elapsed().as_secs_f64();
         if show_fps {
             let camera = cameras.len() as u32;
-            markers.extend_from_slice(self.fps.sprites(&self.compiled, self.assets_version, seconds, window, camera, gpu.software));
+            markers.extend_from_slice(self.fps.sprites(&self.compiled, self.assets_version, seconds, window, camera, software, self.settings.display.fps_detailed));
             cameras.push(Camera { cells: false, ..Camera::new(window) });
         }
-        let cursor_moved = cursor_sprites != self.drawn_cursor;
+        // The host not answering (a busy or stuck game), over everything,
+        // next to the driver's top-left buttons (`host_status`).
+        let host = self.display.host();
+        let stale = host_status::stale(host, Instant::now());
+        let responsiveness = host_status::judge(host, Instant::now());
+        self.host_status.note(responsiveness, stale);
+        if responsiveness != host_status::Responsiveness::Answering && cameras.len() < tile_render::MAX_VIEWS {
+            let anchor = host_status::anchor(&self.compiled, scene, &arranged.cameras, &arranged.view_cameras);
+            if let Some((camera, sprites)) = host_status::compose(&self.compiled, responsiveness, anchor, window, seconds, cameras.len() as u32) {
+                markers.extend(sprites);
+                cameras.push(camera);
+            }
+        }
         markers.extend_from_slice(&cursor_sprites);
         markers.extend(snap_sprites);
         mark(&mut self.profile, "markers+cursor", &mut t);
-        let world = self.world.as_mut().expect("built above");
+        let world = self.world.as_ref().expect("built above");
         if let Some(p) = &mut self.profile {
             p.count("free sprites", world.free.len());
             p.count("markers", markers.len());
             p.count("cameras", cameras.len());
         }
-        let dirty = world.take_dirty();
-        if new_assets {
-            gpu.renderer.set_world(&gpu.device, world);
-        } else if full {
-            gpu.renderer.update_cells(&gpu.device, &gpu.queue, world, &tile_render::Dirty::All);
-            gpu.renderer.update_free(&gpu.device, &gpu.queue, world);
+        let dirty = take_world_dirty(self.world.as_mut().expect("built above"));
+        let id = self.next_frame_id;
+        if let Some(since) = self.pointer_since.take().filter(|_| log_latency() && (self.drawn_cursor != cursor_sprites || self.drawn_views != arranged.view_cameras)) {
+            self.latency.begin(id, since, started);
+        }
+        self.next_frame_id += 1;
+        let mut drawn = if self.settings_preview.active() {
+            scaling::drawn_physical(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
         } else {
-            if cells_changed {
-                gpu.renderer.update_cells(&gpu.device, &gpu.queue, world, &dirty);
-            }
-            if free_changed || looks_changed {
-                gpu.renderer.update_free(&gpu.device, &gpu.queue, world);
+            scaling::drawn(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
+        };
+        if let Some(seconds) = self.settings_preview.seconds(Instant::now()) {
+            if drawn.cameras.len() < tile_render::MAX_VIEWS {
+                let (camera, sprites) = settings_preview::compose_presented(&self.compiled, drawn.present, seconds, drawn.cameras.len() as u32);
+                markers.extend(sprites);
+                drawn.cameras.push(camera);
             }
         }
-        mark(&mut self.profile, "upload world", &mut t);
-        // The viewer's markers (cursor, counter, ...) change more often
-        // than the world: uploaded on their own.
-        let markers_moved = markers != self.drawn_markers;
-        if markers_moved {
-            gpu.renderer.set_markers(&gpu.device, &gpu.queue, &markers);
-            mark(&mut self.profile, "upload markers", &mut t);
-        }
+        let mut packet = render_worker::Frame {
+            id, config_revision: self.gpu.as_ref().expect("initialized").config_revision, base: self.whole_version, through: self.assets_version,
+            world: self.world.clone(), world_version: id, previous_world_version: self.worker_world_version,
+            replace_world: new_assets || full, dirty, free_changed: free_changed || looks_changed,
+            markers: markers.clone(), cameras: drawn.cameras, copies: drawn.copies.clone(),
+            overlay_from: arranged.cameras.len(), tick: scene.tick, host_tick_ms: self.started.elapsed().as_millis() as u32, clear: self.config.clear, present: drawn.present,
+            patches: self.patches.values().cloned().collect(), background, main_prepare: started.elapsed(),
+        };
         self.drawn_markers = markers;
         self.drawn_cursor = cursor_sprites;
         self.drawn_views = arranged.view_cameras.clone();
-        if new_assets || (scene.seq != self.drawn_seq && matches) {
-            apply_patches(&mut gpu.renderer, &gpu.queue, &self.compiled, self.patches.values());
-            mark(&mut self.profile, "patches", &mut t);
-        }
-        if matches {
-            self.drawn_seq = scene.seq;
-            // (For measuring how soon a world asked for beside a screen shows.)
-            let beside = scene.interface.beside.map(|b| (scene.shape, b.world));
-            if beside.is_some() && beside != self.beside_drawn {
-                log::info!("viewer: the world beside the screen drawn: {:?} (scene {})", beside, scene.seq);
-            }
-            self.beside_drawn = beside;
-        }
-        // (For measuring how long a game takes to show its map.)
-        if !self.map_drawn && matches && scene.shape.cols > 0 && scene.views.iter().any(|v| !v.view.interface_only) {
-            self.map_drawn = true;
-            log::info!("viewer: first map drawn (scene {})", scene.seq);
-        }
-        let views_followed = self.drawn_frame.as_ref().map(|f| &f.cameras) != self.cursor_cameras.as_ref();
-        // A software renderer draws a frame only when it differs from the
-        // last. A panned menu can change only the cameras.
-        let unchanged = !full && !cells_changed && !free_changed && !looks_changed && !markers_moved && !views_followed && scene.tick == self.drawn_tick && window == self.drawn_window && !gpu.reconfigured;
-        // The pointer's motion is drawn (or there was nothing to draw): the
-        // cursor moved, or the views following it.
-        let since = self.pointer_since.take().filter(|_| cursor_moved || views_followed);
-        // (Not while the mouse waits to be let go after a frame.)
-        if gpu.software && unchanged && self.unlock_pending.is_none() {
-            if show_fps {
-                self.fps.counter.skipped(seconds);
-            }
-            // The cached picture has exactly these cameras and UI mapping.
-            self.refresh_presented_world_pointer();
-            return;
-        }
+        self.drawn_seq = scene.seq;
         self.drawn_tick = scene.tick;
         self.drawn_window = window;
-        mark(&mut self.profile, "misc", &mut t);
-        let frame = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                gpu.surface.configure(&gpu.device, &gpu.config);
-                return;
-            }
-            other => {
-                log::warn!("surface: {other:?}");
-                return;
-            }
-        };
-        mark(&mut self.profile, "acquire", &mut t);
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        let target = &frame.texture;
-        let copies = &arranged.copies;
-        gpu.reconfigured = false;
-        // (The cursor's and the counter's cameras come after the layout's:
-        // they draw over a picture that is not drawn again unless it changed.)
-        let overlay_from = arranged.cameras.len();
-        gpu.renderer.render_layered(&gpu.device, &gpu.queue, &mut encoder, target, &cameras, overlay_from, copies, scene.tick, self.config.clear, plan.present);
-        if let Some(timer) = gpu.renderer.timer() {
-            timer.finish(&mut encoder);
-        }
-        mark(&mut self.profile, "encode", &mut t);
-        if let Some(p) = &mut self.profile {
-            p.event(if gpu.renderer.reused() { "frames drawn on the last picture" } else { "frames drawn whole" }, 1);
-        }
-        gpu.queue.submit([encoder.finish()]);
-        mark(&mut self.profile, "submit", &mut t);
-        if let Some(timer) = gpu.renderer.timer() {
-            timer.submitted();
-            let frames = timer.collect(&gpu.device);
-            if let Some(p) = &mut self.profile {
-                for f in frames {
-                    p.add_ms("gpu frame span", f.span);
-                    p.add_ms("gpu passes sum", f.passes.iter().map(|(_, ms)| ms).sum());
-                    p.count("gpu passes", f.passes.len());
-                    for (label, ms) in f.passes {
-                        p.add_ms(&format!("gpu {label}"), ms);
-                    }
-                }
-            }
-        }
-        if let (Some(since), true) = (since, log_latency()) {
-            let done = self.latency.done.clone();
-            gpu.queue.on_submitted_work_done(move || done.lock().unwrap_or_else(|e| e.into_inner()).push(since.elapsed().as_secs_f64() * 1000.0));
-        }
-        if gpu.software {
-            // (Called back from a later poll once this submission is done.)
-            self.frame_done.store(false, std::sync::atomic::Ordering::Release);
-            let done = self.frame_done.clone();
-            gpu.queue.on_submitted_work_done(move || done.store(true, std::sync::atomic::Ordering::Release));
-        }
+        self.drawn_background = background;
+        let mapping = ui_submission::Mapping::capture(self);
+        let picture = CachedPicture { plan, copies: drawn.copies, pixel_box: drawn.pixel_box };
+        let inputs = self.preparing_inputs.take().unwrap_or_default();
+        self.pending_ui = Some(ui_submission::PendingUi { id, config_revision: packet.config_revision, input_revision: self.input_revision, mapping, started, main_prepare: packet.main_prepare, frame: arranged, picture, inputs });
+        packet.main_prepare = started.elapsed();
+        if let Some(pending) = &mut self.pending_ui { pending.main_prepare = packet.main_prepare; }
+        let gpu = self.gpu.as_ref().expect("initialized above");
         gpu.window.pre_present_notify();
-        gpu.queue.present(frame);
-        // Keep the last presented cameras when acquiring a frame failed,
-        // so a static menu pan is retried on a software renderer.
-        self.cursor_cameras = Some(arranged.cameras.clone());
-        self.feedback.presented(self.started.elapsed().as_secs_f64());
-        self.cached_picture = Some(CachedPicture { plan, copies: copies.to_vec() });
-        self.record_presented(started);
-        self.refresh_presented_world_pointer();
-        mark(&mut self.profile, "present", &mut t);
-        if let (Some(since), true) = (since, log_latency()) {
-            self.latency.start.push(started.saturating_duration_since(since).as_secs_f64() * 1000.0);
-            self.latency.present.push(since.elapsed().as_secs_f64() * 1000.0);
-            self.latency.last = Some(Instant::now());
+        let accepted = gpu.worker.frame(packet);
+        if let Some(d) = &mut self.diagnostics {
+            if accepted { d.accepted_world += 1; } else { d.rejected += 1; }
         }
-        // Logged every 10 s, and once the pointer has rested for 2 s.
-        let rested = self.latency.last.is_some_and(|t| t.elapsed() >= Duration::from_secs(2));
-        if !self.latency.present.is_empty() && (self.latency_logged.elapsed() >= Duration::from_secs(10) || rested) {
-            let span = std::mem::replace(&mut self.latency_logged, Instant::now()).elapsed();
-            let _ = self.gpu.as_ref().expect("checked above").device.poll(wgpu::PollType::Poll);
-            let frames = std::mem::take(&mut self.frames_presented);
-            let mut done = std::mem::take(&mut *self.latency.done.lock().unwrap_or_else(|e| e.into_inner()));
-            let fmt = |s: Option<(f64, f64, f64, usize)>| s.map_or("-".to_owned(), |(p50, p95, max, n)| format!("p50 {p50:.1} ms, p95 {p95:.1} ms, max {max:.1} ms ({n})"));
-            log::info!(
-                "viewer: cursor latency, motion to its frame started: {}; to frame presented: {}; to frame done on the GPU: {}; {frames} frames in {:.1} s",
-                fmt(cursor::Latency::summary(&mut std::mem::take(&mut self.latency.start))),
-                fmt(cursor::Latency::summary(&mut std::mem::take(&mut self.latency.present))),
-                fmt(cursor::Latency::summary(&mut done)),
-                span.as_secs_f64()
-            );
+        if !accepted {
+            self.pending_ui = None;
+            self.error = Some(ViewerError::RenderWorker("rejected a complete frame".into()));
         }
+
     }
 
 }
@@ -3082,23 +3692,28 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         self.woken_idle = false;
+        if !matches!(event, WindowEvent::RedrawRequested) { self.input_revision = self.input_revision.wrapping_add(1); }
         match &event {
             WindowEvent::CloseRequested => {
-                self.display.send_input(Input::Quit);
+                frame_input(&mut self.preparing_inputs, &self.display, Input::Quit);
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.config.width = size.width.max(1);
                     gpu.config.height = size.height.max(1);
-                    gpu.surface.configure(&gpu.device, &gpu.config);
+                    gpu.config_revision = gpu.config_revision.wrapping_add(1);
+                    gpu.worker.configure(render_worker::Config { revision: gpu.config_revision, width: gpu.config.width, height: gpu.config.height,
+                        present_mode: gpu.config.present_mode, latency: gpu.config.desired_maximum_frame_latency });
                     gpu.reconfigured = true;
                     log::debug!("viewer: window {}×{} pixels at scale {}", size.width, size.height, gpu.window.scale_factor());
                 }
-                self.update_plan();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 log::info!("viewer: the window's scale is now {scale_factor}");
+                if let Some(gpu) = &self.gpu {
+                    self.system_cursor_size = pointer_control::system_cursor_size(&gpu.window);
+                }
             }
             WindowEvent::RedrawRequested => {
                 self.draw();
@@ -3111,12 +3726,12 @@ impl ApplicationHandler for App {
                 self.system_pointer = self.plan.map_or((position.x as i32, position.y as i32), |p| p.to_screen((position.x, position.y)));
                 // At the world's edge the system pointer moves the world
                 // cursor (`cursor::Machine::edge`).
-                if self.machine.edge() && self.unlock_pending.is_none() {
+                if !self.settings_preview.active() && self.machine.edge() && self.unlock_pending.is_none() {
                     for input in self.layout.pointer_to(self.system_pointer) {
                         self.send(input);
                     }
                 }
-                self.pointer_moved();
+                if !self.settings_preview.active() { self.pointer_moved(); }
             }
             WindowEvent::CursorEntered { .. } => self.pointer_inside = true,
             WindowEvent::CursorLeft { .. } => self.pointer_inside = false,
@@ -3139,13 +3754,24 @@ impl ApplicationHandler for App {
             self.feedback.pointer_gone(self.started.elapsed().as_secs_f64());
         }
         let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
+        self.input.set_wheel_scale(self.gpu.as_ref().map_or(1.0, |gpu| gpu.window.scale_factor()));
+        self.input.sync_wheel_context(self.display.scene(), self.layout.route_window(self.layout.pointer_in_window()), self.snap.snap_mode_active() || self.layout.captured());
         for input in self.input.translate(&event) {
+            let pointer = self.input.window_pointer();
+            let window = self.gpu.as_ref().map_or((1, 1), |g| (g.config.width, g.config.height));
+            let (consumed, result) = self.settings_preview.input(&input, (pointer.0 as i32, pointer.1 as i32), window);
+            self.resolve_settings_preview(result);
+            if consumed { self.input.reset_wheel(); continue; }
+            if self.settings_preview.active() && matches!(input, Input::Key { vk: 16..=18, .. } | Input::WorldKey { vk: 16..=18, .. }) {
+                self.display.send_input(input);
+                continue;
+            }
             // (Through button snapping, which passes on what is not its.)
             let routed = self.snap.route(input.clone(), &mut self.layout, &self.shown_scene, now, rates);
             // The pointer moved where the driver does not get it, a release
             // the driver does not get: no longer over its interactables.
             match input {
-                Input::MouseMove { .. } if !self.layout.captured() && !routed.iter().any(|i| matches!(i, Input::MouseMove { .. })) => self.feedback.pointer_gone(now),
+                Input::MouseMove { .. } if motion_leaves_driver(self.layout.captured(), self.snap.active(), &routed) => self.feedback.pointer_gone(now),
                 Input::MouseButton { button: scene::Button::Left, down: false, .. } if !routed.iter().any(|i| matches!(i, Input::MouseButton { button: scene::Button::Left, down: false, .. })) => self.feedback.released(now),
                 _ => {}
             }
@@ -3153,22 +3779,19 @@ impl ApplicationHandler for App {
                 self.send(input);
             }
         }
+        self.show_keyboard_slider();
         // (After a redraw too: what the pointer is over may have changed.)
         self.apply_layout_requests(event_loop);
         if let Some(zooms) = self.layout.take_zooms_change() {
-            self.display.send_input(Input::Zooms(zooms));
+            frame_input(&mut self.preparing_inputs, &self.display, Input::Zooms(zooms));
         }
-        if let Some((x, y, w, h)) = self.layout.take_main_view_change() {
-            self.display.send_input(Input::MainView { x, y, w, h });
-        }
-        if let Some(views) = self.layout.take_views_change() {
-            log::debug!("viewer: own views now show {views:?}");
-            self.display.send_input(Input::Views(views));
-        }
+        // MainView/Views are consumed only while preparing a complete
+        // frame, then delivered with its matching Presented reply.
     }
 
     fn device_event(&mut self, event_loop: &ActiveEventLoop, _id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
         self.woken_idle = false;
+        self.input_revision = self.input_revision.wrapping_add(1);
         // While the mouse is captured its motion moves the world cursor.
         // (While snapping, it moves the snapping pointer's hidden pointer.)
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
@@ -3195,6 +3818,12 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.receive_worker();
+        self.update_system_pointer(event_loop);
+        if self.error.is_some() || self.stop.load(std::sync::atomic::Ordering::Acquire) {
+            event_loop.exit();
+            return;
+        }
         // Receive updates and input immediately. Without an explicit cap,
         // new updates also draw immediately; otherwise the event loop waits
         // for the next allowed frame while continuing to receive events.
@@ -3202,7 +3831,7 @@ impl ApplicationHandler for App {
         let idle = std::mem::take(&mut self.woken_idle) && !self.frame_clock.capped
             && self.frame_clock.deadline().is_some_and(|t| t > Instant::now());
         let received = Instant::now();
-        let changed = self.display.receive(if idle { IDLE_WAIT } else { Duration::ZERO });
+        let mut changed = self.display.receive(if idle { IDLE_WAIT } else { Duration::ZERO });
         if let Some(p) = &mut self.profile {
             // (Waiting for nothing, when idle, is not the work of receiving.)
             if changed {
@@ -3212,16 +3841,32 @@ impl ApplicationHandler for App {
             p.event("scenes", seq.saturating_sub(self.received_seq));
             self.received_seq = seq;
         }
-        if let Some(settings) = self.display.take_settings() {
+        let lease = self.display.scene().settings_preview;
+        let was_previewing = self.settings_preview.active();
+        self.settings_preview.observe(lease, Instant::now());
+        if was_previewing != self.settings_preview.active() { self.input.reset_wheel(); }
+        if !was_previewing && self.settings_preview.active() {
+            self.settings_preview.seed_held_keys(self.input.held_virtual_keys());
+            for input in self.snap.focus_lost(&mut self.layout) { self.display.send_input(input); }
+            self.layout.released();
+        }
+        if let Some(mut settings) = self.display.take_settings() {
+            self.settings_preview.project(lease, &mut settings);
             if settings != self.settings {
                 log::info!("viewer: new settings from the driver");
                 self.set_settings(settings);
             }
         }
+        let expired = self.settings_preview.tick(Instant::now());
+        changed |= self.settings_preview.active() || expired.is_some();
+        self.resolve_settings_preview(expired);
         let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
-        for input in self.snap.tick(&mut self.layout, &self.shown_scene, now, rates) {
-            self.send(input);
-        }
+        let snapped_inputs = if self.settings_preview.active() { Vec::new() } else {
+            self.snap.tick(&mut self.layout, &self.shown_scene, now, rates)
+        };
+        if !snapped_inputs.is_empty() { self.input_revision = self.input_revision.wrapping_add(1); }
+        for input in snapped_inputs { self.send(input); }
+        self.show_keyboard_slider();
         // (Snapping may have put the pointer somewhere, or let go of it.)
         self.apply_layout_requests(event_loop);
         let now = Instant::now();
@@ -3245,10 +3890,31 @@ impl ApplicationHandler for App {
                 }
             }
         }
-        event_loop.set_control_flow(match self.frame_clock.wake_at(Instant::now()) {
-            Some(at) => ControlFlow::WaitUntil(at),
-            None => ControlFlow::Poll,
-        });
+        let waiting_worker = self.pending_ui.is_some() || self.pending_replay.is_some()
+            || self.gpu.as_ref().is_some_and(|gpu| !gpu.ready);
+        let flow = if waiting_worker {
+            // Reply proxies and OS input wake immediately. A bounded idle
+            // deadline keeps stop/timer checks alive without spinning a CPU
+            // core while the GPU actor is busy or initializing.
+            ControlFlow::WaitUntil(Instant::now() + DEFAULT_FRAME)
+        } else {
+            match self.frame_clock.wake_at(Instant::now()) {
+                Some(at) => ControlFlow::WaitUntil(at),
+                None => ControlFlow::Poll,
+            }
+        };
+        let cursor_wake = self.os_cursor.next_animation_wake(self.pointer_hidden(), Duration::from_secs_f64(self.now().max(0.0)));
+        let flow = match (flow, cursor_wake) {
+            (ControlFlow::WaitUntil(at), Some(delay)) => ControlFlow::WaitUntil(at.min(Instant::now() + delay)),
+            (ControlFlow::Wait, Some(delay)) => ControlFlow::WaitUntil(Instant::now() + delay),
+            (other, _) => other,
+        };
+        let flow = match (flow, self.settings_preview.wake(Instant::now())) {
+            (ControlFlow::WaitUntil(at), Some(preview)) => ControlFlow::WaitUntil(at.min(preview)),
+            (ControlFlow::Wait, Some(preview)) => ControlFlow::WaitUntil(preview),
+            (flow, _) => flow,
+        };
+        event_loop.set_control_flow(flow);
     }
 }
 
@@ -3263,39 +3929,123 @@ fn within_screen(want: winit::dpi::PhysicalSize<u32>, screen: winit::dpi::Physic
     }
 }
 
+fn window_frame(inner: winit::dpi::PhysicalSize<u32>, outer: winit::dpi::PhysicalSize<u32>) -> winit::dpi::PhysicalSize<u32> {
+    winit::dpi::PhysicalSize::new(outer.width.saturating_sub(inner.width), outer.height.saturating_sub(inner.height))
+}
+
+/// Fit and center the decorated window, counting its title bar exactly once.
+fn window_placement(
+    inner: winit::dpi::PhysicalSize<u32>,
+    frame: winit::dpi::PhysicalSize<u32>,
+    area: (winit::dpi::PhysicalPosition<i32>, winit::dpi::PhysicalSize<u32>),
+) -> (winit::dpi::PhysicalSize<u32>, winit::dpi::PhysicalPosition<i32>) {
+    let inner = winit::dpi::PhysicalSize::new(
+        inner.width.min(area.1.width.saturating_sub(frame.width)).max(1),
+        inner.height.min(area.1.height.saturating_sub(frame.height)).max(1),
+    );
+    let axis = |start: i32, span: u32, content: u32, border: u32| {
+        (start as i64 + (span as i64 - content as i64 - border as i64).max(0) / 2)
+            .clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    };
+    let at = winit::dpi::PhysicalPosition::new(
+        axis(area.0.x, area.1.width, inner.width, frame.width),
+        axis(area.0.y, area.1.height, inner.height, frame.height),
+    );
+    (inner, at)
+}
+
+fn window_in_work_area(
+    at: winit::dpi::PhysicalPosition<i32>,
+    size: winit::dpi::PhysicalSize<u32>,
+    area: (winit::dpi::PhysicalPosition<i32>, winit::dpi::PhysicalSize<u32>),
+) -> bool {
+    at.x >= area.0.x && at.y >= area.0.y
+        && at.x as i64 + size.width as i64 <= area.0.x as i64 + area.1.width as i64
+        && at.y as i64 + size.height as i64 <= area.0.y as i64 + area.1.height as i64
+}
+
+#[cfg(test)]
+mod window_work_area_tests {
+    use super::*;
+    use winit::dpi::{PhysicalPosition as Position, PhysicalSize as Size};
+
+    #[test]
+    fn dock_and_title_bar_are_both_outside_the_usable_client() {
+        let area = (Position::new(0, 25), Size::new(1280, 706));
+        let inner = Size::new(1152, 675);
+        let frame = Size::new(0, 28);
+        assert!(!window_in_work_area(Position::new(64, 40), Size::new(1152, 703), area));
+        let (fits, at) = window_placement(inner, frame, area);
+        assert_eq!(fits, inner);
+        assert_eq!(at, Position::new(64, 26));
+        assert!(window_in_work_area(at, Size::new(fits.width, fits.height + frame.height), area));
+        let (fits, at) = window_placement(Size::new(1280, 800), frame, area);
+        assert_eq!(fits, Size::new(1280, 678));
+        assert_eq!(at, Position::new(0, 25));
+    }
+
+    #[test]
+    fn side_dock_negative_monitor_origin_and_retina_use_physical_bounds() {
+        let area = (Position::new(-1860, -1040), Size::new(1800, 1040));
+        for scale in [1, 2, 3] {
+            let scaled_area = (Position::new(area.0.x * scale, area.0.y * scale), Size::new(area.1.width * scale as u32, area.1.height * scale as u32));
+            let inner = Size::new(1600 * scale as u32, 1000 * scale as u32);
+            let frame = Size::new(16 * scale as u32, 40 * scale as u32);
+            let (fits, at) = window_placement(inner, frame, scaled_area);
+            assert_eq!(fits, inner);
+            assert!(window_in_work_area(at, Size::new(fits.width + frame.width, fits.height + frame.height), scaled_area));
+        }
+        assert!(!window_in_work_area(Position::new(-1920, -1080), Size::new(1600, 1000), area));
+    }
+
+    #[test]
+    fn large_coordinates_and_missing_frame_metrics_do_not_overflow() {
+        let area = (Position::new(i32::MAX - 400, i32::MIN), Size::new(400, 300));
+        let frame = window_frame(Size::new(800, 600), Size::new(0, 0));
+        assert_eq!(frame, Size::new(0, 0));
+        let (fits, at) = window_placement(Size::new(800, 600), frame, area);
+        assert_eq!(fits, area.1);
+        assert!(window_in_work_area(at, fits, area));
+    }
+}
+
 /// System cursors made from cursor art at a pixel scale, each on a thread
 /// of its own; by (sprite set, pixel scale).
 #[derive(Default)]
 struct CursorBuilds {
+    native_thread_init: Option<fn()>,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
     /// What is being made, and of which art (see `forget`).
-    pending: std::collections::HashSet<(u32, u32)>,
+    pending: std::collections::HashSet<(u32, cursor::Scale)>,
     generation: u64,
     ready: Option<(std::sync::mpsc::Sender<CursorBuilt>, std::sync::mpsc::Receiver<CursorBuilt>)>,
 }
 
-type CursorBuilt = (u64, (u32, u32), Option<winit::window::CustomCursorSource>);
+type CursorBuilt = (u64, (u32, cursor::Scale), Option<winit::window::CustomCursorSource>);
 
 impl CursorBuilds {
-    /// Makes `image` at pixel scale `key.1`, unless it is being made.
-    fn start(&mut self, key: (u32, u32), image: cursor::Image) {
+    /// Makes `image` at cursor scale `key.1`, unless it is being made.
+    fn start(&mut self, key: (u32, cursor::Scale), image: cursor::Image) {
         if !self.pending.insert(key) {
             return;
         }
         let tx = self.ready.get_or_insert_with(std::sync::mpsc::channel).0.clone();
+        let wake = self.wake.clone();
         let generation = self.generation;
-        std::thread::spawn(move || {
-            let n = key.1;
-            let (rgba, (w, h)) = cursor::upscaled(&image.rgba, image.size, n);
-            let hotspot = (image.hotspot.0 * n as u16, image.hotspot.1 * n as u16);
-            let source = winit::window::CustomCursor::from_rgba(rgba, w, h, hotspot.0, hotspot.1)
+        let initialize = self.native_thread_init;
+        std::thread::spawn(move || thread_start::initialized(initialize, || {
+            let native = key.1.native(&image);
+            let source = winit::window::CustomCursor::from_rgba(native.rgba, native.size.0, native.size.1, native.hotspot.0, native.hotspot.1)
                 .inspect_err(|e| log::warn!("viewer: cursor of set {}: {e}", key.0))
                 .ok();
-            let _ = tx.send((generation, key, source));
-        });
+            if tx.send((generation, key, source)).is_ok() {
+                if let Some(wake) = wake { wake(); }
+            }
+        }));
     }
 
     /// The cursors made since last asked (of the current art).
-    fn take_ready(&mut self) -> Vec<((u32, u32), winit::window::CustomCursorSource)> {
+    fn take_ready(&mut self) -> Vec<((u32, cursor::Scale), winit::window::CustomCursorSource)> {
         let Some((_, rx)) = &self.ready else { return Vec::new() };
         let mut out = Vec::new();
         while let Ok((generation, key, source)) = rx.try_recv() {
@@ -3315,5 +4065,211 @@ impl CursorBuilds {
     fn forget(&mut self) {
         self.generation += 1;
         self.pending.clear();
+    }
+}
+
+#[cfg(test)]
+mod snap_hover_tests {
+    use super::{looks, motion_leaves_driver};
+    use scene::{FreeSprite, Input, Interactable, InteractableKind, LookState, Looks, PointerState, ViewLooks};
+
+    #[test]
+    fn the_hidden_pointers_motion_keeps_the_snapped_rows_hover() {
+        // Two menu rows; the driver shows row 2 hovered (the snapping
+        // pointer landed there and the driver got it).
+        let hover = LookState { pointer: PointerState::Hover, selected: false };
+        let row = |id: u64, y: i32| Interactable { alt_right_click: false, rect: [0, y, 100, 20], anchor: None, kind: InteractableKind::Button, id };
+        let looks_of = |id: u64, shown: LookState, sprites: (u32, u32)| Looks {
+            id,
+            select: scene::Select::None,
+            shown,
+            views: vec![ViewLooks { view: 5, sprites, states: vec![(hover, vec![FreeSprite { set: 11, ..Default::default() }]), (LookState::default(), vec![FreeSprite { set: 10, ..Default::default() }])] }],
+        };
+        let scene = looks::LookScene { interactables: vec![row(1, 0), row(2, 20)], looks: vec![looks_of(1, LookState::default(), (0, 1)), looks_of(2, hover, (1, 2))] };
+        let mut feedback = looks::Feedback::default();
+        feedback.sent(&Input::MouseMove { x: 50, y: 30 }, &scene, 0.0);
+        assert!(feedback.replacements(&scene, 0.01).is_empty(), "as the driver shows it");
+        // The system pointer moves while snapping: swallowed, not gone.
+        assert!(!motion_leaves_driver(false, true, &[]));
+        // (Without snapping, a move the driver does not get takes it off.)
+        assert!(motion_leaves_driver(false, false, &[]));
+        assert!(!motion_leaves_driver(true, false, &[]));
+        assert!(!motion_leaves_driver(false, false, &[Input::MouseMove { x: 1, y: 1 }]));
+        // Had it been taken off, row 2 would be drawn unhovered.
+        feedback.pointer_gone(0.02);
+        assert_eq!(feedback.replacements(&scene, 0.03).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod cursor_completion_tests {
+    use super::*;
+
+    thread_local! { static INITIALIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+    fn initialize_cursor_thread() { INITIALIZED.set(true); }
+
+    #[test]
+    fn cursor_worker_initializes_before_waking_main() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut builds = CursorBuilds::default();
+        builds.native_thread_init = Some(initialize_cursor_thread);
+        builds.wake = Some(Arc::new(move || { tx.send(INITIALIZED.get()).unwrap(); }));
+        builds.start((7, cursor::Scale::default()), cursor::Image {
+            rgba: vec![255, 255, 255, 255], size: (1, 1), hotspot: (0, 0),
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert_eq!(builds.take_ready().len(), 1);
+        assert!(!INITIALIZED.get(), "caller context must remain untouched");
+    }
+
+
+    #[test]
+    fn prepared_cursor_wakes_the_event_loop_without_a_rendered_frame() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut builds = CursorBuilds::default();
+        builds.wake = Some(Arc::new(move || { let _ = tx.send(()); }));
+        builds.start((7, cursor::Scale::default()), cursor::Image {
+            rgba: vec![255, 255, 255, 255], size: (1, 1), hotspot: (0, 0),
+        });
+        rx.recv_timeout(Duration::from_secs(5)).expect("cursor worker must wake main independently of frame completion");
+        assert_eq!(builds.take_ready().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod incremental_scene_adoption_tests {
+    use super::*;
+    #[test]
+    fn control_only_adoption_reuses_owned_world_and_pinned_readers_stay_immutable() {
+        let (driver, mut display) = scene::connect();
+        let mut shown = Arc::new(Scene::default());
+        let mut pending = None;
+        assert!(driver.send(vec![scene::Update::World { shape: scene::WorldShape { cols: 1024, rows: 1, ..Default::default() }, layers: vec![scene::LayerCells { values: vec![1; 1024], ..Default::default() }] }]));
+        display.receive(Duration::ZERO);
+        assert!(adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 1).is_some());
+        let pointer = shown.layers[0].values.as_ptr();
+        assert!(driver.send(vec![scene::Update::Tick(17)])); display.receive(Duration::ZERO);
+        assert!(adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 1).is_some());
+        assert_eq!(shown.layers[0].values.as_ptr(), pointer);
+        let pinned = shown.clone();
+        assert!(adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 1).is_none());
+        assert!(Arc::ptr_eq(&shown, &pinned));
+        assert!(driver.send(vec![scene::Update::Cells(vec![(0, 31, 9)]), scene::Update::Tick(19)])); display.receive(Duration::ZERO);
+        assert!(adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 1).is_some());
+        assert_eq!(*shown, *display.scene());
+        assert_eq!(pinned.layers[0].values[31], 1);
+        assert_eq!(pinned.tick, 17);
+        assert_eq!(shown.layers[0].values[31], 9);
+    }
+}
+
+#[cfg(test)]
+mod shared_world_dirty_tests {
+    use super::*;
+    #[test]
+    fn unchanged_published_world_keeps_identity_while_real_dirty_records_are_owned() {
+        let mut value = TileWorld::new(tile_render::Grid { cols: 4, rows: 1, layout: tile_render::Layout::Orthogonal, wrap_x: false, wrap_y: false, step: (8, 8) }, tile_render::SpriteSets::default());
+        value.add_layer(tile_render::LayerSpec::new("cells", vec![tile_render::SpriteSetId::EMPTY; 2]));
+        value.take_dirty();
+        let mut world = Arc::new(value);
+        let pinned = world.clone();
+        assert_eq!(take_world_dirty(&mut world), tile_render::Dirty::None);
+        assert!(Arc::ptr_eq(&world, &pinned), "a clean frame must not copy pinned cell records");
+        drop(pinned);
+        Arc::get_mut(&mut world).unwrap().set(tile_render::LayerId(0), 2, 0, 1);
+        let pinned = world.clone();
+        assert_eq!(take_world_dirty(&mut world), tile_render::Dirty::Records(vec![(0, 2)]));
+        assert_eq!(*world.dirty(), tile_render::Dirty::None);
+        assert_eq!(*pinned.dirty(), tile_render::Dirty::Records(vec![(0, 2)]));
+        assert_eq!(pinned.get(tile_render::LayerId(0), 2, 0), 1);
+        drop(pinned);
+        let slot = Arc::get_mut(&mut world).unwrap().add_slot(tile_render::LayerId(0));
+        take_world_dirty(&mut world);
+        Arc::get_mut(&mut world).unwrap().bind(7, tile_render::LayerId(0), Some(slot));
+        let pinned = world.clone();
+        assert_eq!(take_world_dirty(&mut world), tile_render::Dirty::Records(vec![]), "binding-only changes must still be published");
+        assert_eq!(*world.dirty(), tile_render::Dirty::None);
+        assert_eq!(*pinned.dirty(), tile_render::Dirty::Records(vec![]));
+    }
+}
+
+#[cfg(test)]
+mod rejected_snapshot_recovery_tests {
+    use super::*;
+    use scene::{Changes, FreeSprite, LayerCells, Update, View, WorldShape};
+
+    fn connected() -> (scene::Driver, Display, Arc<Scene>, Option<PendingScene>) {
+        let (driver, mut display) = scene::connect();
+        let mut shown = Arc::new(Scene::default());
+        let mut pending = None;
+        assert!(driver.send(vec![Update::World { shape: WorldShape { cols: 4, rows: 1, ..Default::default() }, layers: vec![LayerCells { values: vec![1; 4], phases: Some(vec![0; 4]), offsets: Some(vec![(0, 0); 4]) }] }, Update::Assets(1)]));
+        assert!(display.receive(Duration::ZERO));
+        assert!(adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 1).is_some());
+        (driver, display, shown, pending)
+    }
+    fn assert_full(changes: &Changes) {
+        assert!(changes.world && changes.sprites && changes.views && changes.slots,
+            "a mismatched consumed-delta predecessor must invalidate world, sprites, views and slots");
+        assert!(changes.cells.is_empty() && changes.slot_cells.is_empty());
+    }
+    #[test]
+    fn rejected_preparation_restores_complete_latest_scene_after_delta_was_consumed() {
+        let (driver, mut display, mut shown, mut pending) = connected();
+        let committed = shown.clone();
+        assert!(driver.send(vec![Update::Cells(vec![(0, 0, 9)]), Update::Phases(vec![(0, 0, 13)]), Update::Offsets(vec![(0, 0, (-3, 7))]),
+            Update::Sprites(vec![FreeSprite { x: 41, ..Default::default() }]), Update::View { id: 7, view: Some(View { camera_x: 111, ..Default::default() }) },
+            Update::Overlay { view: 7, sprites: vec![FreeSprite { x: 19, ..Default::default() }] },
+            Update::Slot { id: 3, slot: Some((0, LayerCells { values: vec![2; 4], ..Default::default() })) },
+            Update::Bindings(vec![scene::Binding { id: 5, slots: vec![(0, 3)] }]), Update::Tick(17)]));
+        display.receive(Duration::ZERO);
+        assert!(adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 1).is_some());
+        assert_eq!(*shown, *display.scene());
+        assert!(display.changes().is_empty());
+        // The presented input mapping stays committed when acquisition or
+        // worker submission rejects this preparation. Its deltas are gone.
+        shown = committed.clone();
+        let recovered = adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 1).unwrap();
+        assert_eq!(*shown, *display.scene(), "re-adoption must not leave stale cells, views or slots");
+        assert_full(&recovered.changes);
+        assert_eq!(committed.layers[0].values, [1; 4]);
+        assert!(committed.views.is_empty() && committed.slots.is_empty());
+    }
+    #[test]
+    fn new_delta_after_rejected_preparation_cannot_hide_the_earlier_changed_cell() {
+        let (driver, mut display, mut shown, mut pending) = connected();
+        let committed = shown.clone();
+        assert!(driver.send(vec![Update::Cells(vec![(0, 0, 9)]), Update::Tick(17)]));display.receive(Duration::ZERO);
+        adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 1).unwrap();
+        shown = committed;
+        assert!(driver.send(vec![Update::Cells(vec![(0, 1, 7)]), Update::Tick(19)]));display.receive(Duration::ZERO);
+        let recovered = adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 1).unwrap();
+        assert_eq!(shown.layers[0].values, [9, 7, 1, 1]);
+        assert_eq!(*shown, *display.scene());
+        assert_full(&recovered.changes);
+    }
+    #[test]
+    fn pending_scene_and_later_latest_scene_require_their_actual_delta_predecessor() {
+        let (driver, mut display, mut shown, mut pending) = connected();
+        assert!(driver.send(vec![Update::Assets(2), Update::Cells(vec![(0, 0, 9)])]));display.receive(Duration::ZERO);
+        retain_pending_scene(&mut pending, &shown, &display, 1, 1, 1);
+        assert!(driver.send(vec![Update::Assets(3), Update::Cells(vec![(0, 1, 7)])]));display.receive(Duration::ZERO);
+        assert!(adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 2).unwrap().changes.world,
+            "pending adoption already replaces the whole world, including slots");
+        assert_eq!(shown.layers[0].values, [9, 1, 1, 1]);
+        let adopted = adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 3).unwrap();
+        assert_eq!(*shown, *display.scene());
+        assert_full(&adopted.changes);
+    }
+    #[test]
+    fn uninterrupted_delta_adoption_preserves_the_existing_incremental_path() {
+        let (driver, mut display, mut shown, mut pending) = connected();
+        let cells = shown.layers[0].values.as_ptr();
+        assert!(driver.send(vec![Update::Cells(vec![(0, 2, 11)]), Update::Tick(23)]));display.receive(Duration::ZERO);
+        let adopted = adopt_available_shared_scene(&mut shown, &mut pending, &mut display, 1, 1).unwrap();
+        assert!(!adopted.changes.world && !adopted.changes.sprites && !adopted.changes.views && !adopted.changes.slots);
+        assert_eq!(adopted.changes.cells, [(0, 2)]);
+        assert_eq!(shown.layers[0].values.as_ptr(), cells);
+        assert_eq!(*shown, *display.scene());
     }
 }

@@ -80,6 +80,11 @@ pub fn upscaled(rgba: &[u8], size: (u16, u16), n: u32) -> (Vec<u8>, (u16, u16)) 
 pub struct Art {
     images: HashMap<u32, Image>,
     capture: Option<u32>,
+    /// Sets whose first frame shows nothing (e.g. the game's go-to
+    /// pointer, a blank cell of its cursor art): the arrow stands in.
+    blank: std::collections::HashSet<u32>,
+    arrow: Option<u32>,
+    busy: Vec<u32>,
 }
 
 impl Art {
@@ -87,13 +92,64 @@ impl Art {
     /// pixels; without them, none).
     pub fn of(compiled: &Compiled) -> Self {
         let mut images = HashMap::new();
+        let mut blank = std::collections::HashSet::new();
         for (_, set) in compiled.sets_with_prefix(KEPT_SETS) {
-            if let Some(image) = image(compiled, set) {
-                images.insert(set.raw(), image);
+            match image(compiled, set) {
+                Some(image) if image.rgba.chunks_exact(4).any(|p| p[3] != 0) => {
+                    images.insert(set.raw(), image);
+                }
+                Some(_) => {
+                    blank.insert(set.raw());
+                }
+                None if empty_frame(compiled, set) => {
+                    blank.insert(set.raw());
+                }
+                None => {}
             }
         }
         let capture = compiled.sets_with_prefix(CAPTURE_SPRITES).map(|(_, s)| s.raw()).next();
-        Self { images, capture }
+        let arrow = compiled.set(crate::snap::ARROW_SPRITE).map(|(s, _)| s.raw()).filter(|s| images.contains_key(s));
+        let mut busy = Vec::new();
+        if let Some(pointer) = arrow.and_then(|id| images.get(&id)).cloned() {
+            if let Some((set, _)) = compiled.set(scene::loading_cursor::SET) {
+                for frame in 0..scene::loading_cursor::FRAME_COUNT {
+                    let Some(ring) = image_frame(compiled, set, frame) else { break };
+                    let mut id = u32::MAX - frame;
+                    while images.contains_key(&id) { id = id.saturating_sub(scene::loading_cursor::FRAME_COUNT); }
+                    images.insert(id, busy_composite(&pointer, &ring));
+                    busy.push(id);
+                }
+            }
+        }
+        Self { images, capture, blank, arrow, busy }
+    }
+
+    /// The cursor to show for the driver's `cursor`: a sprite that shows
+    /// nothing (the game hides its pointer that way, e.g. while it waits
+    /// for a go-to target) becomes the arrow, so that the pointer never
+    /// disappears.
+    pub fn shown(&self, cursor: scene::Cursor) -> scene::Cursor {
+        match cursor {
+            scene::Cursor::Sprite(set) if self.blank.contains(&set) => self.arrow.map_or(scene::Cursor::Default, scene::Cursor::Sprite),
+            c => c,
+        }
+    }
+
+    /// The normal OS pointer uses our arrow art too.
+    pub fn system_shown(&self, cursor: scene::Cursor) -> scene::Cursor {
+        match self.shown(cursor) {
+            scene::Cursor::Default | scene::Cursor::System(scene::SystemCursor::Arrow) =>
+                self.arrow.map_or(cursor, scene::Cursor::Sprite),
+            shown => shown,
+        }
+    }
+
+    pub(crate) fn busy_frames(&self) -> usize { self.busy.len() }
+
+    /// CPU animation uses elapsed host time, independently of presented frames.
+    pub fn busy_cursor(&self, elapsed: std::time::Duration) -> Option<u32> {
+        if self.busy.is_empty() { return self.arrow; }
+        Some(self.busy[scene::loading_cursor::frame_at(elapsed) as usize % self.busy.len()])
     }
 
     pub fn get(&self, set: u32) -> Option<&Image> {
@@ -110,7 +166,11 @@ impl Art {
 /// indexed one through its palette row): its anchor is minus the hot spot
 /// (a hot spot outside the image is moved onto its edge).
 fn image(compiled: &Compiled, set: SpriteSetId) -> Option<Image> {
-    let id = compiled.sets.frame(set, 0)?;
+    image_frame(compiled, set, 0)
+}
+
+fn image_frame(compiled: &Compiled, set: SpriteSetId, frame: u32) -> Option<Image> {
+    let id = compiled.sets.frame(set, frame)?;
     let atlas = &compiled.atlas;
     let s = atlas.sprites.get(id.0 as usize)?;
     if s.width == 0 || s.height == 0 || s.width > 256 || s.height > 256 {
@@ -130,12 +190,220 @@ fn image(compiled: &Compiled, set: SpriteSetId) -> Option<Image> {
         }
         out
     };
-    let clamp = |a: i32, len: u32| (-a).clamp(0, len as i32 - 1) as u16;
     Some(Image {
         rgba,
         size: (s.width as u16, s.height as u16),
-        hotspot: (clamp(s.anchor_x, s.width), clamp(s.anchor_y, s.height)),
+        hotspot: hotspot((s.anchor_x, s.anchor_y), (s.width, s.height)),
     })
+}
+
+/// Preserve the pointer and its hot spot. The game's animated selection ring
+/// is a small badge beside it, with nearest-neighbour sampling of actual art.
+fn busy_composite(pointer: &Image, ring: &Image) -> Image {
+    let width = pointer.size.0.saturating_add(17).min(256);
+    let height = pointer.size.1.max(8).min(256);
+    let mut rgba = vec![0; width as usize * height as usize * 4];
+    for y in 0..pointer.size.1.min(height) {
+        for x in 0..pointer.size.0.min(width) {
+            let src = (y as usize * pointer.size.0 as usize + x as usize) * 4;
+            let dst = (y as usize * width as usize + x as usize) * 4;
+            rgba[dst..dst+4].copy_from_slice(&pointer.rgba[src..src+4]);
+        }
+    }
+    if ring.size.0 != 0 && ring.size.1 != 0 {
+        for y in 0..8u16 { for x in 0..16u16 {
+            let dx = pointer.size.0 as u32 + 1 + x as u32;
+            if dx >= width as u32 || y >= height { continue; }
+            let sx = x as usize * ring.size.0 as usize / 16;
+            let sy = y as usize * ring.size.1 as usize / 8;
+            let src = (sy * ring.size.0 as usize + sx) * 4;
+            let dst = (y as usize * width as usize + dx as usize) * 4;
+            rgba[dst..dst+4].copy_from_slice(&ring.rgba[src..src+4]);
+        }}
+    }
+    Image { rgba, size: (width, height), hotspot: pointer.hotspot }
+}
+
+/// A sprite's hot spot: minus its anchor, moved onto its edge if outside.
+fn hotspot(anchor: (i32, i32), size: (u32, u32)) -> (u16, u16) {
+    let clamp = |a: i32, len: u32| (-a).clamp(0, len.max(1) as i32 - 1) as u16;
+    (clamp(anchor.0, size.0), clamp(anchor.1, size.1))
+}
+
+/// Whether `set`'s first frame has no pixels at all.
+fn empty_frame(compiled: &Compiled, set: SpriteSetId) -> bool {
+    compiled.sets.frame(set, 0).and_then(|id| compiled.atlas.sprites.get(id.0 as usize)).is_some_and(|s| s.width == 0 || s.height == 0)
+}
+
+/// What the viewer needs of a cursor set to draw it at a size of its own:
+/// the set, its first frame's size, hot spot (as [`Image::hotspot`]) and
+/// anchor.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SetArt {
+    pub set: SpriteSetId,
+    pub size: (u32, u32),
+    pub hotspot: (u16, u16),
+    pub anchor: (i32, i32),
+}
+
+impl SetArt {
+    pub fn of(compiled: &Compiled, set: SpriteSetId) -> Option<SetArt> {
+        let id = compiled.sets.frame(set, 0)?;
+        let s = compiled.atlas.sprites.get(id.0 as usize)?;
+        Some(SetArt { set, size: (s.width, s.height), hotspot: hotspot((s.anchor_x, s.anchor_y), (s.width, s.height)), anchor: (s.anchor_x, s.anchor_y) })
+    }
+}
+
+/// The art cell every cursor size is measured against: the game's cursor
+/// cells are 32×32, so at a cursor size of 32 they show 1:1.
+pub const NOMINAL: u32 = 32;
+
+/// How big the cursor shows (`viewer_settings::Display::cursor_size`):
+/// canvas pixels per art pixel (`zoom`, reduced) and window pixels per
+/// canvas pixel (`present`, the pixel scale). The viewer draws its cursor
+/// sprites at `zoom` on the canvas (nearest pixel, as every scaled view) and
+/// the canvas shows `present`×`present` boxes; the system pointer made from
+/// the same art ([`Scale::native`]) is that picture pixel for pixel. A size
+/// is rounded to whole canvas pixels, so both are always the same size.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Scale {
+    pub zoom: (u32, u32),
+    pub present: u32,
+}
+
+impl Default for Scale {
+    fn default() -> Self {
+        Scale { zoom: (1, 1), present: 1 }
+    }
+}
+
+impl Scale {
+    /// [`NOMINAL`] art pixels `size` window pixels across, at pixel scale
+    /// `present` (the nearest whole number of canvas pixels, at least one).
+    pub fn new(size: u32, present: u32) -> Scale {
+        let p = present.clamp(1, 64);
+        let canvas = ((size.clamp(1, 1024) + p / 2) / p).max(1);
+        let g = gcd(canvas, NOMINAL);
+        Scale { zoom: (canvas / g, NOMINAL / g), present: p }
+    }
+
+    /// Whether the art shows 1:1 on the canvas.
+    pub fn unscaled(&self) -> bool {
+        self.zoom.0 == self.zoom.1
+    }
+
+    /// The window pixels [`NOMINAL`] art pixels span: the size in effect.
+    pub fn size(&self) -> u32 {
+        self.present * self.span(NOMINAL)
+    }
+
+    /// The canvas pixels `art` art pixels span, which is also the first
+    /// canvas pixel that shows art pixel `art` (canvas pixel `c` shows art
+    /// pixel ⌊c·zoom.1/zoom.0⌋, as the renderer scales a view).
+    pub fn span(&self, art: u32) -> u32 {
+        (art as u64 * self.zoom.0.max(1) as u64).div_ceil(self.zoom.1.max(1) as u64) as u32
+    }
+
+    fn art_of(&self, canvas: u32) -> u32 {
+        (canvas as u64 * self.zoom.1.max(1) as u64 / self.zoom.0.max(1) as u64) as u32
+    }
+
+    /// The system pointer's hot spot (window pixels) for art hot spot `h`:
+    /// in the middle of the canvas pixel showing it, as the window puts the
+    /// pointer in the middle of a canvas pixel.
+    pub fn native_hotspot(&self, h: (u16, u16), size: (u16, u16)) -> (u16, u16) {
+        let axis = |h: u16, len: u16| (self.present * self.span(h as u32) + self.present / 2).min((self.present * self.span(len as u32)).max(1) - 1) as u16;
+        (axis(h.0, size.0), axis(h.1, size.1))
+    }
+
+    /// `image` as the system pointer at this size (window pixels): what the
+    /// viewer draws of it on the canvas, each canvas pixel a
+    /// `present`×`present` box.
+    pub fn native(&self, image: &Image) -> Image {
+        let (w, h) = (image.size.0 as u32, image.size.1 as u32);
+        if image.rgba.len() < (w * h * 4) as usize || w == 0 || h == 0 {
+            return image.clone();
+        }
+        let p = self.present;
+        let (nw, nh) = (p * self.span(w), p * self.span(h));
+        let mut rgba = Vec::with_capacity((nw * nh * 4) as usize);
+        for y in 0..nh {
+            let ay = self.art_of(y / p).min(h - 1);
+            for x in 0..nw {
+                let ax = self.art_of(x / p).min(w - 1);
+                let i = ((ay * w + ax) * 4) as usize;
+                rgba.extend_from_slice(&image.rgba[i..i + 4]);
+            }
+        }
+        Image { rgba, size: (nw as u16, nh as u16), hotspot: self.native_hotspot(image.hotspot, image.size) }
+    }
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a.max(1) } else { gcd(b, a % b) }
+}
+
+/// The centre of the map tile whose diamond holds world pixel `p` on a
+/// staggered grid with half-tile `step` (Civ III: tile (x, y), x + y even,
+/// its 128×64 box at (64·x, 32·y), its centre at (64·x + 64, 32·y + 32)),
+/// or of the cell holding it on an orthogonal grid.
+pub fn tile_centre(p: (i32, i32), step: (u32, u32), staggered: bool) -> (i32, i32) {
+    let (sx, sy) = (step.0.max(1) as i64, step.1.max(1) as i64);
+    let (x, y) = (p.0 as i64, p.1 as i64);
+    if !staggered {
+        return ((x.div_euclid(sx) * sx + sx / 2) as i32, (y.div_euclid(sy) * sy + sy / 2) as i32);
+    }
+    let (cx, cy) = ((x - sx).div_euclid(sx), (y - sy).div_euclid(sy));
+    let mut best: Option<(i64, (i64, i64))> = None;
+    for ty in cy - 1..=cy + 2 {
+        for tx in cx - 1..=cx + 2 {
+            if (tx + ty).rem_euclid(2) != 0 {
+                continue;
+            }
+            let centre = (sx * tx + sx, sy * ty + sy);
+            // Diamond distance from the centre (at most sx·sy inside).
+            let d = (x - centre.0).abs() * sy + (y - centre.1).abs() * sx;
+            if best.is_none_or(|(b, _)| d < b) {
+                best = Some((d, centre));
+            }
+        }
+    }
+    let (_, (x, y)) = best.expect("candidates");
+    (x as i32, y as i32)
+}
+
+/// While the driver waits for a target tile (`scene::Interface::targeting`):
+/// the cursor shown snapped to the centre of the tile it points at, so it
+/// moves tile by tile, in the view the pointer is in and every other view
+/// showing that tile. The system pointer still moves freely; it is hidden
+/// meanwhile and the viewer draws the cursor.
+pub fn snap_to_tiles(marks: Marks, f: &Facts, centre: impl Fn((i32, i32)) -> (i32, i32)) -> Marks {
+    if f.snap_mode || (!f.captured && f.interface_open) {
+        return marks;
+    }
+    if f.captured {
+        let input = f.cursor_view.map(|(_, at, _)| at);
+        return Marks { world: f.world_cursor.iter().copied().map(&centre).collect(), system: None, input, ..marks };
+    }
+    match f.pointer_world.filter(|_| f.pointer_inside && !f.unlocking) {
+        Some(w) => Marks { world: vec![centre(w)], system: None, input: Some(f.pointer), ..marks },
+        None => marks,
+    }
+}
+
+/// Whether the cursor is shown snapped to tiles ([`snap_to_tiles`]) this
+/// frame: only while the driver waits for a move's target tile
+/// (`scene::Interface::snap_to_tiles`: go-to, a stack's move), the cursor
+/// over the world; for every other target (bombard, rebase, airlift, air
+/// drop, ...) the driver's cursor stays at the pointer.
+pub fn snaps_to_tiles(interface: &scene::Interface, f: &Facts) -> bool {
+    interface.targeting && interface.snap_to_tiles && !f.snap_mode && (f.captured || (f.pointer_inside && f.pointer_world.is_some() && !f.interface_open))
+}
+
+/// An empty camera: a place in the drawing order kept for the cursor
+/// (`layout::Frame::cursor_slots`), drawing nothing until filled.
+pub fn empty_camera() -> Camera {
+    Camera { cells: false, target_clip: Some([0, 0, 0, 0]), ..Camera::new((1, 1)) }
 }
 
 /// What the system pointer shows.
@@ -233,8 +501,29 @@ pub struct Facts {
     pub pointer: (i32, i32),
     pub pointer_inside: bool,
     pub pointer_world: Option<(i32, i32)>,
+    /// The driver shows more than its plain map ([`interface_open`]: a
+    /// title, setup or preview screen, a menu, a popup): the free pointer
+    /// is the system's alone, mirrored nowhere.
+    pub interface_open: bool,
     /// Seconds (any clock).
     pub now: f64,
+}
+
+/// Whether `scene` shows more than the driver's plain map: no world (the
+/// title and setup screens), a named screen (an advisor, Preferences), the
+/// Load Scenario screen with its preview beside it, a popup, menus, or
+/// menus fitted to the window. The free pointer is then not mirrored in any
+/// view ([`Facts::interface_open`]): what is under it is the interface, not
+/// a place of a world other views show.
+pub fn interface_open(scene: &scene::Scene) -> bool {
+    let i = &scene.interface;
+    scene.shape.cols == 0
+        || scene.shape.rows == 0
+        || i.screen.is_some()
+        || i.beside.is_some()
+        || i.popup.is_some()
+        || i.menu_fit
+        || scene.views.iter().any(|v| v.view.menu && !v.overlay.is_empty())
 }
 
 /// How the cursor shows this frame, and what changes for the system
@@ -331,10 +620,12 @@ impl Machine {
             Marks::default()
         } else if f.captured {
             let at = f.cursor_view.map(|(_, at, _)| at);
-            Marks { world: f.world_cursor.clone(), window: vec![], system: if self.edge && !f.unlocking && !entering { at } else { None } }
+            let system = if self.edge && !f.unlocking && !entering { at } else { None };
+            Marks { world: f.world_cursor.clone(), window: vec![], system, input: if system.is_none() { at } else { None } }
         } else {
-            let world = f.pointer_world.filter(|_| f.pointer_inside).into_iter().collect();
-            Marks { world, window: vec![], system: (!f.unlocking).then_some(f.pointer) }
+            // (Mirrored in the other views only over the plain map.)
+            let world = f.pointer_world.filter(|_| f.pointer_inside && !f.interface_open).into_iter().collect();
+            Marks { world, window: vec![], system: (!f.unlocking).then_some(f.pointer), input: None }
         };
         plan
     }
@@ -351,6 +642,24 @@ pub struct Marks {
     /// Where the system draws its pointer (none while it is hidden): a
     /// view showing a marked point there is left to it.
     pub system: Option<(i32, i32)>,
+    /// Where the pointer the input goes by is (window pixels) when the
+    /// viewer draws it itself (none: the system pointer is that one, or
+    /// none shows): the mark in the view there is the cursor, on top of
+    /// everything; the marks in other views mirror it, drawn under the
+    /// driver's interface (a click there would not reach that interface).
+    pub input: Option<(i32, i32)>,
+}
+
+/// A cursor mark as drawn: where (window pixels, the hot spot), clipped to
+/// which rectangle (left, top, right, bottom), in which camera's view (none:
+/// a window mark), and whether it is the pointer itself rather than its
+/// mirror in another view.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub at: (i32, i32),
+    pub clip: Option<[i32; 4]>,
+    pub view: Option<usize>,
+    pub own: bool,
 }
 
 /// The cursor sprites for `marks`, all in camera `overlay` (a camera over
@@ -358,8 +667,15 @@ pub struct Marks {
 /// each clipped to the view it marks. `period`: how far the world repeats
 /// (0: not), in the views' pixels.
 pub fn sprites(set: SpriteSetId, marks: &Marks, cameras: &[Camera], overlay: u32, period: (i32, i32)) -> Vec<PlacedSprite> {
+    placements(marks, cameras, period).into_iter().map(|p| PlacedSprite { screen: true, view: Some(overlay), clip: p.clip, ..PlacedSprite::new(set, p.at.0, p.at.1) }).collect()
+}
+
+/// Where the cursor shows for `marks` (see [`sprites`]).
+pub fn placements(marks: &Marks, cameras: &[Camera], period: (i32, i32)) -> Vec<Placed> {
     let mut out = Vec::new();
-    let place = |(x, y): (i32, i32), clip: Option<[i32; 4]>| PlacedSprite { screen: true, view: Some(overlay), clip, ..PlacedSprite::new(set, x, y) };
+    let inside = |c: &Camera, q: (i32, i32)| c.cells && !c.stacked && q.0 >= c.origin.0 && q.1 >= c.origin.1 && q.0 < c.origin.0 + c.viewport.0 as i32 && q.1 < c.origin.1 + c.viewport.1 as i32;
+    // The view the input goes to: the topmost showing the world there.
+    let input_view = marks.input.and_then(|p| cameras.iter().rposition(|c| inside(c, p)));
     let shifts = |p: i32| if p > 0 { vec![-p, 0, p] } else { vec![0] };
     for (k, c) in cameras.iter().enumerate() {
         if !c.cells || c.stacked {
@@ -384,13 +700,75 @@ pub fn sprites(set: SpriteSetId, marks: &Marks, cameras: &[Camera], overlay: u32
                     });
                     let system = marks.system.is_some_and(|s| (s.0 - q.0).abs() <= span && (s.1 - q.1).abs() <= span);
                     if !covered && !system {
-                        out.push(place(q, Some(rect)));
+                        out.push(Placed { at: q, clip: Some(rect), view: Some(k), own: Some(k) == input_view });
                     }
                 }
             }
         }
     }
-    out.extend(marks.window.iter().map(|&p| place(p, None)));
+    out.extend(marks.window.iter().map(|&p| Placed { at: p, clip: None, view: None, own: true }));
+    out
+}
+
+/// The cursor as drawn this frame: its sprites, the cameras filling the
+/// frame's cursor slots (`slots`, cameras under the driver's interface:
+/// marks mirroring the pointer in views drawn below them), and cameras to
+/// add on top after camera `overlay` (a 1:1 camera over the canvas, the
+/// next free index `overlay + 1`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Composed {
+    pub sprites: Vec<PlacedSprite>,
+    pub slots: Vec<(u32, Camera)>,
+    pub top: Vec<Camera>,
+}
+
+/// The cursor `art` for `marks` at `scale` (see [`Composed`]): 1:1 in the
+/// overlay (or a slot made an overlay), else each mark in a camera of its
+/// own scaled to the cursor's size, its hot spot on the marked canvas
+/// pixel. Marks in views drawn below the slots that are not the pointer
+/// itself go into the slots; the rest on top (as long as the renderer
+/// draws that many views; beyond that they are left out).
+pub fn compose(art: SetArt, marks: &Marks, cameras: &[Camera], slots: &[u32], scale: Scale, canvas: (u32, u32), overlay: u32, period: (i32, i32)) -> Composed {
+    let mut out = Composed::default();
+    let below = |p: &Placed| !p.own && slots.first().is_some_and(|&first| p.view.is_some_and(|v| (v as u32) < first));
+    let (mut free_slots, mut next) = (slots.iter().copied(), overlay + 1);
+    let mut overlay_slot: Option<u32> = None;
+    for p in placements(marks, cameras, period) {
+        let under = below(&p);
+        if scale.unscaled() {
+            let view = if under {
+                match overlay_slot.or_else(|| free_slots.next()) {
+                    Some(slot) => {
+                        if overlay_slot.replace(slot).is_none() {
+                            out.slots.push((slot, overlay_camera(canvas)));
+                        }
+                        slot
+                    }
+                    None => overlay,
+                }
+            } else {
+                overlay
+            };
+            out.sprites.push(PlacedSprite { screen: true, view: Some(view), clip: p.clip, ..PlacedSprite::new(art.set, p.at.0, p.at.1) });
+            continue;
+        }
+        let origin = (p.at.0 - scale.span(art.hotspot.0 as u32) as i32, p.at.1 - scale.span(art.hotspot.1 as u32) as i32);
+        let viewport = (scale.span(art.size.0).max(1), scale.span(art.size.1).max(1));
+        let camera = Camera { cells: false, zoom: scale.zoom, origin, screen_shift: origin, hairline: true, target_clip: p.clip, ..Camera::new(viewport) };
+        let view = match under.then(|| free_slots.next()).flatten() {
+            Some(slot) => {
+                out.slots.push((slot, camera));
+                slot
+            }
+            None if (next as usize) < tile_render::MAX_VIEWS => {
+                out.top.push(camera);
+                next += 1;
+                next - 1
+            }
+            None => continue,
+        };
+        out.sprites.push(PlacedSprite { screen: true, view: Some(view), ..PlacedSprite::new(art.set, -art.anchor.0, -art.anchor.1) });
+    }
     out
 }
 
@@ -405,16 +783,34 @@ pub fn overlay_camera(window: (u32, u32)) -> Camera {
 /// (`start`: the event loop's part), to that frame handed to the system
 /// (`present`: with the wait for a surface texture), and to the GPU having
 /// finished it (`done`), in milliseconds.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Latency {
+    pub pending: std::collections::BTreeMap<u64, Instant>,
     pub start: Vec<f64>,
     pub present: Vec<f64>,
     /// When the last sample was taken.
     pub last: Option<Instant>,
-    pub done: std::sync::Arc<std::sync::Mutex<Vec<f64>>>,
+    /// Sent by the GPU's completion callbacks, whichever thread runs them.
+    pub done: std::sync::Arc<civ3r_sync::Mailbox<f64>>,
+}
+
+impl std::fmt::Debug for Latency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Latency").field("start", &self.start).field("present", &self.present).field("last", &self.last).field("done", &self.done.len()).finish()
+    }
 }
 
 impl Latency {
+    pub fn begin(&mut self, id: u64, since: Instant, started: Instant) {
+        self.start.push(started.saturating_duration_since(since).as_secs_f64() * 1000.0);
+        self.pending.insert(id, since);
+        while self.pending.len() > 64 { self.pending.pop_first(); }
+    }
+    pub fn completed(&self, id: u64, at: Instant) {
+        if let Some(since) = self.pending.get(&id) {
+            self.done.send(at.saturating_duration_since(*since).as_secs_f64() * 1000.0);
+        }
+    }
     /// The percentiles 50, 95, 100 of `v`, and how many.
     pub fn summary(v: &mut [f64]) -> Option<(f64, f64, f64, usize)> {
         if v.is_empty() {
@@ -429,6 +825,22 @@ impl Latency {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latency_tokens_keep_out_of_order_completions_and_bound_stale_frames() {
+        let mut latency = Latency::default();
+        let now = Instant::now();
+        for id in 0..66 { latency.begin(id, now + std::time::Duration::from_millis(id), now + std::time::Duration::from_millis(id + 1)); }
+        assert_eq!(latency.pending.len(), 64);
+        latency.completed(0, now + std::time::Duration::from_millis(100));
+        assert!(latency.done.try_recv().is_none());
+        latency.completed(65, now + std::time::Duration::from_millis(70));
+        latency.completed(64, now + std::time::Duration::from_millis(72));
+        assert_eq!(latency.done.try_recv(), Some(5.0));
+        assert_eq!(latency.done.try_recv(), Some(8.0));
+        // GPU completion can precede bitmap presentation. Keep its input time.
+        assert!(latency.pending.contains_key(&65));
+    }
 
     #[test]
     fn a_cursor_upscaled_is_whole_boxes() {
@@ -454,7 +866,7 @@ mod tests {
         let interface = Camera { cells: false, ..Camera::new((800, 300)) };
         let cameras = [a, b, interface];
         // The pointer over A at world (150, 120): drawn in B only, clipped.
-        let marks = Marks { world: vec![(150, 120)], window: vec![], system: Some((150, 120)) };
+        let marks = Marks { world: vec![(150, 120)], window: vec![], system: Some((150, 120)), input: None };
         let s = sprites(set, &marks, &cameras, 3, (0, 0));
         assert_eq!(s.len(), 1);
         assert_eq!((s[0].x, s[0].y, s[0].view, s[0].screen), (400 + 100, 40, Some(3), true));
@@ -463,7 +875,7 @@ mod tests {
         let s = sprites(set, &Marks { system: None, ..marks.clone() }, &cameras, 3, (0, 0));
         assert_eq!(s.len(), 2);
         // A world that wraps every 1000 pixels: (1150, 120) is the same.
-        let s = sprites(set, &Marks { world: vec![(1150, 120)], window: vec![(5, 6)], system: None }, &cameras, 3, (1000, 0));
+        let s = sprites(set, &Marks { world: vec![(1150, 120)], window: vec![(5, 6)], system: None, input: None }, &cameras, 3, (1000, 0));
         assert_eq!(s.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>(), [(150, 120), (500, 40), (5, 6)]);
         assert_eq!(s[2].clip, None);
     }
@@ -489,6 +901,17 @@ mod tests {
         assert_eq!(system_pointer(scene::Cursor::System(scene::SystemCursor::Wait), &art, false, false), Shown::Icon(CursorIcon::Wait));
         assert_eq!(system_pointer(scene::Cursor::Default, &art, false, true), Shown::Custom(7));
         assert_eq!(system_pointer(scene::Cursor::Default, &Art::default(), false, true), Shown::Icon(CursorIcon::Crosshair));
+    }
+
+    #[test]
+    fn normal_system_pointer_uses_our_arrow_and_keeps_busy_and_invalid_icons() {
+        let mut art = Art::default();
+        art.arrow = Some(7);
+        assert_eq!(art.system_shown(scene::Cursor::Default), scene::Cursor::Sprite(7));
+        assert_eq!(art.system_shown(scene::Cursor::System(scene::SystemCursor::Arrow)), scene::Cursor::Sprite(7));
+        for icon in [scene::SystemCursor::Wait, scene::SystemCursor::Progress, scene::SystemCursor::NotAllowed] {
+            assert_eq!(art.system_shown(scene::Cursor::System(icon)), scene::Cursor::System(icon));
+        }
     }
 
     /// The views: A (left) at 1:1 showing world (0, 0)..; B (right) at 2:1
@@ -668,6 +1091,267 @@ mod tests {
         assert_eq!(m.edge_rect, None);
     }
 
+    struct NoFiles;
+    impl render_desc::ImageLoader for NoFiles {
+        fn load(&self, source: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> {
+            Err(format!("no file {source}"))
+        }
+    }
+
+    /// The game's arrow and a blank cell (as its go-to pointer is), both
+    /// kept cursor sets.
+    fn arrow_and_blank() -> Compiled {
+        render_desc::Description::parse(
+            r#"
+            grid = { layout = "orthogonal", step = [8, 8] }
+            [images.arrow]
+            source = "pointer:255,255,255,255:14x22"
+            [images.blank]
+            source = "solid:0,0,0,0:32x32"
+            [images.target]
+            source = "solid:200,40,40,255:32x32"
+            [sheets.arrow]
+            image = "arrow"
+            cell = [14, 22]
+            group = "Viewer@cursors"
+            [sheets.blank]
+            image = "blank"
+            cell = [32, 32]
+            group = "Viewer@blank"
+            [sheets.target]
+            image = "target"
+            cell = [32, 32]
+            anchor = [-16, -16]
+            group = "Viewer@bombard"
+            "#,
+        )
+        .unwrap()
+        .compile(&NoFiles, 256)
+        .unwrap()
+    }
+
+    #[test]
+    fn a_targeting_pointer_that_shows_nothing_becomes_the_arrow_everywhere() {
+        let compiled = arrow_and_blank();
+        let art = Art::of(&compiled);
+        let raw = |name: &str| compiled.set(name).map(|(s, _)| s.raw());
+        let (arrow, blank, target) = (raw("Viewer@cursors/0"), raw("Viewer@blank/0"), raw("Viewer@bombard/0"));
+        let (arrow, target) = (arrow.unwrap(), target.unwrap());
+        // A blank cell, or one the description dropped: the arrow, as the
+        // system pointer and as the sprite the viewer draws.
+        if let Some(blank) = blank {
+            assert_eq!(art.shown(scene::Cursor::Sprite(blank)), scene::Cursor::Sprite(arrow));
+            assert_eq!(system_pointer(art.shown(scene::Cursor::Sprite(blank)), &art, false, false), Shown::Custom(arrow));
+            assert_eq!(sprite_set(&compiled, art.shown(scene::Cursor::Sprite(blank))), Some(SpriteSetId::from_raw(arrow)));
+        }
+        // The game's own targeting cursors show as they are.
+        assert_eq!(art.shown(scene::Cursor::Sprite(target)), scene::Cursor::Sprite(target));
+        assert_eq!(system_pointer(art.shown(scene::Cursor::Sprite(target)), &art, false, false), Shown::Custom(target));
+        assert_eq!(sprite_set(&compiled, scene::Cursor::Sprite(target)), Some(SpriteSetId::from_raw(target)));
+        assert_eq!(SetArt::of(&compiled, SpriteSetId::from_raw(target)).map(|a| a.hotspot), Some((16, 16)));
+        // Never hidden while the viewer does not draw it.
+        assert_eq!(art.shown(scene::Cursor::System(scene::SystemCursor::Wait)), scene::Cursor::System(scene::SystemCursor::Wait));
+        assert_ne!(system_pointer(art.shown(scene::Cursor::Sprite(target)), &art, false, false), Shown::Hidden);
+    }
+
+    #[test]
+    fn cursor_sizes_round_to_whole_canvas_pixels_and_the_system_pointer_matches() {
+        for present in 1..=4 {
+            for size in [16, 24, 32, 36, 40, 48, 64, 72, 96, 128, 192] {
+                let s = Scale::new(size, present);
+                // The size in effect: the nearest multiple of the pixel scale.
+                assert_eq!(s.size() % present, 0, "{size} {present}");
+                assert!((s.size() as i64 - size as i64).abs() <= present as i64 / 2 + (size < present) as i64 * present as i64, "{size} {present}: {}", s.size());
+                let image = Image { rgba: (0..32 * 32).flat_map(|i| [i as u8, (i >> 8) as u8, 7, 255]).collect(), size: (32, 32), hotspot: (5, 9) };
+                let native = s.native(&image);
+                assert_eq!((native.size.0 as u32, native.size.1 as u32), (s.size(), s.size()), "{size} {present}");
+                // Each canvas pixel a present×present box of one art pixel.
+                for y in 0..native.size.1 as usize {
+                    for x in 0..native.size.0 as usize {
+                        let (bx, by) = (x / present as usize * present as usize, y / present as usize * present as usize);
+                        assert_eq!(native.rgba[(y * native.size.0 as usize + x) * 4..][..4], native.rgba[(by * native.size.0 as usize + bx) * 4..][..4]);
+                    }
+                }
+                // The hot spot in the middle of the canvas pixel showing it.
+                let h = native.hotspot;
+                assert_eq!((h.0 as u32 / present, h.1 as u32 / present), (s.span(5), s.span(9)));
+                let at = |x: u32, y: u32| native.rgba[((y * s.size() + x) * 4) as usize];
+                if s.zoom.0 >= s.zoom.1 {
+                    assert_eq!(at(h.0 as u32, h.1 as u32), image.rgba[((9 * 32 + 5) * 4) as usize], "{size} {present}");
+                }
+            }
+        }
+        // At 32 and the pixel scale 1: the art as it is.
+        let s = Scale::new(32, 1);
+        assert!(s.unscaled() && s == Scale::default());
+        assert_eq!(Scale::new(64, 2), Scale { zoom: (1, 1), present: 2 });
+        assert_eq!(Scale::new(48, 1).zoom, (3, 2));
+        assert_eq!(Scale::new(24, 1).zoom, (3, 4));
+    }
+
+    /// The drawn cursor at every size is, pixel for pixel, the system
+    /// pointer made from the same art: both the same size, the same hot
+    /// spot, the same pixels (the canvas's at the pixel scale).
+    #[test]
+    fn the_drawn_cursor_is_the_system_pointer_pixel_for_pixel() {
+        use tile_render::{AtlasBuilder, Grid, RgbaImage, SpriteSets, TileWorld};
+        let pixel = |x: u32, y: u32| if x == 3 { [0, 0, 0, 0] } else { [(x * 8) as u8, (y * 8) as u8, 200, 255] };
+        let picture = RgbaImage::from_fn(32, 32, pixel);
+        let hot = (5u16, 9u16);
+        let mut builder = AtlasBuilder::new(64);
+        let id = builder.add(&picture, (-(hot.0 as i32), -(hot.1 as i32))).unwrap();
+        let atlas = builder.finish();
+        let mut sets = SpriteSets::default();
+        let set = sets.single(id);
+        let mut world = TileWorld::new(Grid { cols: 4, rows: 4, layout: tile_render::Layout::Orthogonal, wrap_x: false, wrap_y: false, step: (8, 8) }, sets);
+        let art = SetArt { set, size: (32, 32), hotspot: hot, anchor: (-(hot.0 as i32), -(hot.1 as i32)) };
+        let image = Image { rgba: (0..32).flat_map(|y| (0..32).flat_map(move |x| pixel(x, y))).collect(), size: (32, 32), hotspot: hot };
+        let canvas = (240, 200);
+        for present in [1, 2, 3] {
+            for size in [24, 32, 48, 64, 80, 96] {
+                let scale = Scale::new(size, present);
+                let q = (97, 61);
+                let marks = Marks { window: vec![q], ..Default::default() };
+                let base = vec![overlay_camera(canvas)];
+                let composed = compose(art, &marks, &[], &[], scale, canvas, 0, (0, 0));
+                let mut cameras = base.clone();
+                cameras.extend(composed.top.iter().copied());
+                world.free = composed.sprites.clone();
+                let picture = tile_render::reference::render_views(&world, &atlas, &cameras, canvas, 0, [1, 2, 3, 255]);
+                let native = scale.native(&image);
+                let origin = (q.0 - (native.hotspot.0 as u32 / present) as i32, q.1 - (native.hotspot.1 as u32 / present) as i32);
+                let span = scale.span(32);
+                for cy in 0..span {
+                    for cx in 0..span {
+                        let n = &native.rgba[(((cy * present) * native.size.0 as u32 + cx * present) * 4) as usize..][..4];
+                        let drawn = picture.get(origin.0 as u32 + cx, origin.1 as u32 + cy);
+                        let expected = if n[3] == 0 { [1, 2, 3, 255] } else { [n[0], n[1], n[2], n[3]] };
+                        assert_eq!(drawn, expected, "size {size} present {present} at {cx},{cy}");
+                    }
+                }
+                // Nothing beside it.
+                for (x, y) in [(origin.0 - 1, origin.1), (origin.0, origin.1 - 1), (origin.0 + span as i32, origin.1), (origin.0, origin.1 + span as i32)] {
+                    assert_eq!(picture.get(x as u32, y as u32), [1, 2, 3, 255], "size {size} present {present}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mirrored_cursors_go_under_the_interface_and_the_pointer_on_top() {
+        let set = SpriteSetId::from_raw(3);
+        let art = SetArt { set, size: (32, 32), hotspot: (1, 1), anchor: (-1, -1) };
+        // A (left) and B (right) show the world; slot 2 is kept under the
+        // interface (3); the overlay on top is 4.
+        let a = cam((0, 0), (400, 300), (0, 0), (1, 1));
+        let b = cam((400, 0), (400, 300), (0, 0), (1, 1));
+        let interface = Camera { cells: false, ..Camera::new((800, 300)) };
+        let cameras = [a, b, empty_camera(), interface];
+        // The mouse captured, the world cursor drawn in A (where the input
+        // goes) and mirrored in B.
+        let marks = Marks { world: vec![(100, 50)], window: vec![], system: None, input: Some((100, 50)) };
+        for scale in [Scale::default(), Scale::new(48, 1)] {
+            let c = compose(art, &marks, &cameras, &[2], scale, (800, 300), 4, (0, 0));
+            assert_eq!(c.sprites.len(), 2, "{scale:?}");
+            let views: Vec<u32> = c.sprites.iter().map(|s| s.view.unwrap()).collect();
+            // The mirror in B: in the slot, before the interface.
+            assert!(views.contains(&2), "{views:?}");
+            assert_eq!(c.slots.len(), 1);
+            assert_eq!(c.slots[0].0, 2);
+            assert!(scale.unscaled() || c.slots[0].1.target_clip.is_some_and(|r| r[0] >= 400), "{:?}", c.slots);
+            // The pointer itself in A: on top of everything.
+            let top = views.iter().copied().find(|&v| v != 2).unwrap();
+            assert!(top >= 4 && top > 3, "{views:?}");
+            assert_eq!(c.top.len(), if scale.unscaled() { 0 } else { 1 });
+        }
+        // The pointer free (the system's): every drawn mark is a mirror.
+        let free = Marks { world: vec![(100, 50)], window: vec![], system: Some((100, 50)), input: None };
+        let c = compose(art, &free, &cameras, &[2], Scale::default(), (800, 300), 4, (0, 0));
+        assert_eq!(c.sprites.iter().map(|s| s.view).collect::<Vec<_>>(), [Some(2)]);
+        // No slot (e.g. the world beside a screen): on top as before.
+        let c = compose(art, &free, &cameras, &[], Scale::default(), (800, 300), 4, (0, 0));
+        assert_eq!(c.sprites.iter().map(|s| s.view).collect::<Vec<_>>(), [Some(4)]);
+    }
+
+    #[test]
+    fn tile_centres_are_the_games_diamonds_at_every_world_zoom() {
+        // Civ III: tile (x, y), x + y even, its centre at (64x + 64, 32y + 32).
+        let game = |(wx, wy): (i32, i32)| -> (i32, i32) {
+            let mut best = (i64::MAX, (0, 0));
+            for y in -2..40 {
+                for x in -2..40 {
+                    if (x + y) % 2 != 0 { continue; }
+                    let c = (64 * x + 64, 32 * y + 32);
+                    let d = ((wx - c.0).abs() * 32 + (wy - c.1).abs() * 64) as i64;
+                    if d < best.0 { best = (d, c); }
+                }
+            }
+            best.1
+        };
+        for p in [(64, 32), (0, 0), (100, 40), (127, 63), (128, 64), (191, 47), (300, 211), (513, 777), (63, 31), (65, 33)] {
+            assert_eq!(tile_centre(p, (64, 32), true), game(p), "{p:?}");
+        }
+        // The centre of a tile is its own; points inside its diamond go to it.
+        for (x, y) in [(0, 0), (1, 1), (4, 2), (7, 9)] {
+            let c = (64 * x + 64, 32 * y + 32);
+            for d in [(0, 0), (60, 0), (-60, 0), (0, 28), (0, -28), (30, 14), (-30, -14)] {
+                assert_eq!(tile_centre((c.0 + d.0, c.1 + d.1), (64, 32), true), c, "{c:?} {d:?}");
+            }
+        }
+        // Zoomed out (Z): half the steps, half the centres.
+        for p in [(32, 16), (50, 20), (150, 105)] {
+            let full = game((2 * p.0, 2 * p.1));
+            assert_eq!(tile_centre(p, (32, 16), true), (full.0 / 2, full.1 / 2), "{p:?}");
+        }
+        // An orthogonal grid: the cell's middle.
+        assert_eq!(tile_centre((17, 3), (8, 8), false), (20, 4));
+        assert_eq!(tile_centre((-1, -9), (8, 8), false), (-4, -12));
+    }
+
+    #[test]
+    fn while_targeting_the_drawn_cursor_moves_tile_by_tile() {
+        let centre = |p: (i32, i32)| tile_centre(p, (64, 32), true);
+        // The mouse free over the world: drawn (the system pointer hidden)
+        // at the middle of the tile, in the pointer's view and mirrored.
+        for (pointer, world) in [((150, 120), (150, 120)), ((151, 121), (151, 121)), ((200, 90), (200, 90))] {
+            let f = free(pointer, Some(world));
+            let p = Machine::default().step(&f);
+            let m = snap_to_tiles(p.marks, &f, centre);
+            assert_eq!(m.world, vec![centre(world)]);
+            assert_eq!((m.system, m.input), (None, Some(pointer)));
+        }
+        // Over invalid tiles too: the driver's cursor (its "cannot" pointer)
+        // is what shows there, at the tile's middle.
+        let f = free((10, 10), Some((60, 30)));
+        assert_eq!(snap_to_tiles(Machine::default().step(&f).marks, &f, centre).world, vec![(64, 32)]);
+        // Captured: the world cursor snapped in every view.
+        let f = captured((150, 120), (600, 150), false, (600, 150), 1.0);
+        let m = snap_to_tiles(Machine::default().step(&f).marks, &f, centre);
+        assert_eq!(m.world, vec![centre((150, 120))]);
+        assert_eq!((m.system, m.input), (None, Some((600, 150))));
+        // Off the world: as it was.
+        let f = free((10, 10), None);
+        let p = Machine::default().step(&f);
+        assert_eq!(snap_to_tiles(p.marks.clone(), &f, centre), p.marks);
+    }
+
+    #[test]
+    fn only_a_moves_target_snaps_the_cursor_to_tiles() {
+        // Go-to and the stack moves: snapped, free or captured.
+        let go_to = scene::Interface { targeting: true, snap_to_tiles: true, ..Default::default() };
+        // Rebase, airlift, bombard, air drop, ...: the cursor at the pointer.
+        let other = scene::Interface { targeting: true, ..Default::default() };
+        for f in [free((150, 120), Some((150, 120))), captured((150, 120), (600, 150), false, (600, 150), 1.0)] {
+            assert!(snaps_to_tiles(&go_to, &f));
+            assert!(!snaps_to_tiles(&other, &f));
+            // No command waiting (a stale flag alone does nothing).
+            assert!(!snaps_to_tiles(&scene::Interface { snap_to_tiles: true, ..Default::default() }, &f));
+        }
+        // Off the world, or button snapping on: never.
+        assert!(!snaps_to_tiles(&go_to, &free((10, 10), None)));
+        assert!(!snaps_to_tiles(&go_to, &Facts { snap_mode: true, ..free((150, 120), Some((150, 120))) }));
+    }
+
     #[test]
     fn intentional_release_cancels_pending_edge_state_before_the_next_frame() {
         let mut m = Machine::default();
@@ -681,4 +1365,32 @@ mod tests {
         assert_eq!(p.marks.system, Some((250, 100)));
     }
 
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+
+    #[test]
+    fn game_loading_badge_preserves_pointer_pixels_and_hotspot() {
+        let arrow = Image { rgba: vec![17; 4*3*4], size: (4,3), hotspot: (1,2) };
+        let ring = Image { rgba: vec![29; 2*2*4], size: (2,2), hotspot: (0,0) };
+        let image = busy_composite(&arrow, &ring);
+        assert_eq!(image.size, (21,8));
+        assert_eq!(image.hotspot, arrow.hotspot);
+        for y in 0..3 { assert_eq!(&image.rgba[y*21*4..y*21*4+16], &[17;16]); }
+        assert_eq!(&image.rgba[16..20], &[0;4]);
+        assert_eq!(&image.rgba[20..24], &[29;4]);
+        let huge = Image { rgba: vec![1;256*256*4], size: (256,256), hotspot: (255,255) };
+        assert_eq!(busy_composite(&huge,&ring), huge);
+    }
+
+    #[test]
+    fn loading_frames_use_host_time_and_loop_at_native_cadence() {
+        let art = Art { busy: vec![90,91,92], arrow: Some(5), ..Default::default() };
+        for (ms,id) in [(0,90),(82,90),(83,91),(165,91),(166,92),(249,90)] {
+            assert_eq!(art.busy_cursor(std::time::Duration::from_millis(ms)),Some(id));
+        }
+        assert_eq!(Art { arrow: Some(5), ..Default::default() }.busy_cursor(std::time::Duration::ZERO),Some(5));
+    }
 }

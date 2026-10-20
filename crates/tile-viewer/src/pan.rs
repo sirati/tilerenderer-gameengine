@@ -233,6 +233,11 @@ fn view_name(hit: Hit) -> String {
 }
 
 impl Layout {
+    /// End map gestures and momentum when the driver leaves its world.
+    pub(super) fn clear_world_motion(&mut self) {
+        self.pan = Pan { mode: self.pan.mode, ..Default::default() };
+    }
+
     /// How the mouse moves the map (from the settings).
     pub fn set_map_movement(&mut self, m: MapMovement) {
         if self.pan.mode != m {
@@ -260,7 +265,7 @@ impl Layout {
     /// and its world pixels per window pixel.
     fn shown_center(&self, hit: Hit) -> Option<((f64, f64), f64)> {
         let (_, c) = self.shown.iter().find(|(h, _)| *h == hit)?;
-        let (w, h) = c.source_size();
+        let (w, h) = c.world_size();
         Some((((c.x + w as i32 / 2) as f64, (c.y + h as i32 / 2) as f64), c.zoom.1 as f64 / c.zoom.0.max(1) as f64))
     }
 
@@ -268,7 +273,7 @@ impl Layout {
     /// wrap (as its camera shows it), and per axis whether it was held.
     fn clamp_view_center(&self, hit: Hit, c: (f64, f64)) -> ((f64, f64), (bool, bool)) {
         let (Some(b), Some((_, cam))) = (self.bounds, self.shown.iter().find(|(h, _)| *h == hit)) else { return (c, (false, false)) };
-        let (w, h) = cam.source_size();
+        let (w, h) = cam.world_size();
         let axis = |v: f64, size: i32, wrap: bool, span: u32| -> f64 {
             let (size, span) = (size as f64, span as f64);
             match wrap {
@@ -284,7 +289,7 @@ impl Layout {
     /// Puts the middle of view `hit` at world pixel `c` (moved by hand; a
     /// view following the world cursor moves the cursor). A following the
     /// driver keeps that mode, but ignores the unchanged native camera.
-    fn place_view(&mut self, hit: Hit, c: (i32, i32)) {
+    pub(super) fn place_view(&mut self, hit: Hit, c: (i32, i32)) {
         let driver = hit == Hit::Main && self.main_view.follow == Follow::Driver;
         if driver && self.pan.manual_driver.is_none() {
             self.pan.manual_driver = self.driver_center();
@@ -520,7 +525,7 @@ impl Layout {
 
     fn slide(&mut self, dt: f64) {
         let Some(mut c) = self.pan.coast else { return };
-        if self.locked || !self.shown.iter().any(|(h, _)| *h == c.hit) {
+        if self.locked || self.click_popup_open() || !self.shown.iter().any(|(h, _)| *h == c.hit) {
             self.pan.coast = None;
             return;
         }
@@ -586,7 +591,8 @@ impl Layout {
         // A held right-button unit preview can reach beyond this pane in
         // Drag mode. Its pending destination stops scrolling on release.
         let enabled = self.pan.mode == MapMovement::EdgeScroll || self.unit_order_dragging();
-        let active = enabled && self.pan.inside && !self.locked && !self.snapping && self.drag.is_none() && self.pan.grab.is_none();
+        // (Not under a popup opened at a world click: the map stays put.)
+        let active = enabled && self.pan.inside && !self.locked && !self.snapping && self.drag.is_none() && self.pan.grab.is_none() && !self.click_popup_open();
         let target = self
             .view_edge(self.pointer)
             .filter(|&(hit, e)| active && e != (0, 0) && fitted != Some(hit));
@@ -895,6 +901,38 @@ mod tests {
         let out = left(&mut l, false, (600, 300));
         assert!(matches!(out[..], [Input::Look { .. }, Input::WorldButton { down: true, .. }, Input::WorldButton { down: false, .. }]), "{out:?}");
         assert_eq!(l.map_movement(), MapMovement::Drag);
+    }
+
+    #[test]
+    fn leaving_the_game_for_title_or_preview_stops_map_drag_and_momentum() {
+        for preview in [false, true] {
+            for release_drag in [false, true] {
+                let mut l = Layout::default();
+                frame(&mut l);
+                button(&mut l, Button::Middle, true, (200, 200));
+                mv(&mut l, (230, 200));
+                tick(&mut l, 10);
+                mv(&mut l, (260, 200));
+                tick(&mut l, 10);
+                if release_drag {
+                    button(&mut l, Button::Middle, false, (260, 200));
+                    assert!(l.pan.coast.is_some());
+                } else { assert!(l.pan.grab.is_some()); }
+                let mut menu = scene_at(1000);
+                menu.shape = Default::default();
+                if preview { menu.interface.beside = Some(scene::Beside { screen: [100, 100, 400, 400], edge: scene::Edge::Left, world: None }); }
+                l.frame(&menu, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                assert!(l.pan.grab.is_none() && l.pan.press.is_none() && l.pan.coast.is_none());
+                assert!(l.pan.manual_driver.is_none() && l.pan.edge_view.is_none());
+                assert_eq!(l.pointer_walls(), None);
+                assert!(!l.captured());
+                // A new game starts without the old drag or fling resuming.
+                frame(&mut l);
+                let at = l.main_view.center;
+                tick(&mut l, 100);
+                assert_eq!(l.main_view.center, at);
+            }
+        }
     }
 
     #[test]

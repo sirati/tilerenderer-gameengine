@@ -1,0 +1,14 @@
+[package]
+name = "application-icon"
+description = "Common window and application icon API"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+image.workspace = true
+thiserror.workspace = true
+winit.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+application-icon-macos = { path = "../application-icon-macos" }

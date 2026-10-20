@@ -95,6 +95,12 @@ impl Layout {
         std::mem::take(&mut self.unit_orders.queued)
     }
 
+    /// Queues `input` for the driver with them (e.g. dismissing a popup
+    /// when the mouse is captured other than by a press).
+    pub(super) fn unit_order_events_push(&mut self, input: Input) {
+        self.unit_orders.queued.push(input);
+    }
+
     /// A key or wheel leaves the pending order before it does its usual
     /// work. Escape belongs to the cancellation and must not also open the
     /// game's menu. Its release is paired here too.
@@ -249,6 +255,7 @@ mod tests {
     fn scene() -> Scene {
         Scene {
             views: vec![ViewState { id: 0, view: View { camera_x: 1000, camera_y: 500, ..Default::default() }, overlay: vec![] }],
+            shape: scene::WorldShape { cols: 125, rows: 250, wrap_x: true, wrap_y: false },
             ..Default::default()
         }
     }
@@ -279,6 +286,22 @@ mod tests {
     }
     fn cancelled(out: &[Input]) -> bool {
         out.contains(&order(UnitOrderAction::Cancel, (0, 0)))
+    }
+
+    #[test]
+    fn leaving_the_game_for_title_or_optional_preview_cancels_pending_unit_orders() {
+        for preview_ready in [None, Some(false), Some(true)] {
+            let mut l = layout();
+            preview(&mut l, (100, 100), (140, 100));
+            let mut menu = scene();
+            if preview_ready != Some(true) { menu.shape = Default::default(); }
+            menu.interface.beside = preview_ready.map(|ready| scene::Beside { screen: [200, 100, 400, 400], edge: scene::Edge::Left, world: ready.then_some([0, 0, 8000, 4000]) });
+            frame(&mut l, &menu, vec![]);
+            assert!(cancelled(&l.take_unit_order_events()));
+            assert!(l.unit_orders.destination.is_none());
+            assert!(!l.captured());
+            assert!(!l.route(Input::MouseButton { button: Button::Left, down: true, x: 50, y: 300 }).iter().any(|input| matches!(input, Input::UnitOrder { action: UnitOrderAction::Confirm, .. })));
+        }
     }
 
     #[test]

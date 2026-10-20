@@ -6,6 +6,8 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+civ3r-sync = { path = "../civ3r-sync" }
+crossbeam-channel = "0.5"
 thiserror.workspace = true
 viewer-settings = { path = "../viewer-settings" }
 toml = "0.9"

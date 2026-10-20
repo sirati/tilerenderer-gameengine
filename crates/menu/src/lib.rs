@@ -293,13 +293,14 @@ impl Menus {
                 phase: 0,
                 ticks_per_frame: 1,
                 scale_den: art.scale_den,
+                blend: scene::SpriteBlend::Alpha,
                 tint: 0,
                 zoom_art: 0,
                 zoom: (0, 0),
                 zoom_offset: (0, 0),
                 clip: None,
                 not_in_view: None,
-                glyph: None,
+                glyph: None, solid: None,
                 palette: 0,
                 category: 0,
             });
@@ -390,7 +391,7 @@ impl Menus {
         menu.items
             .iter()
             .filter_map(|item| match item {
-                Item::Button { id, at, size, .. } => Some(scene::Interactable { anchor: None,
+                Item::Button { id, at, size, .. } => Some(scene::Interactable { alt_right_click: false, anchor: None,
                     rect: [ox + at.0, oy + at.1, size.0 as i32, size.1 as i32],
                     kind: scene::InteractableKind::Button,
                     id: id_hash(&menu.name, id),

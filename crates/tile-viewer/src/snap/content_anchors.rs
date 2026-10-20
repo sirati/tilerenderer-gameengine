@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn semantic_pointer_anchor_keeps_the_real_hit_rectangle_at_every_ui_scale() {
-    let item = Interactable {
+    let item = Interactable { alt_right_click: false,
         rect: [20, 30, 400, 70],
         anchor: Some([85, 85]),
         id: 0x10_0000_0000_0001,
@@ -20,7 +20,7 @@ fn semantic_pointer_anchor_keeps_the_real_hit_rectangle_at_every_ui_scale() {
 
 #[test]
 fn clipped_anchor_stays_in_the_visible_fragment() {
-    let item = Interactable {
+    let item = Interactable { alt_right_click: false,
         rect: [20, 30, 400, 70],
         anchor: Some([419, 65]),
         id: 7,
@@ -35,13 +35,13 @@ fn clipped_anchor_stays_in_the_visible_fragment() {
 #[test]
 fn text_links_are_directional_targets_and_click_at_the_semantic_tip() {
     let items = [
-        Interactable {
+        Interactable { alt_right_click: false,
             rect: [20, 20, 400, 24],
             anchor: Some([100, 31]),
             id: 7,
             kind: InteractableKind::Button,
         },
-        Interactable {
+        Interactable { alt_right_click: false,
             rect: [20, 60, 400, 24],
             anchor: Some([160, 71]),
             id: 8,
@@ -71,13 +71,13 @@ fn text_links_are_directional_targets_and_click_at_the_semantic_tip() {
 fn clipping_rejects_hidden_controls_and_keeps_full_anchor_and_slider_affines() {
     for scale in [0.5, 1.0, 3.0, 6.0] {
         let controls = [
-            Interactable {
+            Interactable { alt_right_click: false,
                 rect: [0, 0, 200, 100],
                 anchor: Some([190, 50]),
                 id: 1,
                 kind: InteractableKind::Button,
             },
-            Interactable {
+            Interactable { alt_right_click: false,
                 rect: [300, 0, 200, 100],
                 anchor: Some([490, 50]),
                 id: 2,
@@ -101,13 +101,13 @@ fn clipping_rejects_hidden_controls_and_keeps_full_anchor_and_slider_affines() {
 #[test]
 fn clipping_a_prior_target_does_not_reassign_a_list_to_an_unrelated_control() {
     let controls = [
-        Interactable {
+        Interactable { alt_right_click: false,
             rect: [600, 10, 100, 20],
             anchor: None,
             id: 1,
             kind: InteractableKind::Button,
         },
-        Interactable {
+        Interactable { alt_right_click: false,
             rect: [10, 10, 100, 100],
             anchor: None,
             id: 2,
@@ -116,7 +116,7 @@ fn clipping_a_prior_target_does_not_reassign_a_list_to_an_unrelated_control() {
                 step: 20,
             },
         },
-        Interactable {
+        Interactable { alt_right_click: false,
             rect: [10, 10, 100, 20],
             anchor: Some([40, 20]),
             id: 3,
@@ -132,7 +132,7 @@ fn clipping_a_prior_target_does_not_reassign_a_list_to_an_unrelated_control() {
 
 #[test]
 fn clipping_a_slider_changes_its_hit_area_without_shrinking_the_value_track() {
-    let control = Interactable {
+    let control = Interactable { alt_right_click: false,
         rect: [20, 30, 400, 24],
         anchor: None,
         id: 1,
@@ -185,16 +185,16 @@ fn oversized_menu_alt_targets_stay_in_the_opening_pane_through_all_panned_corner
         scene
     };
     for pixel_scale in [3, 6] {
-        let plan = crate::scaling::plan(
+        let mut plan = crate::scaling::plan(
             (3840, 2160),
             2.0,
             (1920, 1080),
             &Resolution {
                 pixel_scale,
-                menu_scale: 1.5,
                 ..Default::default()
             },
         );
+        plan.menu.zoom = crate::scaling::ratio(1.5);
         let mut layout = Layout::default();
         layout.apply_settings(&viewer_settings::Layout {
             split: Split::Vertical1To1,
@@ -218,7 +218,7 @@ fn oversized_menu_alt_targets_stay_in_the_opening_pane_through_all_panned_corner
             overlay: vec![scene::FreeSprite::default()],
         });
         for (id, (x, y)) in [(1, (448, 156)), (2, (1471, 156)), (3, (448, 923)), (4, (1471, 923))] {
-            scene.interactables.push(Interactable {
+            scene.interactables.push(Interactable { alt_right_click: false,
                 rect: [x, y, 1, 1],
                 anchor: Some([x, y]),
                 id,
@@ -279,4 +279,36 @@ fn oversized_menu_alt_targets_stay_in_the_opening_pane_through_all_panned_corner
             }
         }
     }
+}
+
+#[test]
+fn title_target_keeps_its_hit_box_when_its_middle_overlaps_a_glyph_sprite() {
+    use scene::{FreeSprite, Scene, View, ViewState};
+    let item = Interactable { alt_right_click: false,
+        rect: [328, 416, 114, 38], anchor: None, id: 7,
+        kind: InteractableKind::Button,
+    };
+    let scene = Scene {
+        screen_size: (1280, 800),
+        interactables: vec![item],
+        views: vec![ViewState {
+            id: 255, view: View { interface_only: true, menu: true, ..Default::default() },
+            overlay: vec![
+                FreeSprite { set: 0, x: 0, y: 0, screen: true, ..Default::default() },
+                FreeSprite { set: 1, x: 384, y: 423, screen: true, ..Default::default() },
+            ],
+        }], ..Default::default()
+    };
+    let plan = crate::scaling::plan((1012, 632), 1.0, scene.screen_size,
+        &viewer_settings::Resolution::default());
+    let mut layout = Layout::default();
+    layout.driver_screen = Some(plan.screen);
+    let mut frame = layout.frame(&scene, plan.canvas(), (0,0,0,0), vec![], None);
+    let arranged = crate::scaling::arrange(&plan, &scene, &mut frame,
+        |s| Some(if s.set == 0 { [0,0,1280,800] } else { [384,423,6,24] }));
+    layout.set_interface_shown(arranged.shown);
+    let targets = SnapInput::targets(&scene, &layout);
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].rect, [194.0,332.0,114.0,38.0]);
+    assert_eq!(layout.route_window((251,351)), Some((385,435)));
 }

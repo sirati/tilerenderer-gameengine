@@ -7,8 +7,8 @@ fn status_orb_and_select_unit_targets_follow_the_drawn_panel_across_splits_and_s
     let orb_id = gui << 32 | 0x3000_0000;
     let select_id = (gui + 0x274) << 32 | 0x0E00_0000;
     let items = vec![
-        Interactable { anchor: None, rect: [1621, 1011, 48, 28], kind: InteractableKind::Button, id: orb_id },
-        Interactable { anchor: None, rect: [1740, 940, 32, 22], kind: InteractableKind::Button, id: select_id },
+        Interactable { alt_right_click: false, anchor: None, rect: [1621, 1011, 48, 28], kind: InteractableKind::Button, id: orb_id },
+        Interactable { alt_right_click: false, anchor: None, rect: [1740, 940, 32, 22], kind: InteractableKind::Button, id: select_id },
     ];
     let sprite = |x, y| FreeSprite { x, y, screen: true, after_pass: u32::MAX, ..Default::default() };
     let scene = Scene {

@@ -44,7 +44,7 @@ impl Layout {
         // replacements exist. Rebase their centres, keeping physical span
         // and zoom, so edge pans and hover use the new world coordinates.
         for (_, camera) in &mut self.shown {
-            let (w, h) = camera.source_size();
+            let (w, h) = camera.world_size();
             let center = point((camera.x + w as i32 / 2, camera.y + h as i32 / 2));
             camera.x = center.0 - w as i32 / 2;
             camera.y = center.1 - h as i32 / 2;
@@ -86,6 +86,19 @@ mod tests {
     }
 
     #[test]
+    fn z_rebases_the_full_center_of_a_view_larger_than_a_source_picture() {
+        let mut l = Layout::default();
+        l.world_downscale = Some(1);
+        l.shown = vec![(Hit::Main, tile_render::Camera {
+            x: 100, y: 200, zoom: (1, 12), ..tile_render::Camera::new((100, 400))
+        })];
+        l.rescale_world(2);
+        let c = l.shown[0].1;
+        assert_eq!((c.x, c.y), (-250, -1100));
+        assert_eq!(c.downscale, 2);
+    }
+
+    #[test]
     fn z_keeps_manual_a_free_b_and_insets_at_the_same_world_position() {
         for smooth in [false, true] {
             let mut l = Layout::default();
@@ -106,6 +119,47 @@ mod tests {
                 let logical = l.shown.iter().find(|(hit, _)| *hit == Hit::Magnifier).unwrap().1;
                 let rendered = f.cameras.iter().find(|c| c.origin == logical.origin && c.cells).unwrap();
                 assert_eq!(rendered.downscale, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn z_preserves_camera_centres_and_only_clamps_the_wider_field_at_map_edges() {
+        for focus_y in [1080, 672] {
+            let mut l = Layout::default();
+            l.apply_settings(&viewer_settings::Layout { split: Split::Vertical1To1, roles: Roles::Free, ..Default::default() });
+            l.world_scale = (5, 4);
+            let mut scene_at = |scale: u32| {
+                let mut s = scene(scale);
+                s.camera_focus.as_mut().unwrap().center = (2496 / scale as i32, focus_y / scale as i32);
+                s.focus = s.camera_focus.map(|f| f.center);
+                let bounds = WorldBounds { size: (8000 / scale as i32, 4000 / scale as i32), wrap: (true, false) };
+                l.frame(&s, (1920, 1080), (0, 0, 0, 0), vec![], Some(bounds));
+            };
+            scene_at(1);
+            drop(scene_at);
+            l.split.as_mut().unwrap().view.moved_by_hand((3100, 1080), None);
+            for scale in [1, 2, 1, 2, 1] {
+                let mut s = scene(scale);
+                let requested = (2496 / scale as i32, focus_y / scale as i32);
+                s.camera_focus.as_mut().unwrap().center = requested;
+                s.focus = Some(requested);
+                let bounds = WorldBounds { size: (8000 / scale as i32, 4000 / scale as i32), wrap: (true, false) };
+                l.frame(&s, (1920, 1080), (0, 0, 0, 0), vec![], Some(bounds));
+                assert_eq!(l.main_view.center, requested, "Z must not reset the requested centre");
+                assert_eq!(l.split.unwrap().view.center, (3100 / scale as i32, 1080 / scale as i32));
+                for (hit, camera) in l.shown.iter().filter(|(hit, _)| matches!(hit, Hit::Main | Hit::Pane)) {
+                    let (w, h) = camera.world_size();
+                    let wanted = if *hit == Hit::Main { requested } else { (3100 / scale as i32, 1080 / scale as i32) };
+                    let actual = (camera.x + w as i32 / 2, camera.y + h as i32 / 2);
+                    assert_eq!(actual, (bounds.clamp_center(0, wanted.0, w as i32), bounds.clamp_center(1, wanted.1, h as i32)));
+                    assert_eq!(h, 864);
+                    if *hit == Hit::Main && focus_y == 672 && scale == 2 {
+                        assert_eq!((wanted.1, actual.1), (336, 432), "only the reduced view's wider field reaches the top edge");
+                    } else {
+                        assert_eq!(actual, wanted, "an interior view must preserve its exact centre");
+                    }
+                }
             }
         }
     }

@@ -1,0 +1,10 @@
+[package]
+name = "viewer-transport"
+description = "Authenticated bounded local transport between a game driver and a native viewer"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+civ3r-sync = { path = "../civ3r-sync" }
+scene = { path = "../scene" }

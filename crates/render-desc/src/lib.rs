@@ -32,6 +32,11 @@
 //! sets = ["xtgc/*"]              # sets drawable on this layer; `*` expands
 //! ```
 
+mod fallback_font;
+
+/// Embedded GPU outline face for viewer warnings and confirmations.
+pub const FALLBACK_FONT: &str = "Viewer@fallback";
+
 mod cancel;
 
 pub use cancel::{CANCELLED, StopWhen};
@@ -155,7 +160,82 @@ struct Sliced {
 /// Where an indexed sprite's indices come from: image source, frame, and
 /// the cell (x, y, width, height). Sprites of the same pixels share them in
 /// the atlas, whatever their colours (e.g. a unit's body and its shadow).
-type TexelKey = (String, usize, [u32; 4]);
+type TexelKey = (String, usize, [u32; 4], Option<AlphaTexels>);
+
+/// A source-alpha edit changes the stored indices even when the source
+/// crop stays the same. Its replacement index also depends on the palette.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AlphaTexels {
+    keep: bool,
+    rects: Vec<[u32; 4]>,
+    transparent: u8,
+}
+
+#[derive(Clone, Copy)]
+struct SourceAlphaMask<'a> {
+    keep: bool,
+    rects: &'a [[u32; 4]],
+}
+
+impl SourceAlphaMask<'_> {
+    fn retains(self, x: u32, y: u32) -> bool {
+        let inside = self.rects.iter().any(|&[rx, ry, w, h]| x >= rx && y >= ry && x - rx < w && y - ry < h);
+        inside == self.keep
+    }
+
+    fn rgba(self, mut image: RgbaImage) -> RgbaImage {
+        for y in 0..image.height {
+            for x in 0..image.width {
+                if !self.retains(x, y) {
+                    image.pixels[(y * image.width + x) as usize][3] = 0;
+                }
+            }
+        }
+        image
+    }
+
+    fn indexed(self, image: std::sync::Arc<IndexImage>, row: std::sync::Arc<Vec<u32>>, mut key: TexelKey, remap: u32, shared: &mut SharedTexels) -> Result<Cut, String> {
+        // An index inside the remapped range can become opaque through a
+        // named palette, including when its own palette entry is clear.
+        let remapped = |i: usize| i as u32 >= (remap & 0xFFFF) && (i as u32) < (remap >> 16);
+        let mut used = [false; 256];
+        let mut drops_pixels = false;
+        for y in 0..image.height {
+            for x in 0..image.width {
+                if self.retains(x, y) {
+                    used[image.get(x, y) as usize] = true;
+                } else {
+                    drops_pixels = true;
+                }
+            }
+        }
+        if !drops_pixels {
+            return Ok(Cut::Indexed { image, row, key });
+        }
+        let transparent = (0..256).find(|&i| !remapped(i) && row[i] >> 24 == 0)
+            .or_else(|| (0..256).find(|&i| !remapped(i) && !used[i]));
+        let Some(transparent) = transparent else {
+            if (remap & 0xFFFF) < (remap >> 16) {
+                return Err("source alpha mask has no safe transparent index outside its remapped palette range (indexed = false)".into());
+            }
+            // All indices are still used. Converting this cell preserves
+            // every retained colour and alpha without changing its palette.
+            return Ok(Cut::Rgba(self.rgba(RgbaImage::from_fn(image.width, image.height, |x, y| row[image.get(x, y) as usize].to_le_bytes()))));
+        };
+        key.3 = Some(AlphaTexels { keep: self.keep, rects: self.rects.to_vec(), transparent: transparent as u8 });
+        let masked = shared.entry(key.clone()).or_insert_with(|| {
+            std::sync::Arc::new(IndexImage::from_fn(image.width, image.height, |x, y| if self.retains(x, y) { image.get(x, y) } else { transparent as u8 }))
+        }).clone();
+        let row = if row[transparent] >> 24 == 0 {
+            row
+        } else {
+            let mut masked_row = (*row).clone();
+            masked_row[transparent] &= 0x00FF_FFFF;
+            std::sync::Arc::new(masked_row)
+        };
+        Ok(Cut::Indexed { image: masked, row, key })
+    }
+}
 
 /// The indices of every indexed sprite sliced, by where they come from:
 /// sprites of the same pixels (a unit's body, its shadow, an army's banner
@@ -181,6 +261,8 @@ struct SlicedSprite {
     /// see `tile_render_shared::SpriteDesc::box_x`): the whole sprite, or
     /// its box (`sample_from = "box"`, known with the pixels only).
     sample_box: [u32; 4],
+    /// Source-image coordinates used to anchor background-only dithering.
+    sample_origin: [u32; 2],
     /// The cell drawn instead there (`scaled_origin`): its pixels (with
     /// the pixels) and sample box.
     scaled: Option<(Option<Cut>, [u32; 4])>,
@@ -569,6 +651,20 @@ pub struct SheetDesc {
     /// How such a view draws them.
     #[serde(default)]
     pub scaling: SheetScaling,
+    /// Explicit pure UI background role. Ordinary art, controls and text
+    /// retain nearest sampling. Does not apply to world-space draws.
+    #[serde(default)]
+    pub sampling: Sampling,
+    /// Preserve source alpha only inside the union of these `[x, y, width,
+    /// height]` rectangles, relative to each original, unresized cell.
+    /// Elsewhere alpha becomes zero. Applied before outline and resize.
+    /// Mutually exclusive with `alpha_clear`; requires cell sampling and an
+    /// image source, rather than a sheet aliasing an existing sprite.
+    pub alpha_keep: Option<Vec<[u32; 4]>>,
+    /// Clear source alpha inside these cell-relative rectangles, preserving
+    /// it elsewhere. Complements `alpha_keep` without changing geometry,
+    /// retained pixel alpha, or the original source sampling coordinates.
+    pub alpha_clear: Option<Vec<[u32; 4]>>,
     /// Each sprite replaced by a band `width` pixels wide just outside its
     /// art, in `color` (a ring around a ring); the sprite grows by `width` on
     /// every side, its anchor moves accordingly.
@@ -577,12 +673,45 @@ pub struct SheetDesc {
     /// fitted into a smaller picture); after `outline`. Colour images only
     /// (`indexed = false`).
     pub resize: Option<[u32; 2]>,
+    /// Explicit source increments for a legacy16.16 nearest sampler.
+    /// Used only with `resize`; each output pixel samples floor(i*step/65536)
+    /// from the original cell rather than inferring scale from its final size.
+    pub resize_step: Option<[u32; 2]>,
     /// See [`Description::parse`].
     pub variants: Option<Vec<i64>>,
     /// Cut every frame of the image (`frame` aside), one after the other:
     /// sprite `f·n + i` is cell `i` of frame `f` (`n` cells a frame).
     #[serde(default)]
     pub all_frames: bool,
+}
+
+impl SheetDesc {
+    fn alpha_mask(&self) -> Option<SourceAlphaMask<'_>> {
+        self.alpha_keep.as_deref().map(|rects| SourceAlphaMask { keep: true, rects })
+            .or_else(|| self.alpha_clear.as_deref().map(|rects| SourceAlphaMask { keep: false, rects }))
+    }
+
+    fn validate_alpha_mask(&self) -> Result<(), String> {
+        if self.alpha_keep.is_some() && self.alpha_clear.is_some() {
+            return Err("alpha_keep and alpha_clear are mutually exclusive".into());
+        }
+        let Some(mask) = self.alpha_mask() else { return Ok(()) };
+        if self.sample_from == SampleFrom::Box {
+            // Complementary masks must share an unchanged sampling grid.
+            // Finding separate opaque boxes would change their phase.
+            return Err("source alpha masks require sample_from = 'cell'".into());
+        }
+        if self.sprite.is_some() {
+            return Err("source alpha masks require an image source, not sprite parts".into());
+        }
+        let [cw, ch] = self.cell;
+        for &[x, y, w, h] in mask.rects {
+            if w == 0 || h == 0 || u64::from(x) + u64::from(w) > u64::from(cw) || u64::from(y) + u64::from(h) > u64::from(ch) {
+                return Err(format!("source alpha rectangle [{x}, {y}, {w}, {h}] is empty or outside its {cw}×{ch} cell"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -664,10 +793,10 @@ pub enum BlendDesc {
 const GENERATED: [&str; 8] = ["solid:", "line:", "arrow:", "crosshair:", "panes:", "pointer:", "rects:", "glyphs:"];
 
 /// The characters of a [`glyphs`] image, one cell each, in this order.
-pub const GLYPHS: &str = " 0123456789.%fpsmkingart";
+pub const GLYPHS: &str = " 0123456789.%fpsmkingartCPUGbuld/~";
 
 /// The rows of each of [`GLYPHS`] in 5 × 7 pixels (bit 4 the left column).
-const GLYPH_ROWS: [[u8; 7]; 24] = [
+const GLYPH_ROWS: [[u8; 7]; 34] = [
     [0; 7],
     [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
     [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
@@ -692,6 +821,17 @@ const GLYPH_ROWS: [[u8; 7]; 24] = [
     [0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111],
     [0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000],
     [0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110],
+    [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110], // C
+    [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000], // P
+    [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110], // U
+    [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110], // G
+    [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b11110], // b
+    [0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101], // u
+    [0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110], // l
+    [0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10001, 0b01111], // d
+    [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000], // /
+    [0b00000, 0b00000, 0b01001, 0b10110, 0b00000, 0b00000, 0b00000], // ~
+
 ];
 
 /// The cell of each glyph of a [`glyphs`] image at scale `n`: a 5 × 7 glyph
@@ -959,6 +1099,15 @@ fn outlined(w: u32, h: u32, color: [u8; 4], inside: impl Fn(i32, i32) -> bool) -
 fn resize_nearest(image: &RgbaImage, (w, h): (u32, u32)) -> RgbaImage {
     let (sw, sh) = (image.width as u64, image.height as u64);
     RgbaImage::from_fn(w, h, |x, y| image.get(((2 * x as u64 + 1) * sw / (2 * w as u64)) as u32, ((2 * y as u64 + 1) * sh / (2 * h as u64)) as u32))
+}
+
+/// The native UI scaler advances exact16.16 source coordinates. Keeping
+/// those increments avoids changing its phase after fractional dimension
+/// truncation or clipping.
+fn resize_fixed(image: &RgbaImage, (w, h): (u32, u32), [sx, sy]: [u32; 2]) -> RgbaImage {
+    RgbaImage::from_fn(w, h, |x, y| image.get(
+        ((u64::from(x) * u64::from(sx)) >> 16) as u32,
+        ((u64::from(y) * u64::from(sy)) >> 16) as u32))
 }
 
 /// The band `width` pixels wide outside `sprite`'s art (its opaque pixels
@@ -1361,31 +1510,50 @@ impl Description {
             return Err(err("resized to nothing".into()));
         }
         let grow = sheet.outline.as_ref().map_or(0, |o| o.width);
+        if let Some([sx, sy]) = sheet.resize_step {
+            let Some([w, h]) = sheet.resize else { return Err(err("resize_step requires resize".into())) };
+            if sx == 0 || sy == 0 || ((u64::from(w - 1) * u64::from(sx)) >> 16) >= u64::from(cw + 2 * grow)
+                || ((u64::from(h - 1) * u64::from(sy)) >> 16) >= u64::from(ch + 2 * grow) {
+                return Err(err("resize_step samples outside its source cell".into()));
+            }
+        }
         let (gw, gh) = match sheet.resize {
             Some([w, h]) => (w, h),
             None => (cw + 2 * grow, ch + 2 * grow),
         };
+        let alpha_mask = sheet.alpha_mask();
         let shape = |cell: RgbaImage| {
+            let cell = match alpha_mask {
+                Some(mask) => mask.rgba(cell),
+                None => cell,
+            };
             let cell = match &sheet.outline {
                 Some(o) => outline(&cell, o.width, o.color),
                 None => cell,
             };
             match sheet.resize {
-                Some([w, h]) => resize_nearest(&cell, (w, h)),
+                Some([w, h]) => match sheet.resize_step {
+                    Some(step) => resize_fixed(&cell, (w, h), step),
+                    None => resize_nearest(&cell, (w, h)),
+                },
                 None => cell,
             }
         };
         // A cell's pixels and what a view showing the world smaller samples
         // of it: its box (empty if it is all blank) or all of it.
-        let mut cut = |x: u32, y: u32| -> (Option<Cut>, [u32; 4]) {
+        let mut cut = |x: u32, y: u32| -> Result<(Option<Cut>, [u32; 4]), DescError> {
             let image = all.filter(|_| pixels).map(|f| match f {
-                Frames::Rgba(frames) => Cut::Rgba(shape(frames[frame].crop(x, y, cw, ch))),
+                Frames::Rgba(frames) => Ok(Cut::Rgba(shape(frames[frame].crop(x, y, cw, ch)))),
                 Frames::Indexed { frames, rows } => {
-                    let key = (source.to_owned(), frame, [x, y, cw, ch]);
+                    let key = (source.to_owned(), frame, [x, y, cw, ch], None);
                     let image = shared.entry(key.clone()).or_insert_with(|| std::sync::Arc::new(frames[frame].pixels.crop(x, y, cw, ch))).clone();
-                    Cut::Indexed { image, row: rows[frame].clone(), key }
+                    let row = rows[frame].clone();
+                    match alpha_mask {
+                        Some(mask) => mask.indexed(image, row, key, self.remap(&sheet.image), shared).map_err(&err),
+                        None => Ok(Cut::Indexed { image, row, key }),
+                    }
                 }
-            });
+            }).transpose()?;
             let sample_box = match all_blank {
                 Some(Frames::Rgba(blank)) => opaque_box(&shape(blank[frame].crop(x, y, cw, ch))).unwrap_or_default(),
                 Some(Frames::Indexed { frames, rows }) => {
@@ -1396,7 +1564,7 @@ impl Description {
                 }
                 None => [0, 0, gw, gh],
             };
-            (image, sample_box)
+            Ok((image, sample_box))
         };
         let mut sprites = Vec::new();
         for i in 0..cols * rows {
@@ -1406,18 +1574,18 @@ impl Description {
             let (c, r) = (i % cols, i / cols);
             let at = |[ox, oy]: [u32; 2]| (ox + c * (cw + sx), oy + r * (ch + sy));
             let (x, y) = at(sheet.origin);
-            let (image, sample_box) = cut(x, y);
+            let (image, sample_box) = cut(x, y)?;
             let scaled = sheet.scaled_origin.map(|o| {
                 let (x, y) = at(o);
                 cut(x, y)
-            });
+            }).transpose()?;
             let marked = match (sheet.anchor_marks, all) {
                 (Some(mark), Some(f)) => anchor_marked(f, frame, (iw, ih), (x, y), (cw, ch), mark),
                 _ => None,
             };
             let [ax, ay] = marked.unwrap_or(sheet.anchor);
             let anchor = (ax - grow as i32, ay - grow as i32);
-            sprites.push(SlicedSprite { index: i, image, size: (gw, gh), anchor, sample_box, scaled });
+            sprites.push(SlicedSprite { index: i, image, size: (gw, gh), anchor, sample_box, sample_origin: [x, y], scaled });
         }
         Ok(Sliced { sprites, cells: cols * rows })
     }
@@ -1625,6 +1793,9 @@ impl Description {
                 Err(e) => log::warn!("font {name:?} ({}): {e}", font.source),
             }
         }
+        if !known(FALLBACK_FONT) {
+            fonts.push((FALLBACK_FONT.into(), std::sync::Arc::new(fallback_font::face())));
+        }
         fonts
     }
 
@@ -1707,6 +1878,10 @@ impl Description {
         // be those of the first).
         let ordered = self.sheets.iter().filter(|(_, s)| s.sprite.is_none()).chain(self.sheets.iter().filter(|(_, s)| s.sprite.is_some()));
         for (sheet_name, sheet) in ordered {
+            sheet.validate_alpha_mask().map_err(|message| DescError::Sheet { sheet: sheet_name.clone(), message })?;
+            if sheet.sampling == Sampling::UiBackground && (sheet.resize.is_some() || sheet.outline.is_some()) {
+                return Err(DescError::Sheet { sheet: sheet_name.clone(), message: "UI background sampling requires unresized source art without an outline".into() });
+            }
             let sprite_name = |index: u32| match &sheet.group {
                 Some(g) => format!("{g}/{}", sheet.first_index + index * sheet.index_stride),
                 None => format!("{sheet_name}/{index}"),
@@ -1759,6 +1934,9 @@ impl Description {
                     let (x, y) = (ox + c * (cw + sx), oy + r * (ch + sy));
                     let mut desc = tile_render::atlas::sprite_at((base.page, base.atlas_x + x, base.atlas_y + y), (cw, ch), (sheet.anchor[0], sheet.anchor[1]));
                     (desc.scaling, desc.palette, desc.remap) = (scaling, base.palette, base.remap);
+                    desc.sampling = sheet.sampling.flag();
+                    desc.sampling_origin_x = base.sampling_origin_x + x;
+                    desc.sampling_origin_y = base.sampling_origin_y + y;
                     let id = placer.alias(desc);
                     if placer.unavailable(base_id, known) { placer.unavailable.insert(id.0); }
                     if sprites.insert(name.clone(), id).is_some() {
@@ -1788,6 +1966,10 @@ impl Description {
                     continue;
                 }
                 let id = placer.add(&name, s.image.as_ref(), s.size, s.anchor, scaling, s.sample_box, remap, known)?;
+                let desc = placer.sprite_mut(id);
+                desc.sampling = sheet.sampling.flag();
+                desc.sampling_origin_x = s.sample_origin[0];
+                desc.sampling_origin_y = s.sample_origin[1];
                 if s.scaled.is_some() {
                     twins.push((id, sliced.clone(), k, scaling, remap));
                 }
@@ -2126,6 +2308,41 @@ impl Growing {
 }
 
 impl Compiled {
+    /// Applies growth and reports whether frames resolved before it retain
+    /// their numeric sprite/set/font IDs and sprite/set name resolution.
+    /// The frame owns its old layer lookup tables, so replacing a layer's
+    /// named set does not itself invalidate those tables.
+    ///
+    /// This checks only names the growth writes. Sets and fonts append and
+    /// old palettes remain a prefix by construction in `apply`. Appended
+    /// palette rows can change old sprite transparency bounds, so only that
+    /// case retains and compares the old sprite descriptors.
+    pub fn apply_with_prefix_check(&mut self, growth: &Growth) -> bool {
+        let old_empty_blend = self.set_blend.get(&SpriteSetId::EMPTY).copied().unwrap_or_default();
+        let empty_blend_changed = growth.sets.iter().rev()
+            .find(|(_, frames, _)| frames.is_empty())
+            .is_some_and(|(_, _, blend)| *blend != old_empty_blend
+                && self.set_ids.values().any(|id| *id == SpriteSetId::EMPTY));
+        let final_sets: HashMap<&str, bool> = growth.sets.iter()
+            .map(|(name, frames, _)| (name.as_str(), frames.is_empty())).collect();
+        let set_name_preserved = |name: &String| {
+            self.set_ids.get(name).is_none_or(|old| {
+                // A later empty set can restore an old empty-set alias that
+                // an earlier entry in this growth temporarily replaced.
+                *old == SpriteSetId::EMPTY && final_sets.get(name.as_str()) == Some(&true)
+            })
+        };
+        let names_preserved = !empty_blend_changed
+            && self.sprite_names.len() <= self.atlas.sprites.len()
+            && growth.sprite_names.iter().filter(|name| !name.is_empty())
+                .all(|name| !self.sprite_ids.contains_key(name) && set_name_preserved(name))
+            && growth.sets.iter().all(|(name, _, _)| set_name_preserved(name));
+        let old_descriptors = (!growth.atlas.palettes.is_empty()).then(|| self.atlas.sprites.clone());
+        self.apply(growth);
+        names_preserved && old_descriptors.as_ref()
+            .is_none_or(|old| self.atlas.sprites.starts_with(old))
+    }
+
     /// Adds `growth` (made for this description as it is now, or for
     /// another copy of it, see [`Growing`]): the same sprite ids, set ids,
     /// palette rows and layer values on every copy. A copy with the atlas
@@ -2349,6 +2566,25 @@ fn opaque_box(img: &RgbaImage) -> Option<[u32; 4]> {
     bounds.map(|[l, t, r, b]| [l, t, r - l + 1, b - t + 1])
 }
 
+/// Sampling policy for a declared sprite sheet. Only pure background
+/// textures opt in; controls, text and mixed art use exact nearest pixels.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Sampling {
+    #[default]
+    Nearest,
+    UiBackground,
+}
+
+impl Sampling {
+    fn flag(self) -> u32 {
+        match self {
+            Self::Nearest => 0,
+            Self::UiBackground => tile_render_shared::SAMPLING_UI_BACKGROUND,
+        }
+    }
+}
+
 /// Where a view showing the world `n` times smaller samples a sheet's
 /// sprites (`sample_from = "..."`): every `n`-th pixel of every `n`-th row
 /// from there (`tile_render_shared::placed`).
@@ -2481,11 +2717,7 @@ mod tests {
         assert!(glyphs("1,2,3,4:5,6,7,8:0").is_err());
         assert!(glyphs("1,2,3,4:5,6,7,8").is_err());
         assert_eq!(GLYPHS.chars().count(), GLYPH_ROWS.len());
-        assert_eq!(&GLYPHS[..19], " 0123456789.%fpsmki", "existing glyph indices must stay stable");
-        for c in "missing art".chars() {
-            let index = GLYPHS.chars().position(|glyph| glyph == c).expect("diagnostic letters must be generated without game assets");
-            if c != ' ' { assert!(GLYPH_ROWS[index].iter().any(|row| *row != 0), "missing pixels for {c}"); }
-        }
+        assert_eq!(&GLYPHS[..24], " 0123456789.%fpsmkingart", "existing glyph indices must stay stable");
     }
 
     #[test]
@@ -2668,7 +2900,8 @@ mod tests {
         .unwrap();
         // A loader without fonts: none, and the rest compiles.
         let c = d.compile(&Checker, 256).unwrap();
-        assert!(c.fonts.is_empty() && c.font("Lucida Sans").is_none());
+        assert_eq!(c.fonts.len(), 1);
+        assert!(c.font(FALLBACK_FONT).is_some() && c.font("Lucida Sans").is_none());
         let install = std::path::PathBuf::from(std::env::var("CIV3_INSTALL").unwrap_or_else(|_| "/mnt/datasets/winvm/civ3-src/Civilization III Complete".into()));
         if !install.join("LSANS.TTF").is_file() {
             return eprintln!("no Civ III installation, skipped");
@@ -2678,8 +2911,395 @@ mod tests {
             assert_eq!(index, 0);
             assert!(face.glyph('R').is_some());
             assert!(c.font("missing").is_none());
-            assert_eq!(c.world(2, 2, false, false).fonts.len(), 1);
+            assert_eq!(c.world(2, 2, false, false).fonts.len(), 2);
         }
+    }
+
+    #[test]
+    fn explicit_background_sampling_preserves_source_origins_across_compile_modes_and_growth() {
+        let source = r#"
+            grid = { layout = "orthogonal", step = [1, 1] }
+            [images.a]
+            source = "a.pcx"
+            [sheets.texture]
+            image = "a"
+            origin = [4, 2]
+            cell = [24, 16]
+            grid = [1, 1]
+            sampling = "ui-background"
+            [sheets.texture_crop]
+            sprite = "texture/0"
+            origin = [3, 5]
+            cell = [8, 8]
+            grid = [1, 1]
+            sampling = "ui-background"
+            [sheets.control_crop]
+            sprite = "texture/0"
+            cell = [8, 8]
+            grid = [1, 1]
+        "#;
+        let desc = Description::parse(source).unwrap();
+        let expected = [("texture/0", 1, (4, 2)), ("texture_crop/0", 1, (7, 7)), ("control_crop/0", 0, (4, 2))];
+        let check = |compiled: &Compiled| {
+            for (name, sampling, origin) in expected {
+                let id = compiled.sprite(name).unwrap();
+                let sprite = compiled.atlas.sprites[id.0 as usize];
+                assert_eq!(sprite.sampling, sampling, "{name}");
+                assert_eq!((sprite.sampling_origin_x, sprite.sampling_origin_y), origin, "{name}");
+            }
+        };
+        check(&desc.compile(&Checker, 128).unwrap());
+        check(&desc.compile_layout(&Checker, 128).unwrap());
+        let mut cache = SheetCache::new();
+        check(&desc.compile_cached(&Checker, 128, &mut cache).unwrap());
+        check(&desc.compile_cached(&Checker, 128, &mut cache).unwrap());
+        let (mut compiled, mut growing) = Description::parse("grid = { layout = 'orthogonal', step = [1, 1] }").unwrap().compile_growing(&Checker, 128, true).unwrap();
+        let addition = source.lines().skip(2).collect::<Vec<_>>().join("\n");
+        let growth = growing.grow(&compiled, &addition, &Checker).unwrap();
+        compiled.apply(&growth);
+        check(&compiled);
+    }
+
+    #[test]
+    fn background_sampling_does_not_accept_art_with_a_baked_resize_or_outline() {
+        for operation in ["resize = [8, 8]", "outline = { width = 1, color = [1,2,3,255] }"] {
+            let source = format!("grid = {{ layout = 'orthogonal', step = [1, 1] }}\n[images.a]\nsource = 'a.pcx'\n[sheets.background]\nimage = 'a'\ncell = [16, 16]\ngrid = [1, 1]\nsampling = 'ui-background'\n{operation}\n");
+            let desc = Description::parse(&source).unwrap();
+            assert!(desc.compile(&Checker, 128).err().unwrap().to_string().contains("requires unresized source art"));
+        }
+    }
+
+    /// Indexed source for alpha-mask tests. Every used index keeps an
+    /// identifiable colour, with optional keyed or partial transparency.
+    struct MaskedIndexed;
+    impl ImageLoader for MaskedIndexed {
+        fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<RgbaImage>, String> {
+            Err("indexed fixture should not load RGBA".into())
+        }
+        fn sizes(&self, source: &str, _: &toml::Table) -> Result<Vec<(u32, u32)>, String> {
+            Ok(vec![if source == "full" { (257, 1) } else { (8, 2) }])
+        }
+        fn indexed(&self, source: &str, options: &toml::Table) -> Result<Option<Vec<IndexedFrame>>, String> {
+            let clear = options.get("clear").and_then(toml::Value::as_integer);
+            let palette = (0..256).map(|i| [i as u8, 255 - i as u8, 17, if clear == Some(i) { 0 } else if i == 3 { 99 } else { 255 }]).collect();
+            let pixels = if source == "full" { IndexImage::from_fn(257, 1, |x, _| x as u8) } else { IndexImage::from_fn(8, 2, |x, y| ((x + 2 * y) % 8) as u8) };
+            Ok(Some(vec![IndexedFrame { pixels, palette }]))
+        }
+        fn palette(&self, _: &str, _: &toml::Table) -> Result<Vec<[u8; 4]>, String> {
+            Ok((0..256).map(|i| [37, i as u8, 99, 255]).collect())
+        }
+    }
+
+    fn indexed_sprite_pixels(compiled: &Compiled, name: &str, named: u32) -> Vec<[u32; 4]> {
+        let s = compiled.atlas.sprites[compiled.sprite(name).unwrap().0 as usize];
+        (0..s.height).flat_map(|y| (0..s.width).map(move |x| {
+            let index = compiled.atlas.index_pages[s.page as usize].get(s.atlas_x + x, s.atlas_y + y) as u32;
+            tile_render_shared::indexed_color(index, s.palette, s.remap, named, compiled.atlas.named_palettes, &compiled.atlas.palettes)
+        })).collect()
+    }
+
+    const MASKED_RGBA_SHEETS: &str = r#"
+        [images.art]
+        source = "a.pcx"
+        [sheets.original]
+        image = "art"
+        origin = [3, 2]
+        cell = [8, 6]
+        grid = [1, 1]
+        anchor = [-2, 4]
+        scaling = "keep"
+        [sheets.keep]
+        image = "art"
+        origin = [3, 2]
+        cell = [8, 6]
+        grid = [1, 1]
+        anchor = [-2, 4]
+        scaling = "keep"
+        sampling = "ui-background"
+        alpha_keep = [[1, 1, 4, 3], [4, 2, 3, 3]]
+        [sheets.clear]
+        image = "art"
+        origin = [3, 2]
+        cell = [8, 6]
+        grid = [1, 1]
+        anchor = [-2, 4]
+        scaling = "keep"
+        alpha_clear = [[1, 1, 4, 3], [4, 2, 3, 3]]
+    "#;
+
+    struct PartialAlpha;
+    impl ImageLoader for PartialAlpha {
+        fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<RgbaImage>, String> {
+            Ok(vec![RgbaImage::from_fn(12, 10, |x, y| [x as u8, y as u8, 73, [0, 1, 64, 128, 255][((x + y) % 5) as usize]])])
+        }
+        fn sizes(&self, _: &str, _: &toml::Table) -> Result<Vec<(u32, u32)>, String> {
+            Ok(vec![(12, 10)])
+        }
+    }
+
+    #[test]
+    fn source_alpha_masks_complement_keyed_and_partial_rgba_without_geometry_changes() {
+        let desc = Description::parse(&format!("grid = {{ layout = 'orthogonal', step = [1, 1] }}\n{MASKED_RGBA_SHEETS}")).unwrap();
+        let compiled = desc.compile(&PartialAlpha, 64).unwrap();
+        let original = sprite_pixels(&compiled, "original/0");
+        let kept = sprite_pixels(&compiled, "keep/0");
+        let cleared = sprite_pixels(&compiled, "clear/0");
+        let mask = desc.sheets["keep"].alpha_mask().unwrap();
+        for y in 0..6 {
+            for x in 0..8 {
+                let at = (y * 8 + x) as usize;
+                let (retained, dropped) = if mask.retains(x, y) { (kept[at], cleared[at]) } else { (cleared[at], kept[at]) };
+                assert_eq!(retained, original[at]);
+                assert_eq!(dropped, [original[at][0], original[at][1], original[at][2], 0]);
+                assert_eq!(u16::from(kept[at][3]) + u16::from(cleared[at][3]), u16::from(original[at][3]));
+                // Applying one uniform draw opacity still gives precisely
+                // one source contribution, including partial source alpha.
+                for opacity in [0u32, 1, 63, 128, 255] {
+                    let effective = |a: u8| u32::from(a) * opacity / 255;
+                    assert_eq!(effective(kept[at][3]) + effective(cleared[at][3]), effective(original[at][3]));
+                }
+            }
+        }
+        for name in ["original/0", "keep/0", "clear/0"] {
+            let s = compiled.atlas.sprites[compiled.sprite(name).unwrap().0 as usize];
+            assert_eq!((s.width, s.height, s.anchor_x, s.anchor_y, s.scaling), (8, 6, -2, 4, tile_render_shared::KEEP_SIZE));
+            assert_eq!((s.box_x, s.box_y, s.box_w, s.box_h), (0, 0, 8, 6));
+            assert_eq!((s.sampling_origin_x, s.sampling_origin_y), (3, 2));
+        }
+    }
+
+    #[test]
+    fn source_alpha_masks_precede_outline_and_resize() {
+        let source = "grid = { layout = 'orthogonal', step = [1, 1] }\n[images.art]\nsource = 'solid:7,8,9,91:4x4'\n[sheets.masked]\nimage = 'art'\ncell = [4, 4]\ngrid = [1, 1]\nalpha_keep = [[1, 1, 2, 2]]\n";
+        let resized = Description::parse(&format!("{source}resize = [2, 2]\n")).unwrap().compile(&Checker, 64).unwrap();
+        assert_eq!(sprite_pixels(&resized, "masked/0"), vec![[7, 8, 9, 91], [7, 8, 9, 0], [7, 8, 9, 0], [7, 8, 9, 0]]);
+        let outlined = Description::parse(&format!("{source}outline = {{ width = 1, color = [1,2,3,255] }}\n")).unwrap().compile(&Checker, 64).unwrap();
+        let image = RgbaImage::from_fn(4, 4, |x, y| [7, 8, 9, if (1..3).contains(&x) && (1..3).contains(&y) { 91 } else { 0 }]);
+        assert_eq!(sprite_pixels(&outlined, "masked/0"), outline(&image, 1, [1, 2, 3, 255]).pixels);
+    }
+
+    #[test]
+    fn source_alpha_masks_reject_invalid_rectangles_box_sampling_and_sprite_aliases() {
+        let base = "grid = { layout = 'orthogonal', step = [1, 1] }\n[images.art]\nsource = 'a.pcx'\n[sheets.masked]\nimage = 'art'\ncell = [8, 6]\ngrid = [1, 1]\n";
+        for extra in [
+            "alpha_keep = [[1, 1, 0, 2]]",
+            "alpha_clear = [[1, 1, 2, 0]]",
+            "alpha_keep = [[7, 0, 2, 1]]",
+            "alpha_clear = [[0, 5, 1, 2]]",
+            "alpha_keep = [[4294967295, 0, 2, 1]]",
+            "alpha_keep = []\nalpha_clear = []",
+            "alpha_keep = [[1,1,2,2]]\nsample_from = 'box'",
+            "alpha_keep = [[1,1,2,2]]\nsprite = 'anything/0'",
+        ] {
+            let desc = Description::parse(&format!("{base}{extra}\n")).unwrap();
+            assert!(matches!(desc.compile(&Checker, 64), Err(DescError::Sheet { .. })), "{extra}");
+            assert!(matches!(desc.compile_layout(&Checker, 64), Err(DescError::Sheet { .. })), "{extra}");
+        }
+    }
+
+    #[test]
+    fn indexed_alpha_masks_preserve_retained_indices_and_named_palette_remapping() {
+        let source = r#"
+            grid = { layout = "orthogonal", step = [1, 1] }
+            [images.art]
+            source = "partial"
+            remap = [0, 4]
+            [palettes.alternate]
+            source = "alternate"
+            [sheets.original]
+            image = "art"
+            cell = [8, 2]
+            grid = [1, 1]
+            [sheets.keep]
+            image = "art"
+            cell = [8, 2]
+            grid = [1, 1]
+            alpha_keep = [[0, 0, 4, 2]]
+            [sheets.clear]
+            image = "art"
+            cell = [8, 2]
+            grid = [1, 1]
+            alpha_clear = [[0, 0, 4, 2]]
+        "#;
+        let compiled = Description::parse(source).unwrap().compile(&MaskedIndexed, 64).unwrap();
+        assert!(compiled.atlas.sprites.iter().all(|s| s.palette != 0), "source masks retain one-byte indexed storage");
+        let original = compiled.atlas.sprites[compiled.sprite("original/0").unwrap().0 as usize];
+        for (name, keep) in [("keep/0", true), ("clear/0", false)] {
+            let s = compiled.atlas.sprites[compiled.sprite(name).unwrap().0 as usize];
+            assert_eq!(s.remap, original.remap);
+            assert_ne!((s.atlas_x, s.atlas_y), (original.atlas_x, original.atlas_y));
+            for y in 0..2 {
+                for x in 0..8 {
+                    let i = compiled.atlas.index_pages[s.page as usize].get(s.atlas_x + x, s.atlas_y + y);
+                    if (x < 4) == keep {
+                        assert_eq!(i, ((x + 2 * y) % 8) as u8, "retained indices are never rewritten");
+                    } else {
+                        assert!(!(0..4).contains(&i), "replacement is outside the named remap range");
+                        assert_eq!(compiled.atlas.palettes[(s.palette * 256 + u32::from(i)) as usize] >> 24, 0);
+                    }
+                }
+            }
+        }
+        for named in [0, compiled.palette("alternate").unwrap()] {
+            let original = indexed_sprite_pixels(&compiled, "original/0", named);
+            let kept = indexed_sprite_pixels(&compiled, "keep/0", named);
+            let cleared = indexed_sprite_pixels(&compiled, "clear/0", named);
+            for at in 0..16 {
+                let (retained, dropped) = if at % 8 < 4 { (kept[at], cleared[at]) } else { (cleared[at], kept[at]) };
+                assert_eq!(retained, original[at]);
+                assert_eq!(dropped[3], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_alpha_masks_reuse_keyed_indices_without_mutating_the_original_palette() {
+        let source = r#"
+            grid = { layout = "orthogonal", step = [1, 1] }
+            [images.art]
+            source = "partial"
+            clear = 3
+            [sheets.original]
+            image = "art"
+            cell = [8, 2]
+            grid = [1, 1]
+            [sheets.keep]
+            image = "art"
+            cell = [8, 2]
+            grid = [1, 1]
+            alpha_keep = [[0, 0, 4, 2]]
+        "#;
+        let compiled = Description::parse(source).unwrap().compile(&MaskedIndexed, 64).unwrap();
+        let sprite = |name: &str| compiled.atlas.sprites[compiled.sprite(name).unwrap().0 as usize];
+        let original = sprite("original/0");
+        let keep = sprite("keep/0");
+        assert_eq!(original.palette, keep.palette, "existing transparent entry does not need a new palette row");
+        for y in 0..2 {
+            for x in 0..8 {
+                assert_eq!(compiled.atlas.index_pages[keep.page as usize].get(keep.atlas_x + x, keep.atlas_y + y), if x < 4 { ((x + 2 * y) % 8) as u8 } else { 3 });
+            }
+        }
+        assert_eq!(indexed_sprite_pixels(&compiled, "original/0", 0)[7], [7, 248, 17, 255]);
+        assert_eq!(indexed_sprite_pixels(&compiled, "original/0", 0)[3][3], 0);
+    }
+
+    #[test]
+    fn indexed_alpha_masks_fall_back_to_rgba_when_all_indices_remain_used() {
+        let source = "grid = { layout = 'orthogonal', step = [1, 1] }\n[images.art]\nsource = 'full'\n[sheets.keep]\nimage = 'art'\ncell = [257, 1]\ngrid = [1, 1]\nalpha_keep = [[0, 0, 256, 1]]\n";
+        let compiled = Description::parse(source).unwrap().compile(&MaskedIndexed, 512).unwrap();
+        assert_eq!(compiled.atlas.index_pages.len(), 0);
+        let pixels = sprite_pixels(&compiled, "keep/0");
+        for i in 0..256 {
+            assert_eq!(pixels[i], [i as u8, 255 - i as u8, 17, if i == 3 { 99 } else { 255 }]);
+        }
+        assert_eq!(pixels[256], [0, 255, 17, 0]);
+        let remapped = source.replace("source = 'full'", "source = 'full'\nremap = [0, 256]");
+        assert!(Description::parse(&remapped).unwrap().compile(&MaskedIndexed, 512).err().unwrap().to_string().contains("no safe transparent index"));
+    }
+
+    #[test]
+    fn indexed_alpha_masks_with_different_palette_options_keep_distinct_replacement_indices() {
+        let source = r#"
+            grid = { layout = "orthogonal", step = [1, 1] }
+            [images.first]
+            source = "partial"
+            clear = 3
+            [images.second]
+            source = "partial"
+            clear = 5
+            [sheets.first]
+            image = "first"
+            cell = [8, 2]
+            grid = [1, 1]
+            alpha_keep = [[0, 0, 4, 2]]
+            [sheets.second]
+            image = "second"
+            cell = [8, 2]
+            grid = [1, 1]
+            alpha_keep = [[0, 0, 4, 2]]
+        "#;
+        let desc = Description::parse(source).unwrap();
+        let mut cache = SheetCache::new();
+        for compiled in [desc.compile_cached(&MaskedIndexed, 64, &mut cache).unwrap(), desc.compile_cached(&MaskedIndexed, 64, &mut cache).unwrap()] {
+            let sprite = |name: &str| compiled.atlas.sprites[compiled.sprite(name).unwrap().0 as usize];
+            let first = sprite("first/0");
+            let second = sprite("second/0");
+            assert_ne!((first.atlas_x, first.atlas_y), (second.atlas_x, second.atlas_y));
+            for (s, transparent) in [(first, 3), (second, 5)] {
+                assert_eq!(compiled.atlas.index_pages[s.page as usize].get(s.atlas_x + 7, s.atlas_y), transparent);
+            }
+            let first_pixels = indexed_sprite_pixels(&compiled, "first/0", 0);
+            let second_pixels = indexed_sprite_pixels(&compiled, "second/0", 0);
+            assert_eq!((first_pixels[3][3], second_pixels[3][3]), (0, 99));
+            assert_eq!((first_pixels[7][3], second_pixels[7][3]), (0, 0));
+        }
+    }
+
+    #[test]
+    fn identity_alpha_masks_keep_full_indexed_palettes_and_dynamic_remapping() {
+        let source = "grid = { layout = 'orthogonal', step = [1, 1] }\n[images.art]\nsource = 'full'\nremap = [0, 256]\n[sheets.keep]\nimage = 'art'\ncell = [257, 1]\ngrid = [1, 1]\nalpha_keep = [[0, 0, 257, 1]]\n";
+        let compiled = Description::parse(source).unwrap().compile(&MaskedIndexed, 512).unwrap();
+        let s = compiled.atlas.sprites[compiled.sprite("keep/0").unwrap().0 as usize];
+        assert_ne!(s.palette, 0);
+        assert_eq!(s.remap, tile_render_shared::remap_range(0, 256));
+        for x in 0..257 { assert_eq!(compiled.atlas.index_pages[s.page as usize].get(s.atlas_x + x, s.atlas_y), x as u8); }
+    }
+
+    #[test]
+    fn source_alpha_masks_keep_source_origins_across_cache_layout_and_growth() {
+        let source = format!("grid = {{ layout = 'orthogonal', step = [1, 1] }}\n{MASKED_RGBA_SHEETS}");
+        let desc = Description::parse(&source).unwrap();
+        let reference = desc.compile(&PartialAlpha, 64).unwrap();
+        let mut cache = SheetCache::new();
+        for compiled in [desc.compile_cached(&PartialAlpha, 64, &mut cache).unwrap(), desc.compile_cached(&PartialAlpha, 64, &mut cache).unwrap(), desc.compile_layout(&PartialAlpha, 64).unwrap()] {
+            assert_eq!(compiled.sprite_names, reference.sprite_names);
+            for name in ["original/0", "keep/0", "clear/0"] {
+                let s = compiled.atlas.sprites[compiled.sprite(name).unwrap().0 as usize];
+                let expected = reference.atlas.sprites[reference.sprite(name).unwrap().0 as usize];
+                assert_eq!((s.width, s.height, s.anchor_x, s.anchor_y, s.sampling, s.sampling_origin_x, s.sampling_origin_y), (expected.width, expected.height, expected.anchor_x, expected.anchor_y, expected.sampling, expected.sampling_origin_x, expected.sampling_origin_y));
+                if !compiled.atlas.pages.is_empty() { assert_eq!(sprite_pixels(&compiled, name), sprite_pixels(&reference, name)); }
+            }
+        }
+        let base = Description::parse("grid = { layout = 'orthogonal', step = [1, 1] }").unwrap();
+        for pixels in [true, false] {
+            let (mut compiled, mut growing) = base.compile_growing(&PartialAlpha, 64, pixels).unwrap();
+            let growth = growing.grow(&compiled, MASKED_RGBA_SHEETS, &PartialAlpha).unwrap();
+            compiled.apply(&growth);
+            for name in ["original/0", "keep/0", "clear/0"] {
+                let s = compiled.atlas.sprites[compiled.sprite(name).unwrap().0 as usize];
+                assert_eq!((s.sampling_origin_x, s.sampling_origin_y), (3, 2));
+                if pixels { assert_eq!(sprite_pixels(&compiled, name), sprite_pixels(&reference, name)); }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_alpha_mask_cache_and_growth_do_not_share_different_pixels() {
+        let base = "grid = { layout = 'orthogonal', step = [1, 1] }\n";
+        let original = "[images.art]\nsource = 'partial'\n[sheets.original]\nimage = 'art'\ncell = [8, 2]\ngrid = [1, 1]\n";
+        let masked = "[sheets.keep]\nimage = 'art'\ncell = [8, 2]\ngrid = [1, 1]\nalpha_keep = [[0, 0, 4, 2]]\n[sheets.clear]\nimage = 'art'\ncell = [8, 2]\ngrid = [1, 1]\nalpha_clear = [[0, 0, 4, 2]]\n";
+        let source = format!("{base}{original}{masked}");
+        let desc = Description::parse(&source).unwrap();
+        let plain = desc.compile(&MaskedIndexed, 64).unwrap();
+        let mut cache = SheetCache::new();
+        Description::parse(&format!("{base}{original}")).unwrap().compile_cached(&MaskedIndexed, 64, &mut cache).unwrap();
+        for compiled in [desc.compile_cached(&MaskedIndexed, 64, &mut cache).unwrap(), desc.compile_cached(&MaskedIndexed, 64, &mut cache).unwrap()] {
+            for name in ["original/0", "keep/0", "clear/0"] { assert_eq!(indexed_sprite_pixels(&compiled, name, 0), indexed_sprite_pixels(&plain, name, 0)); }
+        }
+        let changed = Description::parse(&source.replace("alpha_keep = [[0, 0, 4, 2]]", "alpha_keep = [[2, 0, 4, 2]]")).unwrap().compile_cached(&MaskedIndexed, 64, &mut cache).unwrap();
+        assert_eq!(indexed_sprite_pixels(&changed, "keep/0", 0)[0][3], 0, "mask changes invalidate cached texels");
+        assert_eq!(indexed_sprite_pixels(&changed, "keep/0", 0)[4][3], 255);
+        let (mut grown, mut growing) = Description::parse(&format!("{base}{original}")).unwrap().compile_growing(&MaskedIndexed, 64, true).unwrap();
+        let addition = format!("[images.art]\nsource = 'partial'\n{masked}");
+        let growth = growing.grow(&grown, &addition, &MaskedIndexed).unwrap();
+        assert_eq!(growth.atlas.blits.len(), 2, "keep and clear cannot reuse unmasked or each other's texels");
+        grown.apply(&growth);
+        for name in ["original/0", "keep/0", "clear/0"] { assert_eq!(indexed_sprite_pixels(&grown, name, 0), indexed_sprite_pixels(&plain, name, 0)); }
+        let alias = "[images.art]\nsource = 'partial'\n[sheets.keep_again]\nimage = 'art'\ncell = [8, 2]\ngrid = [1, 1]\nalpha_keep = [[0, 0, 4, 2]]\n";
+        let growth = growing.grow(&grown, alias, &MaskedIndexed).unwrap();
+        assert!(growth.atlas.blits.is_empty(), "identical masked indices can share previous pixels");
+        grown.apply(&growth);
+        assert_eq!(indexed_sprite_pixels(&grown, "keep_again/0", 0), indexed_sprite_pixels(&grown, "keep/0", 0));
     }
 
     #[test]
@@ -3178,6 +3798,28 @@ mod tests {
         // Sources differ in length only by the padded value: "b03.pcx" vs "b12.pcx".
         let s = c.atlas.sprites[c.sprite_names.iter().position(|n| n == "B@3/0").unwrap()];
         assert_eq!(c.atlas.pages[s.page as usize].get(s.atlas_x, s.atlas_y)[2], 7);
+    }
+
+    #[test]
+    fn fixed_resize_keeps_native_phase_instead_of_centered_nearest() {
+        let image = RgbaImage::from_fn(4, 1, |x, _| [x as u8, 0, 0, 255]);
+        let fixed = resize_fixed(&image, (3, 1), [87381, 65536]);
+        assert_eq!((0..3).map(|x| fixed.get(x, 0)[0]).collect::<Vec<_>>(), [0, 1, 2]);
+        let nearest = resize_nearest(&image, (3, 1));
+        assert_eq!((0..3).map(|x| nearest.get(x, 0)[0]).collect::<Vec<_>>(), [0, 2, 3]);
+    }
+
+    #[test]
+    fn fixed_resize_rejects_missing_output_size_and_out_of_cell_reads() {
+        for (options, expected) in [
+            ("resize_step = [65536,65536]", "resize_step requires resize"),
+            ("resize = [4,4]\nresize_step = [262144,262144]", "resize_step samples outside"),
+            ("resize = [4,4]\nresize_step = [0,65536]", "resize_step samples outside"),
+        ] {
+            let text=format!("grid = {{ layout = \"orthogonal\", step = [1,1] }}\n[images.a]\nsource = \"a\"\n[sheets.icon]\nimage = \"a\"\ncell = [4,4]\ngrid = [1,1]\n{options}\n[[layers]]\nname = \"l\"\nsets = [\"icon/0\"]");
+            let error=Description::parse(&text).unwrap().compile(&Checker,256).err().expect("invalid sampler accepted").to_string();
+            assert!(error.contains(expected),"{error}");
+        }
     }
 
     #[test]

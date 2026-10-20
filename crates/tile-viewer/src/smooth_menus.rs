@@ -51,12 +51,17 @@ impl Picture {
             let rows: Vec<Row> = scene.interactables.iter().filter(|row| row.kind == InteractableKind::ListItem)
                 .filter(|row| {
                     let r = bounds(row.rect);
-                    r[2] > r[0] && r[3] > r[1] && inside(rect, ((r[0] + r[2]) / 2, (r[1] + r[3]) / 2))
+                    let center = ((r[0] + r[2]) / 2, (r[1] + r[3]) / 2);
+                    r[2] > r[0] && r[3] > r[1] && inside(rect, center)
+                        && scene.interactables.iter().filter_map(|candidate| match candidate.kind {
+                            InteractableKind::List { scroll, .. } if inside(bounds(scroll), center) => Some((candidate.id, i64::from(scroll[2]) * i64::from(scroll[3]))),
+                            _ => None,
+                        }).min_by_key(|(_, area)| *area).is_some_and(|(id, _)| id == list.id)
                 }).map(|row| Row { id: row.id, rect: bounds(row.rect) }).collect();
-            // Side controls and the list's frame stay stationary. The
-            // driver's item rectangles delimit the scrolling content.
-            let rect = [rows.iter().map(|r| r.rect[0]).min()?.max(rect[0]), rect[1],
-                rows.iter().map(|r| r.rect[2]).max()?.min(rect[2]), rect[3]];
+            // ListItem hit areas can cover only a row's name. The native
+            // scroll rectangle covers every column, including nonclickable
+            // statistics and cells represented as buttons.
+            if rows.is_empty() { return None }
             let mut sprites = Vec::new();
             let mut cameras = Vec::new();
             // Overlays are the driver's screen pixels; world sprites are
@@ -73,6 +78,17 @@ impl Picture {
             }
             Some(Picture { id: list.id, rect, rows, sprites, cameras })
         }).collect()
+    }
+
+    fn row_at(&self, point: (i32, i32)) -> Option<&Row> {
+        if !inside(self.rect, point) { return None }
+        if let Some(row) = self.rows.iter().find(|row| inside(row.rect, point)) { return Some(row) }
+        // Tables often expose only the name as ListItem. Other columns
+        // share that row's vertical transform. Ambiguous multicolumn lists
+        // keep their independent native hit areas.
+        let mut rows = self.rows.iter().filter(|row| point.1 >= row.rect[1] && point.1 < row.rect[3]);
+        let row = rows.next()?;
+        rows.next().is_none().then_some(row)
     }
 
     fn displacement_from(&self, old: &Self) -> Option<i32> {
@@ -144,8 +160,16 @@ impl Slide {
         let (picture, offset) = if old_clip.is_some_and(|r| inside(r, point)) { (&self.from, old) }
             else if new_clip.is_some_and(|r| inside(r, point)) { (&self.to, new) }
             else { return None };
-        picture.rows.iter().find(|row| inside(shifted(row.rect, offset), point))
+        picture.row_at((point.0, point.1 - offset))
     }
+}
+
+struct Press {
+    button: Button,
+    list: u64,
+    row: Option<u64>,
+    /// Preserve ordinary coordinates when a static list never moved.
+    original_rect: Option<Rect>,
 }
 
 /// State of independently enabled smooth menu scrolling. No wheel message
@@ -155,7 +179,7 @@ pub struct SmoothMenus {
     pictures: Vec<Picture>,
     slides: Vec<Slide>,
     key: Option<(u64, Option<String>, Option<u32>)>,
-    pressed: Vec<(Button, u64, Option<u64>)>,
+    pressed: Vec<Press>,
     hover: Option<(i32, i32)>,
     /// Input uses the pixels of the last drawn frame, even with a low FPS cap.
     shown_at: f64,
@@ -213,7 +237,7 @@ impl SmoothMenus {
         for slide in &self.slides {
             let mut outside = Vec::new();
             for s in result {
-                if !s.screen || !s.view.is_some_and(|v| slide.to.cameras.contains(&v))
+                if !s.screen || s.except_view || !s.view.is_some_and(|v| slide.to.cameras.contains(&v))
                     || !rect_of(&s).is_some_and(|r| intersect(bounds(r), slide.to.rect).is_some()) {
                     outside.push(s);
                     continue;
@@ -261,21 +285,21 @@ impl SmoothMenus {
             _ => return Some(input),
         };
         if let Input::MouseButton { button, down: false, .. } = input {
-            if let Some(k) = self.pressed.iter().position(|p| p.0 == button) {
-                let (_, list, row) = self.pressed.remove(k);
+            if let Some(k) = self.pressed.iter().position(|p| p.button == button) {
+                let Press { list, row, original_rect, .. } = self.pressed.remove(k);
                 let row = row?; // A press on a departed row was suppressed.
                 let Some(picture) = self.pictures.iter().find(|p| p.id == list) else {
                     return Some(Input::MouseButton { button, down: false, x: -1, y: -1 });
                 };
-                let shown = self.slides.iter().find(|s| s.to.id == list && now - s.at < DURATION)
-                    .and_then(|s| s.row_at((x, y), now)).map(|r| r.id)
-                    .or_else(|| (!self.slides.iter().any(|s| s.to.id == list && now - s.at < DURATION))
-                        .then(|| picture.rows.iter().find(|r| inside(r.rect, (x, y))).map(|r| r.id)).flatten());
+                let slide = self.slides.iter().find(|s| s.to.id == list && now - s.at < DURATION);
                 let Some(current) = picture.rows.iter().find(|r| r.id == row) else {
                     return Some(Input::MouseButton { button, down: false, x: -1, y: -1 });
                 };
+                if slide.is_none() && original_rect == Some(current.rect) { return Some(input); }
+                let shown = slide.and_then(|s| s.row_at((x, y), now)).map(|r| r.id)
+                    .or_else(|| slide.is_none().then(|| picture.row_at((x, y)).map(|r| r.id)).flatten());
                 let (x, y) = if shown == Some(row) {
-                    (x.clamp(current.rect[0], current.rect[2] - 1), (current.rect[1] + current.rect[3]) / 2)
+                    (x.clamp(picture.rect[0], picture.rect[2] - 1), (current.rect[1] + current.rect[3]) / 2)
                 } else {
                     // Release outside the pressed row cancels its click.
                     (current.rect[0] - 1, current.rect[1] - 1)
@@ -283,13 +307,32 @@ impl SmoothMenus {
                 return Some(Input::MouseButton { button, down: false, x, y });
             }
         }
-        let Some(slide) = self.slides.iter().find(|s| now - s.at < DURATION && inside(s.to.rect, (x, y))) else { return Some(input) };
+        let Some(slide) = self.slides.iter().find(|s| now - s.at < DURATION && inside(s.to.rect, (x, y))) else {
+            if let Input::MouseButton { button, down: true, .. } = input {
+                self.pressed.retain(|p| p.button != button);
+                if let Some((picture, row)) = self.pictures.iter().filter(|p| inside(p.rect, (x, y)))
+                    .find_map(|p| p.row_at((x, y)).map(|r| (p, r))) {
+                    // A wheel event may start a slide while this button is
+                    // held. Remember the row before that can happen.
+                    self.pressed.push(Press { button, list: picture.id, row: Some(row.id), original_rect: Some(row.rect) });
+                }
+            }
+            return Some(input);
+        };
         let shown = slide.row_at((x, y), now);
-        if shown.is_none() { return Some(input) }
+        if shown.is_none() {
+            // A gap in the displayed rows must not click a different row
+            // that already occupies this coordinate in the native list.
+            if let Input::MouseButton { button, down: true, .. } = input {
+                self.pressed.retain(|p| p.button != button);
+                self.pressed.push(Press { button, list: slide.to.id, row: None, original_rect: None });
+            }
+            return None;
+        }
         let current = shown.and_then(|shown| slide.to.rows.iter().find(|row| row.id == shown.id));
         if let Input::MouseButton { button, down: true, .. } = input {
-            self.pressed.retain(|p| p.0 != button);
-            self.pressed.push((button, slide.to.id, current.map(|row| row.id)));
+            self.pressed.retain(|p| p.button != button);
+            self.pressed.push(Press { button, list: slide.to.id, row: current.map(|row| row.id), original_rect: None });
         }
         let shown = shown?;
         let current = current?;
@@ -316,12 +359,12 @@ mod tests {
     fn frame(first: u64) -> (Scene, Vec<PlacedSprite>, Vec<Span>) {
         let mut scene = Scene::default();
         scene.views.push(ViewState { id: 7, ..Default::default() });
-        scene.interactables.push(Interactable { anchor: None, id: 99, rect: [10, 10, 100, 60], kind: InteractableKind::List { scroll: [10, 10, 100, 60], step: 20 } });
+        scene.interactables.push(Interactable { alt_right_click: false, anchor: None, id: 99, rect: [10, 10, 100, 60], kind: InteractableKind::List { scroll: [10, 10, 100, 60], step: 20 } });
         let mut free = Vec::new();
         for k in 0..3 {
             let id = first + k;
             let y = 10 + k as i32 * 20;
-            scene.interactables.push(Interactable { anchor: None, id, rect: [10, y, 100, 20], kind: InteractableKind::ListItem });
+            scene.interactables.push(Interactable { alt_right_click: false, anchor: None, id, rect: [10, y, 100, 20], kind: InteractableKind::ListItem });
             free.push(PlacedSprite { screen: true, view: Some(0), clip: Some([10, 10, 110, 70]), ..PlacedSprite::new(SpriteSetId::from_raw(id as u32), 10, y) });
         }
         let spans = vec![Span { view: 7, start: 0, len: free.len(), cameras: vec![0; free.len()] }];
@@ -457,6 +500,28 @@ mod tests {
     }
 
     #[test]
+    fn popup_and_alt_mode_changes_drop_saved_animation_and_held_rows() {
+        let mut state = SmoothMenus::default();
+        draw(&mut state, 1, 0.0, true);
+        draw(&mut state, 2, 1.0, true);
+        state.route(Input::MouseButton { button: Button::Left, down: true, x: 20, y: 35 }, 1.0);
+        assert!(!state.pressed.is_empty());
+        state.focus_lost();
+        assert!(state.pressed.is_empty());
+        let (mut scene, free, spans) = frame(2);
+        scene.interface.popup = Some(123);
+        assert!(state.draw(&scene, &free, &spans, 1.01, true, 1, rect).is_none());
+        assert!(!state.running());
+        let (mut scene, free, spans) = frame(3);
+        scene.interface.popup = Some(123);
+        assert!(state.draw(&scene, &free, &spans, 1.02, true, 1, rect).is_some());
+        // App disables menu interpolation while Alt snapping owns input.
+        assert!(state.draw(&scene, &free, &spans, 1.03, false, 1, rect).is_none());
+        assert!(!state.running());
+        assert!(state.draw(&scene, &free, &spans, 1.04, true, 1, rect).is_none());
+    }
+
+    #[test]
     fn scene_changes_and_unrelated_row_replacement_do_not_replay_old_rows() {
         let mut state = SmoothMenus::default();
         draw(&mut state, 1, 0.0, true);
@@ -483,6 +548,41 @@ mod tests {
         let animated = state.draw(&scene, &free, &spans, 1.0, true, 1, rect).unwrap();
         assert!(animated.contains(&world));
         assert!(animated.contains(&button));
+    }
+
+    #[test]
+    fn a_press_before_scrolling_gets_a_cancelled_release_if_its_row_leaves() {
+        let mut state = SmoothMenus::default();
+        draw(&mut state, 1, 0.0, true);
+        let press = Input::MouseButton { button: Button::Left, down: true, x: 20, y: 15 };
+        assert_eq!(state.route(press.clone(), 0.0), Some(press));
+        draw(&mut state, 2, 1.0, true);
+        // Row 1 remains visible at the start of the animation, but has
+        // left the native list. The native press still needs a release.
+        assert_eq!(state.route(Input::MouseButton { button: Button::Left, down: false, x: 20, y: 15 }, 1.0),
+            Some(Input::MouseButton { button: Button::Left, down: false, x: -1, y: -1 }));
+    }
+
+    #[test]
+    fn a_press_before_scrolling_keeps_its_row_when_the_release_is_over_another_row() {
+        let mut state = SmoothMenus::default();
+        draw(&mut state, 1, 0.0, true);
+        state.route(Input::MouseButton { button: Button::Left, down: true, x: 20, y: 45 }, 0.0);
+        draw(&mut state, 2, 1.0, true);
+        draw(&mut state, 2, 1.0 + DURATION / 2.0, true);
+        // The pointer now covers row 3, not the originally pressed row 2.
+        assert_eq!(state.route(Input::MouseButton { button: Button::Left, down: false, x: 20, y: 45 }, 1.1),
+            Some(Input::MouseButton { button: Button::Left, down: false, x: 9, y: 9 }));
+    }
+
+    #[test]
+    fn a_stationary_list_keeps_ordinary_button_coordinates_unchanged() {
+        let mut state = SmoothMenus::default();
+        draw(&mut state, 1, 0.0, true);
+        for (down, x, y) in [(true, 23, 35), (false, 25, 39), (true, 23, 35), (false, 200, 200)] {
+            let input = Input::MouseButton { button: Button::Left, down, x, y };
+            assert_eq!(state.route(input.clone(), 0.0), Some(input));
+        }
     }
 
     #[test]
@@ -560,13 +660,91 @@ mod tests {
 
 
     #[test]
+    fn every_table_column_moves_and_routes_to_its_visible_native_row() {
+        let mut state = SmoothMenus::default();
+        let table = |first| {
+            let (mut scene, mut sprites, spans) = frame(first);
+            for item in &mut scene.interactables {
+                if item.kind == InteractableKind::ListItem { item.rect[2] = 25; }
+            }
+            for row in 0..3 {
+                scene.interactables.push(Interactable { alt_right_click: false, anchor: None,
+                    id: 1000 + first + row, rect: [65, 10 + row as i32 * 20, 30, 20], kind: InteractableKind::Button });
+            }
+            // Each row sprite spans names, statistics and clickable cells.
+            for sprite in &mut sprites { sprite.clip = Some([10, 10, 110, 70]); }
+            (scene, sprites, spans)
+        };
+        let (scene, free, spans) = table(1);
+        state.draw(&scene, &free, &spans, 0.0, true, 1, rect);
+        let (scene, free, spans) = table(2);
+        state.draw(&scene, &free, &spans, 1.0, true, 1, rect);
+        let now = 1.0 + DURATION / 2.0;
+        let shown = state.draw(&scene, &free, &spans, now, true, 1, rect).unwrap();
+        for x in [20, 50, 80, 105] {
+            assert_eq!(pixel(&shown, (x, 25)), Some(2), "column {x}");
+            assert_eq!(state.route(Input::MouseMove { x, y: 25 }, now), Some(Input::MouseMove { x, y: 15 }));
+            assert_eq!(state.route(Input::MouseButton { button: Button::Right, down: true, x, y: 15 }, now), None);
+            assert_eq!(state.route(Input::MouseButton { button: Button::Right, down: false, x, y: 15 }, now), None);
+        }
+    }
+
+    #[test]
+    fn animated_row_gaps_do_not_hit_a_native_row_at_another_offset() {
+        let mut state = SmoothMenus::default();
+        for (first, now) in [(1, 0.0), (2, 1.0), (2, 1.0 + DURATION / 2.0)] {
+            let (mut scene, free, spans) = frame(first);
+            for item in &mut scene.interactables {
+                if item.kind == InteractableKind::ListItem { item.rect[3] = 16; }
+            }
+            state.draw(&scene, &free, &spans, now, true, 1, rect);
+        }
+        // Old row 2 occupies y20..36, then a four-pixel gap. Native
+        // row 3 already occupies y30..46 at this same coordinate.
+        for down in [true, false] {
+            assert_eq!(state.route(Input::MouseButton { button: Button::Left, down, x: 20, y: 38 }, 1.07), None);
+        }
+    }
+
+    #[test]
+    fn multicolumn_lists_keep_distinct_native_row_targets() {
+        let (mut scene, free, spans) = frame(1);
+        for row in scene.interactables.iter_mut().filter(|i| i.kind == InteractableKind::ListItem) { row.rect[2] = 40; }
+        scene.interactables.push(Interactable { alt_right_click: false, anchor: None, id: 500,
+            rect: [65, 10, 40, 20], kind: InteractableKind::ListItem });
+        let picture = Picture::take(&scene, &free, &spans, &rect).remove(0);
+        assert_eq!(picture.row_at((20, 15)).map(|r| r.id), Some(1));
+        assert_eq!(picture.row_at((80, 15)).map(|r| r.id), Some(500));
+        assert!(picture.row_at((60, 15)).is_none());
+        assert_eq!(picture.row_at((80, 35)).map(|r| r.id), Some(2));
+    }
+
+    #[test]
+    fn coalesced_whole_pages_and_endpoints_do_not_leave_an_animation_backlog() {
+        let mut state = SmoothMenus::default();
+        draw(&mut state, 1, 0.0, true);
+        let shown = draw(&mut state, 8, 1.0, true);
+        assert_eq!(pixel(&shown, (20, 15)), Some(8));
+        assert!(!state.running());
+        draw(&mut state, 9, 2.0, true);
+        draw(&mut state, 9, 2.0 + DURATION, true);
+        for at in [3.0, 4.0, 5.0] {
+            assert_eq!(pixel(&draw(&mut state, 9, at, true), (20, 15)), Some(9));
+            assert!(!state.running());
+        }
+    }
+
+    #[test]
     fn the_lists_side_controls_stay_still_and_keep_their_input() {
         let mut state = SmoothMenus::default();
         let side = PlacedSprite { screen: true, view: Some(0), clip: Some([95, 15, 105, 25]),
             ..PlacedSprite::new(SpriteSetId::from_raw(8), 95, 15) };
         for (first, at) in [(1, 0.0), (2, 1.0)] {
             let (mut scene, mut free, spans) = frame(first);
-            for row in scene.interactables.iter_mut().filter(|i| i.kind == InteractableKind::ListItem) { row.rect[2] = 80; }
+            for item in &mut scene.interactables {
+                if item.kind == InteractableKind::ListItem { item.rect[2] = 80; }
+                if let InteractableKind::List { scroll, .. } = &mut item.kind { scroll[2] = 80; }
+            }
             free.push(side);
             let output = state.draw(&scene, &free, &spans, at, true, 1, rect);
             if first == 2 { assert!(output.unwrap().contains(&side)); }

@@ -40,11 +40,28 @@
 //! **Clicks** go to the element snapped to, never to the world. The view
 //! a click captures the mouse in (the one following the world cursor) is
 //! an element too ([`TargetKind::Capture`], from the layout, not the
-//! driver): clicking it ends the mode and captures the mouse (again).
+//! driver), snapped to at its middle, which draws the pointer from afar
+//! ([`ATTRACTION`]): clicking it ends the mode and captures the mouse
+//! (again), the click going nowhere else. A command given in the mode (a
+//! click on its button, or its key) that waits for a place of the world
+//! (`scene::Interface::targeting`, e.g. a go-to's destination) ends the
+//! mode the same way: the mouse is captured again, the view and the world
+//! cursor staying put, the tile under it the command's target.
 //!
 //! **Lists.** On an entry of a list that scrolls, motion up or down that
 //! stays inside the list scrolls it instead, smoothly ([`Scroller`]: wheel
 //! notches spread out in time), the pointer staying on its entry.
+//!
+//! **Sliders by keyboard** (in the mode or not). A slider or scroll bar is
+//! selected by a left press the driver gets on it (a click or the start of
+//! a drag), by its Alt edit, or by stepping it; it stays selected as the
+//! one last interacted with. In the mode the slider snapped to is the one
+//! (none while snapped to anything else). Arrow keys step it
+//! (`SliderAction::Step`: Left/Up down, Right/Down up, Shift ten steps;
+//! the driver's own step) and never reach the driver or the world. Esc, a
+//! press anywhere else (the world too), or the slider no longer shown (a
+//! tab or screen changed) deselect it. The selected slider is drawn
+//! hovered (`looks`). Without one, arrow keys are what they were.
 //!
 //! **Leaving.** The pointer lands, and the usual rules take over where it
 //! is: on an element of the driver's the system pointer shows there (a
@@ -101,6 +118,13 @@ pub const ANGLE_WEIGHT: f64 = 16.0;
 /// far off).
 pub const DISTANCE_WEIGHT: f64 = 0.25;
 
+/// The capture view's middle (its target) attracts the pointer: in
+/// [`pick`] it is as far as the edge of a disc round it, its radius this
+/// fraction of the view's smaller side (a quarter: the middle of a 600
+/// pixel tall view counts 150 pixels nearer than it is), so that motion
+/// towards the middle of the view reaches it past the elements on the way.
+pub const ATTRACTION: f64 = 0.25;
+
 /// Window pixels per raw mouse count (as an unaccelerated system pointer).
 pub const MOTION_GAIN: f64 = 1.0;
 
@@ -133,6 +157,11 @@ pub const CAPTURE_ID: u64 = u64::MAX;
 const VK_CONTROL: u32 = 0x11;
 const VK_MENU: u32 = 0x12;
 const VK_ESCAPE: u32 = 0x1B;
+const VK_SHIFT: u32 = 0x10;
+const VK_LEFT: u32 = 0x25;
+const VK_UP: u32 = 0x26;
+const VK_DOWN: u32 = 0x28;
+const VK_C: u32 = 0x43;
 
 /// Something to snap to, in window pixels.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -143,6 +172,9 @@ pub struct Target {
     pub anchor: Option<Point>,
     pub kind: TargetKind,
     pub id: u64,
+    /// A left click on it goes to the driver as a right click
+    /// ([`Interactable::alt_right_click`]).
+    pub alt_right_click: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -168,7 +200,7 @@ impl Target {
     /// The capture view `rect` (window pixels), the world cursor at `at`.
     pub fn capture(rect: [i32; 4], at: (i32, i32)) -> Self {
         let [x, y, w, h] = rect;
-        Self { rect: [x as f64, y as f64, w as f64, h as f64], anchor: None, kind: TargetKind::Capture { at: (at.0 as f64, at.1 as f64) }, id: CAPTURE_ID }
+        Self { rect: [x as f64, y as f64, w as f64, h as f64], anchor: None, kind: TargetKind::Capture { at: (at.0 as f64, at.1 as f64) }, id: CAPTURE_ID, alt_right_click: false }
     }
 
     /// Where the pointer goes on it.
@@ -228,6 +260,7 @@ pub fn targets_mapped(items: &[Interactable], map: impl Fn([i32; 4]) -> [f64; 4]
     let mut out: Vec<Target> = items
         .iter()
         .map(|i| Target {
+            alt_right_click: i.alt_right_click,
             rect: map(i.rect),
             anchor: i.anchor.map(|[x, y]| {
                 // Choose the affine from the full control rectangle. An
@@ -367,7 +400,10 @@ pub fn pick(targets: &[Target], from: Point, current: Option<u64>, moved: Point)
             if angle > CONE + 1e-9 {
                 return None;
             }
-            let off = (dist - reach).abs() + DISTANCE_WEIGHT * dist + 1.0;
+            // (The capture view's middle draws the pointer from afar: it
+            // counts as near as the edge of its disc of attraction.)
+            let near = if t.is_capture() { (dist - ATTRACTION * t.rect[2].min(t.rect[3])).max(0.0) } else { dist };
+            let off = (near - reach).abs() + DISTANCE_WEIGHT * near + 1.0;
             Some((k, off * (1.0 + ANGLE_WEIGHT * (angle / CONE).powi(2))))
         })
         .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -523,6 +559,8 @@ struct Snapped {
     /// scrolls under it).
     entry: bool,
     capture: bool,
+    /// Its left clicks go to the driver as right clicks.
+    alt_right_click: bool,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -589,8 +627,8 @@ pub struct Snapper {
     /// Notches were sent: once they are all out, the driver gets the
     /// pointer again (what is under it now shows its hover).
     scrolled: bool,
-    /// Where each button's press went.
-    pressed: [Option<Point>; 3],
+    /// Where each button's press went, and as which button.
+    pressed: [Option<(Point, Button)>; 3],
     /// The driver's element the pointer last rested on (kept across modes:
     /// the next one goes on from it).
     rested: Option<u64>,
@@ -784,12 +822,16 @@ impl Snapper {
     pub fn click(&mut self, button: Button, down: bool) -> Option<Vec<Action>> {
         let b = button_index(button);
         if !down {
-            return self.pressed[b].take().map(|at| vec![Action::Button { button, down, at }]);
+            return self.pressed[b].take().map(|(at, sent)| vec![Action::Button { button: sent, down, at }]);
         }
+        let mut sent = button;
         let at = match self.phase {
             Phase::Snapping | Phase::Landing => match self.snapped {
                 Some(s) if s.capture => return Some(vec![Action::Capture(self.flight.to)]),
                 Some(s) => {
+                    if s.alt_right_click && button == Button::Left {
+                        sent = Button::Right;
+                    }
                     // On the element now.
                     let at = self.flight.to;
                     self.flight = Flight::rest(at);
@@ -808,8 +850,8 @@ impl Snapper {
             Phase::Parked(p) => p,
             Phase::Off => return None,
         };
-        self.pressed[b] = Some(at);
-        Some(vec![Action::Move(at), Action::Button { button, down, at }])
+        self.pressed[b] = Some((at, sent));
+        Some(vec![Action::Move(at), Action::Button { button: sent, down, at }])
     }
 
     /// A wheel turn goes to the element snapped to, or where the pointer
@@ -904,7 +946,7 @@ impl Snapper {
     fn snap_to(&mut self, targets: &[Target], k: usize, now: f64) {
         let t = &targets[k];
         let list = t.list(k).map(|l| targets[l].id);
-        self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }), capture: t.is_capture() });
+        self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }), capture: t.is_capture(), alt_right_click: t.alt_right_click });
         let c = t.center();
         self.picked = now;
         self.scroll_rest = 0.0;
@@ -964,7 +1006,12 @@ impl Snapper {
     /// that moved is followed; a list's entry stays where the pointer is
     /// (the entry there now, once the list scrolled).
     fn track(&mut self, targets: &[Target], now: f64) {
-        let Some(s) = self.snapped else { return };
+        let Some(s) = self.snapped else {
+            if let Some(k) = nearest(targets, self.pos).or_else(|| targets.iter().position(Target::is_capture)) {
+                self.snap_to(targets, k, now);
+            }
+            return;
+        };
         let t = self.flight.to;
         if s.entry {
             if targets.iter().any(|x| x.id == s.id && inside(x.rect, t)) {
@@ -973,7 +1020,7 @@ impl Snapper {
             let list = s.list.and_then(|id| targets.iter().position(|x| x.id == id));
             let under = targets.iter().find(|x| matches!(x.kind, TargetKind::ListItem { list: l } if l == list) && inside(x.rect, t));
             match under {
-                Some(x) => self.snapped = Some(Snapped { id: x.id, ..s }),
+                Some(x) => self.snapped = Some(Snapped { id: x.id, alt_right_click: x.alt_right_click, ..s }),
                 None => self.gone(targets, s.id, now),
             }
             return;
@@ -994,7 +1041,15 @@ impl Snapper {
     /// on to the one nearest the pointer (the capture view if there is no
     /// other), so that it never rests where nothing is.
     fn gone(&mut self, targets: &[Target], id: u64, now: f64) {
-        let Some(k) = nearest(targets, self.pos).or_else(|| targets.iter().position(Target::is_capture)) else { return };
+        let Some(k) = nearest(targets, self.pos).or_else(|| targets.iter().position(Target::is_capture)) else {
+            self.snapped = None;
+            self.ghost = None;
+            self.rested = None;
+            self.moved = (0.0, 0.0);
+            self.flight = Flight::rest(self.pos);
+            self.arrived = true;
+            return;
+        };
         log::debug!("snap: {id} is gone: on to the nearest, {}", targets[k].id);
         self.moved = (0.0, 0.0);
         self.snap_to(targets, k, now);
@@ -1007,6 +1062,9 @@ struct SliderEdit {
     track: [f64; 4],
     value: f64,
     dirty: bool,
+    /// An arrow key stepped it in the driver: the scene's value then, the
+    /// first different one it shows becomes the edit's value.
+    resync: Option<i32>,
 }
 
 /// Button snapping in the viewer: Alt turns the mode on and off; buttons
@@ -1030,6 +1088,17 @@ pub struct SnapInput {
     slider: Option<SliderEdit>,
     /// Initial selection and confirm/cancel presses never reach the driver.
     swallowed_buttons: [bool; 3],
+    /// The driver's command waiting for a place of the world, as of the
+    /// last scene seen (`scene::Interface::targeting`).
+    targeting: bool,
+    /// The slider last interacted with (pressed in the driver, edited or
+    /// stepped in the Alt mode): arrow keys step it ([`SnapInput::selected_slider`]).
+    selected: Option<u64>,
+    /// The slider arrow keys step now, as of the last input or tick.
+    shown: Option<u64>,
+    /// Arrow keys whose press stepped a slider (their releases are ours).
+    stepped_keys: Vec<u32>,
+    shift: bool,
 }
 
 /// An action as the driver gets it (nothing for a point it does not take
@@ -1178,8 +1247,11 @@ impl SnapInput {
 
     fn validate_slider(&mut self, targets: &[Target]) -> Vec<Input> {
         let Some(edit) = &mut self.slider else { return vec![] };
-        if let Some(Target { kind: TargetKind::Slider { track, .. }, .. }) = targets.iter().find(|t| t.id == edit.id) {
+        if let Some(Target { kind: TargetKind::Slider { track, value }, .. }) = targets.iter().find(|t| t.id == edit.id) {
             edit.track = *track;
+            if edit.resync.is_some_and(|before| before != *value) {
+                (edit.value, edit.dirty, edit.resync) = ((*value).clamp(0, 1_000_000) as f64, false, None);
+            }
             vec![]
         } else {
             self.end_slider(SliderAction::Cancel)
@@ -1195,7 +1267,8 @@ impl SnapInput {
         self.snapper.rested = Some(target.id);
         self.snapper.ghost = Some(at);
         self.snapper.moved = (0.0, 0.0);
-        self.slider = Some(SliderEdit { id: target.id, track, value: value.clamp(0, 1_000_000) as f64, dirty: false });
+        self.slider = Some(SliderEdit { id: target.id, track, value: value.clamp(0, 1_000_000) as f64, dirty: false, resync: None });
+        self.selected = Some(target.id);
         vec![Input::Slider { id: target.id, action: SliderAction::Begin, value }]
     }
 
@@ -1211,10 +1284,141 @@ impl SnapInput {
         out
     }
 
+    /// The slider arrow keys step: the Alt mode's slider edit, else (in
+    /// the mode) the slider snapped to, else the one last interacted with
+    /// ([`SnapInput::selected`]) while it is still shown. Up and Left step
+    /// down, Down and Right up, Shift ten steps at a time.
+    fn keyboard_slider(&self, targets: &[Target]) -> Option<u64> {
+        let slider = |id: u64| targets.iter().any(|t| t.id == id && matches!(t.kind, TargetKind::Slider { .. }));
+        if let Some(edit) = &self.slider {
+            return Some(edit.id);
+        }
+        if self.snapper.snapping() {
+            return self.snapper.target_id().filter(|&id| slider(id));
+        }
+        self.selected.filter(|&id| slider(id))
+    }
+
+    /// The slider arrow keys step now (it is shown hovered: `looks`).
+    pub fn selected_slider(&self) -> Option<u64> {
+        self.shown
+    }
+
+    /// Window bounds for a keyboard focus border when the driver has no
+    /// hover art for the selected slider.
+    pub fn keyboard_focus_rect(&self, scene: &scene::Scene, layout: &Layout) -> Option<[i32; 4]> {
+        let id = self.selected_slider()?;
+        if scene.looks.iter().filter(|looks| looks.id == id).any(|looks| {
+            let hover = scene::LookState { pointer: scene::PointerState::Hover, selected: looks.shown.selected };
+            looks.views.iter().any(|view| view.state(hover).is_some_and(|sprites| !sprites.is_empty()))
+        }) {
+            return None;
+        }
+        let targets = Self::targets(scene, layout);
+        let slider = targets.iter().find(|target| target.id == id && matches!(target.kind, TargetKind::Slider { .. }))?;
+        let [x, y, w, h] = slider.rect;
+        let (x0, y0, x1, y1) = (x.floor() as i32, y.floor() as i32, (x + w).ceil() as i32, (y + h).ceil() as i32);
+        (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
+    }
+
+    /// The selection goes once its slider is no longer shown (its tab or
+    /// screen changed, it was closed).
+    fn validate_selection(&mut self, targets: &[Target]) {
+        if self.selected.is_some_and(|id| !targets.iter().any(|t| t.id == id && matches!(t.kind, TargetKind::Slider { .. }))) {
+            self.selected = None;
+        }
+    }
+
+    /// Arrow keys on the selected slider (and Esc deselecting it): `None`
+    /// if the key is not for that.
+    fn keyboard(&mut self, input: &Input, targets: &[Target]) -> Option<Vec<Input>> {
+        let Input::Key { vk, down, .. } = *input else { return None };
+        if vk == VK_ESCAPE && down {
+            // (In the mode Esc also ends the mode, as before.)
+            let deselect = self.selected.take().is_some() && !self.snapper.snapping();
+            if deselect {
+                self.esc = true;
+                return Some(vec![]);
+            }
+            return None;
+        }
+        if !(VK_LEFT..=VK_DOWN).contains(&vk) {
+            return None;
+        }
+        if !down {
+            let k = self.stepped_keys.iter().position(|&k| k == vk)?;
+            self.stepped_keys.remove(k);
+            return Some(vec![]);
+        }
+        // (Ctrl+Shift+arrows pan a view; Alt+arrow is a shortcut.)
+        if self.ctrl || self.alt {
+            return None;
+        }
+        let id = self.keyboard_slider(targets)?;
+        let mut out = self.validate_slider(targets);
+        let steps = if self.shift { 10 } else { 1 } * if matches!(vk, VK_LEFT | VK_UP) { -1 } else { 1 };
+        out.extend(self.slider_preview());
+        let value = targets.iter().find_map(|t| match t.kind { TargetKind::Slider { value, .. } if t.id == id => Some(value), _ => None });
+        if let Some(edit) = self.slider.as_mut().filter(|e| e.id == id) {
+            edit.resync = value;
+        }
+        self.selected = Some(id);
+        if !self.stepped_keys.contains(&vk) {
+            self.stepped_keys.push(vk);
+        }
+        out.push(Input::Slider { id, action: SliderAction::Step, value: steps });
+        Some(out)
+    }
+
+    /// A press the driver gets selects the slider it lands on, and
+    /// deselects any other; one on the world deselects.
+    fn follow_presses(&mut self, out: &[Input], scene: &scene::Scene) {
+        for input in out {
+            match *input {
+                Input::MouseButton { button, down: true, x, y } => {
+                    let hit = scene.interactables.iter()
+                        .filter(|i| !matches!(i.kind, InteractableKind::List { .. }))
+                        .find(|i| { let [ix, iy, w, h] = i.rect; x >= ix && y >= iy && x < ix + w && y < iy + h });
+                    let slider = hit.filter(|i| matches!(i.kind, InteractableKind::Slider { .. })).map(|i| i.id);
+                    self.selected = if button == Button::Left { slider } else { self.selected.filter(|&id| slider == Some(id)) };
+                }
+                Input::WorldButton { down: true, .. } => self.selected = None,
+                _ => {}
+            }
+        }
+    }
+
     /// A window input at time `now`: what goes to the driver.
     pub fn route(&mut self, input: Input, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
+        if let Input::Key { vk: VK_SHIFT, down, .. } = input {
+            self.shift = down;
+        }
+        // (Only keys and presses can select, step or deselect.)
+        if !matches!(input, Input::Key { .. } | Input::MouseButton { down: true, .. }) {
+            return self.route_input(input, layout, scene, now, rates);
+        }
+        let targets = Self::targets(scene, layout);
+        self.validate_selection(&targets);
+        // A tab or modal can replace the edited control between animation
+        // ticks. Retire that transaction before a key resolves its slider ID.
+        let mut out = self.validate_slider(&targets);
+        out.extend(match self.keyboard(&input, &targets) {
+            Some(out) => out,
+            None => self.route_input(input, layout, scene, now, rates),
+        });
+        self.follow_presses(&out, scene);
+        self.shown = self.keyboard_slider(&targets);
+        out
+    }
+
+    fn route_input(&mut self, input: Input, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
         let targets = Self::targets(scene, layout);
         let mut before = self.validate_slider(&targets);
+        // Scene/layout publication can precede the next animation tick.
+        // Revalidate a new gesture now; releases retain their press identity.
+        if self.snapper.holds_pointer() && matches!(input, Input::MouseButton { down: true, .. } | Input::Wheel { .. }) {
+            self.snapper.track(&targets, now);
+        }
         if let Input::MouseButton { button, down, .. } = input {
             let b = button_index(button);
             if !down && std::mem::take(&mut self.swallowed_buttons[b]) {
@@ -1233,6 +1437,9 @@ impl SnapInput {
                 }
             }
         }
+        // The game's C (centre on the active unit), going to the driver:
+        // the view following the world cursor centres on the unit too.
+        let centre = matches!(input, Input::Key { vk: VK_C, down: true, .. }) && !self.ctrl && !self.alt;
         let out = match input {
             // (Held, it repeats.)
             Input::Key { vk: VK_MENU, down: true, .. } if self.alt => vec![],
@@ -1324,6 +1531,9 @@ impl SnapInput {
             }
             other => layout.route(other),
         };
+        if centre && out.iter().any(|i| matches!(i, Input::Key { vk: VK_C, down: true, .. } | Input::WorldKey { vk: VK_C, down: true, .. })) {
+            layout.centre_on_focus(scene.focus);
+        }
         before.extend(out);
         before
     }
@@ -1346,8 +1556,17 @@ impl SnapInput {
 
     /// Time `now`: the pointer moves on; what goes to the driver.
     pub fn tick(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
+        // A command given in the mode (its button clicked, or its key)
+        // waits for a place of the world: the next click is the world's,
+        // so the mode ends and the mouse is captured for it.
+        let targeting = std::mem::replace(&mut self.targeting, scene.interface.targeting);
+        if scene.interface.targeting && !targeting && self.snapper.snapping() {
+            return self.capture_for_target(layout);
+        }
         let targets = Self::targets(scene, layout);
         let mut out = self.validate_slider(&targets);
+        self.validate_selection(&targets);
+        self.shown = self.keyboard_slider(&targets);
         if self.slider.is_some() {
             self.snapper.last = now;
             out.extend(self.slider_preview());
@@ -1355,6 +1574,23 @@ impl SnapInput {
         }
         let actions = self.snapper.tick(now, &targets, rates);
         out.extend(self.perform(actions, layout));
+        self.shown = self.keyboard_slider(&targets);
+        out
+    }
+
+    /// The mode ends at once for a command of the driver's that waits for
+    /// a place of the world: the mouse is captured again in the view
+    /// following the world cursor, the view and the world cursor staying
+    /// put, the tile under it the command's target at once
+    /// (`Layout::capture_for_target`). Nothing is clicked: a press still
+    /// held is let go on the element it went to.
+    fn capture_for_target(&mut self, layout: &mut Layout) -> Vec<Input> {
+        let mut out = self.end_slider(SliderAction::Cancel);
+        self.snapper.stop();
+        let target = layout.capture_for_target();
+        log::debug!("snap: a command waits for a place of the world: off, {}", if target.is_some() { "the mouse captured again" } else { "no view to capture the mouse in" });
+        out.extend(self.sync(layout));
+        out.extend(target.into_iter().flatten());
         out
     }
 
@@ -1362,7 +1598,11 @@ impl SnapInput {
     pub fn focus_lost(&mut self, layout: &mut Layout) -> Vec<Input> {
         let mut out = self.end_slider(SliderAction::Cancel);
         self.snapper.stop();
-        (self.ctrl, self.alt, self.alt_entered, self.alt_sent, self.esc) = (false, false, false, false, false);
+        if self.alt_sent {
+            out.extend(layout.route(Input::Key { vk: VK_MENU, down: false, text: None }));
+        }
+        (self.ctrl, self.alt, self.alt_entered, self.alt_sent, self.esc, self.shift) = (false, false, false, false, false, false);
+        self.stepped_keys.clear();
         out.extend(self.sync(layout));
         out
     }
@@ -1374,17 +1614,43 @@ impl SnapInput {
 
     /// The pointers as sprites in camera `overlay` (over the whole window
     /// at 1:1, on top of every view: window pixels): the ghost, then the
-    /// pointer over it; the driver's arrow if the description has it.
+    /// pointer over it; the driver's arrow if the description has it. At
+    /// the art's own size ([`SnapInput::compose`] at any cursor size).
     pub fn sprites(&self, compiled: &render_desc::Compiled, overlay: u32) -> Vec<tile_render::PlacedSprite> {
-        let Some(pointer) = self.snapper.pointer() else { return vec![] };
+        self.compose(compiled, overlay, overlay + 1, crate::cursor::Scale::default(), (0, 0)).sprites
+    }
+
+    /// The pointers at the cursor's size `scale`, as the viewer's cursor is
+    /// drawn (`crate::cursor::compose`: the same whole canvas pixels and hot
+    /// spot): 1:1 in camera `overlay`, else each in a camera of its own,
+    /// numbered from `next` on (cameras to add after the others on top),
+    /// as long as the renderer draws that many views. `window`: the
+    /// canvas.
+    pub fn compose(&self, compiled: &render_desc::Compiled, overlay: u32, next: u32, scale: crate::cursor::Scale, window: (u32, u32)) -> crate::cursor::Composed {
+        let mut out = crate::cursor::Composed::default();
+        let Some(pointer) = self.snapper.pointer() else { return out };
         let set = |names: &[&str]| names.iter().find_map(|n| compiled.set(n).map(|(s, _)| s));
-        let place = |set: Option<tile_render::SpriteSetId>, (x, y): Point| {
-            Some(tile_render::PlacedSprite { screen: true, view: Some(overlay), ..tile_render::PlacedSprite::new(set?, x.round() as i32, y.round() as i32) })
-        };
-        let solid = place(set(&[ARROW_SPRITE, POINTER_SPRITE, crate::CURSOR_SPRITE]), pointer);
         // (Under the pointer it would not be seen.)
-        let ghost = self.snapper.ghost().filter(|g| (g.0 - pointer.0).hypot(g.1 - pointer.1) >= 2.0).and_then(|g| place(set(&[ARROW_GHOST_SPRITE, GHOST_SPRITE]), g));
-        ghost.into_iter().chain(solid).collect()
+        let ghost = self.snapper.ghost().filter(|g| (g.0 - pointer.0).hypot(g.1 - pointer.1) >= 2.0).map(|g| (set(&[ARROW_GHOST_SPRITE, GHOST_SPRITE]), g));
+        let solid = Some((set(&[ARROW_SPRITE, POINTER_SPRITE, crate::CURSOR_SPRITE]), pointer));
+        for (set, (x, y)) in ghost.into_iter().chain(solid) {
+            let Some(art) = set.and_then(|set| crate::cursor::SetArt::of(compiled, set)) else { continue };
+            let marks = crate::cursor::Marks { window: vec![(x.round() as i32, y.round() as i32)], ..Default::default() };
+            let c = crate::cursor::compose(art, &marks, &[], &[], scale, window, overlay, (0, 0));
+            // Its own cameras after those taken already.
+            let first = next + out.top.len() as u32;
+            if !c.top.is_empty() && (first as usize + c.top.len()) > tile_render::MAX_VIEWS {
+                continue;
+            }
+            out.sprites.extend(c.sprites.into_iter().map(|mut s| {
+                if let Some(v) = s.view.filter(|&v| v != overlay) {
+                    s.view = Some(v - (overlay + 1) + first);
+                }
+                s
+            }));
+            out.top.extend(c.top);
+        }
+        out
     }
 }
 
@@ -1402,3 +1668,15 @@ mod sliders;
 #[cfg(test)]
 #[path = "snap/status_controls.rs"]
 mod status_controls;
+
+#[cfg(test)]
+#[path = "snap/targeting.rs"]
+mod targeting;
+
+#[cfg(test)]
+#[path = "snap/cursor_size.rs"]
+mod cursor_size;
+
+#[cfg(test)]
+#[path = "snap/city_work.rs"]
+mod city_work;

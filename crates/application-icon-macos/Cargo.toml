@@ -1,0 +1,16 @@
+[package]
+name = "application-icon-macos"
+description = "AppKit application icon backend"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData"] }
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+image.workspace = true
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSBitmapImageRep", "NSImageRep", "NSColor", "NSColorSpace", "objc2-core-foundation"] }
