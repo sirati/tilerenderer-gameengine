@@ -2260,6 +2260,50 @@ mod tests {
         }
     }
 
+    /// A full menu-sized modal screen over the title (the Hall of Fame:
+    /// the driver sends its 1024×768 board as the modal part) is shown as
+    /// large as the title under it, at 100 % from the canvas's top to its
+    /// bottom. A part as large as the driver's whole window would instead
+    /// be shrunk to fit: TS Neo's 3274×2048 into 1629×952, the board under
+    /// a third of the canvas wide.
+    #[test]
+    fn a_menu_sized_modal_screen_over_the_title_is_as_large_as_the_title() {
+        use scene::{View, ViewState};
+        let (screen, window, desktop) = ((3274u32, 2048u32), (3258u32, 1904u32), 2.0);
+        let menu = [(3274 - 1024) / 2, (2048 - 768) / 2, 1024, 768];
+        let rect_of = |s: &FreeSprite| Some(if s.set == 1 { [s.x, s.y, 1024, 768] } else { [s.x, s.y, 3274, 2048] });
+        let sprite = |set: u32, (x, y): (i32, i32)| FreeSprite { set, x, y, screen: true, ..Default::default() };
+        let scene = |part: [i32; 4]| Scene {
+            screen_size: screen,
+            interface: scene::Interface { popup: Some(257), ..Default::default() },
+            views: vec![
+                ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() }, overlay: vec![sprite(1, (menu[0], menu[1]))] },
+                ViewState { id: 257, view: View { interface_only: true, origin: (part[0], part[1]), viewport: (part[2] as u32, part[3] as u32), ..Default::default() },
+                    overlay: vec![sprite(2, (0, 0)), sprite(1, (menu[0], menu[1]))] },
+            ],
+            ..Default::default()
+        };
+        let settings = Resolution { pixel_scale: Resolution::AUTO, scale_menus: true, menu_scale_percent: 100.0, ..Default::default() };
+        let shown = |part: [i32; 4]| {
+            let scene = scene(part);
+            let p = plan(window, desktop, screen, &settings).for_scene(&scene, rect_of);
+            let mut layout = layout::Layout::default();
+            layout.driver_screen = Some(p.screen);
+            layout.menu_scale = p.menu.zoom;
+            let mut f = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+            let shown = arrange_panned(&p, &scene, &mut f, &mut layout.menu_pan, rect_of).shown.unwrap();
+            let of = |r: [i32; 4]| *shown.iter().find(|s| s.driver == r).expect("shown");
+            (p.canvas(), of(menu), of(part))
+        };
+        let (canvas, title, board) = shown(menu);
+        assert_eq!(canvas, (1629, 952));
+        assert_eq!((title.rect[1], title.rect[3]), (0, 952), "the title fills the height: {:?}", title.rect);
+        assert_eq!((board.piece.zoom, board.rect), (title.piece.zoom, title.rect), "as the title");
+        let (_, _, window_sized) = shown([0, 0, 3274, 2048]);
+        assert!(window_sized.rect[2] <= 1629 && board.rect[2] > 2 * scaled(1024, window_sized.piece.zoom) as i32,
+            "a window-sized part is shrunk: {:?} vs {:?}", window_sized.rect, board.rect);
+    }
+
     /// In a game (split views, the user's macOS setup: the game's 3274×2048
     /// screen in a 3274×2048 window at pixel scale ×3, menus scaled to
     /// 100 %): a modal popup over Preferences (C3X's info box at the top of
