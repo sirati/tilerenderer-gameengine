@@ -732,6 +732,12 @@ pub struct Layout {
     /// Whether zoomed views show text at their resolution (the driver's
     /// zoomed art) rather than its pixels scaled.
     pub sharp_text: bool,
+    /// Whether a canvas shown at a pixel scale is composed at the window's
+    /// resolution, for text from outlines at its size on the window
+    /// (`text=window`, `scaling::drawn`). Off, the default: it is composed
+    /// at the canvas's own size (`scaling::drawn_on_canvas`), which is
+    /// what makes a pixel scale render fewer pixels.
+    pub text_at_window: bool,
     window: (u32, u32),
     pointer: (i32, i32),
     /// The world cursor, and the motion not yet a whole world pixel.
@@ -846,6 +852,7 @@ impl Default for Layout {
             reported_views: [(0, 0, 0, 0); 4],
             reported_main: (0, 0, 0, 0),
             sharp_text: true,
+            text_at_window: false,
             ui_in_pane: false,
             fit: None,
             placed_screen: None,
@@ -1172,7 +1179,9 @@ impl Layout {
     /// share), `main` and `pane` (what they follow: driver, focus, pointer,
     /// free), `main_zoom` and `pane_zoom` (e.g. 2 or 1/2), `magnifier`
     /// (screen, world, off), `magnifier_zoom`, `arrow` (on, off), `text`
-    /// (sharp: zoomed views show text at their resolution; pixel), `ui`
+    /// (sharp: zoomed views show text at their resolution; window: also a
+    /// canvas at a pixel scale composed at the window's resolution, every
+    /// window pixel rendered; pixel), `ui`
     /// (window; pane: with a split, the driver's whole screen in the main pane).
     pub fn configure(&mut self, spec: &str) -> Result<(), String> {
         for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -1215,9 +1224,10 @@ impl Layout {
                     }
                 }
                 "text" => {
-                    self.sharp_text = match value {
-                        "sharp" => true,
-                        "pixel" => false,
+                    (self.sharp_text, self.text_at_window) = match value {
+                        "sharp" => (true, false),
+                        "window" => (true, true),
+                        "pixel" => (false, false),
                         _ => return Err(bad()),
                     }
                 }

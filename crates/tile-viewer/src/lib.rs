@@ -3632,8 +3632,10 @@ impl App {
         self.next_frame_id += 1;
         let mut drawn = if self.settings_preview.active() {
             scaling::drawn_physical(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
-        } else {
+        } else if self.layout.text_at_window {
             scaling::drawn(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
+        } else {
+            scaling::drawn_on_canvas(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
         };
         if let Some(seconds) = self.settings_preview.seconds(Instant::now()) {
             if drawn.cameras.len() < tile_render::MAX_VIEWS {

@@ -20,10 +20,13 @@
 //! part scales are nearest-pixel zooms like the viewer's own (crisp, never
 //! filtered).
 //!
-//! Text is never scaled as pixels where it can be drawn from outlines
-//! ([`drawn`]): the canvas is then composed at the window's resolution
-//! (the boxes drawn as such), and the driver's text is drawn at the size
-//! it shows at on the window, in every view at its own scale.
+//! The canvas is rendered at its own size and enlarged once onto the
+//! window ([`drawn_on_canvas`]): a pixel scale `n` renders `n²` times fewer
+//! pixels. Text from outlines is drawn at the canvas's resolution. Only on
+//! request (`text=window`, [`drawn`]) is the canvas composed at the
+//! window's resolution instead (the boxes drawn as such, every window
+//! pixel rendered), the driver's text drawn at the size it shows at on
+//! the window, in every view at its own scale.
 
 use scene::{FreeSprite, Scene};
 use tile_render::{Camera, Present};
@@ -892,6 +895,17 @@ pub struct Drawn {
 pub fn drawn(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: Present, outlines: impl Fn(Ratio) -> bool) -> Drawn {
     let k = present.pixel_box().filter(|&k| outlines((k, 1))).unwrap_or(1);
     drawn_boxed(cameras, copies, present, outlines, k)
+}
+
+/// The cameras, screen copies and presentation that draw the layout's
+/// `cameras` into the canvas at its own size, shown on the window in whole
+/// boxes as `present` says: at pixel scale `n` the GPU renders the
+/// window's pixels divided by `n²`, enlarged by one nearest-pixel copy
+/// (`TileRenderer::render_layered`). Views zoomed in the canvas still show
+/// text from outlines at their zoom, at the canvas's resolution. The
+/// default; [`drawn`] (`text=window`) composes at the window's resolution.
+pub fn drawn_on_canvas(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: Present, outlines: impl Fn(Ratio) -> bool) -> Drawn {
+    drawn_boxed(cameras, copies, present, outlines, 1)
 }
 
 /// Compose a viewer-owned physical overlay without scaling its commands.
