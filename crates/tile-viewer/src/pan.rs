@@ -36,6 +36,20 @@
 //! Insets, A and B alike; a view following
 //! the world cursor moves the world cursor (it keeps it in its middle).
 //!
+//! # Continuous positions
+//!
+//! Panning keeps each view's centre as a continuous world position
+//! ([`Exact`]) and draws the view at its nearest whole pixel. A drag, a
+//! slide, edge scrolling and the wheel all go on from that continuous
+//! position while the view is still where panning drew it, never from the
+//! pixel the last frame showed, so rounding cannot build up or feed back
+//! over chained pans. A view moved by something else (a game camera
+//! request, a glide, a popup) is taken over once from where that put it
+//! (a glide's own continuous position). Nothing goes back to the game.
+//! While a gesture moves a view, what the view follows (the active unit,
+//! a standing game request, the driver's camera) leaves it alone
+//! ([`Layout::pan_holds`]); otherwise the two would pull it in turn.
+//!
 //! Panning A while it follows the driver preserves its exact pixel centre.
 //! It follows again when the driver requests a new semantic camera focus,
 //! or moves its native camera if it supplies no semantic metadata. Panning
@@ -204,6 +218,17 @@ struct Coast {
     scale: f64,
 }
 
+/// Where panning last put a view: its continuous centre (world pixels,
+/// not rounded), and the whole pixel the view was drawn at for it. The
+/// next pan of that view goes on from `exact` while the view is still at
+/// `drawn`; once something else moved it, from where that put it.
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct Exact {
+    hit: Hit,
+    exact: (f64, f64),
+    drawn: (i32, i32),
+}
+
 /// The state of map movement (a part of [`Layout`]).
 #[derive(Clone, Debug, Default)]
 pub struct Pan {
@@ -216,9 +241,10 @@ pub struct Pan {
     /// The native camera where a manual A pan began. A keeps its exact
     /// centre until the game itself next moves that camera.
     manual_driver: Option<(i32, i32)>,
-    /// The view scrolled at the edge, and the motion not yet a world pixel.
+    /// The view scrolled at the edge (and which way).
     edge_view: Option<(Hit, (i32, i32))>,
-    edge_rest: (f64, f64),
+    /// The continuous centres of the views panning placed last.
+    exact: Vec<Exact>,
     /// Replaying a held-back press as a click.
     replaying: bool,
 }
@@ -261,12 +287,12 @@ impl Layout {
         self.main.map(|m| (m.x + m.viewport.0 as i32 / 2, m.y + m.viewport.1 as i32 / 2))
     }
 
-    /// The world pixel at the middle of the view `hit` shows (last frame),
-    /// and its world pixels per window pixel.
-    fn shown_center(&self, hit: Hit) -> Option<((f64, f64), f64)> {
+    /// The world pixels per window pixel of the view `hit` (as the last
+    /// frame showed it). Where it is comes from [`Layout::exact_center`],
+    /// never from the snapped camera.
+    fn shown_scale(&self, hit: Hit) -> Option<f64> {
         let (_, c) = self.shown.iter().find(|(h, _)| *h == hit)?;
-        let (w, h) = c.world_size();
-        Some((((c.x + w as i32 / 2) as f64, (c.y + h as i32 / 2) as f64), c.zoom.1 as f64 / c.zoom.0.max(1) as f64))
+        Some(c.zoom.1 as f64 / c.zoom.0.max(1) as f64)
     }
 
     /// Centre `c` of view `hit` kept off the edges of a world that does not
@@ -295,7 +321,12 @@ impl Layout {
             self.pan.manual_driver = self.driver_center();
         }
         match self.follow_of(hit) {
-            Some(Follow::Pointer) => self.cursor = self.bounds.map_or(c, |b| b.clamp_point(c)),
+            Some(Follow::Pointer) => {
+                self.cursor = self.bounds.map_or(c, |b| b.clamp_point(c));
+                // (Placed by hand: no longer put where the driver's view
+                // settles, as a free view moved by hand is not.)
+                self.cursor_placed = true;
+            }
             Some(_) => {
                 let focus = self.focus;
                 if let Some(v) = self.free_view(hit) {
@@ -305,6 +336,65 @@ impl Layout {
             }
             None => {}
         }
+    }
+
+    /// The whole world pixel view `hit` is centred on now (a view following
+    /// the world cursor: the cursor).
+    fn view_point(&self, hit: Hit) -> Option<(i32, i32)> {
+        match self.follow_of(hit)? {
+            Follow::Pointer => Some(self.cursor),
+            _ => match hit {
+                Hit::Main => Some(self.main_view.center),
+                Hit::Pane => self.split.map(|s| s.view.center),
+                Hit::Inset(k) => self.insets.get(k).map(|i| i.view.center),
+                _ => None,
+            },
+        }
+    }
+
+    /// The continuous centre a pan of view `hit` starts from. While the view
+    /// is still where panning drew it, that pan's own exact centre: never
+    /// re-derived from the rounded pixel, so rounding cannot build up over
+    /// pans. Moved since by something else (a game focus request, a popup,
+    /// following the driver), it is taken over once from there: from a
+    /// glide's own continuous position if it is that glide's pixel, else
+    /// from the whole pixel. Nothing flows back from here to the game.
+    fn exact_center(&self, hit: Hit) -> Option<(f64, f64)> {
+        let now = self.view_point(hit)?;
+        if let Some(e) = self.pan.exact.iter().find(|e| e.hit == hit && e.drawn == now) {
+            return Some(e.exact);
+        }
+        let glide = match (self.follow_of(hit)?, hit) {
+            (Follow::Pointer, _) => None,
+            (_, Hit::Main) => Some(self.main_view.glide),
+            (_, Hit::Pane) => self.split.map(|s| s.view.glide),
+            (_, Hit::Inset(k)) => self.insets.get(k).map(|i| i.view.glide),
+            _ => None,
+        };
+        Some(match glide {
+            Some(g) if g.placed && (g.pos.0.round() as i32, g.pos.1.round() as i32) == now => g.pos,
+            _ => (now.0 as f64, now.1 as f64),
+        })
+    }
+
+    /// Puts the middle of view `hit` at continuous world position `c` (by
+    /// hand): drawn at its nearest whole pixel, `c` itself kept for the
+    /// next pan ([`Layout::exact_center`]).
+    fn place_exact(&mut self, hit: Hit, c: (f64, f64)) {
+        self.place_view(hit, (c.0.round() as i32, c.1.round() as i32));
+        self.pan.exact.retain(|e| e.hit != hit);
+        if let Some(drawn) = self.view_point(hit) {
+            self.pan.exact.push(Exact { hit, exact: c, drawn });
+        }
+    }
+
+    /// Whether a pan gesture moves view `hit` now (grabbed, sliding or
+    /// scrolled at the edge): what the view follows leaves it alone
+    /// meanwhile (`Layout::frame`), so the two cannot pull it in turn.
+    pub(super) fn pan_holds(&self, hit: Hit) -> bool {
+        self.pan.grab.is_some_and(|g| g.hit == hit)
+            || self.pan.coast.is_some_and(|c| c.hit == hit)
+            || self.pan.edge_view.is_some_and(|(h, _)| h == hit)
     }
 
     /// The view of the world the pointer at `p` is in (beneath the
@@ -371,13 +461,13 @@ impl Layout {
             self.pan_view_at(p)?
         };
         if self.fit.is_some_and(|fit| fit.hit == hit) { return None; }
-        let (center, _) = self.shown_center(hit)?;
+        let (center, _) = self.clamp_view_center(hit, self.exact_center(hit)?);
         let notches = -(delta / 120) as f64;
         if notches == 0.0 { return Some(vec![]); }
         let step = if self.shift { (self.map_wheel_step.0 as f64, 0.0) } else { (0.0, self.map_wheel_step.1 as f64) };
         let (to, _) = self.clamp_view_center(hit, (center.0 + notches * step.0, center.1 + notches * step.1));
         self.pan.coast = None;
-        self.place_view(hit, (to.0.round() as i32, to.1.round() as i32));
+        self.place_exact(hit, to);
         let old_point = if self.locked { Some(self.cursor) } else { self.world_under(p) };
         let out = old_point.map(|old| {
             let point = if self.locked { self.cursor } else { (old.0 + (to.0 - center.0).round() as i32, old.1 + (to.1 - center.1).round() as i32) };
@@ -477,13 +567,16 @@ impl Layout {
             g.start = (g.start.0 + at.0 - desired.0, g.start.1 + at.1 - desired.1);
             g.at = at;
         }
-        self.place_view(g.hit, (at.0.round() as i32, at.1.round() as i32));
+        self.place_exact(g.hit, at);
         Some(self.edge_change((0, 0)))
     }
 
-    /// Grabs view `hit` at window pixel `from`.
+    /// Grabs view `hit` at window pixel `from`: from its continuous centre
+    /// (as the world's edge holds it), not the pixel the last frame showed.
     fn grab(&mut self, hit: Hit, button: Button, from: (i32, i32)) {
-        let Some((center, scale)) = self.shown_center(hit) else { return };
+        let Some(scale) = self.shown_scale(hit) else { return };
+        let Some(center) = self.exact_center(hit) else { return };
+        let (center, _) = self.clamp_view_center(hit, center);
         self.pan.coast = None;
         self.pan.edge_view = None;
         self.pan.grab = Some(Grab { hit, button, from, start: center, at: center, scale, tracker: Tracker::new(from) });
@@ -539,7 +632,7 @@ impl Layout {
             c.momentum.vel.1 = 0.0;
         }
         c.pos = pos;
-        self.place_view(c.hit, (pos.0.round() as i32, pos.1.round() as i32));
+        self.place_exact(c.hit, pos);
         self.pan.coast = c.momentum.moving().then_some(c);
     }
 
@@ -566,13 +659,28 @@ impl Layout {
         self.pan.coast = self.pan.coast.filter(|c| c.hit != Hit::Main);
         self.pan.grab = self.pan.grab.filter(|g| g.hit != Hit::Main);
         self.pan.press = self.pan.press.filter(|p| p.hit != Hit::Main);
+        // (The next pan starts from where the request puts A.)
+        self.pan.exact.retain(|e| e.hit != Hit::Main);
     }
 
     pub(super) fn pan_rescale_world(&mut self, ratio: f64) {
         let point = |p: (i32, i32)| ((p.0 as f64 * ratio).round() as i32, (p.1 as f64 * ratio).round() as i32);
         let scaled = |p: (f64, f64)| (p.0 * ratio, p.1 * ratio);
         self.pan.manual_driver = self.pan.manual_driver.map(point);
-        self.pan.edge_rest = scaled(self.pan.edge_rest);
+        // The continuous centres scale exactly; the views were moved to
+        // their rescaled pixels already (`rescale_world`).
+        let mut exact = std::mem::take(&mut self.pan.exact);
+        // (Only where the view still was where panning drew it: its old
+        // pixel and the fraction it carried, `scale_rest`, map there.)
+        let near = |old: i32, now: i32| (old as f64 * ratio - now as f64).abs() < ratio + 1.0;
+        exact.retain_mut(|e| {
+            e.exact = scaled(e.exact);
+            match self.view_point(e.hit) {
+                Some(drawn) if near(e.drawn.0, drawn.0) && near(e.drawn.1, drawn.1) => { e.drawn = drawn; true }
+                _ => false,
+            }
+        });
+        self.pan.exact = exact;
         if let Some(g) = &mut self.pan.grab {
             g.at = scaled(g.at);
             g.start = g.at;
@@ -604,22 +712,16 @@ impl Layout {
                 None => {}
             }
             self.pan.edge_view = target.map(sign);
-            self.pan.edge_rest = (0.0, 0.0);
         }
         let Some((hit, e)) = target else { return };
         if dt <= 0.0 {
             return;
         }
-        let Some((center, scale)) = self.shown_center(hit) else { return };
-        let rest = self.pan.edge_rest;
-        let total = (rest.0 + edge_speed(e.0) * dt * scale, rest.1 + edge_speed(e.1) * dt * scale);
-        let whole = (total.0.trunc(), total.1.trunc());
-        self.pan.edge_rest = (total.0 - whole.0, total.1 - whole.1);
-        if whole == (0.0, 0.0) {
-            return;
-        }
-        let (to, _) = self.clamp_view_center(hit, (center.0 + whole.0, center.1 + whole.1));
-        self.place_view(hit, (to.0.round() as i32, to.1.round() as i32));
+        let (Some(scale), Some(center)) = (self.shown_scale(hit), self.exact_center(hit)) else { return };
+        let (center, _) = self.clamp_view_center(hit, center);
+        let by = (edge_speed(e.0) * dt * scale, edge_speed(e.1) * dt * scale);
+        let (to, _) = self.clamp_view_center(hit, (center.0 + by.0, center.1 + by.1));
+        self.place_exact(hit, to);
     }
 }
 
@@ -861,7 +963,10 @@ mod tests {
         let start = l.main_view.center;
         assert!(edges(&mv(&mut l, (790, 595))).is_empty());
         tick(&mut l, 100);
-        assert_eq!(l.main_view.center, (start.0 + 16, start.1 + 24));
+        // (The continuous position, drawn at its nearest pixel.)
+        let world = |e: i32| (edge_speed(e) * 0.1 * l.shown_scale(Hit::Main).unwrap()).round() as i32;
+        assert_eq!((world(10), world(5)), (17, 24));
+        assert_eq!(l.main_view.center, (start.0 + world(10), start.1 + world(5)));
         assert_eq!(l.main_view.follow, Follow::Driver);
     }
 
@@ -1289,5 +1394,277 @@ mod tests {
         assert!(mv(&mut l, (700, 300)).is_empty());
         left(&mut l, false, (700, 300));
         assert!(l.captured());
+    }
+
+    // ---- The continuous pan position --------------------------------------
+
+    /// A frame of `scene`, `ms` milliseconds on.
+    fn step(l: &mut Layout, scene: &Scene, ms: u64, bounds: Option<WorldBounds>) {
+        l.advance(Duration::from_millis(ms));
+        l.frame(scene, (800, 600), (0, 0, 0, 0), vec![], bounds);
+    }
+
+    /// Where view `hit` is centred (one following the world cursor: on the
+    /// cursor, which it shows from the next frame on).
+    fn center_of(l: &Layout, hit: Hit) -> (i32, i32) {
+        l.view_point(hit).unwrap()
+    }
+
+    /// `d` the short way round a world `period` pixels around.
+    fn wrapped(d: i32, period: i32) -> i32 {
+        (d + period / 2).rem_euclid(period) - period / 2
+    }
+
+    /// Where positions `xs` along a world 8000 pixels around first turn
+    /// back (standing still is no turn).
+    fn turn(xs: &[i32]) -> Option<usize> {
+        let mut way = 0;
+        for (i, w) in xs.windows(2).enumerate() {
+            let d = wrapped(w[1] - w[0], 8000).signum();
+            if d != 0 && way != 0 && d != way {
+                return Some(i);
+            }
+            if d != 0 {
+                way = d;
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn middle_drags_and_slides_never_turn_back_while_what_the_view_follows_moves() {
+        // The unit A follows in UnitMouse roles walks every frame, a game
+        // camera request (and a combat arrival) stands, the views glide:
+        // none of it may pull the dragged or sliding view back between the
+        // pointer's motions or the slide's steps. At every zoom and pixel
+        // scale, short and long, across the wrapping seam at x = 8000.
+        let one = super::super::ONE;
+        for roles in [Roles::Free, Roles::UnitMouse] {
+            for smooth in [false, true] {
+                for zoom in [one - 1, one, one + 2] {
+                    for scale in [(1, 1), (3, 2), (2, 1), (1, 2)] {
+                        for hit in [Hit::Main, Hit::Pane] {
+                            for game in [None, Some(false), Some(true)] {
+                                for (pixels, ms) in [(3, 16), (40, 8)] {
+                                    for dir in [1, -1] {
+                                        let case = format!("{roles:?} smooth={smooth} zoom={zoom} scale={scale:?} {hit:?} game={game:?} {pixels}px/{ms}ms dir={dir}");
+                                        let mut l = Layout::default();
+                                        l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles, smooth_world_movement: smooth, ..Default::default() });
+                                        l.world_scale = scale;
+                                        l.main_view.zoom = zoom;
+                                        l.split.as_mut().unwrap().view.zoom = zoom;
+                                        let mut scene = scene_at(1000);
+                                        scene.focus = Some((7950, 2000));
+                                        if let Some(combat) = game {
+                                            scene.camera_focus = Some(scene::CameraFocus { serial: 1, center: (7950, 2000) });
+                                            if combat {
+                                                scene.camera_arrival = Some(scene::CameraArrival { serial: 1, bounds: [7900, 1950, 8000, 2050] });
+                                            }
+                                        }
+                                        for _ in 0..3 {
+                                            step(&mut l, &scene, 16, BOUNDS);
+                                        }
+                                        if hit == Hit::Pane {
+                                            let v = &mut l.split.as_mut().unwrap().view;
+                                            (v.center, v.settling) = ((7950, 2000), false);
+                                            (l.cursor, l.cursor_placed) = ((7950, 2000), true);
+                                            step(&mut l, &scene, 16, BOUNDS);
+                                        }
+                                        let x0 = if hit == Hit::Main { 200 } else { 600 };
+                                        mv(&mut l, (x0, 300));
+                                        button(&mut l, Button::Middle, true, (x0, 300));
+                                        let mut xs = vec![center_of(&l, hit).0];
+                                        let mut ys = vec![center_of(&l, hit).1];
+                                        let mut walk = |scene: &mut Scene, k: i32| scene.focus = Some((7950 + 5 * k, 2000 + k));
+                                        for k in 1..=10 {
+                                            mv(&mut l, (x0 - dir * pixels * k, 300 - k));
+                                            let moved = center_of(&l, hit);
+                                            walk(&mut scene, k);
+                                            step(&mut l, &scene, ms, BOUNDS);
+                                            // Nothing moved it between the pointer's motions.
+                                            assert_eq!(center_of(&l, hit), moved, "{case}: pulled during the drag");
+                                            xs.push(moved.0);
+                                            ys.push(moved.1);
+                                        }
+                                        button(&mut l, Button::Middle, false, (x0 - dir * pixels * 10, 290));
+                                        assert!(l.pan.coast.is_some(), "{case}");
+                                        let mut frames = 0;
+                                        while l.pan.coast.is_some() {
+                                            walk(&mut scene, 11 + frames);
+                                            step(&mut l, &scene, 16, BOUNDS);
+                                            xs.push(center_of(&l, hit).0);
+                                            ys.push(center_of(&l, hit).1);
+                                            frames += 1;
+                                            assert!(frames < 600, "{case}: never settles");
+                                        }
+                                        assert_eq!(turn(&xs), None, "{case}: {xs:?}");
+                                        assert_eq!(turn(&ys), None, "{case}: {ys:?}");
+                                        // (A fast fling may go more than half round.)
+                                        let gone: i32 = xs.windows(2).map(|w| wrapped(w[1] - w[0], 8000)).sum::<i32>() * dir;
+                                        assert!(gone > 0, "{case}: {gone}");
+                                        // Let go and settled, it stays (a combat arrival
+                                        // is the game's to show again, in Focus mode).
+                                        let refocus = game == Some(true) && hit == Hit::Main && roles == Roles::UnitMouse;
+                                        if !refocus {
+                                            let at = center_of(&l, hit);
+                                            for _ in 0..60 {
+                                                step(&mut l, &scene, 16, BOUNDS);
+                                                assert_eq!(center_of(&l, hit), at, "{case}: moved after settling");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_pans_chain_on_the_continuous_position_without_drift() {
+        // At a 3:2 pixel scale a window pixel is 2/3 of a world pixel. A pan
+        // starting from the pixel the last one was drawn at rounds each 2/3
+        // up to 1 (30 pans: 30 pixels, not 20). Across the seam, too.
+        for scale in [(3, 2), (1, 2), (2, 1), (3, 1)] {
+            for hit in [Hit::Main, Hit::Pane] {
+                let mut l = split(MapMovement::EdgeScroll, Roles::Free);
+                l.world_scale = scale;
+                frame(&mut l);
+                let v = &mut l.split.as_mut().unwrap().view;
+                (v.center, v.settling) = ((7995, 2000), false);
+                frame(&mut l);
+                let per_pixel = l.shown_scale(hit).unwrap();
+                let start = center_of(&l, hit);
+                let x0 = if hit == Hit::Main { 200 } else { 600 };
+                for n in 1..=30 {
+                    mv(&mut l, (x0, 300));
+                    button(&mut l, Button::Middle, true, (x0, 300));
+                    mv(&mut l, (x0 - 1, 300));
+                    // (Held still: no slide.)
+                    for _ in 0..6 {
+                        tick(&mut l, 16);
+                    }
+                    button(&mut l, Button::Middle, false, (x0 - 1, 300));
+                    assert!(l.pan.coast.is_none());
+                    tick(&mut l, 16);
+                    let want = (n as f64 * per_pixel).round() as i32;
+                    assert_eq!(wrapped(center_of(&l, hit).0 - start.0, 8000), want, "{scale:?} {hit:?} pan {n}");
+                }
+                // Short bursts of edge scrolling chain on the same position.
+                let at = center_of(&l, hit);
+                let exact = l.exact_center(hit).unwrap();
+                let edge = if hit == Hit::Main { (200, 599) } else { (600, 599) };
+                for n in 1..=20 {
+                    mv(&mut l, edge);
+                    tick(&mut l, 16);
+                    mv(&mut l, (x0, 300));
+                    tick(&mut l, 16);
+                    let want = exact.1 + n as f64 * EDGE_PAN_SPEED * 0.016 * per_pixel;
+                    assert!((l.exact_center(hit).unwrap().1 - want).abs() < 1e-6, "{scale:?} {hit:?} burst {n}");
+                    assert_eq!(center_of(&l, hit), (at.0, want.round() as i32), "{scale:?} {hit:?} burst {n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_game_camera_glide_hands_over_to_a_pan_once_and_nothing_echoes_back() {
+        let mut l = Layout::default();
+        l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles: Roles::Free, smooth_world_movement: true, ..Default::default() });
+        let mut scene = scene_at(0);
+        scene.views[0].view.camera_y = 0;
+        scene.camera_focus = Some(scene::CameraFocus { serial: 1, center: (3000, 2000) });
+        for _ in 0..3 {
+            step(&mut l, &scene, 16, BOUNDS);
+        }
+        assert_eq!(l.main_view.center, (3000, 2000));
+        let parked = l.main;
+        // The game centres on a unit: A glides there.
+        scene.camera_focus = Some(scene::CameraFocus { serial: 2, center: (5000, 2000) });
+        for _ in 0..4 {
+            step(&mut l, &scene, 16, BOUNDS);
+        }
+        let mid = l.main_view.center;
+        let glide = l.main_view.glide.pos;
+        assert!(mid.0 > 3000 && mid.0 < 5000, "{mid:?}");
+        // Grabbed mid-glide: the pan takes the glide's own continuous
+        // position over, once.
+        mv(&mut l, (200, 300));
+        let mut out = button(&mut l, Button::Middle, true, (200, 300));
+        assert_eq!(l.pan.grab.map(|g| g.start), Some(glide));
+        out.extend(mv(&mut l, (199, 300)));
+        assert_eq!(l.main_view.center, ((glide.0 + 1.0).round() as i32, 2000));
+        let held = l.main_view.center;
+        for _ in 0..30 {
+            step(&mut l, &scene, 16, BOUNDS);
+            assert_eq!(l.main_view.center, held, "the old glide resumed under the hand");
+        }
+        out.extend(button(&mut l, Button::Middle, false, (199, 300)));
+        // Neither the standing request nor the parked native camera pull A
+        // back, and nothing went to the game to move its camera.
+        for _ in 0..60 {
+            step(&mut l, &scene, 16, BOUNDS);
+            assert_eq!(l.main_view.center, held);
+        }
+        assert_eq!(l.main, parked);
+        assert!(out.iter().all(|i| matches!(i, Input::Edge { .. } | Input::MouseMove { .. })), "{out:?}");
+        // What the game sees under the pointer is what A shows there.
+        let shown = l.shown.iter().find(|(h, _)| *h == Hit::Main).unwrap().1;
+        assert_eq!(l.world_under((200, 300)), Some((shown.x + 200, shown.y + 300)));
+        // A new request takes A over, one way; the next pan starts from it.
+        scene.camera_focus = Some(scene::CameraFocus { serial: 3, center: (6000, 2000) });
+        for _ in 0..120 {
+            step(&mut l, &scene, 16, BOUNDS);
+        }
+        assert_eq!(l.main_view.center, (6000, 2000));
+        assert!(l.pan.exact.iter().all(|e| e.hit != Hit::Main));
+        button(&mut l, Button::Middle, true, (200, 300));
+        mv(&mut l, (199, 300));
+        assert_eq!(l.main_view.center, (6001, 2000));
+        button(&mut l, Button::Middle, false, (199, 300));
+    }
+
+    #[test]
+    fn switching_movement_mode_or_game_zoom_mid_slide_keeps_the_slide_continuous() {
+        for change in ["mode", "zoom"] {
+            let mut l = split(MapMovement::Drag, Roles::Free);
+            let mut scene = scene_at(1000);
+            button(&mut l, Button::Middle, true, (600, 300));
+            for k in 1..=10 {
+                mv(&mut l, (600 - 20 * k, 300));
+                step(&mut l, &scene, 16, BOUNDS);
+            }
+            button(&mut l, Button::Middle, false, (400, 300));
+            for _ in 0..5 {
+                step(&mut l, &scene, 16, BOUNDS);
+            }
+            let before = l.pan.coast.unwrap().pos;
+            let mut bounds = BOUNDS;
+            let ratio = match change {
+                "mode" => {
+                    l.set_map_movement(MapMovement::EdgeScroll);
+                    1.0
+                }
+                _ => {
+                    // Z: the game's world drawn at half size.
+                    scene.views[0].view.downscale = 2;
+                    bounds = Some(WorldBounds { size: (4000, 2000), wrap: (true, false) });
+                    0.5
+                }
+            };
+            let mut xs = vec![(before.0 * ratio).round() as i32];
+            step(&mut l, &scene, 0, bounds);
+            assert_eq!(l.pan.coast.map(|c| c.pos), Some((before.0 * ratio, before.1 * ratio)), "{change}");
+            assert_eq!(l.exact_center(Hit::Pane), Some((before.0 * ratio, before.1 * ratio)), "{change}");
+            while l.pan.coast.is_some() {
+                step(&mut l, &scene, 16, bounds);
+                xs.push(b(&l).0);
+                assert!(xs.len() < 600);
+            }
+            assert_eq!(turn(&xs), None, "{change}: {xs:?}");
+            assert!(xs[xs.len() - 1] > xs[0], "{change}");
+        }
     }
 }

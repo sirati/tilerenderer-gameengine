@@ -2372,7 +2372,25 @@ impl Layout {
         let focus_scale = self.world_scale;
         let tile_half = (self.grid_step.0.div_ceil(downscale) as i32, self.grid_step.1.div_ceil(downscale) as i32);
         let focus_rects: Vec<_> = if capture_focus { std::iter::once(main_rect).chain(pane_rect.filter(|_| self.split.is_some())).chain(self.insets.iter().map(|i| i.rect)).collect() } else { Vec::new() };
+        // A view a pan gesture moves (grabbed, sliding, edge scrolled) is
+        // that gesture's alone until it ends: what it follows must not pull
+        // it back between the gesture's steps (`pan`). What the focus did
+        // meanwhile is the user's to override.
+        let held: Vec<bool> = std::iter::once(Hit::Main)
+            .chain(self.split.map(|_| Hit::Pane))
+            .chain((0..self.insets.len()).map(Hit::Inset))
+            .map(|hit| self.pan_holds(hit))
+            .collect();
         for (k, v) in self.views_mut().enumerate() {
+            // (A view following the world cursor is moved through the
+            // cursor, below.)
+            if held[k] && v.center != UNPLACED && v.follow != Follow::Pointer {
+                if v.follow == Follow::Focus {
+                    v.hand_focus = focus.or(Some(UNPLACED));
+                }
+                v.glide.snap(v.center);
+                continue;
+            }
             let target = match v.follow {
                 Follow::Driver if k == 0 && main_panned_by_hand => None,
                 Follow::Driver if k == 0 => main_driver,
