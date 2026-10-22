@@ -68,7 +68,7 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 29] = [
+pub const KEYS: [&str; 30] = [
     "resolution.pixel_scale",
     "resolution.scale_menus",
     "resolution.menu_scale_percent",

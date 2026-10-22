@@ -966,7 +966,7 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
             }
             Input::DismissPopup => w.u8(17),
             Input::CloseDetached { serial } => {
-                w.u8(21);
+                w.u8(22);
                 w.u32(serial as u32);
                 w.u32((serial >> 32) as u32);
             }
@@ -1093,7 +1093,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
                 id: r.u32()? as u64 | (r.u32()? as u64) << 32, keep: r.bool()?,
             },
             17 => Input::DismissPopup,
-            21 => Input::CloseDetached { serial: r.u32()? as u64 | (r.u32()? as u64) << 32 },
+            22 => Input::CloseDetached { serial: r.u32()? as u64 | (r.u32()? as u64) << 32 },
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
             14 => Input::WorldMove { x: r.i32()?, y: r.i32()? },
             15 => {

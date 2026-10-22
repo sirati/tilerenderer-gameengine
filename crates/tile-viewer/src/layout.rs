@@ -1407,10 +1407,9 @@ impl Layout {
             }
         }
         if let Some(r) = self.orders_shown() {
-            let (lo, hi, a0, a1) = spans([r[0] - GAP, r[1] - GAP, r[2] + 2 * GAP, r[3] + 2 * GAP]);
-            if (lo < g1 && hi > g0) || self.unit_buttons == UnitButtons::ActiveView {
-                open.push((a0, a1));
-            }
+            // (All along their rows, a little around them: `open_spans`.)
+            let (_, _, a0, a1) = spans([r[0] - GAP, r[1] - GAP, r[2] + 2 * GAP, r[3] + 2 * GAP]);
+            open.push((a0, a1));
         }
         let mut walls = Vec::new();
         for (r, _) in self.divider_pieces() {
@@ -1887,21 +1886,21 @@ impl Layout {
     /// from one view to the other: its middle third while the mouse is not
     /// captured, and where the driver's always reachable controls are.
     pub(crate) fn open_spans(&self) -> Vec<(i32, i32)> {
-        let Some((across, (s0, s1))) = self.gap() else { return vec![] };
+        let Some((_, (s0, s1))) = self.gap() else { return vec![] };
         let mut spans = Vec::new();
         if !self.locked {
             let third = (s1 - s0) / 3;
             spans.push((s0 + third, s1 - third));
         }
         if let (Some([x, y, w, h]), Some(split)) = (self.orders_shown(), self.split) {
-            // Where they are drawn: only where they reach over the gap
-            // (split there, the gap between their halves); in the active
-            // view, alongside them, to cross to the other view there.
-            let (lo, hi, a0, a1) = match split.axis {
-                Axis::Vertical => (x, x + w, y, y + h),
-                Axis::Horizontal => (y, y + h, x, x + w),
+            // Where they are drawn, along all of their rows (columns),
+            // whether they reach over the gap or not: the pointer crosses
+            // from one view to the other anywhere there.
+            let (a0, a1) = match split.axis {
+                Axis::Vertical => (y, y + h),
+                Axis::Horizontal => (x, x + w),
             };
-            if ((lo < across.1 && hi > across.0) || self.unit_buttons == UnitButtons::ActiveView) && a1 > a0 {
+            if a1 > a0 {
                 spans.push((a0.max(s0), a1.min(s1)));
             }
         }
