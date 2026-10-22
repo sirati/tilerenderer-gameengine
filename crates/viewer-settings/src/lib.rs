@@ -451,11 +451,15 @@ pub struct Input {
     pub map_movement: MapMovement,
     /// Animate list scrolling in menus independently of map movement.
     pub smooth_menu_scrolling: bool,
+    /// Button snapping (the Alt mode) comes on by itself while a menu is
+    /// open (a screen, popup, dialog or context menu) and goes off when the
+    /// last one closes. In the world Alt still turns it on.
+    pub alt_in_menus: bool,
 }
 
 impl Default for Input {
     fn default() -> Self {
-        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 3.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false }
+        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 3.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false, alt_in_menus: true }
     }
 }
 
@@ -681,6 +685,11 @@ mod tests {
         let smooth: Settings = toml::from_str("[input]\nsmooth_menu_scrolling = true\n").unwrap();
         assert!(smooth.input.smooth_menu_scrolling);
         assert_eq!(toml::from_str::<Settings>(&toml::to_string(&smooth).unwrap()).unwrap(), smooth);
+        // Alt mode in menus: on by default, older files too; off stays off.
+        assert!(Settings::default().input.alt_in_menus && old.input.alt_in_menus);
+        let off: Settings = toml::from_str("[input]\nalt_in_menus = false\n").unwrap();
+        assert!(!off.input.alt_in_menus);
+        assert_eq!(toml::from_str::<Settings>(&toml::to_string(&off).unwrap()).unwrap(), off);
         let drag: Settings = toml::from_str("[input]\nmap_movement = \"Drag\"\n").unwrap();
         assert_eq!(drag.input.map_movement, MapMovement::Drag);
         assert_eq!(drag.input.snap_ghost_fps, Input::default().snap_ghost_fps);

@@ -92,6 +92,7 @@ pub const KEYS: [&str; 29] = [
     "animation.combat_speed",
     "input.map_movement",
     "input.smooth_menu_scrolling",
+    "input.alt_in_menus",
     "display.show_fps",
     "display.fps_detailed",
     "display.vsync",
@@ -234,6 +235,7 @@ impl Settings {
             "animation.combat_speed" => Some(ControlValue::Number(self.animation.effective_combat_speed())),
             "input.map_movement" => choice(i.map_movement),
             "input.smooth_menu_scrolling" => Some(ControlValue::On(i.smooth_menu_scrolling)),
+            "input.alt_in_menus" => Some(ControlValue::On(i.alt_in_menus)),
             "display.vsync" => Some(ControlValue::On(self.display.present == crate::Present::Vsync)),
             "display.limit_fps" => Some(ControlValue::On(self.display.max_fps > 0)),
             "display.fps_limit" => Some(ControlValue::Number(FPS_LIMIT_RANGE.snap(if self.display.max_fps > 0 { self.display.max_fps } else { self.display.fps_limit } as f32))),
@@ -320,6 +322,13 @@ impl Settings {
                 "input.smooth_menu_scrolling" => match value {
                     ControlValue::On(on) => {
                         i.smooth_menu_scrolling = *on;
+                        true
+                    }
+                    _ => false,
+                },
+                "input.alt_in_menus" => match value {
+                    ControlValue::On(on) => {
+                        i.alt_in_menus = *on;
                         true
                     }
                     _ => false,
@@ -480,6 +489,7 @@ mod tests {
             ("display.show_fps", ControlValue::On(true)),
             ("input.map_movement", ControlValue::Choice("Drag".into())),
             ("input.smooth_menu_scrolling", ControlValue::On(true)),
+            ("input.alt_in_menus", ControlValue::On(false)),
             ("layout.screen_place", ControlValue::Choice("LeftOrBottom".into())),
         ] {
             assert!(s.set_control(key, &value), "{key}");
