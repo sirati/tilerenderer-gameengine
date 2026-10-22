@@ -304,6 +304,29 @@ fn complete_frame(frame: Arc<Frame>, completion: Option<Event>, shared: &Shared)
     }
 }
 
+/// What the worker calls immediately before each `Queue::present`.
+type PresentNotify = Arc<dyn Fn() + Send + Sync>;
+
+/// Tells `window` a presentation follows (`Window::pre_present_notify`).
+/// The worker calls it only immediately before `Queue::present`, never for
+/// a frame it may still answer with `Retry`: on Wayland it requests a frame
+/// callback, and until that callback arrives winit withholds every
+/// `RedrawRequested`. Only a surface commit (a present) makes the
+/// compositor send it. Notifying on hand-off, for a frame the worker then
+/// retried, left the viewer without redraws until a focus change or resize
+/// committed the surface: a game screen that changed on its own (the
+/// loading screen's seconds, the main menu) no longer appeared. Elsewhere
+/// the call does nothing; on macOS it would only be sent to the main
+/// thread, so it is not made there.
+fn present_notify(window: Arc<Window>) -> PresentNotify {
+    Arc::new(move || {
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        window.pre_present_notify();
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let _ = &window;
+    })
+}
+
 struct Gpu {
     surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
@@ -336,6 +359,8 @@ struct State {
     art_error: Option<String>,
     profile: Option<crate::profile::Profile>,
     gpu_profile: Option<crate::profile::Profile>,
+    /// Called just before each actual presentation ([`present_notify`]).
+    notify_present: Option<PresentNotify>,
 }
 /// Cumulative application counters. Surface presentation is queued by the GPU
 /// actor; `presented` means its matching completion was committed by the UI.
@@ -744,6 +769,7 @@ impl State {
             gpu_profile: init.profile.then(|| {
                 crate::profile::Profile::new("viewer GPU execution", Duration::from_secs(5))
             }),
+            notify_present: Some(present_notify(init.window.clone())),
         })
     }
     fn receive_art(&mut self, art: &ArtSnapshot) {
@@ -1015,6 +1041,8 @@ impl State {
         }
         let completion = if let Some(texture) = acquired {
             let present_started = self.profile.as_ref().map(|_| Instant::now());
+            // Only here, where a commit follows: see `present_notify`.
+            if let Some(notify) = &self.notify_present { notify(); }
             gpu.queue.present(texture);
             if let (Some(profile), Some(started)) = (&mut self.profile, present_started) {
                 profile.add("present enqueue (host)", started.elapsed());
@@ -1704,6 +1732,7 @@ mod tests {
             whole_version: 1, assets_version: 1, compatible_from: 1,
             pending_art: None, preparing_art: None, target: 1,
             received_through: 1, art_error: None, profile: None, gpu_profile: None,
+            notify_present: None,
         }
     }
 
@@ -1818,7 +1847,15 @@ mod tests {
                     art_error: None,
                     profile: None,
                     gpu_profile: None,
+                    notify_present: None,
                 };
+                // Window notifications: only for frames actually presented
+                // (a retried one would hold back Wayland redraws).
+                let notified = Arc::new(AtomicU64::new(0));
+                state.notify_present = Some({
+                    let notified = notified.clone();
+                    Arc::new(move || { notified.fetch_add(1, Ordering::SeqCst); })
+                });
                 let shared = shared(Arc::new(|| {}));
                 let mut stale = frame(1);
                 stale.config_revision = 9;
@@ -1838,6 +1875,7 @@ mod tests {
                     state.draw(&stale, &shared).unwrap(),
                     Some(Event::Retry { id: 1 })
                 ));
+                assert_eq!(notified.load(Ordering::SeqCst), 0, "a retried frame never notifies the window");
                 let mut draw = frame(2);
                 draw.world = Some(Arc::new(crate::scene_world(
                     &compiled,
@@ -1909,6 +1947,9 @@ mod tests {
                             state.draw(&pending, &shared).unwrap(),
                             Some(Event::Retry { id: 3 })
                         ));
+                        // Neither retried nor bitmap-only frames present to a
+                        // surface: none of them notified the window.
+                        assert_eq!(notified.load(Ordering::SeqCst), 0);
                         shared
                             .surfaces
                             .send(Err("synthetic native binding failure".into()));

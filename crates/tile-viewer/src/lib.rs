@@ -3269,7 +3269,8 @@ impl App {
         let plan = picture.plan_for_target((gpu.config.width, gpu.config.height));
         let id = self.next_frame_id;
         self.next_frame_id += 1;
-        gpu.window.pre_present_notify();
+        // (The worker notifies the window only when it presents: a frame it
+        // retries must not hold back redraws, `render_worker::notify_present`.)
         let accepted = gpu.worker.frame(render_worker::Frame {
             id, config_revision: gpu.config_revision, base: self.whole_version, through: self.assets_version, world: None,
             world_version: self.worker_world_version, previous_world_version: self.worker_world_version,
@@ -3661,7 +3662,7 @@ impl App {
         packet.main_prepare = started.elapsed();
         if let Some(pending) = &mut self.pending_ui { pending.main_prepare = packet.main_prepare; }
         let gpu = self.gpu.as_ref().expect("initialized above");
-        gpu.window.pre_present_notify();
+        // (Notified by the worker only when it presents this frame.)
         let accepted = gpu.worker.frame(packet);
         if let Some(d) = &mut self.diagnostics {
             if accepted { d.accepted_world += 1; } else { d.rejected += 1; }
