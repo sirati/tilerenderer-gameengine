@@ -2,8 +2,9 @@
 //! thread): after [`BUSY_AFTER`] without an answer the viewer shows a
 //! small panel next to the driver's top-left buttons (or the hint that
 //! takes their place while the mouse is captured; else at the top-left of
-//! the view showing the world, else of the window): the busy cursor art
-//! from the game, and "Game appears busy" in orange; after
+//! the view showing the world, else of the window): the busy cursor (the
+//! turning hourglass) at its left, then "Game appears busy" in orange,
+//! both on its parchment; after
 //! [`STUCK_AFTER`] "Game appears stuck" in red. It goes the moment the host
 //! answers again.
 //!
@@ -23,11 +24,12 @@ pub const BUSY_AFTER: Duration = Duration::from_millis(500);
 pub const STUCK_AFTER: Duration = Duration::from_secs(3);
 
 /// The panel's art: the parchment, its edges (a row, a column), the busy
-/// cursor, the accent line along its bottom in each state's colour.
+/// cursor (the loading cursor's turning hourglass, as the busy pointer),
+/// the accent line along its bottom in each state's colour.
 pub const PANEL_SPRITE: &str = "Viewer@busy_panel/0";
 pub const EDGE_ROW_SPRITE: &str = "Viewer@busy_edge_h/0";
 pub const EDGE_COLUMN_SPRITE: &str = "Viewer@busy_edge_v/0";
-pub const ICON_SPRITE: &str = "Viewer@busy/0";
+pub const ICON_SPRITE: &str = scene::loading_cursor::SET;
 pub const BUSY_ACCENT_SPRITE: &str = "Viewer@busy_accent/0";
 pub const STUCK_ACCENT_SPRITE: &str = "Viewer@stuck_accent/0";
 /// The game's font, as its "Press CTRL" hint uses it.
@@ -256,7 +258,15 @@ pub fn compose(compiled: &Compiled, state: Responsiveness, anchor: Anchor, windo
     // Keep current UI scale whenever the group fits. Only exceptionally
     // small windows reduce the group to its readable 14px minimum.
     let scales = [requested, 1.0];
+    // The turning hourglass, if its frames are uploaded: (set, frame size,
+    // anchor). Decoration only: without room for it the text stays alone.
+    let icon = compiled.set(ICON_SPRITE).filter(|_| compiled.set_available(ICON_SPRITE)).and_then(|(set, _)| {
+        let art = compiled.atlas.sprites.get(compiled.sets.frame(set, 0)?.0 as usize).filter(|a| a.page != u32::MAX)?;
+        Some((set, (art.width as i32, art.height as i32), (art.anchor_x, art.anchor_y)))
+    });
+    let slot = scene::loading_cursor::ENVELOPE as i32;
     for factor in scales {
+    for icon in [icon, None].into_iter().take(if icon.is_some() { 2 } else { 1 }) {
         let px = (f64::from(FONT_PX) * factor).round().clamp(14.0, 1024.0) as u32;
         let pad = (f64::from(PAD) * factor).round().max(2.0) as i32;
         let gap = (f64::from(GAP) * factor).round().max(1.0) as i32;
@@ -266,7 +276,9 @@ pub fn compose(compiled: &Compiled, state: Responsiveness, anchor: Anchor, windo
         let min_word_width = letters.split(|(ch,_,_)| *ch == ' ').map(|word| word.iter().map(|(_,_,advance)| *advance).sum::<i32>()).max().unwrap_or(1);
         for region in regions(anchor, window, gap) {
             let [x,y,available_w,available_h] = region;
-            let text_room = available_w - 2*pad;
+            // The hourglass's slot and a pad before the text.
+            let lead = if icon.is_some() { slot + pad } else { 0 };
+            let text_room = available_w - 2*pad - lead;
             if text_room < min_word_width { continue; }
             let mut lines: Vec<Vec<(u32,i32)>> = vec![Vec::new()];
             let mut widths = vec![0];
@@ -284,9 +296,10 @@ pub fn compose(compiled: &Compiled, state: Responsiveness, anchor: Anchor, windo
                 lines[i].push((glyph,advance)); widths[i]+=advance;
             }
             let line_h=px as i32+pad;
-            let h=(lines.len() as i32*line_h+2*pad).max(PANEL_HEIGHT);
+            // (Room for the hourglass inside the frame and above the accent.)
+            let h=(lines.len() as i32*line_h+2*pad).max(PANEL_HEIGHT).max(if icon.is_some() { slot+4 } else { 0 });
             let text_w=widths.iter().copied().max().unwrap_or(0);
-            let w=text_w+2*pad;
+            let w=text_w+2*pad+lead;
             if h > available_h { continue; }
             let clip=Some([x,y,x+w,y+h]);
             let solid=|[sx,sy,sw,sh]:[i32;4],rgba| PlacedSprite { screen:true,view:Some(camera),clip,
@@ -295,8 +308,18 @@ pub fn compose(compiled: &Compiled, state: Responsiveness, anchor: Anchor, windo
             let mut out=vec![solid([x,y,w,h],[245,233,198,255]),solid([x,y,w,1],[72,52,24,255]),
                 solid([x,y+h-1,w,1],[72,52,24,255]),solid([x,y,1,h],[72,52,24,255]),solid([x+w-1,y,1,h],[72,52,24,255]),
                 solid([x+1,y+h-3,w-2,2],[color[0],color[1],color[2],255])];
+            // First the hourglass, at the left inside the panel, turning
+            // about its slot's middle by the viewer's clock.
+            if let Some((set,(fw,fh),(ax,ay)))=icon {
+                // (Centred between the top edge and the accent line.)
+                let (ix,iy)=(x+pad,y+1+(h-4-slot)/2);
+                out.push(PlacedSprite {screen:true,view:Some(camera),phase:0,ticks_per_frame:scene::loading_cursor::TICKS_PER_FRAME,
+                    clip:Some([ix,iy.max(y+1),ix+slot,(iy+slot).min(y+h-3)]),
+                    ..PlacedSprite::new(set,ix-(fw-slot)/2-ax,iy-(fh-slot)/2-ay)});
+            }
+            // Then the text.
             for (row,line) in lines.iter().enumerate() {
-                let mut pen=x+pad;
+                let mut pen=x+pad+lead;
                 let baseline=y+pad+px as i32+row as i32*line_h;
                 for &(glyph,advance) in line {
                     let g=OutlineGlyph {font,shape:GlyphShape::Glyph(glyph),em64:px*64,advance,bold:true,italic:false,color,key:None};
@@ -305,21 +328,9 @@ pub fn compose(compiled: &Compiled, state: Responsiveness, anchor: Anchor, windo
                     pen+=advance;
                 }
             }
-            // Reuse the game's actual 30-frame cursor animation as an
-            // optional ornament, never as a substitute for missing text.
-            if let Some((set,_))=compiled.set("Viewer@loading_bar/0").filter(|_| compiled.set_available("Viewer@loading_bar/0")) {
-                if let Some(id)=compiled.sets.frame(set,0) {
-                    if let Some(art)=compiled.atlas.sprites.get(id.0 as usize).filter(|a| a.page != u32::MAX) {
-                        let iw=art.width as i32;
-                        if x+w+gap+iw <= x+available_w {
-                            out.push(PlacedSprite {screen:true,view:Some(camera),phase:0,ticks_per_frame:scene::loading_cursor::TICKS_PER_FRAME,clip:Some([x+w+gap,y,x+w+gap+iw,y+h]),
-                                ..PlacedSprite::new(set,x+w+gap-art.anchor_x,y+(h-art.height as i32)/2-art.anchor_y)});
-                        }
-                    }
-                }
-            }
             return Some((Camera {cells:false,..Camera::new(window)},out));
         }
+    }
     }
     None
 }
@@ -465,6 +476,64 @@ mod tests {
             assert_eq!(commands.iter().filter(|s|s.text.is_some()).count(),"Game appears stuck".len());
         }
         assert!(compose(&c,Responsiveness::Busy,Anchor::Beside([0,0,100,100],(1,1)),(100,100),0.0,0).is_none());
+    }
+    /// The test font and an uploaded (solid) hourglass frame in the loading
+    /// cursor's set.
+    fn with_font_and_hourglass() -> Compiled {
+        struct Empty;
+        impl render_desc::ImageLoader for Empty {
+            fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> { Err("no art".into()) }
+        }
+        let mut c=render_desc::Description::parse(r#"
+            grid = { layout = "orthogonal", step = [1, 1] }
+            [images.hourglass]
+            source = "solid:20,20,20,255:46x46"
+            [sheets.hourglass]
+            image = "hourglass"
+            cell = [46, 46]
+            anchor = [-23, -23]
+            group = "Viewer@loading_cursor_frame"
+            [sets."Viewer@loading_cursor/0"]
+            frames = ["Viewer@loading_cursor_frame/0"]
+            "#).unwrap().compile(&Empty,256).unwrap();
+        c.fonts=with_font().fonts;
+        assert!(c.set_available(ICON_SPRITE));
+        c
+    }
+    #[test]
+    fn the_hourglass_comes_first_then_the_text_both_inside_the_panel() {
+        let c=with_font_and_hourglass();
+        let hourglass=c.set(ICON_SPRITE).unwrap().0;
+        for (state,text) in [(Responsiveness::Busy,"Game appears busy"),(Responsiveness::Stuck,"Game appears stuck")] {
+            for (window,controls,zoom) in [((1600,900),[0,0,149,54],(1,1)),((1600,900),[800,0,298,108],(2,1)),((900,600),[0,0,224,81],(3,2))] {
+                let (_,commands)=compose(&c,state,Anchor::Beside(controls,zoom),window,0.0,0).unwrap();
+                let [px,py,pw,ph]=group_bounds(&commands);
+                let icons:Vec<_>=commands.iter().enumerate().filter(|(_,s)|s.text.is_none() && s.solid.is_none()).collect();
+                assert_eq!(icons.len(),1,"one hourglass");
+                let (at,icon)=icons[0];
+                assert_eq!(icon.set,hourglass);
+                assert_eq!(icon.ticks_per_frame,scene::loading_cursor::TICKS_PER_FRAME,"turning by the viewer's clock");
+                let [l,t,r,b]=icon.clip.unwrap();
+                // Inside the parchment: off its frame, above the accent.
+                assert!(l>px && t>py && r<px+pw && b<=py+ph-3,"{state:?} {zoom:?}: icon {:?} in panel {:?}",[l,t,r,b],[px,py,pw,ph]);
+                assert_eq!((r-l,b-t),(32,32),"the whole turning hourglass shows");
+                assert_eq!((icon.x,icon.y),(l+16,t+16),"it turns about its slot's middle");
+                // Then the text: every glyph right of the icon, inside too.
+                let glyphs:Vec<_>=commands.iter().enumerate().filter(|(_,s)|s.text.is_some()).collect();
+                assert_eq!(glyphs.len(),text.len());
+                for (i,g) in glyphs {
+                    assert!(i>at,"drawn after the icon");
+                    let advance=g.text.as_ref().unwrap().advance;
+                    assert!(g.x>=r,"{state:?} {zoom:?}: glyph at {} left of the icon's right {r}",g.x);
+                    assert!(g.x+advance<=px+pw && g.y>py && g.y<py+ph,"{state:?} {zoom:?}: glyph ({},{}) outside {:?}",g.x,g.y,[px,py,pw,ph]);
+                }
+                let first=commands.iter().filter(|s|s.text.is_some()).map(|s|s.x).min().unwrap();
+                assert!(l<first,"icon first, then text");
+            }
+        }
+        // Too narrow for both: the text alone, never the icon instead.
+        let (_,commands)=compose(&c,Responsiveness::Stuck,Anchor::Beside([0,0,149,54],(1,1)),(300,200),0.0,0).unwrap();
+        assert_eq!(commands.iter().filter(|s|s.text.is_some()).count(),"Game appears stuck".len());
     }
     #[test]
     fn anchor_uses_real_drawn_command_bounds_at_current_ui_scale() {

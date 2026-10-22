@@ -109,18 +109,12 @@ impl Art {
         }
         let capture = compiled.sets_with_prefix(CAPTURE_SPRITES).map(|(_, s)| s.raw()).next();
         let arrow = compiled.set(crate::snap::ARROW_SPRITE).map(|(s, _)| s.raw()).filter(|s| images.contains_key(s));
-        let mut busy = Vec::new();
-        if let Some(pointer) = arrow.and_then(|id| images.get(&id)).cloned() {
-            if let Some((set, _)) = compiled.set(scene::loading_cursor::SET) {
-                for frame in 0..scene::loading_cursor::FRAME_COUNT {
-                    let Some(ring) = image_frame(compiled, set, frame) else { break };
-                    let mut id = u32::MAX - frame;
-                    while images.contains_key(&id) { id = id.saturating_sub(scene::loading_cursor::FRAME_COUNT); }
-                    images.insert(id, busy_composite(&pointer, &ring));
-                    busy.push(id);
-                }
-            }
-        }
+        let busy = busy_frames(compiled).into_iter().map(|image| {
+            let mut id = u32::MAX;
+            while images.contains_key(&id) { id -= 1; }
+            images.insert(id, image);
+            id
+        }).collect();
         Self { images, capture, blank, arrow, busy }
     }
 
@@ -197,31 +191,18 @@ fn image_frame(compiled: &Compiled, set: SpriteSetId, frame: u32) -> Option<Imag
     })
 }
 
-/// Preserve the pointer and its hot spot. The game's animated selection ring
-/// is a small badge beside it, with nearest-neighbour sampling of actual art.
-fn busy_composite(pointer: &Image, ring: &Image) -> Image {
-    let width = pointer.size.0.saturating_add(17).min(256);
-    let height = pointer.size.1.max(8).min(256);
-    let mut rgba = vec![0; width as usize * height as usize * 4];
-    for y in 0..pointer.size.1.min(height) {
-        for x in 0..pointer.size.0.min(width) {
-            let src = (y as usize * pointer.size.0 as usize + x as usize) * 4;
-            let dst = (y as usize * width as usize + x as usize) * 4;
-            rgba[dst..dst+4].copy_from_slice(&pointer.rgba[src..src+4]);
-        }
+/// The busy pointer's pictures: the loading cursor's turned hourglass
+/// frames (`scene::loading_cursor::SET`, pre-rendered rotations), each its
+/// own system cursor with the hot spot in its middle. None where the
+/// description lacks them or they show nothing (no system wait cursor to
+/// read): the arrow then stands in.
+fn busy_frames(compiled: &Compiled) -> Vec<Image> {
+    let Some((set, _)) = compiled.set(scene::loading_cursor::SET) else { return Vec::new() };
+    let frames: Vec<Image> = (0..scene::loading_cursor::FRAME_COUNT).map_while(|frame| image_frame(compiled, set, frame)).collect();
+    if frames.iter().all(|f| f.rgba.chunks_exact(4).all(|p| p[3] == 0)) {
+        return Vec::new();
     }
-    if ring.size.0 != 0 && ring.size.1 != 0 {
-        for y in 0..8u16 { for x in 0..16u16 {
-            let dx = pointer.size.0 as u32 + 1 + x as u32;
-            if dx >= width as u32 || y >= height { continue; }
-            let sx = x as usize * ring.size.0 as usize / 16;
-            let sy = y as usize * ring.size.1 as usize / 8;
-            let src = (sy * ring.size.0 as usize + sx) * 4;
-            let dst = (y as usize * width as usize + dx as usize) * 4;
-            rgba[dst..dst+4].copy_from_slice(&ring.rgba[src..src+4]);
-        }}
-    }
-    Image { rgba, size: (width, height), hotspot: pointer.hotspot }
+    frames
 }
 
 /// A sprite's hot spot: minus its anchor, moved onto its edge if outside.
@@ -1371,18 +1352,64 @@ mod tests {
 mod busy_tests {
     use super::*;
 
+    /// The game's arrow and the real loading-cursor description, its wait
+    /// cursor's turned frames made here: frame `k` marked with red `k` in
+    /// its middle (`clear`: the system has no wait cursor).
+    fn with_hourglass(clear: bool) -> Compiled {
+        struct Hourglass { clear: bool }
+        impl render_desc::ImageLoader for Hourglass {
+            fn load(&self, source: &str, options: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> {
+                assert_eq!(source, "system-cursor:32514/32", "the busy cursor is the wait cursor's hourglass");
+                assert_eq!(options.get("rotations").and_then(toml::Value::as_integer), Some(12));
+                let side = scene::loading_cursor::FRAME_SIDE;
+                Ok((0..12u8).map(|k| tile_render::RgbaImage::from_fn(side, side, |x, y| {
+                    if self.clear { [0; 4] } else if (x, y) == (side / 2, side / 2) { [k, 0, 0, 255] } else { [0, 0, 0, 255] }
+                })).collect())
+            }
+        }
+        let text = format!(r#"
+            grid = {{ layout = "orthogonal", step = [8, 8] }}
+            [images.arrow]
+            source = "pointer:255,255,255,255:14x22"
+            [sheets.arrow]
+            image = "arrow"
+            cell = [14, 22]
+            group = "Viewer@cursors"
+            {}"#, include_str!("../../../assets/civ3/loading-cursor.toml"));
+        assert!(!text.contains("Cursor.flc"), "never the unit-selection ring");
+        let desc = render_desc::Description::parse(&text).unwrap();
+        // (The arrow is generated; only the hourglass goes to the loader.)
+        desc.compile(&Hourglass { clear }, 256).unwrap()
+    }
+
     #[test]
-    fn game_loading_badge_preserves_pointer_pixels_and_hotspot() {
-        let arrow = Image { rgba: vec![17; 4*3*4], size: (4,3), hotspot: (1,2) };
-        let ring = Image { rgba: vec![29; 2*2*4], size: (2,2), hotspot: (0,0) };
-        let image = busy_composite(&arrow, &ring);
-        assert_eq!(image.size, (21,8));
-        assert_eq!(image.hotspot, arrow.hotspot);
-        for y in 0..3 { assert_eq!(&image.rgba[y*21*4..y*21*4+16], &[17;16]); }
-        assert_eq!(&image.rgba[16..20], &[0;4]);
-        assert_eq!(&image.rgba[20..24], &[29;4]);
-        let huge = Image { rgba: vec![1;256*256*4], size: (256,256), hotspot: (255,255) };
-        assert_eq!(busy_composite(&huge,&ring), huge);
+    fn the_busy_pointer_is_the_turning_hourglass_with_its_hot_spot_in_the_middle() {
+        let compiled = with_hourglass(false);
+        let art = Art::of(&compiled);
+        assert_eq!(art.busy_frames(), 12);
+        let arrow = art.arrow.unwrap();
+        let side = scene::loading_cursor::FRAME_SIDE as usize;
+        for k in 0..12u32 {
+            let elapsed = std::time::Duration::from_millis(u64::from(k) * scene::loading_cursor::FRAME_MS);
+            let id = art.busy_cursor(elapsed).unwrap();
+            assert_ne!(id, arrow, "not the arrow with a badge");
+            let image = art.get(id).unwrap();
+            assert_eq!(image.size, (side as u16, side as u16));
+            assert_eq!(image.hotspot, (23, 23), "hot spot at the centre, where the hourglass turns");
+            let middle = (side / 2 * side + side / 2) * 4;
+            assert_eq!(&image.rgba[middle..middle + 4], &[k as u8, 0, 0, 255], "frame {k}: {}°", scene::loading_cursor::angle_of(k));
+            assert_eq!(crate::cursor::system_pointer(scene::Cursor::Sprite(id), &art, false, false), Shown::Custom(id));
+        }
+        // A full turn later: upright again.
+        let turn = std::time::Duration::from_millis(12 * scene::loading_cursor::FRAME_MS);
+        assert_eq!(art.busy_cursor(turn), art.busy_cursor(std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn without_a_system_hourglass_the_busy_pointer_is_the_arrow() {
+        let art = Art::of(&with_hourglass(true));
+        assert_eq!(art.busy_frames(), 0);
+        assert_eq!(art.busy_cursor(std::time::Duration::from_millis(500)), art.arrow);
     }
 
     #[test]
