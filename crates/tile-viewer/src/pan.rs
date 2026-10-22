@@ -857,6 +857,38 @@ mod tests {
         assert_eq!(edge_axis(800, 800, true, true), 0);
     }
 
+    /// The pointer resting on each edge as macOS reports it (the flipped
+    /// view's y is `height − cocoa_y`: 0 at the top, but the bottom
+    /// boundary itself, `height`, on the last row), windowed and
+    /// fullscreen with a scaled canvas: every edge is its outermost pixel.
+    #[test]
+    fn every_edge_scrolls_from_macos_style_pointer_positions() {
+        use tile_render::Present;
+        let presents = [
+            ("windowed", Present::unscaled((800, 600))),
+            ("fullscreen, canvas 2x", Present { canvas: (960, 540), zoom: (2, 1), at: (0, 0), target: (1920, 1080) }),
+            ("fullscreen, canvas 3/2", Present { canvas: (1280, 720), zoom: (3, 2), at: (0, 0), target: (1920, 1080) }),
+        ];
+        for (name, p) in presents {
+            let (tw, th) = (p.target.0 as f64, p.target.1 as f64);
+            let (cw, ch) = (p.canvas.0 as i32, p.canvas.1 as i32);
+            let flipped = |cocoa_x: f64, cocoa_y: f64| (cocoa_x, th - cocoa_y);
+            let edge = |at: (f64, f64)| {
+                let (x, y) = p.to_canvas(at);
+                (edge_axis(x, cw, true, true), edge_axis(y, ch, true, true))
+            };
+            assert_eq!(edge(flipped(tw / 2.0, th)), (0, -1), "{name}: top");
+            assert_eq!(edge(flipped(tw / 2.0, 0.0)), (0, 1), "{name}: bottom");
+            assert_eq!(edge(flipped(0.0, th / 2.0)), (-1, 0), "{name}: left");
+            assert_eq!(edge(flipped(tw - 1.0, th / 2.0)), (1, 0), "{name}: right (last column)");
+            assert_eq!(edge(flipped(tw, th / 2.0)), (1, 0), "{name}: right (boundary)");
+            assert_eq!(edge(flipped(0.0, 0.0)), (-1, 1), "{name}: bottom-left corner");
+            assert_eq!(edge(flipped(tw, 0.0)), (1, 1), "{name}: bottom-right corner");
+            // Past the window (a drag outside) is no edge.
+            assert_eq!(edge(flipped(tw / 2.0, -2.0 * th)), (0, 0), "{name}: below the window");
+        }
+    }
+
     #[test]
     fn edge_scrolling_is_faster_nearer_the_edge() {
         assert_eq!(edge_speed(0), 0.0);
