@@ -1,12 +1,12 @@
 //! How the viewer shows its picture and the driver's interface in its
 //! window, at the user's resolution settings (`viewer_settings::Resolution`).
 //!
-//! The viewer renders at its window's size divided by the pixel scale `n`
-//! (a whole number; Auto: the desktop's scale rounded down), the canvas,
-//! and shows each rendered pixel as an exact `n`×`n` box of window pixels
-//! (`tile_render::Present`; what is left of the window when it does not
-//! divide is a border of fewer than `n` pixels). Nothing is filtered or
-//! scaled by a fraction there: on a screen at 200 %, Auto gives 2×2 boxes.
+//! The viewer renders at its window's size (physical pixels) divided by
+//! the pixel scale `n` (a whole number, 1 by default whatever the
+//! desktop's scale), the canvas, and shows each rendered pixel as an
+//! exact `n`×`n` box of window pixels (`tile_render::Present`; what is
+//! left of the window when it does not divide is a border of fewer than
+//! `n` pixels). Nothing is filtered or scaled by a fraction there.
 //!
 //! The world is the viewer's own: the layout arranges it in the canvas's
 //! pixels, its main view around the middle of the driver's view and as far
@@ -21,12 +21,8 @@
 //! filtered).
 //!
 //! The canvas is rendered at its own size and enlarged once onto the
-//! window ([`drawn_on_canvas`]): a pixel scale `n` renders `n²` times fewer
-//! pixels. Text from outlines is drawn at the canvas's resolution. Only on
-//! request (`text=window`, [`drawn`]) is the canvas composed at the
-//! window's resolution instead (the boxes drawn as such, every window
-//! pixel rendered), the driver's text drawn at the size it shows at on
-//! the window, in every view at its own scale.
+//! window ([`drawn`]): a pixel scale `n` renders `n²` times fewer pixels.
+//! Text from outlines is drawn at the canvas's resolution too.
 
 use scene::{FreeSprite, Scene};
 use tile_render::{Camera, Present};
@@ -264,13 +260,13 @@ impl Plan {
     }
 }
 
-/// The plan for a window of `window` physical pixels on a desktop scaled
-/// `desktop` times (for `pixel_scale` Auto), a driver's screen of `screen`
-/// ((0, 0): unknown, then the canvas) and `settings`.
-pub fn plan(window: (u32, u32), desktop: f64, screen: (u32, u32), settings: &Resolution) -> Plan {
+/// The plan for a window of `window` physical pixels (the desktop's scale
+/// plays no part), a driver's screen of `screen` ((0, 0): unknown, then
+/// the canvas) and `settings`.
+pub fn plan(window: (u32, u32), screen: (u32, u32), settings: &Resolution) -> Plan {
     let window = (window.0.max(1), window.1.max(1));
-    let n = settings.pixel_scale_in(window, desktop).max(1);
-    let canvas = settings.realised(window, desktop);
+    let n = settings.pixel_scale_in(window).max(1);
+    let canvas = settings.realised(window);
     let reference = if screen.0 > 0 && screen.1 > 0 { (screen.1 as u64).min(768) } else { 768 };
     let screen = if screen.0 > 0 && screen.1 > 0 { screen } else { canvas };
     // (What is left of the window: a border of fewer than n pixels.)
@@ -877,39 +873,24 @@ pub struct Drawn {
 }
 
 /// The cameras, screen copies and presentation that draw the layout's
-/// `cameras` (and `copies`, in the canvas's pixels) on the window as
-/// `present` says, with the driver's text at the resolution it is seen at.
-/// `outlines`: whether a view at a zoom (on the window) shows text drawn
-/// from outlines (`Layout::zoomed_art`).
-///
-/// A canvas shown in whole `k`×`k` boxes (a pixel scale) is composed at
-/// the window's resolution instead (`Present::at_target`, every camera
-/// `Camera::boxed`): art shows as the boxes showed it, text is drawn from
-/// its outlines at its size on the window. The driver's interface views
-/// (no world of their own) show their text from outlines wherever their
-/// zoom on the window is not 1: a menu or popup scaled by the menu scale
-/// or to fit, at any pixel scale. A world view keeps the layout's choice,
-/// made again for its zoom on the window where that was the layout's
-/// rule. Pointer input, hit tests and the layout stay in the canvas's
-/// pixels. At 1:1 (no pixel scale, unscaled views) nothing changes.
+/// `cameras` (and `copies`, in the canvas's pixels) into the canvas at its
+/// own size, shown on the window in whole boxes as `present` says: at
+/// pixel scale `n` the GPU renders the window's pixels divided by `n²`,
+/// enlarged by one nearest-pixel copy (`TileRenderer::render_layered`).
+/// `outlines`: whether a view at a zoom shows text drawn from outlines
+/// (`Layout::zoomed_art`); the driver's interface views show it wherever
+/// their zoom in the canvas is not 1 (a menu scaled by the menu scale or
+/// to fit), at the canvas's resolution.
 pub fn drawn(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: Present, outlines: impl Fn(Ratio) -> bool) -> Drawn {
-    let k = present.pixel_box().filter(|&k| outlines((k, 1))).unwrap_or(1);
-    drawn_boxed(cameras, copies, present, outlines, k)
-}
-
-/// The cameras, screen copies and presentation that draw the layout's
-/// `cameras` into the canvas at its own size, shown on the window in whole
-/// boxes as `present` says: at pixel scale `n` the GPU renders the
-/// window's pixels divided by `n²`, enlarged by one nearest-pixel copy
-/// (`TileRenderer::render_layered`). Views zoomed in the canvas still show
-/// text from outlines at their zoom, at the canvas's resolution. The
-/// default; [`drawn`] (`text=window`) composes at the window's resolution.
-pub fn drawn_on_canvas(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: Present, outlines: impl Fn(Ratio) -> bool) -> Drawn {
     drawn_boxed(cameras, copies, present, outlines, 1)
 }
 
-/// Compose a viewer-owned physical overlay without scaling its commands.
-/// Base art keeps its original outline/zoomed-art selection.
+/// The settings preview's confirmation only: the canvas composed at the
+/// window's resolution (`Present::at_target`, every camera
+/// `Camera::boxed`, art as the boxes showed it) so the viewer-owned
+/// dialog over it is drawn at physical pixels, readable at any pixel
+/// scale, for the few seconds it shows. Base art keeps its original
+/// outline/zoomed-art selection.
 pub fn drawn_physical(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: Present, outlines: impl Fn(Ratio) -> bool) -> Drawn {
     drawn_boxed(cameras, copies, present, outlines, present.pixel_box().unwrap_or(1))
 }
@@ -1009,9 +990,9 @@ mod tests {
 
     // Mechanism tests can exercise arbitrary affine ratios independently
     // of the screen-percentage policy exposed in the settings.
-    fn fixed_plan(window: (u32, u32), desktop: f64, screen: (u32, u32), scales: (u32, f32, f32, f32)) -> Plan {
+    fn fixed_plan(window: (u32, u32), screen: (u32, u32), scales: (u32, f32, f32, f32)) -> Plan {
         let (pixel_scale, menu, frame_scale, world_scale) = scales;
-        let mut p = plan(window, desktop, screen, &Resolution { pixel_scale, frame_scale, world_scale, ..Default::default() });
+        let mut p = plan(window, screen, &Resolution { pixel_scale, frame_scale, world_scale, ..Default::default() });
         p.menu.zoom = ratio(menu);
         p
     }
@@ -1050,7 +1031,7 @@ mod tests {
                     for scale_menus in [false, true] {
                         for menu_scale_percent in [25.0, 60.0, 100.0] {
                             let settings = Resolution { pixel_scale, scale_menus, menu_scale_percent, ..Default::default() };
-                            let p = plan(window, 1.0, scene.screen_size, &settings).for_scene(&scene, rect_of);
+                            let p = plan(window, scene.screen_size, &settings).for_scene(&scene, rect_of);
                             assert_eq!(p.present.zoom, (pixel_scale, 1));
                             let canvas = p.canvas();
                             let expected = if scale_menus { canvas.1 as f64 / 768.0 * menu_scale_percent as f64 / 100.0 } else { 1.0 }
@@ -1096,15 +1077,14 @@ mod tests {
         }
     }
 
-    /// TS Neo's case: the 3274×2048 title in a 3258×1904 window at desktop
-    /// scale 2 (pixel scale Auto: 2). The canvas is composed at the
-    /// window's resolution, the title's text drawn from outlines at its
-    /// size on the window (its zoom times the pixel scale), its 1:1 raster
-    /// twins left out; also when only the menu is scaled (pixel scale 1),
-    /// which scaled the twins as bitmaps before. Without outlines (or with
-    /// sharp text off), or at 1:1, nothing changes.
+    /// TS Neo's case: the 3274×2048 title in a 3258×1904 window, at pixel
+    /// scales 2 and 1. The canvas is composed at its own size (never the
+    /// window's: a pixel scale renders fewer pixels), the title's text
+    /// drawn from outlines at its size in the canvas wherever the menu is
+    /// scaled there, its 1:1 raster twins left out. Without outlines (or
+    /// with sharp text off), or at 1:1, the 1:1 twins.
     #[test]
-    fn driver_text_is_drawn_from_outlines_at_its_size_on_the_window() {
+    fn driver_text_is_drawn_from_outlines_at_its_size_in_the_canvas() {
         use scene::{Glyph, View, ViewState};
         let screen = (3274u32, 2048u32);
         let (mx, my) = ((3274 - 1024) / 2, (2048 - 768) / 2);
@@ -1123,18 +1103,18 @@ mod tests {
             views: vec![ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() }, overlay }],
             ..Default::default()
         };
-        for (window, desktop, pixel_scale, scale_menus, outlines, sharp) in [
-            ((3258, 1904), 2.0, Resolution::AUTO, false, true, true),
-            ((3258, 1904), 2.0, Resolution::AUTO, true, true, true),
-            ((3258, 1904), 2.0, 1, true, true, true),
-            ((3258, 1904), 2.0, Resolution::AUTO, true, false, true),
-            ((3258, 1904), 2.0, Resolution::AUTO, true, true, false),
-            ((1024, 768), 1.0, 1, false, true, true),
+        for (window, pixel_scale, scale_menus, outlines, sharp) in [
+            ((3258, 1904), 2, false, true, true),
+            ((3258, 1904), 2, true, true, true),
+            ((3258, 1904), 1, true, true, true),
+            ((3258, 1904), 2, true, false, true),
+            ((3258, 1904), 2, true, true, false),
+            ((1024, 768), 1, false, true, true),
         ] {
             let mut scene = title.clone();
             if !outlines { scene.zooms.clear(); }
             let settings = Resolution { pixel_scale, scale_menus, ..Default::default() };
-            let p = plan(window, desktop, scene.screen_size, &settings).for_scene(&scene, rect_of);
+            let p = plan(window, scene.screen_size, &settings).for_scene(&scene, rect_of);
             let mut layout = layout::Layout::default();
             layout.sharp_text = sharp;
             layout.driver_screen = Some(p.screen);
@@ -1146,30 +1126,14 @@ mod tests {
             let menu = f.view_cameras[0].unwrap() as usize;
             let (canvas, shown) = (f.cameras[menu], d.cameras[menu]);
             let n = p.present.zoom.0;
-            let on_window = times(canvas.zoom, (n, 1));
-            let text = outlines && sharp && on_window != (1, 1);
+            assert_eq!(n, pixel_scale, "{what}");
+            let text = outlines && sharp && canvas.zoom != (1, 1);
             assert_eq!(shown.zoomed_art, text, "{what}: text from outlines");
-            if text && n > 1 {
-                assert_eq!((d.pixel_box, d.present), (n, p.present.at_target()), "{what}");
-                assert_eq!(d.present.canvas, (p.canvas().0 * n, p.canvas().1 * n));
-                assert_eq!(shown, Camera { zoomed_art: true, ..canvas.boxed(n) }, "{what}");
-                assert_eq!(shown.zoom, on_window);
-                // (What every view of the frame was, at the window's resolution.)
-                assert_eq!(d.cameras.len(), f.cameras.len());
-                for (a, b) in f.cameras.iter().zip(&d.cameras) {
-                    assert_eq!((b.origin, b.viewport), (a.boxed(n).origin, a.boxed(n).viewport));
-                }
-            } else {
-                assert_eq!((d.pixel_box, d.present, &d.copies), (1, p.present, &f.copies), "{what}");
-                assert_eq!(shown, Camera { zoomed_art: text, ..canvas }, "{what}");
-            }
-            if window == (3258, 1904) && pixel_scale == Resolution::AUTO {
-                assert_eq!(n, 2, "TS Neo's pixel scale");
-                if text {
-                    // The title's 18-pixel text on the window.
-                    let em = 18.0 * shown.zoom.0 as f64 / shown.zoom.1 as f64;
-                    assert!(em >= 36.0, "{what}: {em} pixels per em");
-                }
+            assert_eq!((d.pixel_box, d.present, &d.copies), (1, p.present, &f.copies), "{what}: composed in the canvas");
+            assert_eq!(d.present.canvas, (window.0 / n, window.1 / n), "{what}");
+            assert_eq!(shown, Camera { zoomed_art: text, ..canvas }, "{what}");
+            for (a, b) in f.cameras.iter().zip(&d.cameras) {
+                assert_eq!((b.origin, b.viewport, b.zoom), (a.origin, a.viewport, a.zoom), "{what}");
             }
         }
     }
@@ -1225,13 +1189,13 @@ mod tests {
                     scene.views[0].overlay.push(FreeSprite { set: button.raw(), x, y, screen: true, ..Default::default() });
                 }
             }
-            // (TS Neo's 3258×1904 window at desktop scale 2 first.)
+            // (TS Neo's 3258×1904 window first.)
             for window in [(3258, 1904), (2946, 1844), (1920, 1080), (1280, 1024), (1012, 632), (3840, 1600), (1001, 777)] {
-                for pixel_scale in [Resolution::AUTO, 1, 2, 3] {
+                for pixel_scale in [1, 2, 3] {
                     for scale_menus in [false, true] {
                         for menu_scale_percent in [25.0, 60.0, 100.0] {
                             let settings = Resolution { pixel_scale, scale_menus, menu_scale_percent, ..Default::default() };
-                            let p = plan(window, 2.0, scene.screen_size, &settings).for_scene(&scene, rect_of);
+                            let p = plan(window, scene.screen_size, &settings).for_scene(&scene, rect_of);
                             let canvas = p.canvas();
                             let (cw, ch) = (canvas.0 as f64, canvas.1 as f64);
                             let most = (cw / 1024.0).min(ch / vh);
@@ -1360,7 +1324,7 @@ mod tests {
             for percent in [60.758f32, 25.001, 33.333, 49.95, 77.777, 99.999, 100.0 - 1e-4] {
                 for width in [1012u32, 1366 + i as u32, 2560] {
                     let settings = Resolution { pixel_scale: 1, scale_menus: true, menu_scale_percent: percent, ..Default::default() };
-                    let p = plan((width, height), 1.0, screen, &settings).for_scene(&scene, rect_of);
+                    let p = plan((width, height), screen, &settings).for_scene(&scene, rect_of);
                     let canvas = p.canvas();
                     let what = format!("{percent} % of {canvas:?}: {:?}", p.menu.zoom);
                     assert!(small(p.menu.zoom), "{what}");
@@ -1437,7 +1401,7 @@ mod tests {
                 for window in [(1920, 1080), (3258, 1904), (1012, 632), (2560, 1440), (1366, 768)] {
                     for (pixel_scale, percent) in [(3, 25.0), (3, 31.0), (2, 25.0), (1, 25.0), (3, 47.0)] {
                         let settings = Resolution { pixel_scale, scale_menus: true, menu_scale_percent: percent, ..Default::default() };
-                        let p = plan(window, 1.0, screen, &settings).for_scene(&scene, rect_of);
+                        let p = plan(window, screen, &settings).for_scene(&scene, rect_of);
                         let canvas = p.canvas();
                         let mut layout = layout::Layout::default();
                         layout.driver_screen = Some(p.screen);
@@ -1488,7 +1452,7 @@ mod tests {
         scene.views.retain(|v| v.id == 0 || v.id == 255);
         scene.interface = scene::Interface::default();
         for menu_scale_percent in [25.0, 100.0] {
-            let p = plan((1920, 1080), 1.0, scene.screen_size,
+            let p = plan((1920, 1080), scene.screen_size,
                 &Resolution { pixel_scale: 3, scale_menus: false, menu_scale_percent, ..Default::default() }).for_scene(&scene, &rect_of);
             assert_eq!(p.menu.zoom, (1, 1));
             let mut layout = layout::Layout::default();
@@ -1516,7 +1480,7 @@ mod tests {
                             scene.interface = Default::default();
                             let menu = scene.views.pop().unwrap();
                             let resolution = Resolution { pixel_scale, scale_menus, menu_scale_percent, ..Default::default() };
-                            let initial = plan((1920, 1080), 1.0, scene.screen_size, &resolution);
+                            let initial = plan((1920, 1080), scene.screen_size, &resolution);
                             let mut layout = layout::Layout::default();
                             layout.apply_settings(&viewer_settings::Layout { split, menu_follows_pointer: true, ..Default::default() });
                             layout.driver_screen = Some(initial.screen);
@@ -1585,7 +1549,7 @@ mod tests {
                     for ready in [false, true] {
                         scene.shape = if ready { WorldShape { cols: 62, rows: 125, wrap_x: true, wrap_y: false } } else { WorldShape::default() };
                         scene.interface.beside.as_mut().unwrap().world = ready.then_some([0, 0, 8000, 4000]);
-                        let p = plan(window, 1.0, scene.screen_size, &resolution).for_scene(&scene, rect_of);
+                        let p = plan(window, scene.screen_size, &resolution).for_scene(&scene, rect_of);
                         let mut layout = layout::Layout::default();
                         layout.driver_screen = Some(p.screen);
                         layout.menu_scale = p.menu.zoom;
@@ -1633,7 +1597,7 @@ mod tests {
         let set = sets.single(sprite);
         let mut world = TileWorld::new(Grid { cols: 1, rows: 1, layout: tile_render::Layout::Orthogonal, wrap_x: false, wrap_y: false, step: (8, 8) }, sets);
         for menu_scale in [0.5, 1.0, 1.5] {
-            let p = fixed_plan((2946, 1844), 2.0, (3274, 2048), (2, menu_scale, 1.0, 1.0));
+            let p = fixed_plan((2946, 1844), (3274, 2048), (2, menu_scale, 1.0, 1.0));
             let mut l = layout::Layout::default();
             l.configure("split=vertical,pane=pointer,magnifier=world,ui=pane").unwrap();
             l.driver_screen = Some(p.screen);
@@ -1693,26 +1657,27 @@ mod tests {
 
     #[test]
     fn the_picture_is_the_window_in_whole_boxes() {
-        // A 4K screen at 200 %: Auto renders 1920×1080, each pixel 2×2.
-        let p = plan((3840, 2160), 2.0, (1920, 1080), &Resolution::default());
+        // A 4K screen at 200 %: ×2 renders 1920×1080, each pixel 2×2.
+        let two = Resolution { pixel_scale: 2, ..Default::default() };
+        let p = plan((3840, 2160), (1920, 1080), &two);
         assert_eq!(p.present, Present { canvas: (1920, 1080), zoom: (2, 1), at: (0, 0), target: (3840, 2160) });
-        // At 150 %: rounded down, ×1 (no fractional boxes).
-        let p = plan((3840, 2160), 1.5, (2560, 1440), &Resolution::default());
+        // The default, whatever the desktop's scale: ×1, every window pixel.
+        let p = plan((3840, 2160), (1920, 1080), &Resolution::default());
         assert_eq!((p.present.canvas, p.present.zoom), ((3840, 2160), (1, 1)));
         // ×1 and ×3 at 200 %: the same driver's screen, other pictures.
-        let p = fixed_plan((3840, 2160), 2.0, (1920, 1080), (1, 1.0, 1.0, 1.0));
+        let p = fixed_plan((3840, 2160), (1920, 1080), (1, 1.0, 1.0, 1.0));
         assert_eq!((p.present.canvas, p.present.zoom), ((3840, 2160), (1, 1)));
-        let p = fixed_plan((3840, 2160), 2.0, (1920, 1080), (3, 1.0, 1.0, 1.0));
+        let p = fixed_plan((3840, 2160), (1920, 1080), (3, 1.0, 1.0, 1.0));
         assert_eq!((p.present.canvas, p.present.zoom, p.screen), ((1280, 720), (3, 1), (1920, 1080)));
         // A window that does not divide: a border of fewer than n pixels.
-        let p = fixed_plan((2001, 1081), 1.0, (1920, 1080), (2, 1.0, 1.0, 1.0));
+        let p = fixed_plan((2001, 1081), (1920, 1080), (2, 1.0, 1.0, 1.0));
         assert_eq!((p.present.canvas, p.present.at), ((1000, 540), (0, 0)));
-        let p = fixed_plan((2003, 1083), 1.0, (1920, 1080), (4, 1.0, 1.0, 1.0));
+        let p = fixed_plan((2003, 1083), (1920, 1080), (4, 1.0, 1.0, 1.0));
         assert_eq!((p.present.canvas, p.present.at), ((500, 270), (1, 1)));
         // Unknown driver screen: the canvas.
-        assert_eq!(plan((800, 600), 1.0, (0, 0), &Resolution::default()).screen, (800, 600));
+        assert_eq!(plan((800, 600), (0, 0), &Resolution::default()).screen, (800, 600));
         // Window pixels and canvas pixels: the middle of a box, and back.
-        let p = plan((3840, 2160), 2.0, (1920, 1080), &Resolution::default());
+        let p = plan((3840, 2160), (1920, 1080), &two);
         assert_eq!(p.to_window((100, 50)), (201, 101));
         assert_eq!(p.to_screen((201.0, 101.0)), (100, 50));
     }
@@ -1721,7 +1686,7 @@ mod tests {
     fn menus_and_frame_keep_to_the_canvas() {
         // ×1 at 200 %: the game's 1920×1080 interface at its own size on a
         // 3840×2160 picture: menus in its middle, panels at its corners.
-        let p = fixed_plan((3840, 2160), 2.0, (1920, 1080), (1, 1.5, 0.5, 1.0));
+        let p = fixed_plan((3840, 2160), (1920, 1080), (1, 1.5, 0.5, 1.0));
         assert_eq!((p.present.canvas, p.menu.zoom, p.frame), ((3840, 2160), (3, 2), (1, 2)));
         assert_eq!(p.menu.apply((960, 540)), (1920, 1080));
         assert_eq!(p.menu.apply((960 + 100, 540)), (1920 + 150, 1080));
@@ -1732,7 +1697,7 @@ mod tests {
         let tl = p.frame_piece((0, 0));
         assert_eq!(tl.apply((100, 40)), (50, 20));
         // A camera of the driver's moved and scaled with its piece.
-        let p = fixed_plan((3840, 2160), 2.0, (1920, 1080), (1, 1.0, 1.0, 1.0));
+        let p = fixed_plan((3840, 2160), (1920, 1080), (1, 1.0, 1.0, 1.0));
         let c = p.frame_piece((2, 2)).camera(&Camera { origin: (1600, 900), ..Camera::new((320, 180)) });
         assert_eq!((c.origin, c.viewport, c.zoom, c.screen_shift), ((3520, 1980), (320, 180), (1, 1), (1920, 1080)));
     }
@@ -1816,7 +1781,7 @@ mod tests {
                 let what = format!("×{pixel_scale}, menus {menu_scale}");
                 let mut l = layout::Layout::default();
                 l.apply_settings(&split);
-                let p = fixed_plan((3832, 2106), 2.0, (1920, 1080), (pixel_scale, menu_scale, 1.0, 1.0));
+                let p = fixed_plan((3832, 2106), (1920, 1080), (pixel_scale, menu_scale, 1.0, 1.0));
                 l.driver_screen = Some(p.screen);
                 l.menu_scale = p.menu.zoom;
                 let mut closed = scene.clone();
@@ -1868,7 +1833,7 @@ mod tests {
         for pixel_scale in [1, 2, 3] {
             let mut layout = layout::Layout::default();
             layout.apply_settings(&split);
-            let p = fixed_plan((3832, 2106), 2.0, (1920, 1080), (pixel_scale, 1.0, 1.0, 1.0));
+            let p = fixed_plan((3832, 2106), (1920, 1080), (pixel_scale, 1.0, 1.0, 1.0));
             layout.driver_screen = Some(p.screen);
             for _ in 0..3 {
                 let mut f = layout.frame(&scene, p.present.canvas, (0, 0, 0, 0), vec![], None);
@@ -1899,7 +1864,7 @@ mod tests {
             for frame_scale in [1.0, 1.35] {
                 let mut base_views = 0;
                 for optional_views in [false, true] {
-                    let p = fixed_plan(canvas, 1.0, (1920, 1080), (1, 1.0, frame_scale, 1.35));
+                    let p = fixed_plan(canvas, (1920, 1080), (1, 1.0, frame_scale, 1.35));
                     let mut layout = layout::Layout::default();
                     layout.apply_settings(&settings);
                     layout.set_map_movement(viewer_settings::MapMovement::Drag);
@@ -1962,38 +1927,36 @@ mod tests {
         let split = viewer_settings::Layout { split: viewer_settings::Split::Vertical1To1, smooth_world_movement: true, ..Default::default() };
         let windows = [(1, 1), (7, 5), (319, 239), (333, 251), (641, 479), (1001, 667), (1737, 1006), (3840, 2160), (3841, 2161), (5000, 400), (400, 3000)];
         for window in windows {
-            for pixel_scale in [Resolution::AUTO, 1, 2, 3, 4, 5, 6] {
-                for desktop in [1.0, 2.0] {
-                    let settings = Resolution { pixel_scale, ..Default::default() };
-                    let what = format!("{window:?} at ×{pixel_scale} on {desktop}");
-                    let p = plan(window, desktop, (1920, 1080), &settings);
-                    let (canvas, n) = (p.present.canvas, p.present.zoom.0);
-                    assert_eq!(p.present.zoom.1, 1, "{what}");
-                    assert!(canvas.0 * n <= window.0.max(1) && canvas.1 * n <= window.1.max(1), "{what}: {:?}", p.present);
-                    assert!(window.0.max(1) - canvas.0 * n < n && window.1.max(1) - canvas.1 * n < n, "{what}: {:?}", p.present);
-                    if window.0 >= 320 && window.1 >= 240 {
-                        assert!(canvas.0 >= 320 && canvas.1 >= 240, "{what}: {canvas:?}");
-                    }
-                    let mut layout = layout::Layout::default();
-                    layout.apply_settings(&split);
-                    layout.world_scale = p.world;
-                    layout.driver_screen = Some(p.screen);
-                    for _ in 0..3 {
-                        layout.advance(std::time::Duration::from_millis(16));
-                        let mut f = layout.frame(&scene, canvas, (0, 0, 0, 0), vec![], None);
-                        let arranged = arrange(&p, &scene, &mut f, &rect_of);
-                        assert!(f.cameras.len() <= tile_render::MAX_VIEWS, "{what}");
-                        assert!(f.cameras.iter().all(|c| c.viewport.0 > 0 && c.viewport.1 > 0), "{what}: {:?}", f.cameras);
-                        let shown = arranged.shown.clone().unwrap_or_default();
-                        assert!(shown.iter().all(|s| s.rect[2] > 0 && s.rect[3] > 0), "{what}");
-                        layout.interface_shown = arranged.shown;
-                        // The pointer anywhere in the window: somewhere in
-                        // the driver's screen or nowhere, never a panic.
-                        for (x, y) in [(0.0, 0.0), (window.0 as f64 - 1.0, window.1 as f64 - 1.0), (window.0 as f64 / 2.0, window.1 as f64 / 2.0)] {
-                            let q = p.to_screen((x, y));
-                            assert!(q.0 >= 0 && q.1 >= 0 && q.0 <= canvas.0 as i32 && q.1 <= canvas.1 as i32, "{what}: {q:?}");
-                            let _ = layout.route(scene::Input::MouseMove { x: q.0, y: q.1 });
-                        }
+            for pixel_scale in [1, 2, 3, 4, 5, 6] {
+                let settings = Resolution { pixel_scale, ..Default::default() };
+                let what = format!("{window:?} at ×{pixel_scale}");
+                let p = plan(window, (1920, 1080), &settings);
+                let (canvas, n) = (p.present.canvas, p.present.zoom.0);
+                assert_eq!(p.present.zoom.1, 1, "{what}");
+                assert!(canvas.0 * n <= window.0.max(1) && canvas.1 * n <= window.1.max(1), "{what}: {:?}", p.present);
+                assert!(window.0.max(1) - canvas.0 * n < n && window.1.max(1) - canvas.1 * n < n, "{what}: {:?}", p.present);
+                if window.0 >= 320 && window.1 >= 240 {
+                    assert!(canvas.0 >= 320 && canvas.1 >= 240, "{what}: {canvas:?}");
+                }
+                let mut layout = layout::Layout::default();
+                layout.apply_settings(&split);
+                layout.world_scale = p.world;
+                layout.driver_screen = Some(p.screen);
+                for _ in 0..3 {
+                    layout.advance(std::time::Duration::from_millis(16));
+                    let mut f = layout.frame(&scene, canvas, (0, 0, 0, 0), vec![], None);
+                    let arranged = arrange(&p, &scene, &mut f, &rect_of);
+                    assert!(f.cameras.len() <= tile_render::MAX_VIEWS, "{what}");
+                    assert!(f.cameras.iter().all(|c| c.viewport.0 > 0 && c.viewport.1 > 0), "{what}: {:?}", f.cameras);
+                    let shown = arranged.shown.clone().unwrap_or_default();
+                    assert!(shown.iter().all(|s| s.rect[2] > 0 && s.rect[3] > 0), "{what}");
+                    layout.interface_shown = arranged.shown;
+                    // The pointer anywhere in the window: somewhere in
+                    // the driver's screen or nowhere, never a panic.
+                    for (x, y) in [(0.0, 0.0), (window.0 as f64 - 1.0, window.1 as f64 - 1.0), (window.0 as f64 / 2.0, window.1 as f64 / 2.0)] {
+                        let q = p.to_screen((x, y));
+                        assert!(q.0 >= 0 && q.1 >= 0 && q.0 <= canvas.0 as i32 && q.1 <= canvas.1 as i32, "{what}: {q:?}");
+                        let _ = layout.route(scene::Input::MouseMove { x: q.0, y: q.1 });
                     }
                 }
             }
@@ -2002,80 +1965,78 @@ mod tests {
 
     #[test]
     fn every_setting_preserves_scale_and_reachable_interface() {
-        // Every pixel scale, desktop scale and part scale from the slider's
+        // Every pixel scale and part scale from the slider's
         // ends to its middle: whole pixels; the world fills the picture,
         // every part has a camera that draws over what is below it (none blots out the
         // world), takes the pointer where it shows and maps it back to the
         // driver's pixel it shows.
         let (scene, rect_of) = game_scene();
         let scales = [0.5, 0.7, 1.0, 1.2, 2.0, 3.0];
-        for pixel_scale in [Resolution::AUTO, 1, 2, 3, 6] {
-            for desktop in [1.0, 1.5, 2.0] {
-                let mut combos = Vec::new();
-                for m in scales {
-                    for f in scales {
-                        for w in scales {
-                            combos.push((m, f, w));
-                        }
+        for pixel_scale in [1, 2, 3, 6] {
+            let mut combos = Vec::new();
+            for m in scales {
+                for f in scales {
+                    for w in scales {
+                        combos.push((m, f, w));
                     }
                 }
-                for (menu, frame, world) in combos {
-                    let scales = (pixel_scale, menu, frame, world);
-                    let what = format!("{scales:?} at {desktop}");
-                    let p = fixed_plan((3840, 2160), desktop, (1920, 1080), scales);
-                    let mut layout = layout::Layout::default();
-                    layout.world_scale = p.world;
-                    layout.driver_screen = Some(p.screen);
-                    let mut f = layout.frame(&scene, p.present.canvas, (0, 0, 0, 0), vec![], None);
-                    let arranged = arrange(&p, &scene, &mut f, &rect_of);
-                    let canvas = p.present.canvas;
-                    assert_eq!(p.present.zoom.1, 1, "{what}: whole boxes");
-                    assert!((3840 - canvas.0 * p.present.zoom.0) < p.present.zoom.0 && (2160 - canvas.1 * p.present.zoom.0) < p.present.zoom.0, "{what}");
-                    assert!(f.cameras.len() <= tile_render::MAX_VIEWS, "{what}");
-                    assert!(f.cameras.iter().all(|c| c.viewport.0 > 0 && c.viewport.1 > 0), "{what}");
-                    let main = f.cameras[f.view_cameras[0].unwrap() as usize];
-                    assert!(main.cells && main.origin.0 <= 0 && main.origin.1 <= 0, "{what}: {main:?}");
-                    assert!(main.origin.0 + main.viewport.0 as i32 >= canvas.0 as i32 - 1 && main.origin.1 + main.viewport.1 as i32 >= canvas.1 as i32 - 1, "{what}: {main:?}");
-                    for (v, c) in scene.views.iter().zip(&f.view_cameras).filter(|(v, _)| v.view.interface_only) {
-                        let Some(c) = c else { continue };
-                        let c = f.cameras[*c as usize];
-                        assert!(!c.is_scaled() || c.hairline, "{what}: view {} drawn into a picture of its own", v.id);
-                    }
-                    for (_, cams) in &arranged.overlay_cameras {
-                        assert!(cams.iter().all(|&c| (c as usize) < f.cameras.len() && !f.cameras[c as usize].cells), "{what}");
-                    }
-                    {
-                        assert!(arranged.overlay.is_some_and(|o| (o as usize) < f.cameras.len()), "{what}");
-                        let shown = arranged.shown.as_ref().expect("the interface as shown");
-                        // The menu: its middle maps back near its middle (a
-                        // layout pixel may be several driver pixels).
-                        let menu_piece = shown.iter().find(|s| {
-                            let m = s.to_driver((s.rect[0] + s.rect[2] / 2, s.rect[1] + s.rect[3] / 2));
-                            (m.0 - 960).abs() <= 8 && (m.1 - 540).abs() <= 8
-                        });
-                        assert!(menu_piece.is_some(), "{what}: {shown:?}");
-                        // Fitting axes remain wholly visible. Oversized
-                        // axes cover the canvas and retain their scale.
-                        for piece in shown {
-                            let c = piece.rect;
-                            for (at, len, side) in [(c[0], c[2], canvas.0 as i32), (c[1], c[3], canvas.1 as i32)] {
-                                if len <= side {
-                                    assert!(at >= -1 && at + len <= side + 1, "{what}: {c:?} on {canvas:?}");
-                                } else {
-                                    assert!(at <= 0 && at + len >= side, "{what}: {c:?} on {canvas:?}");
-                                }
-                            }
-                            if piece.driver == [448, 156, 1024, 768] {
-                                assert_eq!(piece.piece.zoom, ratio(menu), "{what}");
-                            }
-                            // (The popup is a modal over the menu: at its zoom,
-                            // smaller only where it would not be whole.)
-                            if piece.driver == [800, 400, 320, 200] {
-                                assert_eq!(piece.piece.zoom, fit_at_most(ratio(menu), Some(piece.driver), canvas), "{what}");
+            }
+            for (menu, frame, world) in combos {
+                let scales = (pixel_scale, menu, frame, world);
+                let what = format!("{scales:?}");
+                let p = fixed_plan((3840, 2160), (1920, 1080), scales);
+                let mut layout = layout::Layout::default();
+                layout.world_scale = p.world;
+                layout.driver_screen = Some(p.screen);
+                let mut f = layout.frame(&scene, p.present.canvas, (0, 0, 0, 0), vec![], None);
+                let arranged = arrange(&p, &scene, &mut f, &rect_of);
+                let canvas = p.present.canvas;
+                assert_eq!(p.present.zoom.1, 1, "{what}: whole boxes");
+                assert!((3840 - canvas.0 * p.present.zoom.0) < p.present.zoom.0 && (2160 - canvas.1 * p.present.zoom.0) < p.present.zoom.0, "{what}");
+                assert!(f.cameras.len() <= tile_render::MAX_VIEWS, "{what}");
+                assert!(f.cameras.iter().all(|c| c.viewport.0 > 0 && c.viewport.1 > 0), "{what}");
+                let main = f.cameras[f.view_cameras[0].unwrap() as usize];
+                assert!(main.cells && main.origin.0 <= 0 && main.origin.1 <= 0, "{what}: {main:?}");
+                assert!(main.origin.0 + main.viewport.0 as i32 >= canvas.0 as i32 - 1 && main.origin.1 + main.viewport.1 as i32 >= canvas.1 as i32 - 1, "{what}: {main:?}");
+                for (v, c) in scene.views.iter().zip(&f.view_cameras).filter(|(v, _)| v.view.interface_only) {
+                    let Some(c) = c else { continue };
+                    let c = f.cameras[*c as usize];
+                    assert!(!c.is_scaled() || c.hairline, "{what}: view {} drawn into a picture of its own", v.id);
+                }
+                for (_, cams) in &arranged.overlay_cameras {
+                    assert!(cams.iter().all(|&c| (c as usize) < f.cameras.len() && !f.cameras[c as usize].cells), "{what}");
+                }
+                {
+                    assert!(arranged.overlay.is_some_and(|o| (o as usize) < f.cameras.len()), "{what}");
+                    let shown = arranged.shown.as_ref().expect("the interface as shown");
+                    // The menu: its middle maps back near its middle (a
+                    // layout pixel may be several driver pixels).
+                    let menu_piece = shown.iter().find(|s| {
+                        let m = s.to_driver((s.rect[0] + s.rect[2] / 2, s.rect[1] + s.rect[3] / 2));
+                        (m.0 - 960).abs() <= 8 && (m.1 - 540).abs() <= 8
+                    });
+                    assert!(menu_piece.is_some(), "{what}: {shown:?}");
+                    // Fitting axes remain wholly visible. Oversized
+                    // axes cover the canvas and retain their scale.
+                    for piece in shown {
+                        let c = piece.rect;
+                        for (at, len, side) in [(c[0], c[2], canvas.0 as i32), (c[1], c[3], canvas.1 as i32)] {
+                            if len <= side {
+                                assert!(at >= -1 && at + len <= side + 1, "{what}: {c:?} on {canvas:?}");
+                            } else {
+                                assert!(at <= 0 && at + len >= side, "{what}: {c:?} on {canvas:?}");
                             }
                         }
-                        assert!(shown.iter().all(|s| s.rect[2] > 0 && s.rect[3] > 0), "{what}");
+                        if piece.driver == [448, 156, 1024, 768] {
+                            assert_eq!(piece.piece.zoom, ratio(menu), "{what}");
+                        }
+                        // (The popup is a modal over the menu: at its zoom,
+                        // smaller only where it would not be whole.)
+                        if piece.driver == [800, 400, 320, 200] {
+                            assert_eq!(piece.piece.zoom, fit_at_most(ratio(menu), Some(piece.driver), canvas), "{what}");
+                        }
                     }
+                    assert!(shown.iter().all(|s| s.rect[2] > 0 && s.rect[3] > 0), "{what}");
                 }
             }
         }
@@ -2099,7 +2060,7 @@ mod tests {
                     } else if kind == "popup" {
                         scene.interface.popup = Some(v.id);
                     }
-                    let p = fixed_plan((3840, 2160), 2.0, scene.screen_size, (pixel_scale, menu_scale, 1.0, 1.0));
+                    let p = fixed_plan((3840, 2160), scene.screen_size, (pixel_scale, menu_scale, 1.0, 1.0));
                     let mut layout = layout::Layout::default();
                     layout.driver_screen = Some(p.screen);
                     let mut f = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
@@ -2122,7 +2083,7 @@ mod tests {
         let (mut scene, rect_of) = game_scene();
         scene.views.retain(|v| v.id == 0 || v.id == 255);
         scene.interface = scene::Interface::default();
-        let p = fixed_plan((3840, 2160), 2.0, scene.screen_size, (6, 1.0, 1.0, 1.0));
+        let p = fixed_plan((3840, 2160), scene.screen_size, (6, 1.0, 1.0, 1.0));
         let mut layout = layout::Layout::default();
         layout.driver_screen = Some(p.screen);
         let draw = |layout: &mut layout::Layout| {
@@ -2188,13 +2149,13 @@ mod tests {
     /// it. The popup shows across in the middle of the window, its top in
     /// the top third ([`MODAL_TOP`]), at the menu's zoom, and takes the
     /// clicks on its button. TS Neo first: the game's 3274×2048 screen in a
-    /// 3258×1904 window at desktop scale 2 (a 1629×952 canvas).
+    /// 3258×1904 window at pixel scale 2 (a 1629×952 canvas).
     #[test]
     fn a_modal_over_a_menu_keeps_the_menu_and_shows_in_the_top_third() {
         use scene::{Interactable, InteractableKind, View, ViewState};
         let (background, info, button) = (1, 2, 3);
-        let cases = [((3274u32, 2048u32), (3258u32, 1904u32), 2.0), ((1280, 800), (1280, 800), 1.0), ((1920, 1080), (1920, 1080), 1.0), ((1024, 768), (1024, 768), 1.0)];
-        for (screen, window, desktop) in cases {
+        let cases = [((3274u32, 2048u32), (3258u32, 1904u32), 2u32), ((1280, 800), (1280, 800), 1), ((1920, 1080), (1920, 1080), 1), ((1024, 768), (1024, 768), 1)];
+        for (screen, window, pixel_scale) in cases {
             let menu = [(screen.0 as i32 - 1024) / 2, (screen.1 as i32 - 768) / 2, 1024, 768];
             // Where the game put the info box: at the top of its screen.
             let popup = [(screen.0 as i32 - 500) / 2, 0, 500, 300];
@@ -2223,10 +2184,10 @@ mod tests {
                 with.interactables = vec![Interactable { alt_right_click: false, id: 7, rect: ok, anchor: None, kind: InteractableKind::Button }];
                 for scale_menus in [false, true] {
                     for menu_scale_percent in [60.0, 100.0] {
-                        let settings = Resolution { pixel_scale: Resolution::AUTO, scale_menus, menu_scale_percent, ..Default::default() };
+                        let settings = Resolution { pixel_scale, scale_menus, menu_scale_percent, ..Default::default() };
                         let what = format!("{screen:?} in {window:?}, preferences {preferences}, {settings:?}");
                         let arranged = |scene: &Scene| {
-                            let p = plan(window, desktop, screen, &settings).for_scene(scene, rect_of);
+                            let p = plan(window, screen, &settings).for_scene(scene, rect_of);
                             let mut layout = layout::Layout::default();
                             layout.driver_screen = Some(p.screen);
                             layout.menu_scale = p.menu.zoom;
@@ -2379,7 +2340,7 @@ mod tests {
                         // The layout as the user's settings make it, the
                         // pointer in the pane on the other side from A.
                         let arranged = |scene: &Scene| {
-                            let p = plan(window, 2.0, screen, &settings).for_scene(scene, rect_of);
+                            let p = plan(window, screen, &settings).for_scene(scene, rect_of);
                             assert_eq!(p.canvas(), (1091, 682), "{what}");
                             let mut layout = layout::Layout::default();
                             layout.configure(&format!("split={axis}")).unwrap();

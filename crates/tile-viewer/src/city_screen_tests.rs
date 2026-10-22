@@ -179,7 +179,7 @@ struct Composed {
 /// `scene` as a viewer arranged by `settings` shows it on a window as large
 /// as the game's (the mouse captured first if `capture`), after the map.
 fn compose(compiled: &Compiled, settings: &Settings, scene: &Scene, capture: bool) -> Composed {
-    let plan = scaling::plan(SCREEN, 1.0, SCREEN, &viewer_settings::Resolution::default());
+    let plan = scaling::plan(SCREEN, SCREEN, &viewer_settings::Resolution::default());
     let mut l = Layout::default();
     // (Capturing: B follows the captured mouse.)
     l.apply_settings(&Settings { roles: if capture { viewer_settings::Roles::UnitMouse } else { settings.roles }, ..settings.clone() });
@@ -415,7 +415,7 @@ fn popup_layers_never_change_the_underlying_named_screen_or_world_layout() {
                         let mut layout = Layout::default();
                         layout.apply_settings(&Settings { split, screen_place: ScreenPlace { vertical: place, horizontal: place }, ..Default::default() });
                         let draw = |layout: &mut Layout, scene: &Scene| {
-                            let plan = scaling::plan(window, 1.0, SCREEN, &resolution).for_scene(scene, |s| sprite_rect(&compiled, s));
+                            let plan = scaling::plan(window, SCREEN, &resolution).for_scene(scene, |s| sprite_rect(&compiled, s));
                             layout.driver_screen = Some(SCREEN);
                             layout.menu_scale = plan.menu.zoom;
                             layout.world_scale = plan.world;
@@ -573,7 +573,7 @@ fn check_opaque_modal_stack(gpu: Option<&tile_render::Headless>) {
         open.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (rect[0], rect[1]), viewport: (rect[2] as u32, rect[3] as u32), ..Default::default() }, overlay: art });
         open.views.sort_by_key(|view| view.id);
         for place in [Place::Floating, Place::RightOrTop] {
-            let plan = scaling::plan(if kind == "title-Menu" { (1012, 632) } else { (1280, 800) }, 1.0, base.screen_size, &viewer_settings::Resolution {
+            let plan = scaling::plan(if kind == "title-Menu" { (1012, 632) } else { (1280, 800) }, base.screen_size, &viewer_settings::Resolution {
                 pixel_scale: if kind == "title-Menu" { 1 } else { 2 }, scale_menus: true,
                 menu_scale_percent: if kind == "title-Menu" { 100.0 } else { 75.0 }, ..Default::default()
             }).for_scene(&base, |s| sprite_rect(&compiled, s));

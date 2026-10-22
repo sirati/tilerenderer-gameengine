@@ -143,7 +143,7 @@ mod tests {
             id: 8, config_revision: 3, input_revision: app.input_revision,
             mapping: Mapping::capture(&app), started: Instant::now(), main_prepare: std::time::Duration::ZERO,
             frame: layout::Frame::default(),
-            picture: CachedPicture { plan: scaling::plan((100, 100), 1.0, (100, 100), &app.settings.resolution), copies: vec![], pixel_box: 1 },
+            picture: CachedPicture { plan: scaling::plan((100, 100), (100, 100), &app.settings.resolution), copies: vec![], pixel_box: 1 },
             inputs: vec![scene::Input::MainView { x: 20, y: 30, w: 40, h: 50 }],
         };
         let mut pending = Some(candidate());

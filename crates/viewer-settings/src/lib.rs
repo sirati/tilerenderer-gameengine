@@ -37,6 +37,27 @@ pub struct Settings {
     pub animation: Animation,
     pub display: Display,
     pub clean_map: clean_map::CleanMap,
+    /// What is shown once ever. A file without it is an existing install's:
+    /// that has seen it all (only no file at all is a first run).
+    #[serde(default = "FirstRun::done")]
+    pub first_run: FirstRun,
+}
+
+/// Things shown once, the first time the game runs with the renderer.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FirstRun {
+    /// Preferences have been opened on the Resolution tab by themselves
+    /// (once the title menu is up), so the user picks the pixel scale
+    /// and sizes. Set when they open, whatever the user does then.
+    pub preferences_shown: bool,
+}
+
+impl FirstRun {
+    /// An install from before this marker, or one whose first run is over.
+    pub fn done() -> Self {
+        FirstRun { preferences_shown: true }
+    }
 }
 
 /// Visual combat timing, independent of simulation and audio clocks.
@@ -64,9 +85,10 @@ pub struct Resolution {
     /// Every rendered pixel shown as an n×n box of window pixels (1..=6,
     /// whole numbers only): the viewer renders at the window size divided
     /// by n (rounded down; what is left is a border of fewer than n
-    /// pixels), never scaled by a fraction or filtered. [`Resolution::AUTO`]
-    /// (0, the default): n is the desktop's scale rounded down (2 at 200 %,
-    /// 1 at 150 %).
+    /// pixels), never scaled by a fraction or filtered. 1, the default,
+    /// renders every window pixel, on a high-density (Retina) display too;
+    /// the menu, frame and world scales size things there. (0, "Auto" in
+    /// older files, loads as 1.)
     pub pixel_scale: u32,
     /// Size menus relative to the visible canvas. When false menus use
     /// their native size; the title and Preferences still fit the canvas.
@@ -102,7 +124,7 @@ pub enum BackgroundSampling {
 
 impl Default for Resolution {
     fn default() -> Self {
-        Self { pixel_scale: Self::AUTO, scale_menus: false, menu_scale_percent: 100.0, frame_scale: 1.0, world_scale: 1.0, background_sampling: BackgroundSampling::Dither }
+        Self { pixel_scale: 1, scale_menus: false, menu_scale_percent: 100.0, frame_scale: 1.0, world_scale: 1.0, background_sampling: BackgroundSampling::Dither }
     }
 }
 
@@ -131,7 +153,8 @@ impl<'de> Deserialize<'de> for Resolution {
         }
         let saved = Saved::deserialize(deserializer)?;
         let _legacy_multiplier = saved.menu_scale;
-        let mut resolution = Self { pixel_scale: saved.pixel_scale, scale_menus: saved.scale_menus,
+        // (0 was "Auto", the desktop's scale: now ×1 everywhere.)
+        let mut resolution = Self { pixel_scale: saved.pixel_scale.clamp(1, Self::MAX_PIXEL_SCALE), scale_menus: saved.scale_menus,
             menu_scale_percent: saved.menu_scale_percent, frame_scale: saved.frame_scale, world_scale: saved.world_scale,
             background_sampling: saved.background_sampling };
         resolution.menu_scale_percent = resolution.effective_menu_scale_percent();
@@ -149,18 +172,11 @@ impl Resolution {
 
     /// Most pixels per rendered pixel.
     pub const MAX_PIXEL_SCALE: u32 = 6;
-    /// `pixel_scale`: the desktop's scale.
-    pub const AUTO: u32 = 0;
 
-    /// Window pixels per rendered pixel on a desktop scaled `desktop` times
-    /// (e.g. 2.0 at 200 %; the operating system's scale for the window):
-    /// the pixel scale, or for [`Resolution::AUTO`] the desktop's rounded
-    /// down (between 1 and [`Resolution::MAX_PIXEL_SCALE`]).
-    pub fn effective_pixel_scale(&self, desktop: f64) -> u32 {
-        match self.pixel_scale {
-            Self::AUTO => if desktop.is_finite() { (desktop.floor() as u32).clamp(1, Self::MAX_PIXEL_SCALE) } else { 1 },
-            n => n.min(Self::MAX_PIXEL_SCALE),
-        }
+    /// Window pixels per rendered pixel: the pixel scale, between 1 and
+    /// [`Resolution::MAX_PIXEL_SCALE`], whatever the desktop's scale.
+    pub fn effective_pixel_scale(&self) -> u32 {
+        self.pixel_scale.clamp(1, Self::MAX_PIXEL_SCALE)
     }
 
     /// The smallest resolution a pixel scale renders at, where the window
@@ -171,24 +187,39 @@ impl Resolution {
     /// The pixel scale in a window of `window` pixels: the effective one
     /// ([`Resolution::effective_pixel_scale`]), lowered as far as needed
     /// to render at least [`Resolution::MIN_RENDERED`] (or the window).
-    pub fn pixel_scale_in(&self, (w, h): (u32, u32), desktop: f64) -> u32 {
+    pub fn pixel_scale_in(&self, (w, h): (u32, u32)) -> u32 {
         let most = (w / Self::MIN_RENDERED.0).min(h / Self::MIN_RENDERED.1).max(1);
-        self.effective_pixel_scale(desktop).min(most)
+        self.effective_pixel_scale().min(most)
     }
 
-    /// The resolution actually rendered for a window of `window` pixels on
-    /// a desktop scaled `desktop` times ([`Resolution::pixel_scale_in`]):
-    /// rounded down, at least 1.
-    pub fn realised(&self, (w, h): (u32, u32), desktop: f64) -> (u32, u32) {
-        let n = self.pixel_scale_in((w, h), desktop);
+    /// The resolution actually rendered for a window of `window` physical
+    /// pixels ([`Resolution::pixel_scale_in`]): rounded down, at least 1.
+    pub fn realised(&self, (w, h): (u32, u32)) -> (u32, u32) {
+        let n = self.pixel_scale_in((w, h));
         ((w / n).max(1), (h / n).max(1))
     }
 
-    /// The pixel scale in words, e.g. "×3", or "Auto (×2)" (`desktop` as
-    /// for [`Resolution::realised`]).
-    pub fn describe_pixel_scale(&self, desktop: f64) -> String {
-        let n = self.effective_pixel_scale(desktop);
-        if self.pixel_scale == Self::AUTO { format!("Auto (×{n})") } else { format!("×{n}") }
+    /// The pixel scale in words, e.g. "×3".
+    pub fn describe_pixel_scale(&self) -> String {
+        format!("×{}", self.effective_pixel_scale())
+    }
+
+    /// The first run's sizes on a desktop scaled `desktop` times (2.0 at
+    /// 200 %) in a window `height` physical pixels tall: at ×1 (every
+    /// window pixel rendered), things as large as they were when the pixel
+    /// scale followed the desktop (n, its scale rounded down): the frame
+    /// and the world n times, menus scaled to the share of the window a
+    /// standard 768-row menu took at n. Only the sliders' starting values;
+    /// nothing changes on a desktop at 100 %.
+    pub fn seed_for_desktop(&mut self, desktop: f64, height: u32) {
+        let n = if desktop.is_finite() { desktop.floor().clamp(1.0, 3.0) } else { 1.0 };
+        if n <= 1.0 {
+            return;
+        }
+        (self.frame_scale, self.world_scale) = (n as f32, n as f32);
+        self.scale_menus = true;
+        self.menu_scale_percent = (768.0 * n * 100.0 / f64::from(height.max(1))) as f32;
+        self.menu_scale_percent = self.effective_menu_scale_percent();
     }
 }
 
@@ -666,23 +697,49 @@ mod tests {
     #[test]
     fn realised_resolution_divides_by_the_pixel_scale() {
         let r = Resolution { pixel_scale: 3, ..Default::default() };
-        assert_eq!(r.realised((3840, 2160), 2.0), (1280, 720));
-        assert_eq!(r.describe_pixel_scale(2.0), "×3");
-        assert_eq!(Resolution { pixel_scale: 9, ..Default::default() }.realised((3840, 2160), 1.0), (640, 360));
+        assert_eq!(r.realised((3840, 2160)), (1280, 720));
+        assert_eq!(r.describe_pixel_scale(), "×3");
+        assert_eq!(Resolution { pixel_scale: 9, ..Default::default() }.realised((3840, 2160)), (640, 360));
         // A small window: the pixel scale lowered to keep 320×240 at least.
-        assert_eq!(r.realised((800, 600), 1.0), (400, 300));
-        assert_eq!(r.realised((100, 100), 1.0), (100, 100));
-        assert_eq!(r.realised((0, 0), 1.0), (1, 1));
-        // Auto, the default: the desktop's scale, fractional ones too.
-        let auto = Resolution::default();
-        assert_eq!(auto.realised((3840, 2160), 2.0), (1920, 1080));
-        assert_eq!(auto.describe_pixel_scale(2.0), "Auto (×2)");
-        // At 150 %: rounded down, whole boxes only.
-        assert_eq!(auto.realised((3840, 2160), 1.5), (3840, 2160));
-        assert_eq!(auto.describe_pixel_scale(1.5), "Auto (×1)");
-        assert_eq!(auto.realised((3840, 2160), 2.5), (1920, 1080));
-        assert_eq!(auto.realised((1920, 1080), 1.0), (1920, 1080));
-        assert_eq!(auto.realised((1920, 1080), f64::NAN), (1920, 1080));
+        assert_eq!(r.realised((800, 600)), (400, 300));
+        assert_eq!(r.realised((100, 100)), (100, 100));
+        assert_eq!(r.realised((0, 0)), (1, 1));
+        // The default, on a Retina window too: every window pixel.
+        let default = Resolution::default();
+        assert_eq!(default.realised((3258, 1904)), (3258, 1904));
+        assert_eq!(default.describe_pixel_scale(), "×1");
+    }
+
+    #[test]
+    fn a_first_run_on_a_high_density_desktop_starts_at_the_old_sizes() {
+        // TS Neo: 200 %, a 1904-row window. A 768-row menu took 1536 rows.
+        let mut r = Resolution::default();
+        r.seed_for_desktop(2.0, 1904);
+        assert_eq!((r.pixel_scale, r.frame_scale, r.world_scale, r.scale_menus, r.menu_scale_percent), (1, 2.0, 2.0, true, 81.0));
+        // 150 % (Auto was ×1 there) and 100 %: unchanged.
+        for desktop in [1.0, 1.5, f64::NAN] {
+            let mut r = Resolution::default();
+            r.seed_for_desktop(desktop, 1080);
+            assert_eq!(r, Resolution::default(), "{desktop}");
+        }
+        // Within the sliders and the menu percent's range.
+        let mut r = Resolution::default();
+        r.seed_for_desktop(4.0, 1000);
+        assert_eq!((r.frame_scale, r.world_scale, r.menu_scale_percent), (3.0, 3.0, 100.0));
+    }
+
+    #[test]
+    fn a_settings_file_marks_the_first_run_over_only_no_file_starts_one() {
+        assert!(!Settings::default().first_run.preferences_shown, "no file: the first run");
+        let existing: Settings = toml::from_str("[resolution]\npixel_scale = 2\n").unwrap();
+        assert!(existing.first_run.preferences_shown, "an existing install's file");
+        let mut fresh = Settings::default();
+        let saved: Settings = toml::from_str(&toml::to_string(&fresh).unwrap()).unwrap();
+        assert!(!saved.first_run.preferences_shown, "saved before Preferences opened");
+        fresh.first_run.preferences_shown = true;
+        let text = toml::to_string(&fresh).unwrap();
+        assert!(text.contains("[first_run]") && text.contains("preferences_shown = true"), "{text}");
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), fresh);
     }
 
     #[test]
@@ -717,11 +774,13 @@ mod tests {
 
     #[test]
     fn a_saved_pixel_scale_stays_what_it_was() {
-        // Files from before Auto: their number; without one: Auto.
-        let one: Settings = toml::from_str("[resolution]\npixel_scale = 1\n").unwrap();
-        assert_eq!(one.resolution.pixel_scale, 1);
+        // A number stays; "Auto" (0) and none are ×1.
+        let three: Settings = toml::from_str("[resolution]\npixel_scale = 3\n").unwrap();
+        assert_eq!(three.resolution.pixel_scale, 3);
+        let auto: Settings = toml::from_str("[resolution]\npixel_scale = 0\n").unwrap();
+        assert_eq!(auto.resolution.pixel_scale, 1);
         let none: Settings = toml::from_str("[resolution]\nmenu_scale = 1.5\n").unwrap();
-        assert_eq!(none.resolution.pixel_scale, Resolution::AUTO);
+        assert_eq!(none.resolution.pixel_scale, 1);
     }
 
     #[test]

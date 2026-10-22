@@ -732,12 +732,6 @@ pub struct Layout {
     /// Whether zoomed views show text at their resolution (the driver's
     /// zoomed art) rather than its pixels scaled.
     pub sharp_text: bool,
-    /// Whether a canvas shown at a pixel scale is composed at the window's
-    /// resolution, for text from outlines at its size on the window
-    /// (`text=window`, `scaling::drawn`). Off, the default: it is composed
-    /// at the canvas's own size (`scaling::drawn_on_canvas`), which is
-    /// what makes a pixel scale render fewer pixels.
-    pub text_at_window: bool,
     window: (u32, u32),
     pointer: (i32, i32),
     /// The world cursor, and the motion not yet a whole world pixel.
@@ -852,7 +846,6 @@ impl Default for Layout {
             reported_views: [(0, 0, 0, 0); 4],
             reported_main: (0, 0, 0, 0),
             sharp_text: true,
-            text_at_window: false,
             ui_in_pane: false,
             fit: None,
             placed_screen: None,
@@ -1179,9 +1172,7 @@ impl Layout {
     /// share), `main` and `pane` (what they follow: driver, focus, pointer,
     /// free), `main_zoom` and `pane_zoom` (e.g. 2 or 1/2), `magnifier`
     /// (screen, world, off), `magnifier_zoom`, `arrow` (on, off), `text`
-    /// (sharp: zoomed views show text at their resolution; window: also a
-    /// canvas at a pixel scale composed at the window's resolution, every
-    /// window pixel rendered; pixel), `ui`
+    /// (sharp: zoomed views show text at their resolution; pixel), `ui`
     /// (window; pane: with a split, the driver's whole screen in the main pane).
     pub fn configure(&mut self, spec: &str) -> Result<(), String> {
         for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -1224,10 +1215,9 @@ impl Layout {
                     }
                 }
                 "text" => {
-                    (self.sharp_text, self.text_at_window) = match value {
-                        "sharp" => (true, false),
-                        "window" => (true, true),
-                        "pixel" => (false, false),
+                    self.sharp_text = match value {
+                        "sharp" => true,
+                        "pixel" => false,
                         _ => return Err(bad()),
                     }
                 }
@@ -5925,7 +5915,7 @@ mod tests {
         s.screen_place = ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating };
         let mut l = Layout::default();
         l.apply_settings(&s);
-        let plan = crate::scaling::plan((800, 600), 1.0, (800, 600), &Resolution::default());
+        let plan = crate::scaling::plan((800, 600), (800, 600), &Resolution::default());
         let menu = with_screen("F4");
         l.frame(&scene(), plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
         let mut f = l.frame(&menu, plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
@@ -5963,7 +5953,7 @@ mod tests {
         for pixel_scale in 1..=6 {
             for split in [S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
                 for side in [Side::A, Side::B] {
-                    let mut plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &Resolution { pixel_scale, ..Default::default() });
+                    let mut plan = crate::scaling::plan((3840, 2160), (1920, 1080), &Resolution { pixel_scale, ..Default::default() });
                     plan.menu.zoom = crate::scaling::ratio(1.5);
                     assert_eq!(plan.present.zoom, (pixel_scale, 1));
                     let mut l = Layout::default();
@@ -6045,7 +6035,7 @@ mod tests {
         for pixel_scale in [1, 3, 6] {
             for menu_scale in [0.75, 1.0, 3.0] {
                 for split in [S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
-                    let mut plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &Resolution { pixel_scale, ..Default::default() });
+                    let mut plan = crate::scaling::plan((3840, 2160), (1920, 1080), &Resolution { pixel_scale, ..Default::default() });
                     plan.menu.zoom = crate::scaling::ratio(menu_scale);
                     let mut l = Layout::default();
                     l.apply_settings(&settings(|s| (s.split, s.roles) = (split, Roles::UnitMouse)));
@@ -6102,7 +6092,7 @@ mod tests {
         for pixel_scale in 1..=6 {
             // The separate matrix uses real 4K canvases. This pixel oracle
             // uses a smaller equivalent viewport to compare every pixel.
-            let mut plan = crate::scaling::plan((3840, 2160), 2.0, (192, 108), &Resolution { pixel_scale, ..Default::default() });
+            let mut plan = crate::scaling::plan((3840, 2160), (192, 108), &Resolution { pixel_scale, ..Default::default() });
             plan.menu.zoom = crate::scaling::ratio(1.5);
             plan.present.canvas = (384 / pixel_scale, 216 / pixel_scale);
             let mut l = Layout::default();
@@ -6199,7 +6189,7 @@ mod tests {
         assert_eq!(f.menu_region, l.panes().1);
         assert_eq!(l.shown.iter().filter(|(hit, _)| matches!(hit, Hit::Main | Hit::Pane)).count(), 2);
         assert!(f.placed.is_empty());
-        let mut plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &viewer_settings::Resolution { pixel_scale: 3, ..Default::default() });
+        let mut plan = crate::scaling::plan((3840, 2160), (1920, 1080), &viewer_settings::Resolution { pixel_scale: 3, ..Default::default() });
         plan.menu.zoom = crate::scaling::ratio(1.25);
         let arranged = crate::scaling::arrange_panned(&plan, &s, &mut f, &mut l.menu_pan, |_| Some([448, 156, 1024, 768]));
         let ui = f.cameras[f.view_cameras[3].unwrap() as usize];
@@ -6277,7 +6267,7 @@ mod tests {
                         let name = if city { "City" } else { "F1" };
                         let mut settings = settings(|s| s.split = split);
                         settings.screen_place = ScreenPlace { vertical: place, horizontal: place };
-                        let mut plan = crate::scaling::plan((3840, 2160), 2.0, (1920, 1080), &Resolution { pixel_scale, ..Default::default() });
+                        let mut plan = crate::scaling::plan((3840, 2160), (1920, 1080), &Resolution { pixel_scale, ..Default::default() });
                         plan.menu.zoom = crate::scaling::ratio(3.0);
                         let mut l = Layout::default();
                         l.apply_settings(&settings);
@@ -7196,7 +7186,7 @@ mod tests {
     fn capture_sensitivity_preserves_fractional_motion_with_independent_window_and_world_scales() {
         for pixel_scale in [1, 2, 3, 6] {
             let plan = crate::scaling::plan(
-                (800 * pixel_scale, 600 * pixel_scale), 2.0, (800, 600),
+                (800 * pixel_scale, 600 * pixel_scale), (800, 600),
                 &viewer_settings::Resolution { pixel_scale, ..Default::default() },
             );
             for zoom in [2, ONE, 5, 6] {
@@ -7946,7 +7936,7 @@ mod tests {
         let parent = with_anchored_popup(scene::PopupAnchor { world, offset: (1, 1), world_scaled: false }, (120, 90));
         let mut frame = layout.frame(&parent, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         let (at, _) = frame.popup_at.unwrap();
-        let plan = crate::scaling::plan((800, 600), 1.0, (800, 600), &viewer_settings::Resolution::default());
+        let plan = crate::scaling::plan((800, 600), (800, 600), &viewer_settings::Resolution::default());
         let arranged = crate::scaling::arrange(&plan, &parent, &mut frame, |_| None);
         layout.set_interface_shown(arranged.shown);
         let out = click(&mut layout, (at.0 + 30, at.1 + 30));
@@ -8128,7 +8118,7 @@ mod tests {
         for split in [S::Vertical1To1, S::Horizontal1To1] {
             let mut sides = Vec::new();
             for place in [Place::LeftOrBottom, Place::RightOrTop] {
-                let plan = crate::scaling::plan((1920, 1080), 1.0, (1920, 1080), &Resolution::default());
+                let plan = crate::scaling::plan((1920, 1080), (1920, 1080), &Resolution::default());
                 let mut l = Layout::default();
                 l.apply_settings(&settings(|s| {
                     (s.split, s.roles) = (split, Roles::UnitMouse);

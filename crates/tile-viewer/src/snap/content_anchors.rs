@@ -187,7 +187,6 @@ fn oversized_menu_alt_targets_stay_in_the_opening_pane_through_all_panned_corner
     for pixel_scale in [3, 6] {
         let mut plan = crate::scaling::plan(
             (3840, 2160),
-            2.0,
             (1920, 1080),
             &Resolution {
                 pixel_scale,
@@ -299,7 +298,7 @@ fn title_target_keeps_its_hit_box_when_its_middle_overlaps_a_glyph_sprite() {
             ],
         }], ..Default::default()
     };
-    let plan = crate::scaling::plan((1012, 632), 1.0, scene.screen_size,
+    let plan = crate::scaling::plan((1012, 632), scene.screen_size,
         &viewer_settings::Resolution::default());
     let mut layout = Layout::default();
     layout.driver_screen = Some(plan.screen);

@@ -2405,7 +2405,7 @@ mod cached_picture_tests {
     use tile_render::{Present, ScreenCopy};
 
     fn picture() -> CachedPicture {
-        let mut plan = scaling::plan((1280, 960), 1.0, (640, 480), &Default::default());
+        let mut plan = scaling::plan((1280, 960), (640, 480), &Default::default());
         plan.present = Present { canvas: (640, 480), zoom: (2, 1), at: (0, 0), target: (1280, 960) };
         CachedPicture {
             plan,
@@ -2955,7 +2955,7 @@ impl App {
                 }
             }
         }
-        // The desktop's scale (pixel scale Auto): the window's, or a native
+        // The desktop's scale (for the driver; not the pixel scale): the window's, or a native
         // viewer's launcher's (`CIV3R_SCALE`, which sizes the game too; a
         // viewer in a Wine program has its window in Wine's own pixels,
         // which Wine scales for the desktop itself).
@@ -2970,7 +2970,7 @@ impl App {
             self.cached_picture.as_ref().map(|picture| picture.plan_for_target(window))
         } else {
             None
-        }.unwrap_or_else(|| scaling::plan(window, desktop, screen, &self.settings.resolution)
+        }.unwrap_or_else(|| scaling::plan(window, screen, &self.settings.resolution)
             .for_scene(&self.shown_scene, |s| sprite_rect(self.future_metadata.as_ref().filter(|m| m.base == self.whole_version && m.through == self.shown_scene.assets).map_or(self.compiled.as_ref(), |m| m.layout.as_ref()), s)));
         if Some(plan) != self.plan {
             let p = plan.present;
@@ -2983,7 +2983,7 @@ impl App {
                 window.0,
                 window.1,
                 p.at,
-                self.settings.resolution.describe_pixel_scale(desktop),
+                self.settings.resolution.describe_pixel_scale(),
                 plan.screen.0,
                 plan.screen.1,
                 if plan.menu.zoom != (1, 1) || plan.frame != (1, 1) || plan.world != (1, 1) {
@@ -3632,10 +3632,8 @@ impl App {
         self.next_frame_id += 1;
         let mut drawn = if self.settings_preview.active() {
             scaling::drawn_physical(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
-        } else if self.layout.text_at_window {
-            scaling::drawn(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
         } else {
-            scaling::drawn_on_canvas(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
+            scaling::drawn(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
         };
         if let Some(seconds) = self.settings_preview.seconds(Instant::now()) {
             if drawn.cameras.len() < tile_render::MAX_VIEWS {

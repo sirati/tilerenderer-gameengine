@@ -1,4 +1,4 @@
-//! The pixel scale (Preferences, Resolution: Auto, ×1 … ×6) sets the size
+//! The pixel scale (Preferences, Resolution: ×1 … ×6) sets the size
 //! the frame is rendered at: the window's physical pixels divided by `n`
 //! each way, enlarged once onto the window in `n`×`n` boxes. The GPU then
 //! renders `n²` times fewer pixels; input maps through the same boxes.
@@ -6,9 +6,9 @@ use tile_render::{Camera, ColorModel, Grid, Headless, Layout, LayerSpec, Present
 use tile_viewer::scaling;
 use viewer_settings::Resolution;
 
-/// Physical window sizes and desktop scales: TS Neo's Retina display (the
-/// macOS case), a MacBook's, and a plain desktop.
-const WINDOWS: [((u32, u32), f64); 3] = [((3258, 1904), 2.0), ((2880, 1800), 2.0), ((2560, 1440), 1.0)];
+/// Physical window sizes: TS Neo's Retina display (the macOS case), a
+/// MacBook's, and a plain desktop. The desktop's scale plays no part.
+const WINDOWS: [(u32, u32); 3] = [(3258, 1904), (2880, 1800), (2560, 1440)];
 
 /// A frame as the layout makes it, in the canvas's pixels: the world, and
 /// a menu scaled by the menu scale (a zoomed view, text from outlines).
@@ -18,22 +18,23 @@ fn cameras(canvas: (u32, u32)) -> Vec<Camera> {
 
 #[test]
 fn every_pixel_scale_renders_the_window_divided_by_it() {
-    for (window, desktop) in WINDOWS {
+    for window in WINDOWS {
         for n in 1..=6u32 {
             let settings = Resolution { pixel_scale: n, ..Default::default() };
-            assert_eq!(settings.pixel_scale_in(window, desktop), n, "{window:?} allows ×{n}");
-            let plan = scaling::plan(window, desktop, (1024, 768), &settings);
+            assert_eq!(settings.pixel_scale_in(window), n, "{window:?} allows ×{n}");
+            let plan = scaling::plan(window, (1024, 768), &settings);
             let canvas = (window.0 / n, window.1 / n);
             assert_eq!(plan.canvas(), canvas);
             // Text from outlines in every zoomed view: what made the frame
             // be composed at the window's resolution before.
-            let drawn = scaling::drawn_on_canvas(&cameras(canvas), &[], plan.present, |zoom| zoom.0 != zoom.1);
+            let drawn = scaling::drawn(&cameras(canvas), &[], plan.present, |zoom| zoom.0 != zoom.1);
             assert_eq!(drawn.pixel_box, 1, "×{n} on {window:?}");
             assert_eq!(drawn.present, Present { canvas, zoom: (n, 1), at: plan.present.at, target: window }, "×{n} on {window:?}");
             assert!(drawn.cameras.iter().all(|c| c.viewport == canvas), "×{n}: views in the canvas's pixels");
             assert!(drawn.cameras[1].zoomed_art, "the scaled menu keeps its text from outlines");
-            // The opt-in (`text=window`) renders every window pixel.
-            let window_text = scaling::drawn(&cameras(canvas), &[], plan.present, |zoom| zoom.0 != zoom.1);
+            // Only the settings preview's confirmation (seconds) renders
+            // every window pixel.
+            let window_text = scaling::drawn_physical(&cameras(canvas), &[], plan.present, |zoom| zoom.0 != zoom.1);
             if n > 1 {
                 assert_eq!(window_text.present.canvas, (canvas.0 * n, canvas.1 * n));
             }
@@ -88,16 +89,16 @@ fn gpu_renders_the_canvas_not_the_window() {
     renderer.set_world(&gpu.device, &world);
     let timing = renderer.enable_timing(&gpu.device, &gpu.queue);
     let window = (3840u32, 2160u32);
-    for text_at_window in [false, true] {
+    for at_window in [false, true] {
         for n in 1..=6u32 {
             let settings = Resolution { pixel_scale: n, ..Default::default() };
-            let plan = scaling::plan(window, 1.0, (1024, 768), &settings);
+            let plan = scaling::plan(window, (1024, 768), &settings);
             let canvas = plan.canvas();
             let cams = vec![Camera::new(canvas)];
-            let drawn = if text_at_window {
-                scaling::drawn(&cams, &[], plan.present, |zoom| zoom.0 != zoom.1)
+            let drawn = if at_window {
+                scaling::drawn_physical(&cams, &[], plan.present, |zoom| zoom.0 != zoom.1)
             } else {
-                scaling::drawn_on_canvas(&cams, &[], plan.present, |zoom| zoom.0 != zoom.1)
+                scaling::drawn(&cams, &[], plan.present, |zoom| zoom.0 != zoom.1)
             };
             let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("window"),
@@ -131,9 +132,9 @@ fn gpu_renders_the_canvas_not_the_window() {
                     }
                 }
             }
-            let composed = if text_at_window { (canvas.0 * n, canvas.1 * n) } else { canvas };
-            assert_eq!(renderer.composed_size(), Some(composed), "×{n}, text at window {text_at_window}");
-            if !text_at_window {
+            let composed = if at_window { (canvas.0 * n, canvas.1 * n) } else { canvas };
+            assert_eq!(renderer.composed_size(), Some(composed), "×{n}, at the window's resolution: {at_window}");
+            if !at_window {
                 // Whole boxes: each canvas pixel n×n identical window pixels.
                 let image = image.unwrap();
                 let at = plan.present.at;
@@ -147,7 +148,7 @@ fn gpu_renders_the_canvas_not_the_window() {
                 spans.sort_by(f64::total_cmp);
                 let median = spans[spans.len() / 2];
                 eprintln!("pixel scale ×{n} on {}×{}{}: composed {}×{}, GPU {median:.3} ms per frame (median of {})",
-                    window.0, window.1, if text_at_window { " (text=window)" } else { "" }, composed.0, composed.1, spans.len());
+                    window.0, window.1, if at_window { " (at the window's resolution, as before)" } else { "" }, composed.0, composed.1, spans.len());
             }
         }
     }

@@ -143,7 +143,7 @@ struct Shot {
 }
 
 fn shoot(compiled: &Compiled, settings: &Settings, scene: &Scene, p: Option<(i32, i32)>, snap_mode: bool) -> Shot {
-    let plan = scaling::plan(SCREEN, 1.0, SCREEN, &viewer_settings::Resolution::default());
+    let plan = scaling::plan(SCREEN, SCREEN, &viewer_settings::Resolution::default());
     let mut l = Layout::default();
     let capture = p.is_none();
     l.apply_settings(&Settings { roles: if capture { viewer_settings::Roles::UnitMouse } else { settings.roles }, ..settings.clone() });

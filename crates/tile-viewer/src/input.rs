@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn placement_updates_clicks_and_wheels_without_a_motion_event() {
         let mut input = InputState::default();
-        let plan = crate::scaling::plan((1920, 1080), 2.0, (960, 540), &viewer_settings::Resolution::default());
+        let plan = crate::scaling::plan((1920, 1080), (960, 540), &viewer_settings::Resolution { pixel_scale: 2, ..Default::default() });
         input.set_plan(plan);
         input.place_pointer((100.0, 80.0));
         let target = (1200.0, 700.0);
@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(input.cursor, plan.to_screen((400.0, 200.0)));
         // Scale changes also start from the placed window position.
         input.place_pointer(target);
-        let smaller = crate::scaling::plan((1920, 1080), 1.0, (960, 540), &viewer_settings::Resolution::default());
+        let smaller = crate::scaling::plan((1920, 1080), (960, 540), &viewer_settings::Resolution::default());
         assert_eq!(input.set_plan(smaller), Some(Input::MouseMove { x: smaller.to_screen(target).0, y: smaller.to_screen(target).1 }));
     }
 }
