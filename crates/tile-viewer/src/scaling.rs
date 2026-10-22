@@ -2244,7 +2244,7 @@ mod tests {
     #[test]
     fn a_menu_sized_modal_screen_over_the_title_is_as_large_as_the_title() {
         use scene::{View, ViewState};
-        let (screen, window, desktop) = ((3274u32, 2048u32), (3258u32, 1904u32), 2.0);
+        let (screen, window) = ((3274u32, 2048u32), (3258u32, 1904u32));
         let menu = [(3274 - 1024) / 2, (2048 - 768) / 2, 1024, 768];
         let rect_of = |s: &FreeSprite| Some(if s.set == 1 { [s.x, s.y, 1024, 768] } else { [s.x, s.y, 3274, 2048] });
         let sprite = |set: u32, (x, y): (i32, i32)| FreeSprite { set, x, y, screen: true, ..Default::default() };
@@ -2258,10 +2258,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let settings = Resolution { pixel_scale: Resolution::AUTO, scale_menus: true, menu_scale_percent: 100.0, ..Default::default() };
+        let settings = Resolution { pixel_scale: 2, scale_menus: true, menu_scale_percent: 100.0, ..Default::default() };
         let shown = |part: [i32; 4]| {
             let scene = scene(part);
-            let p = plan(window, desktop, screen, &settings).for_scene(&scene, rect_of);
+            let p = plan(window, screen, &settings).for_scene(&scene, rect_of);
             let mut layout = layout::Layout::default();
             layout.driver_screen = Some(p.screen);
             layout.menu_scale = p.menu.zoom;

@@ -488,7 +488,7 @@ fn a_garrison_units_menu_opens_at_its_click_on_the_city_screen() {
                         let mut layout = Layout::default();
                         layout.apply_settings(&Settings { split, screen_place: ScreenPlace { vertical: place, horizontal: place }, ..Default::default() });
                         let draw = |layout: &mut Layout, scene: &Scene| {
-                            let plan = scaling::plan(window, 1.0, SCREEN, &resolution).for_scene(scene, |s| sprite_rect(&compiled, s));
+                            let plan = scaling::plan(window, SCREEN, &resolution).for_scene(scene, |s| sprite_rect(&compiled, s));
                             layout.driver_screen = Some(SCREEN);
                             layout.menu_scale = plan.menu.zoom;
                             layout.world_scale = plan.world;
