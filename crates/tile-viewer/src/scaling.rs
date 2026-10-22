@@ -669,6 +669,15 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             continue;
         }
         let (o, size) = (camera.origin, camera.viewport);
+        // A tile box the driver closed, its picture kept by the viewer
+        // (`Interface::detached`): exactly where the layout placed it, at
+        // its click. It takes no pointer input (the layout closes it).
+        if parts.detached.iter().any(|d| d.view == v.id) {
+            if let Some((at, zoom)) = anchored(v.id) {
+                pieces[c] = Some(Affine { from: o, to: at, zoom }.at(o));
+            }
+            continue;
+        }
         // (Where the layout put it: moved parts about their own place.)
         let about = |from: (i32, i32), zoom: Ratio| Affine { from, to: from, zoom };
         // A popup attached to the one under it (a combo box's open list) is

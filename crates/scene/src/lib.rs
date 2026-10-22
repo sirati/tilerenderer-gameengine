@@ -422,6 +422,12 @@ pub struct Interface {
     /// garrison): it belongs where the driver put it on that screen, placed
     /// and scaled with the screen, not over it as a modal of the screen's.
     pub popup_on_screen: bool,
+    /// Popups the driver opened at a world click and closed again at once,
+    /// leaving their picture to the renderer (`DetachedPopup`): the tile
+    /// information box. Each stays where its click was, in the view the
+    /// click was made in, while every view goes on playing, until the
+    /// renderer closes it (`Input::CloseDetached`).
+    pub detached: Vec<DetachedPopup>,
     /// A command of the driver's waits for the player to pick a place of
     /// the world (e.g. a unit's go-to destination, a bombard target): the
     /// next click that matters is one on the world (a renderer may give
@@ -469,6 +475,24 @@ pub struct PopupAnchor {
     /// its picture matches the tiles there as in the game at 1:1 (not at
     /// the menus' scale).
     pub world_scaled: bool,
+}
+
+/// A popup's picture the driver keeps sending after it closed it in its
+/// own interface (`Interface::detached`): an interface-only view (`view`,
+/// its `origin` and `viewport` the popup's rectangle), placed as
+/// `Interface::popup_anchor` places one, in the view the click at world
+/// pixel `click` was made in. Nothing in it takes input: the renderer
+/// closes it (`Input::CloseDetached`) where the driver's popup would have
+/// closed.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DetachedPopup {
+    pub view: u32,
+    /// Names this popup for its lifetime (increasing, never reused).
+    pub serial: u64,
+    pub anchor: PopupAnchor,
+    /// The world pixel of the press that opened it (as `Input::WorldButton`
+    /// sent it).
+    pub click: (i32, i32),
 }
 
 /// The driver's screen and its world side by side (`Interface::beside`):
@@ -1089,6 +1113,9 @@ pub enum Input {
     /// the driver's own user dismisses it, if it is still open; nothing
     /// else (the click outside it that asked for this acts on nothing).
     DismissPopup,
+    /// The renderer is done with detached popup `serial`
+    /// (`Interface::detached`): the driver stops sending it.
+    CloseDetached { serial: u64 },
 }
 
 /// How near the window's edge the pointer counts as at it ([`Input::Edge`]).

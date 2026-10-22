@@ -2,7 +2,7 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Beside, Binding, Button, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
+use crate::{Beside, Binding, Button, DetachedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
 pub const VERSION: u32 = 52;
@@ -517,6 +517,16 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 }
                 w.bool(a.world_scaled);
                 w.bool(i.popup_on_screen);
+                w.u32(i.detached.len() as u32);
+                for d in &i.detached {
+                    w.u32(d.view);
+                    w.u32(d.serial as u32);
+                    w.u32((d.serial >> 32) as u32);
+                    for v in [d.anchor.world.0, d.anchor.world.1, d.anchor.offset.0, d.anchor.offset.1, d.click.0, d.click.1] {
+                        w.i32(v);
+                    }
+                    w.bool(d.anchor.world_scaled);
+                }
                 w.bool(i.targeting);
                 w.bool(i.snap_to_tiles);
             }
@@ -602,6 +612,8 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
 
 /// Bytes of one encoded [`Interactable`].
 const INTERACTABLE_BYTES: usize = 16 + 1 + 8 + 8 + 1 + 16 + 4;
+/// One `DetachedPopup`: view, serial, anchor and click, `world_scaled`.
+const DETACHED_BYTES: usize = 4 + 8 + 6 * 4 + 1;
 
 /// Decodes a batch of updates.
 pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
@@ -741,6 +753,13 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     some.then_some(PopupAnchor { world: (v[0], v[1]), offset: (v[2], v[3]), world_scaled })
                 };
                 let popup_on_screen = r.bool()?;
+                let detached = (0..r.len(DETACHED_BYTES)?).map(|_| -> Result<DetachedPopup, WireError> {
+                    let view = r.u32()?;
+                    let serial = r.u32()? as u64 | (r.u32()? as u64) << 32;
+                    let v = [r.i32()?, r.i32()?, r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                    let world_scaled = r.bool()?;
+                    Ok(DetachedPopup { view, serial, anchor: PopupAnchor { world: (v[0], v[1]), offset: (v[2], v[3]), world_scaled }, click: (v[4], v[5]) })
+                }).collect::<Result<Vec<_>, _>>()?;
                 let targeting = r.bool()?;
                 let snap_to_tiles = r.bool()?;
                 Update::Interface(Interface {
@@ -757,6 +776,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     beside: beside.then_some(Beside { screen: screen_rect, edge, world }),
                     popup_anchor,
                     popup_on_screen,
+                    detached,
                     targeting,
                     snap_to_tiles,
                 })
@@ -913,6 +933,11 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.bool(keep);
             }
             Input::DismissPopup => w.u8(17),
+            Input::CloseDetached { serial } => {
+                w.u8(21);
+                w.u32(serial as u32);
+                w.u32((serial >> 32) as u32);
+            }
             Input::WorldMove { x, y } => {
                 w.u8(14);
                 w.i32(x);
@@ -1035,6 +1060,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
                 id: r.u32()? as u64 | (r.u32()? as u64) << 32, keep: r.bool()?,
             },
             17 => Input::DismissPopup,
+            21 => Input::CloseDetached { serial: r.u32()? as u64 | (r.u32()? as u64) << 32 },
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
             14 => Input::WorldMove { x: r.i32()?, y: r.i32()? },
             15 => {
@@ -1226,6 +1252,10 @@ mod tests {
             beside: Some(Beside { screen: [448, 156, 1024, 768], edge: Edge::Bottom, world: Some([-64, 32, 1280, 640]) }),
             popup_anchor: Some(PopupAnchor { world: (-3, 70_000), offset: (-128, 1), world_scaled: true }),
             popup_on_screen: true,
+            detached: vec![
+                DetachedPopup { view: 0xC9_5314, serial: 0x1_0000_0007, anchor: PopupAnchor { world: (-64, 9), offset: (0, 0), world_scaled: true }, click: (-40, 30) },
+                DetachedPopup { view: 300, serial: 8, anchor: PopupAnchor { world: (5, 6), offset: (1, 1), world_scaled: false }, click: (7, 8) },
+            ],
             targeting: true,
             snap_to_tiles: true,
         };
@@ -1297,6 +1327,7 @@ mod tests {
             Input::Quit,
             Input::Look { x: -5, y: 7000 },
             Input::DismissPopup,
+            Input::CloseDetached { serial: 0x2_0000_0009 },
             Input::SettingsPreviewDecision { session: 0x3_0000_0003, id: 0x4_0000_0004, keep: false },
             Input::WorldMove { x: -64, y: 12345 },
             Input::UnitOrder { action: UnitOrderAction::Preview, x: -100, y: 9999 },

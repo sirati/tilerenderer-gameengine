@@ -113,6 +113,8 @@ mod world_rescale;
 mod unit_orders;
 #[path = "world_pointer.rs"]
 mod world_pointer;
+#[path = "detached_popups.rs"]
+mod detached_popups;
 #[cfg(test)]
 #[path = "city_screen_tests.rs"]
 mod city_screen_tests;
@@ -691,6 +693,8 @@ pub struct Layout {
     popup_anchor: Option<(i32, i32)>,
     /// The last press on a world pixel (`Input::WorldButton`).
     world_press: Option<WorldPress>,
+    /// The tile boxes the driver left to the viewer (`detached_popups`).
+    detached: detached_popups::Detached,
     /// The open popup the driver anchors at a world click
     /// (`scene::Interface::popup_anchor`), and that click.
     anchored: Option<(scene::PopupAnchor, WorldPress)>,
@@ -905,6 +909,7 @@ impl Default for Layout {
             last_press: None,
             popup_anchor: None,
             world_press: None,
+            detached: Default::default(),
             anchored: None,
             popup_anchor_seen: None,
             chain_press: None,
@@ -2269,6 +2274,7 @@ impl Layout {
             }
         }
         self.anchored_popup_layers.retain(|(id, _, _)| parts.is_popup_view(*id));
+        self.detached_update(scene);
         self.popup_view = placed_popup;
         self.popup_body = popup.map(|i| rect_of(&base[i]));
         if popup.is_some() != self.popup_shown {
@@ -2820,6 +2826,15 @@ impl Layout {
                 }
             }
         }
+        // The tile boxes the viewer keeps, at their clicks; one not placed
+        // (closing, or its view gone) is not drawn.
+        let detached = self.detached_places();
+        for (i, v) in scene.views.iter().enumerate() {
+            if scene.interface.detached.iter().any(|d| d.view == v.id) && !detached.iter().any(|(id, _)| *id == v.id) {
+                if let Some(camera) = frame.view_cameras.get_mut(i) { *camera = None; }
+            }
+        }
+        frame.popup_places.extend(detached);
         frame
     }
 
@@ -3990,6 +4005,7 @@ impl Layout {
     /// Takes a window input; returns what goes to the driver.
     pub fn route(&mut self, input: Input) -> Vec<Input> {
         let mut out = self.take_unit_order_events();
+        out.extend(self.detached.take_inputs());
         if self.unit_order_before(&input) {
             out.extend(self.take_unit_order_events());
             self.remember_world_inputs(&out);
@@ -4052,6 +4068,11 @@ impl Layout {
                     }
                 }
                 vec![]
+            }
+            // Esc closes the kept tile box of the view the pointer is in.
+            Input::Key { vk: VK_ESCAPE, down: true, .. } if self.detached_escape() => {
+                self.kept_keys.push(VK_ESCAPE);
+                self.detached.take_inputs()
             }
             Input::Key { vk, down, text } => vec![self.key(vk, down, text)],
             Input::MouseMove { x, y } => {
@@ -4168,6 +4189,9 @@ impl Layout {
         if !down && std::mem::take(&mut self.dismissed[button_index(button)]) {
             return vec![];
         }
+        if let Some(out) = self.detached_button(button, down, p) {
+            return out;
+        }
         if down && self.click_popup_open() {
             if let Some(out) = self.dismissing_press(button, p) { return out; }
         }
@@ -4244,6 +4268,9 @@ impl Layout {
                 let hit = if self.locked { self.shown.iter().find(|(h, _)| self.follow_of(*h) == Some(Follow::Pointer)).map(|(h, _)| *h) } else { Some(self.hit(p)) };
                 let at = if self.locked { self.cursor_on_window().unwrap_or(p) } else { p };
                 self.world_press = hit.map(|hit| WorldPress { at, world: w, hit, clock: self.clock });
+                if let Some(press) = self.world_press {
+                    self.detached_press_sent(press);
+                }
                 let press = Input::WorldButton { button, down, x: w.0, y: w.1 };
                 if button == Button::Left { vec![Input::Look { x: w.0, y: w.1 }, press] } else { vec![press] }
             }
@@ -7941,6 +7968,89 @@ mod tests {
         let anchor = (w.0 - 8000 - 64, w.1 - 20);
         let f = l.frame(&with_anchored_popup(scene::PopupAnchor { world: anchor, offset: (0, 0), world_scaled: false }, (256, 173)), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!(f.popup_at, Some(((p.0 - 64, p.1 - 20), (1, 1))));
+    }
+
+    /// The parked scene with kept tile boxes (`Interface::detached`): view,
+    /// serial and the world pixel of its click, each anchored half a tile
+    /// left of and 20 pixels above that click.
+    fn with_detached(kept: &[(u32, u64, (i32, i32))]) -> Scene {
+        let mut s = parked();
+        for &(view, serial, click) in kept {
+            let anchor = scene::PopupAnchor { world: (click.0 - 64, click.1 - 20), offset: (0, 0), world_scaled: false };
+            s.interface.detached.push(scene::DetachedPopup { view, serial, anchor, click });
+            s.views.push(ViewState { id: view, view: View { interface_only: true, viewport: (256, 173), ..Default::default() }, overlay: vec![] });
+        }
+        s
+    }
+
+    #[test]
+    fn kept_tile_boxes_stay_in_their_views_while_the_other_view_plays() {
+        let mut l = Layout::default();
+        l.apply_settings(&settings(|s| s.split = S::Vertical1To1));
+        let s = parked();
+        for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        let (a, b) = l.panes();
+        let b = b.unwrap();
+        let (pa, pb) = ((a[0] + 100, a[1] + 100), (b[0] + 100, b[1] + 100));
+        let wa = world_press(&mut l, Button::Right, pa);
+        let one = with_detached(&[(0x1000, 1, wa)]);
+        let f = l.frame(&one, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(f.popup_places.contains(&(0x1000, ((pa.0 - 64, pa.1 - 20), (1, 1)))), "A's box at its click: {:?}", f.popup_places);
+        assert!(!l.click_popup_open(), "a kept box holds no map still");
+        // B plays on: its presses reach the game.
+        let out = l.route(Input::MouseButton { button: Button::Left, down: true, x: pb.0, y: pb.1 });
+        assert!(out.iter().any(|i| matches!(i, Input::WorldButton { down: true, .. })), "B's press reaches the game: {out:?}");
+        assert!(!out.iter().any(|i| matches!(i, Input::CloseDetached { .. })), "{out:?}");
+        l.route(Input::MouseButton { button: Button::Left, down: false, x: pb.0, y: pb.1 });
+        // And opens its own box, both shown.
+        let wb = world_press(&mut l, Button::Right, pb);
+        let both = with_detached(&[(0x1000, 1, wa), (0x1001, 2, wb)]);
+        let f = l.frame(&both, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(f.popup_places.contains(&(0x1000, ((pa.0 - 64, pa.1 - 20), (1, 1)))), "{:?}", f.popup_places);
+        assert!(f.popup_places.contains(&(0x1001, ((pb.0 - 64, pb.1 - 20), (1, 1)))), "{:?}", f.popup_places);
+        // A press in A closes A's box only, and does nothing else.
+        let p = (a[0] + 300, a[1] + 400);
+        assert_eq!(l.route(Input::MouseButton { button: Button::Left, down: true, x: p.0, y: p.1 }), vec![Input::CloseDetached { serial: 1 }]);
+        assert_eq!(l.route(Input::MouseButton { button: Button::Left, down: false, x: p.0, y: p.1 }), vec![]);
+        // Not drawn while the driver still sends it.
+        let f = l.frame(&both, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let index = both.views.iter().position(|v| v.id == 0x1000).unwrap();
+        assert_eq!(f.view_cameras[index], None);
+        assert!(f.popup_places.iter().any(|(id, _)| *id == 0x1001));
+        // The driver drops it: B's moves into the first slot, still B's.
+        let f = l.frame(&with_detached(&[(0x1000, 2, wb)]), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(f.popup_places.contains(&(0x1000, ((pb.0 - 64, pb.1 - 20), (1, 1)))), "{:?}", f.popup_places);
+        // Esc with the pointer in B closes it there, never reaching the game.
+        l.route(Input::MouseMove { x: pb.0, y: pb.1 });
+        assert_eq!(l.route(Input::Key { vk: VK_ESCAPE, down: true, text: None }), vec![Input::CloseDetached { serial: 2 }]);
+        assert_eq!(l.route(Input::Key { vk: VK_ESCAPE, down: false, text: None }), vec![]);
+        // With none kept, Esc is the game's again.
+        l.frame(&parked(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(matches!(l.route(Input::Key { vk: VK_ESCAPE, down: true, text: None }).as_slice(), [Input::Key { vk: VK_ESCAPE, .. } | Input::WorldKey { vk: VK_ESCAPE, .. }]));
+    }
+
+    #[test]
+    fn a_new_tile_box_replaces_the_one_its_view_kept() {
+        let mut l = Layout::default();
+        l.apply_settings(&settings(|s| s.split = S::Vertical1To1));
+        let s = parked();
+        for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        let (a, _) = l.panes();
+        let w1 = world_press(&mut l, Button::Right, (a[0] + 100, a[1] + 100));
+        l.frame(&with_detached(&[(0x1000, 1, w1)]), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        // A press there first closes it, as in the game.
+        let p = (a[0] + 200, a[1] + 150);
+        assert_eq!(l.route(Input::MouseButton { button: Button::Right, down: true, x: p.0, y: p.1 }), vec![Input::CloseDetached { serial: 1 }]);
+        assert_eq!(l.route(Input::MouseButton { button: Button::Right, down: false, x: p.0, y: p.1 }), vec![]);
+        l.frame(&parked(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        // One opened again from that click (a menu's "Terrain details")
+        // while its first is still kept takes its place.
+        let w2 = world_press(&mut l, Button::Right, p);
+        l.frame(&with_detached(&[(0x1000, 3, w2)]), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        l.frame(&with_detached(&[(0x1000, 3, w2), (0x1001, 4, w2)]), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let out = l.route(Input::MouseMove { x: a[0] + 10, y: a[1] + 10 });
+        assert!(out.contains(&Input::CloseDetached { serial: 3 }), "the older one closes: {out:?}");
+        assert!(!out.contains(&Input::CloseDetached { serial: 4 }), "{out:?}");
     }
 
     #[test]
