@@ -410,6 +410,11 @@ pub struct Interface {
     /// context menu, a tile's information box): a renderer places it there
     /// in the view the click was made in, not with the screens.
     pub popup_anchor: Option<PopupAnchor>,
+    /// The open popup is one the driver opened at a click on its named
+    /// screen (`screen`; e.g. the menu of a unit in a city screen's
+    /// garrison): it belongs where the driver put it on that screen, placed
+    /// and scaled with the screen, not over it as a modal of the screen's.
+    pub popup_on_screen: bool,
     /// A command of the driver's waits for the player to pick a place of
     /// the world (e.g. a unit's go-to destination, a bombard target): the
     /// next click that matters is one on the world (a renderer may give

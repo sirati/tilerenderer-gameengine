@@ -584,7 +584,11 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     // a setup screen; not one anchored at a click): the menu keeps its own
     // fit and place, as without it; the popup goes over it at its zoom,
     // across in the middle of its region, its top `MODAL_TOP` down.
-    let modal = parts.popup.filter(|_| popup_at.is_none() && (parts.screen.is_some() || parts.screen_view.is_some() || menu_box.is_some()));
+    // A popup the driver opened at a click on its named screen (a city
+    // screen garrison unit's menu) is no modal: it stays where the driver
+    // put it on that screen, placed and scaled with it.
+    let on_screen = parts.popup_on_screen && parts.screen.is_some() && parts.screen_view.is_none();
+    let modal = parts.popup.filter(|_| popup_at.is_none() && !on_screen && (parts.screen.is_some() || parts.screen_view.is_some() || menu_box.is_some()));
     let camera_of = |id: u32| scene.views.iter().position(|v| v.id == id)
         .and_then(|i| frame.view_cameras.get(i).copied().flatten())
         .map(|c| frame.cameras[c as usize])
@@ -628,7 +632,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     };
     // (An anchored popup may reach past the canvas: nothing pans for it. A
     // modal one over a menu fits: the menu under it keeps its pan.)
-    let active = parts.popup.filter(|_| popup_at.is_none() && modal.is_none()).or(parts.screen_view);
+    let active = parts.popup.filter(|_| popup_at.is_none() && modal.is_none() && !on_screen).or(parts.screen_view);
     let active_rect = active.and_then(camera_of)
         .map(|c| screen_piece(c, active == parts.popup, active.unwrap_or(u32::MAX)).rect([c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32]))
         .or_else(|| menu_box.map(|r| menu.rect(r)));
@@ -659,7 +663,10 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let (o, size) = (camera.origin, camera.viewport);
         // (Where the layout put it: moved parts about their own place.)
         let about = |from: (i32, i32), zoom: Ratio| Affine { from, to: from, zoom };
-        let piece = if parts.is_popup_view(v.id) || parts.screen_view == Some(v.id) {
+        let piece = if on_screen && parts.popup == Some(v.id) {
+            // As the screen it was opened on: the game's place on it.
+            menu
+        } else if parts.is_popup_view(v.id) || parts.screen_view == Some(v.id) {
             // A popup, or a screen part (an advisor): about its middle,
             // placed as the menus are (and moved as the layout moved it),
             // kept on the canvas.

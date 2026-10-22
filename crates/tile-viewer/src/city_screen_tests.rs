@@ -460,6 +460,81 @@ fn popup_layers_never_change_the_underlying_named_screen_or_world_layout() {
     }
 }
 
+/// A garrison unit's menu, which the game opens at a right click on the
+/// city screen's unit list (`City_Form` 0x420030 -> 0x4224C0 ->
+/// `Context_Menu_open`), shows where that click was on the screen as the
+/// viewer shows it, whatever the window, pixel scale, menu scale, split and
+/// screen place, and its row takes the clicks. Without
+/// `Interface::popup_on_screen` it went over the screen as a modal
+/// (`scaling::MODAL_TOP`), far from the click, where it was easily missed.
+#[test]
+fn a_garrison_units_menu_opens_at_its_click_on_the_city_screen() {
+    use viewer_settings::{Place, ScreenPlace};
+    let compiled = compiled();
+    let mut base = city_scene(&compiled, (10, 10), 1, (0, 0));
+    base.screen_size = SCREEN;
+    // The game's own place for it: one pixel right of and below the click
+    // on the first unit of the garrison strip (y 871..924 on this window).
+    let menu = [758, 898, 120, 26];
+    let shown = |layout: &Layout, r: [i32; 4]| layout.interface_shown.as_ref()
+        .and_then(|shown| shown.iter().find(|piece| piece.driver == r)).map_or_else(|| layout.driver_rect_to_window(r), |piece| piece.to_canvas(r));
+    for (window, pixel_scale) in [((1920, 1080), 1), ((1280, 800), 1), ((1080, 1920), 3), ((3840, 2160), 2)] {
+        for scale_menus in [false, true] {
+            for split in [Split::Standard, Split::Vertical1To1, Split::Horizontal1To1] {
+                for place in [Place::Floating, Place::LeftOrBottom, Place::RightOrTop] {
+                    for on_screen in [true, false] {
+                        let what = format!("{window:?} pixel{pixel_scale} scale{scale_menus} {split:?} {place:?} on screen {on_screen}");
+                        let resolution = viewer_settings::Resolution { pixel_scale, scale_menus, menu_scale_percent: 75.0, ..Default::default() };
+                        let mut layout = Layout::default();
+                        layout.apply_settings(&Settings { split, screen_place: ScreenPlace { vertical: place, horizontal: place }, ..Default::default() });
+                        let draw = |layout: &mut Layout, scene: &Scene| {
+                            let plan = scaling::plan(window, 1.0, SCREEN, &resolution).for_scene(scene, |s| sprite_rect(&compiled, s));
+                            layout.driver_screen = Some(SCREEN);
+                            layout.menu_scale = plan.menu.zoom;
+                            layout.world_scale = plan.world;
+                            layout.screen_content = named_screen_content(&compiled, scene);
+                            let mut frame = layout.frame(scene, plan.canvas(), (0, 0, 0, 0), interface_rects(&compiled, scene), Some(world_bounds(&compiled, scene)));
+                            let arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, |s| sprite_rect(&compiled, s));
+                            layout.set_interface_shown(arranged.shown);
+                        };
+                        for _ in 0..3 { draw(&mut layout, &base); }
+                        let screen = layout.driver_rect_to_window(CITY_PANEL);
+                        let mut scene = base.clone();
+                        let [x, y, w, h] = menu;
+                        scene.interface.popup = Some(257);
+                        scene.interface.popup_on_screen = on_screen;
+                        scene.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (x, y), viewport: (w as u32, h as u32), ..Default::default() }, overlay: panel(&compiled, menu) });
+                        draw(&mut layout, &scene);
+                        draw(&mut layout, &scene);
+                        assert_eq!(layout.driver_rect_to_window(CITY_PANEL), screen, "{what}: the screen stays where it was");
+                        // Where the click on the unit shows: the screen's
+                        // pixel (x - 1, y - 1) as the viewer shows the screen.
+                        let s = screen[2] / CITY_PANEL[2] as f64;
+                        let click = (screen[0] + (x - 1 - CITY_PANEL[0]) as f64 * s, screen[1] + (y - 1 - CITY_PANEL[1]) as f64 * s);
+                        let r = shown(&layout, menu);
+                        let near = (r[0] - click.0).abs() <= 2.0 + s && (r[1] - click.1).abs() <= 2.0 + s;
+                        if !on_screen {
+                            if split == Split::Standard && place == Place::Floating {
+                                assert!(!near, "{what}: (the old placement, away from the click) {r:?}, click {click:?}");
+                            }
+                            continue;
+                        }
+                        assert!(near, "{what}: the menu at {r:?}, the click at {click:?}");
+                        assert!(((r[2] / w as f64) - s).abs() < 0.01, "{what}: the menu at the screen's scale: {r:?}, screen scale {s}");
+                        // Its row takes the click, at the row's pixel.
+                        let at = ((r[0] + r[2] / 2.0).floor() as i32, (r[1] + r[3] / 2.0).floor() as i32);
+                        let driver = layout.route_window(at).unwrap_or_else(|| panic!("{what}: {at:?} goes nowhere"));
+                        // (Within the menu's row, a canvas pixel apart.)
+                        let tolerance = (1.0 / s).ceil() as i32 + 2;
+                        assert!((driver.0 - (x + w / 2)).abs() <= tolerance && (driver.1 - (y + h / 2)).abs() <= tolerance, "{what}: {at:?} reaches {driver:?}");
+                        assert!(driver.0 >= x && driver.0 < x + w && driver.1 >= y && driver.1 < y + h, "{what}: {at:?} reaches {driver:?}, off the menu");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn an_opaque_popup_changes_pixels_only_inside_its_overlay_not_the_screen_beneath_it() {
     check_opaque_modal_stack(None);

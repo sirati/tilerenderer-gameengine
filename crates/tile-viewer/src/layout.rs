@@ -2333,7 +2333,11 @@ impl Layout {
         // A modal popup over the menu (`over_menu`) keeps out of the screen
         // fitted into a pane: that screen's fit stays as without it, the
         // popup goes over it in that pane (`scaling::MODAL_TOP`).
-        let modal = popup.filter(|_| over_menu && self.anchored.is_none());
+        // (Not one the driver opened at a click on its screen, e.g. a city
+        // screen garrison unit's menu: that one stays at the click, with the
+        // screen.)
+        let on_screen = parts.popup_on_screen && parts.screen.is_some() && parts.screen_view.is_none();
+        let modal = popup.filter(|_| over_menu && self.anchored.is_none() && !on_screen);
         let push = |frame: &mut Frame, camera: Camera| {
             frame.cameras.push(camera);
             frame.cameras.len() as u32 - 1
@@ -2433,7 +2437,7 @@ impl Layout {
         } else {
             let roaming_shift = self.roaming_shift(pane_rect);
             // (A modal one is placed over its menu: `scaling::MODAL_TOP`.)
-            let popup_shift = popup.map(|i| if modal.is_some() { (0, 0) } else { self.popup_shift(rect_of(&base[i]), main_rect) });
+            let popup_shift = popup.map(|i| if modal.is_some() || on_screen { (0, 0) } else { self.popup_shift(rect_of(&base[i]), main_rect) });
             let screen_shift = screen_part.map(|i| Some(self.screen_shift(rect_of(&base[i]))));
             for (i, (v, camera)) in scene.views.iter().zip(&base).enumerate() {
                 let inactive_menu = screen_part.is_some() && v.view.interface_only && v.view.menu;

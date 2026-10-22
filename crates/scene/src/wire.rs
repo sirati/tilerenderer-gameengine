@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, Button, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 50;
+pub const VERSION: u32 = 51;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -513,6 +513,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     w.i32(v);
                 }
                 w.bool(a.world_scaled);
+                w.bool(i.popup_on_screen);
                 w.bool(i.targeting);
                 w.bool(i.snap_to_tiles);
             }
@@ -735,6 +736,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     let world_scaled = r.bool()?;
                     some.then_some(PopupAnchor { world: (v[0], v[1]), offset: (v[2], v[3]), world_scaled })
                 };
+                let popup_on_screen = r.bool()?;
                 let targeting = r.bool()?;
                 let snap_to_tiles = r.bool()?;
                 Update::Interface(Interface {
@@ -749,6 +751,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     focus_control,
                     beside: beside.then_some(Beside { screen: screen_rect, edge, world }),
                     popup_anchor,
+                    popup_on_screen,
                     targeting,
                     snap_to_tiles,
                 })
@@ -1216,6 +1219,7 @@ mod tests {
             focus_control: Some([5, 6, 7, 8]),
             beside: Some(Beside { screen: [448, 156, 1024, 768], edge: Edge::Bottom, world: Some([-64, 32, 1280, 640]) }),
             popup_anchor: Some(PopupAnchor { world: (-3, 70_000), offset: (-128, 1), world_scaled: true }),
+            popup_on_screen: true,
             targeting: true,
             snap_to_tiles: true,
         };
