@@ -247,6 +247,19 @@ pub struct Pan {
     exact: Vec<Exact>,
     /// Replaying a held-back press as a click.
     replaying: bool,
+    /// A view flying to a place picked on the minimap (smooth movement):
+    /// its spring, from its continuous centre, and where it goes.
+    flight: Option<Flight>,
+    /// The right button went down on the minimap: its release is ours too.
+    minimap_press: bool,
+}
+
+/// A view flying to `to` ([`Layout::minimap_right`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct Flight {
+    hit: Hit,
+    glide: super::Glide,
+    to: (i32, i32),
 }
 
 fn view_name(hit: Hit) -> String {
@@ -395,6 +408,57 @@ impl Layout {
         self.pan.grab.is_some_and(|g| g.hit == hit)
             || self.pan.coast.is_some_and(|c| c.hit == hit)
             || self.pan.edge_view.is_some_and(|(h, _)| h == hit)
+            || self.pan.flight.is_some_and(|f| f.hit == hit)
+    }
+
+    /// The right button at `p` on the driver's minimap with B shown: B goes
+    /// to the world pixel picked there (flying, with smooth movement, else
+    /// at once), through its continuous centre, and neither the press nor
+    /// its release reach the driver. B keeps that place as a hand pan does;
+    /// the game's camera does not pull it back. Without B (no split), over
+    /// a view, captured or snapping: not ours (the driver's as ever).
+    pub(super) fn minimap_right(&mut self, down: bool, p: (i32, i32)) -> bool {
+        if !down {
+            return std::mem::take(&mut self.pan.minimap_press);
+        }
+        if self.locked || self.snapping || self.split.is_none() || !self.shown.iter().any(|(h, _)| *h == Hit::Pane) {
+            return false;
+        }
+        let Some(minimap) = self.minimap else { return false };
+        if !matches!(self.hit(p), Hit::Interface | Hit::Moved(_)) {
+            return false;
+        }
+        let Some(world) = self.route_free(p).ok().and_then(|q| minimap.world_at(q)) else { return false };
+        let Some(from) = self.exact_center(Hit::Pane) else { return false };
+        self.pan.coast = self.pan.coast.filter(|c| c.hit != Hit::Pane);
+        self.pan.grab = self.pan.grab.filter(|g| g.hit != Hit::Pane);
+        self.pan.minimap_press = true;
+        // (Not past the edge of a world that does not wrap.)
+        let (to, _) = self.clamp_view_center(Hit::Pane, (world.0 as f64, world.1 as f64));
+        let to = (to.0.round() as i32, to.1.round() as i32);
+        log::info!("viewer: B to world pixel {to:?} (right click on the minimap)");
+        if self.smooth {
+            let glide = super::Glide { pos: from, vel: (0.0, 0.0), placed: true };
+            self.pan.flight = Some(Flight { hit: Hit::Pane, glide, to });
+            self.place_exact(Hit::Pane, from);
+        } else {
+            self.pan.flight = None;
+            self.place_exact(Hit::Pane, (to.0 as f64, to.1 as f64));
+        }
+        true
+    }
+
+    /// A minimap flight `dt` seconds on (the short way round a wrapping
+    /// world), ending where it lands; any press on its view ends it.
+    fn fly(&mut self, dt: f64) {
+        let Some(mut f) = self.pan.flight else { return };
+        if self.locked || !self.shown.iter().any(|(h, _)| *h == f.hit) {
+            self.pan.flight = None;
+            return;
+        }
+        f.glide.step(f.to, dt, self.world_period);
+        self.place_exact(f.hit, f.glide.pos);
+        self.pan.flight = (!f.glide.settled(f.to)).then_some(f);
     }
 
     /// The view of the world the pointer at `p` is in (beneath the
@@ -453,6 +517,39 @@ impl Layout {
     /// parked native camera or depending on how large this pane is drawn.
     /// UI wheels and drivers without map-wheel metadata keep their routing.
     pub(super) fn map_wheel(&mut self, delta: i32, p: (i32, i32)) -> Option<Vec<Input>> {
+        let hit = self.wheel_view(p)?;
+        let notches = -(delta / 120) as f64;
+        if notches == 0.0 { return Some(vec![]); }
+        let step = if self.shift { (self.map_wheel_step.0 as f64, 0.0) } else { (0.0, self.map_wheel_step.1 as f64) };
+        self.wheel_pan(hit, (notches * step.0, notches * step.1), p)
+    }
+
+    /// A scroll at `p` along both axes (`Input::Scroll`; `d` in lines, or
+    /// window pixels if `pixels`, positive moving the content right and
+    /// down), in any map movement mode: pans the view under the pointer
+    /// (captured: the world cursor's). Lines move the game's own wheel
+    /// step a line, a fraction of a line that fraction of it; pixels (a
+    /// trackpad) move the map with the fingers, at the view's zoom. With
+    /// Shift a scroll only up or down goes sideways. `None`: not the map's
+    /// (its `Wheel` notches go on as ever).
+    pub(super) fn map_scroll(&mut self, d: (f64, f64), pixels: bool, p: (i32, i32)) -> Option<Vec<Input>> {
+        let hit = self.wheel_view(p)?;
+        let d = if self.shift && d.0 == 0.0 { (d.1, 0.0) } else { d };
+        let per = if pixels {
+            let scale = self.shown_scale(hit)?;
+            (scale, scale)
+        } else {
+            (self.map_wheel_step.0 as f64, self.map_wheel_step.1 as f64)
+        };
+        self.wheel_pan(hit, (-d.0 * per.0, -d.1 * per.1), p)
+    }
+
+    /// The view the wheel at `p` pans, if the map's: the one under the
+    /// pointer (beneath the interface and the zoom box), or with the mouse
+    /// captured the world cursor's. Not while snapping points at the
+    /// interface, nor in a pane showing the driver's screen; not for a
+    /// driver without map-wheel metadata (its routing stays its own).
+    fn wheel_view(&self, p: (i32, i32)) -> Option<Hit> {
         if self.map_wheel_step == (0, 0) || self.snapping { return None; }
         let hit = if self.locked {
             self.shown.iter().find(|(hit, _)| self.follow_of(*hit) == Some(Follow::Pointer)).map(|(hit, _)| *hit)?
@@ -460,13 +557,21 @@ impl Layout {
             if !matches!(self.hit(p), Hit::Main | Hit::Pane | Hit::Inset(_) | Hit::Magnifier) { return None; }
             self.pan_view_at(p)?
         };
-        if self.fit.is_some_and(|fit| fit.hit == hit) { return None; }
+        (!self.fit.is_some_and(|fit| fit.hit == hit)).then_some(hit)
+    }
+
+    /// Pans view `hit` by `by` world pixels for the wheel at `p`, from its
+    /// continuous centre (a drag of it going on from there); what goes to
+    /// the driver: where its world pointer now is.
+    fn wheel_pan(&mut self, hit: Hit, by: (f64, f64), p: (i32, i32)) -> Option<Vec<Input>> {
         let (center, _) = self.clamp_view_center(hit, self.exact_center(hit)?);
-        let notches = -(delta / 120) as f64;
-        if notches == 0.0 { return Some(vec![]); }
-        let step = if self.shift { (self.map_wheel_step.0 as f64, 0.0) } else { (0.0, self.map_wheel_step.1 as f64) };
-        let (to, _) = self.clamp_view_center(hit, (center.0 + notches * step.0, center.1 + notches * step.1));
+        let (to, _) = self.clamp_view_center(hit, (center.0 + by.0, center.1 + by.1));
         self.pan.coast = None;
+        if let Some(g) = self.pan.grab.as_mut().filter(|g| g.hit == hit) {
+            // (Grabbed meanwhile: the pointer holds the moved map.)
+            g.start = (g.start.0 + to.0 - center.0, g.start.1 + to.1 - center.1);
+            g.at = to;
+        }
         self.place_exact(hit, to);
         let old_point = if self.locked { Some(self.cursor) } else { self.world_under(p) };
         let out = old_point.map(|old| {
@@ -520,6 +625,7 @@ impl Layout {
         }
         // A press on a view stops its slide.
         self.pan.coast = None;
+        self.pan.flight = self.pan.flight.filter(|f| f.hit != hit);
         let grabbable = self.fit.map(|f| f.hit) != Some(hit) && self.shown.iter().any(|(h, _)| *h == hit);
         match button {
             Button::Middle if grabbable => {
@@ -579,6 +685,7 @@ impl Layout {
         let (center, _) = self.clamp_view_center(hit, center);
         self.pan.coast = None;
         self.pan.edge_view = None;
+        self.pan.flight = None;
         self.pan.grab = Some(Grab { hit, button, from, start: center, at: center, scale, tracker: Tracker::new(from) });
         log::info!("viewer: {} grabbed ({button:?} button) at {from:?}", view_name(hit));
     }
@@ -608,6 +715,7 @@ impl Layout {
             g.tracker.sample(pointer, dt);
         }
         self.slide(dt);
+        self.fly(dt);
         self.edge_scroll(dt, fitted);
         if native_follow {
             self.follow_driver();
@@ -688,6 +796,9 @@ impl Layout {
         }
         if let Some(c) = &mut self.pan.coast {
             c.pos = scaled(c.pos);
+        }
+        if let Some(f) = &mut self.pan.flight {
+            (f.glide.pos, f.glide.vel, f.to) = (scaled(f.glide.pos), scaled(f.glide.vel), point(f.to));
         }
     }
 
@@ -1666,5 +1777,236 @@ mod tests {
             assert_eq!(turn(&xs), None, "{change}: {xs:?}");
             assert!(xs[xs.len() - 1] > xs[0], "{change}");
         }
+    }
+
+    // ---- The wheel and trackpad --------------------------------------------
+
+    /// A scroll as the window reports it, with its notches (`lines` of a
+    /// wheel), at `p`.
+    fn scroll(l: &mut Layout, d: (f64, f64), pixels: bool, p: (i32, i32)) -> Vec<Input> {
+        let milli = |v: f64| (v * 1000.0).round() as i32;
+        let mut out = l.route(Input::Scroll { dx: milli(d.0), dy: milli(d.1), pixels, x: p.0, y: p.1 });
+        let notches = if pixels { 0 } else { d.1.trunc() as i32 };
+        for _ in 0..notches.abs() {
+            out.extend(l.route(Input::Wheel { delta: 120 * notches.signum(), x: p.0, y: p.1 }));
+        }
+        out
+    }
+
+    fn shift(l: &mut Layout, down: bool) {
+        l.route(Input::Key { vk: 0x10, down, text: None });
+    }
+
+    #[test]
+    fn the_wheel_and_trackpad_pan_the_map_under_the_pointer_in_every_mode() {
+        let one = super::super::ONE;
+        for movement in [MapMovement::EdgeScroll, MapMovement::Drag] {
+            for roles in [Roles::Free, Roles::UnitMouse] {
+                for smooth in [false, true] {
+                    for zoom in [one, one + 2] {
+                        for hit in [Hit::Main, Hit::Pane] {
+                            let case = format!("{movement:?} {roles:?} smooth={smooth} zoom={zoom} {hit:?}");
+                            let mut l = Layout::default();
+                            l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles, smooth_world_movement: smooth, ..Default::default() });
+                            l.set_map_movement(movement);
+                            l.main_view.zoom = zoom;
+                            l.split.as_mut().unwrap().view.zoom = zoom;
+                            let mut scene = scene_at(0);
+                            scene.camera_focus = Some(scene::CameraFocus { serial: 1, center: (3000, 2000) });
+                            scene.map_wheel_step = (128, 64);
+                            for _ in 0..2 {
+                                step(&mut l, &scene, 16, BOUNDS);
+                            }
+                            let p = if hit == Hit::Main { (200, 300) } else { (600, 300) };
+                            mv(&mut l, p);
+                            let per_pixel = l.shown_scale(hit).unwrap();
+                            let start = l.exact_center(hit).unwrap();
+                            let other = if hit == Hit::Main { Hit::Pane } else { Hit::Main };
+                            let other_at = center_of(&l, other);
+                            // A wheel line up: the game's step up, once (its
+                            // notch is not the interface's too).
+                            let out = scroll(&mut l, (0.0, 1.0), false, p);
+                            assert!(out.iter().all(|i| matches!(i, Input::WorldMove { .. })), "{case}: {out:?}");
+                            assert_eq!(l.exact_center(hit).unwrap(), (start.0, start.1 - 64.0), "{case}");
+                            // Shift: sideways; a tilt wheel: sideways by itself.
+                            shift(&mut l, true);
+                            scroll(&mut l, (0.0, 1.0), false, p);
+                            shift(&mut l, false);
+                            scroll(&mut l, (1.0, 0.0), false, p);
+                            assert_eq!(l.exact_center(hit).unwrap(), (start.0 - 256.0, start.1 - 64.0), "{case}");
+                            // A trackpad, diagonally: with the fingers, sub-pixel.
+                            let before = l.exact_center(hit).unwrap();
+                            for _ in 0..4 {
+                                scroll(&mut l, (-2.25, 1.5), true, p);
+                            }
+                            let want = (before.0 + 9.0 * per_pixel, before.1 - 6.0 * per_pixel);
+                            let now = l.exact_center(hit).unwrap();
+                            assert!((now.0 - want.0).abs() < 1e-9 && (now.1 - want.1).abs() < 1e-9, "{case}: {now:?} {want:?}");
+                            assert_eq!(center_of(&l, hit), (want.0.round() as i32, want.1.round() as i32), "{case}");
+                            // It stays there (nothing it follows pulls it back).
+                            for _ in 0..30 {
+                                step(&mut l, &scene, 16, BOUNDS);
+                            }
+                            assert_eq!(center_of(&l, hit), (want.0.round() as i32, want.1.round() as i32), "{case}");
+                            assert_eq!(center_of(&l, other), other_at, "{case}: the other view moved");
+                            // Ctrl: zoom, no pan.
+                            let at = l.exact_center(hit).unwrap();
+                            l.route(Input::Key { vk: 0x11, down: true, text: None });
+                            scroll(&mut l, (0.0, 1.0), false, p);
+                            l.route(Input::Key { vk: 0x11, down: false, text: None });
+                            assert_eq!(l.exact_center(hit), Some(at), "{case}");
+                            step(&mut l, &scene, 16, BOUNDS);
+                            // Grabbed meanwhile: the wheel's pan is kept.
+                            // (At the zoom Ctrl gave it.)
+                            let per_pixel = l.shown_scale(hit).unwrap();
+                            let at = l.exact_center(hit).unwrap();
+                            mv(&mut l, p);
+                            button(&mut l, Button::Middle, true, p);
+                            scroll(&mut l, (0.0, -1.0), false, p);
+                            mv(&mut l, (p.0, p.1 + 1));
+                            let now = l.exact_center(hit).unwrap();
+                            assert!((now.0 - at.0).abs() < 1e-9 && (now.1 - (at.1 + 64.0 - per_pixel)).abs() < 1e-9, "{case}: {now:?} from {at:?} at {per_pixel}");
+                            button(&mut l, Button::Middle, false, (p.0, p.1 + 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_wheel_over_the_interface_and_a_captured_wheel_keep_their_routes() {
+        let mut l = Layout::default();
+        l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles: Roles::UnitMouse, ..Default::default() });
+        let mut scene = scene_at(0);
+        scene.camera_focus = Some(scene::CameraFocus { serial: 1, center: (3000, 2000) });
+        scene.map_wheel_step = (128, 64);
+        let ui = vec![[0, 500, 200, 100]];
+        l.frame(&scene, (800, 600), (0, 0, 0, 0), ui.clone(), BOUNDS);
+        let (a, b0) = (l.main_view.center, b(&l));
+        // Over the interface: its wheel, no pan.
+        let out = scroll(&mut l, (1.0, 1.0), false, (100, 550));
+        assert!(matches!(out[..], [Input::Wheel { delta: 120, .. }]), "{out:?}");
+        assert_eq!((l.main_view.center, b(&l)), (a, b0));
+        // Captured: the world cursor's view (B) pans, diagonally too.
+        assert!(l.capture_at((600, 300)));
+        let cursor = l.cursor;
+        let out = scroll(&mut l, (2.0, 0.0), true, (200, 300));
+        assert_eq!(out, [Input::WorldMove { x: cursor.0 - 2, y: cursor.1 }]);
+        scroll(&mut l, (0.0, 1.0), false, (200, 300));
+        assert_eq!(l.cursor, (cursor.0 - 2, cursor.1 - 64));
+        l.frame(&scene, (800, 600), (0, 0, 0, 0), ui, BOUNDS);
+        assert_eq!((l.main_view.center, b(&l)), (a, l.cursor));
+    }
+
+    // ---- The minimap ---------------------------------------------------------
+
+    /// A minimap at the driver's screen's bottom left, 200 × 100 of an 8000
+    /// × 4000 world: 40 world pixels a minimap pixel.
+    const MINIMAP: scene::Minimap = scene::Minimap { at: (0, 500), size: (200, 100), shown: [0, 500, 200, 100], world: (8000, 4000) };
+
+    fn minimap_scene() -> Scene {
+        let mut s = scene_at(0);
+        s.camera_focus = Some(scene::CameraFocus { serial: 1, center: (3000, 2000) });
+        s.minimap = Some(MINIMAP);
+        s
+    }
+
+    fn minimap_frame(l: &mut Layout, s: &Scene, ms: u64) {
+        l.advance(Duration::from_millis(ms));
+        l.frame(s, (800, 600), (0, 0, 0, 0), vec![[0, 500, 200, 100]], BOUNDS);
+    }
+
+    #[test]
+    fn a_right_click_on_the_minimap_sends_b_there_and_the_game_never_pulls_it() {
+        for roles in [Roles::Free, Roles::UnitMouse] {
+            for smooth in [false, true] {
+                let case = format!("{roles:?} smooth={smooth}");
+                let mut l = Layout::default();
+                l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles, smooth_world_movement: smooth, ..Default::default() });
+                let mut s = minimap_scene();
+                for _ in 0..2 {
+                    minimap_frame(&mut l, &s, 16);
+                }
+                let a = l.main_view.center;
+                // Picked at minimap pixel (100, 50): its middle, 4020, 2020.
+                let to = MINIMAP.world_at((100, 550)).unwrap();
+                assert_eq!(to, (4020, 2020));
+                mv(&mut l, (100, 550));
+                assert_eq!(button(&mut l, Button::Right, true, (100, 550)), [], "{case}");
+                let mut xs = vec![center_of(&l, Hit::Pane).0];
+                let mut frames = 0;
+                while center_of(&l, Hit::Pane) != to || l.pan.flight.is_some() {
+                    minimap_frame(&mut l, &s, 16);
+                    xs.push(center_of(&l, Hit::Pane).0);
+                    frames += 1;
+                    assert!(frames < 200, "{case}: never lands {xs:?}");
+                }
+                assert_eq!(button(&mut l, Button::Right, false, (100, 550)), [], "{case}");
+                assert_eq!(turn(&xs), None, "{case}: {xs:?}");
+                assert!(smooth == (frames > 5), "{case}: {frames} frames");
+                assert_eq!(l.main_view.center, a, "{case}: A moved");
+                // The game's camera (a new request, its native camera) moves
+                // A only; B stays where it was sent.
+                s.camera_focus = Some(scene::CameraFocus { serial: 2, center: (6000, 1000) });
+                s.views[0].view.camera_x = 512;
+                for _ in 0..90 {
+                    minimap_frame(&mut l, &s, 16);
+                }
+                assert_eq!(center_of(&l, Hit::Pane), to, "{case}");
+                assert_eq!(l.main_view.center, (6000, 1000), "{case}");
+                // The next pan of B goes on from there.
+                assert_eq!(l.exact_center(Hit::Pane), Some((to.0 as f64, to.1 as f64)), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_minimap_flight_goes_the_short_way_round_the_seam() {
+        let mut l = Layout::default();
+        l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles: Roles::Free, smooth_world_movement: true, ..Default::default() });
+        let s = minimap_scene();
+        minimap_frame(&mut l, &s, 16);
+        let v = &mut l.split.as_mut().unwrap().view;
+        (v.center, v.settling) = ((7900, 2020), false);
+        minimap_frame(&mut l, &s, 16);
+        // Minimap pixel 2: world x 100, 200 pixels on round the seam.
+        button(&mut l, Button::Right, true, (2, 550));
+        let mut gone = 0;
+        let mut last = center_of(&l, Hit::Pane).0;
+        while l.pan.flight.is_some() {
+            minimap_frame(&mut l, &s, 16);
+            let now = center_of(&l, Hit::Pane).0;
+            let d = wrapped(now - last, 8000);
+            assert!(d >= 0, "{last} -> {now}");
+            gone += d;
+            last = now;
+        }
+        assert_eq!(gone, 200);
+        assert_eq!(center_of(&l, Hit::Pane).0.rem_euclid(8000), 100);
+        button(&mut l, Button::Right, false, (2, 550));
+    }
+
+    #[test]
+    fn without_b_a_right_click_on_the_minimap_stays_the_games() {
+        let mut l = Layout::default();
+        let s = minimap_scene();
+        minimap_frame(&mut l, &s, 16);
+        let a = l.main_view.center;
+        let press = button(&mut l, Button::Right, true, (100, 550));
+        let release = button(&mut l, Button::Right, false, (100, 550));
+        assert_eq!(press, [Input::MouseButton { button: Button::Right, down: true, x: 100, y: 550 }]);
+        assert_eq!(release, [Input::MouseButton { button: Button::Right, down: false, x: 100, y: 550 }]);
+        minimap_frame(&mut l, &s, 16);
+        assert_eq!(l.main_view.center, a);
+        // With B, a right click elsewhere on the interface is still the game's.
+        let mut l = Layout::default();
+        l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, ..Default::default() });
+        let mut s = minimap_scene();
+        s.minimap = Some(scene::Minimap { shown: [0, 500, 100, 100], ..MINIMAP });
+        minimap_frame(&mut l, &s, 16);
+        let b0 = b(&l);
+        assert!(matches!(button(&mut l, Button::Right, true, (150, 550))[..], [Input::MouseButton { button: Button::Right, down: true, .. }]));
+        assert_eq!(b(&l), b0);
     }
 }

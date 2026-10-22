@@ -761,6 +761,11 @@ pub struct Layout {
     /// The game's current native map-wheel distance, independent of the
     /// physical native camera that may be parked at the origin.
     map_wheel_step: (i32, i32),
+    /// The last `Input::Scroll` panned the map: the `Wheel` notches it
+    /// made are not the interface's (until another input).
+    scroll_panned: bool,
+    /// The driver's minimap, where the renderer may point at it.
+    minimap: Option<scene::Minimap>,
     /// Whether zoomed views show text at their resolution (the driver's
     /// zoomed art) rather than its pixels scaled.
     pub sharp_text: bool,
@@ -937,6 +942,8 @@ impl Default for Layout {
             last_world_pointer: None,
             world_downscale: None,
             map_wheel_step: (0, 0),
+            scroll_panned: false,
+            minimap: None,
             ctrl: false,
             shift: false,
             drag: None,
@@ -2204,6 +2211,7 @@ impl Layout {
         let downscale = crate::world_downscale(scene);
         if self.world_shown { self.rescale_world(downscale); }
         self.map_wheel_step = scene.map_wheel_step;
+        self.minimap = scene.minimap;
         // Remember the opening view before a menu releases captured input.
         // Moving over its controls or resizing later must not send it elsewhere.
         if scene.interface.screen.as_deref() == Some("Menu") {
@@ -2913,6 +2921,7 @@ impl Layout {
         self.cursor_placed = false;
         self.world_downscale = None;
         self.map_wheel_step = (0, 0);
+        self.minimap = None;
         self.world_frames = 0;
         self.art_zooms = scene.zooms.clone();
         let base = crate::scene_cameras(scene, self.driver_screen(), overhang);
@@ -4022,6 +4031,9 @@ impl Layout {
 
     /// Takes a window input; returns what goes to the driver.
     pub fn route(&mut self, input: Input) -> Vec<Input> {
+        if !matches!(input, Input::Wheel { .. } | Input::Scroll { .. }) {
+            self.scroll_panned = false;
+        }
         let mut out = self.take_unit_order_events();
         out.extend(self.detached.take_inputs());
         if self.unit_order_before(&input) {
@@ -4055,7 +4067,7 @@ impl Layout {
                     self.release_here("Ctrl on its own");
                 }
             }
-            Input::Key { down: true, .. } | Input::MouseButton { down: true, .. } | Input::Wheel { .. } => self.ctrl_alone = false,
+            Input::Key { down: true, .. } | Input::MouseButton { down: true, .. } | Input::Wheel { .. } | Input::Scroll { .. } => self.ctrl_alone = false,
             _ => {}
         }
         if let Input::Key { vk, down, .. } = input {
@@ -4137,6 +4149,10 @@ impl Layout {
             }
             Input::MouseButton { button, down, x, y } => {
                 let p = self.held_back((x, y));
+                // (On the minimap: B goes there, `pan`.)
+                if button == Button::Right && self.minimap_right(down, p) {
+                    return vec![];
+                }
                 self.button(button, down, p)
             }
             Input::Wheel { delta, x, y } => {
@@ -4149,10 +4165,29 @@ impl Layout {
                     self.zoom_at((x, y), delta.signum());
                     return vec![];
                 }
+                // (Its scroll panned the map already.)
+                if self.scroll_panned { return vec![]; }
                 if let Some(out) = self.map_wheel(delta, (x, y)) { return out; }
                 match self.route_point((x, y)) {
                     Ok((x, y)) => vec![Input::Wheel { delta, x, y }],
                     Err(_) => vec![],
+                }
+            }
+            // A scroll's motion: the map's (both axes, unrounded), else
+            // nothing; its `Wheel` notches follow for the interface.
+            Input::Scroll { dx, dy, pixels, x, y } => {
+                let (x, y) = self.held_back((x, y));
+                self.scroll_panned = false;
+                if self.ctrl || (self.click_popup_open() && (self.locked || matches!(self.hit((x, y)), Hit::Main | Hit::Pane | Hit::Inset(_) | Hit::Magnifier | Hit::Beside))) {
+                    return vec![];
+                }
+                let d = (dx as f64 / 1000.0, dy as f64 / 1000.0);
+                match self.map_scroll(d, pixels, (x, y)) {
+                    Some(out) => {
+                        self.scroll_panned = true;
+                        out
+                    }
+                    None => vec![],
                 }
             }
             other => vec![other],

@@ -122,7 +122,7 @@ impl Layout {
                 self.cancel_unit_order();
                 false
             }
-            Input::Key { down: true, .. } | Input::Wheel { .. } if active => {
+            Input::Key { down: true, .. } | Input::Wheel { .. } | Input::Scroll { .. } if active => {
                 self.cancel_unit_order();
                 false
             }

@@ -443,6 +443,20 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.i32(*x);
                 w.i32(*y);
             }
+            Update::Minimap(m) => {
+                w.u8(28);
+                w.bool(m.is_some());
+                let m = m.unwrap_or_default();
+                w.i32(m.at.0);
+                w.i32(m.at.1);
+                w.u32(m.size.0);
+                w.u32(m.size.1);
+                for v in m.shown {
+                    w.i32(v);
+                }
+                w.i32(m.world.0);
+                w.i32(m.world.1);
+            }
             Update::Assets(n) => {
                 w.u8(8);
                 w.u32(*n as u32);
@@ -703,6 +717,16 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 Some(crate::CameraArrival { serial: r.u32()? as u64 | (r.u32()? as u64) << 32, bounds: [r.i32()?, r.i32()?, r.i32()?, r.i32()?] })
             } else { None }),
             19 => Update::MapWheelStep((r.i32()?, r.i32()?)),
+            28 => {
+                let some = r.bool()?;
+                let m = crate::Minimap {
+                    at: (r.i32()?, r.i32()?),
+                    size: (r.u32()?, r.u32()?),
+                    shown: [r.i32()?, r.i32()?, r.i32()?, r.i32()?],
+                    world: (r.i32()?, r.i32()?),
+                };
+                Update::Minimap(some.then_some(m))
+            }
             8 => Update::Assets(r.u32()? as u64 | (r.u32()? as u64) << 32),
             9 => {
                 let n = r.len(8)?;
@@ -911,6 +935,14 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
+            Input::Scroll { dx, dy, pixels, x, y } => {
+                w.u8(21);
+                w.i32(dx);
+                w.i32(dy);
+                w.bool(pixels);
+                w.i32(x);
+                w.i32(y);
+            }
             Input::Key { vk, down, text } => {
                 w.u8(3);
                 w.u32(vk);
@@ -1050,6 +1082,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
             }
             10 => Input::WorldKey { vk: r.u32()?, down: r.bool()?, text: char::from_u32(r.u32()?), x: r.i32()?, y: r.i32()? },
             2 => Input::Wheel { delta: r.i32()?, x: r.i32()?, y: r.i32()? },
+            21 => Input::Scroll { dx: r.i32()?, dy: r.i32()?, pixels: r.bool()?, x: r.i32()?, y: r.i32()? },
             3 => Input::Key { vk: r.u32()?, down: r.bool()?, text: char::from_u32(r.u32()?) },
             4 => Input::Resized { width: r.u32()?, height: r.u32()? },
             5 => Input::Quit,
@@ -1168,6 +1201,27 @@ mod tests {
         let decoded = decode_updates(&encode_updates(&after.updates_since(&before))).unwrap();
         for update in decoded { before.apply(update); }
         assert_eq!(before.camera_focus, None);
+    }
+
+    #[test]
+    fn the_minimap_travels_and_maps_its_pixels_to_the_world() {
+        let mut before = Scene::default();
+        let mut after = before.clone();
+        let m = crate::Minimap { at: (10, 400), size: (200, 100), shown: [10, 400, 200, 100], world: (8000, 4000) };
+        after.minimap = Some(m);
+        let updates = after.updates_since(&before);
+        assert_eq!(updates, vec![Update::Minimap(Some(m))]);
+        for update in decode_updates(&encode_updates(&updates)).unwrap() { before.apply(update); }
+        assert_eq!(before.minimap, Some(m));
+        after.minimap = None;
+        for update in decode_updates(&encode_updates(&after.updates_since(&before))).unwrap() { before.apply(update); }
+        assert_eq!(before.minimap, None);
+        // 40 world pixels a minimap pixel, its middle; off it: none.
+        assert_eq!(m.world_at((10, 400)), Some((20, 20)));
+        assert_eq!(m.world_at((109, 449)), Some((3980, 1980)));
+        assert_eq!(m.world_at((209, 499)), Some((7980, 3980)));
+        assert_eq!(m.world_at((210, 450)), None);
+        assert_eq!(m.world_at((9, 450)), None);
     }
 
     #[test]
@@ -1321,6 +1375,7 @@ mod tests {
             Input::MouseMove { x: 1, y: -2 },
             Input::MouseButton { button: Button::Right, down: true, x: 3, y: 4 },
             Input::Wheel { delta: -120, x: 0, y: 0 },
+            Input::Scroll { dx: -1500, dy: 250, pixels: true, x: 7, y: -8 },
             Input::Key { vk: 0x41, down: false, text: Some('a') },
             Input::Key { vk: 0x10, down: true, text: None },
             Input::Resized { width: 800, height: 600 },

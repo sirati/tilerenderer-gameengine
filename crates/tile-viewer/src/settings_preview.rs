@@ -175,6 +175,7 @@ impl Preview {
             Input::MouseMove { .. }
                 | Input::MouseButton { .. }
                 | Input::Wheel { .. }
+                | Input::Scroll { .. }
                 | Input::Slider { .. }
                 | Input::WorldMove { .. }
                 | Input::WorldButton { .. }

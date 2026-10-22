@@ -251,6 +251,9 @@ pub struct Scene {
     /// Positive magnitudes; Shift selects X, otherwise Y. Zero preserves
     /// ordinary driver wheel routing for drivers without this metadata.
     pub map_wheel_step: (i32, i32),
+    /// The driver's minimap where the renderer may point at it (none: no
+    /// minimap, or one the renderer must leave to the driver).
+    pub minimap: Option<Minimap>,
     /// New pixels for atlas sprites whose content changes at run time.
     pub patches: Vec<Patch>,
     /// The renderer's own settings as the driver last sent them (the driver
@@ -289,6 +292,36 @@ pub struct CameraFocus {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CameraArrival { pub serial: u64, pub bounds: [i32; 4] }
+
+/// The driver's minimap: a picture of the whole world, linear along both
+/// axes, shown on its screen.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Minimap {
+    /// The driver's screen pixel where the picture's pixel (0, 0) is.
+    pub at: (i32, i32),
+    /// The picture's size, in its pixels.
+    pub size: (u32, u32),
+    /// Where it shows on the driver's screen (x, y, width, height).
+    pub shown: [i32; 4],
+    /// The world pixels (at the current game zoom) the whole picture spans.
+    pub world: (i32, i32),
+}
+
+impl Minimap {
+    /// The world pixel the driver's screen pixel `p` points at, if it is
+    /// on the minimap where it shows.
+    pub fn world_at(&self, p: (i32, i32)) -> Option<(i32, i32)> {
+        let [x, y, w, h] = self.shown;
+        let inside = p.0 >= x && p.1 >= y && p.0 < x + w && p.1 < y + h;
+        if !inside || self.size.0 == 0 || self.size.1 == 0 {
+            return None;
+        }
+        // (The middle of the picture's pixel.)
+        let axis = |v: i32, at: i32, size: u32, world: i32| ((v - at) as f64 + 0.5) * world as f64 / size as f64;
+        let (wx, wy) = (axis(p.0, self.at.0, self.size.0, self.world.0), axis(p.1, self.at.1, self.size.1, self.world.1));
+        (wx >= 0.0 && wy >= 0.0 && wx < self.world.0 as f64 && wy < self.world.1 as f64).then_some((wx as i32, wy as i32))
+    }
+}
 
 /// A mouse pointer.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -694,6 +727,8 @@ pub enum Update {
     CameraArrival(Option<CameraArrival>),
     /// See [`Scene::map_wheel_step`].
     MapWheelStep((i32, i32)),
+    /// See [`Scene::minimap`].
+    Minimap(Option<Minimap>),
     /// The scene now refers to art generation `n` (see [`Scene::assets`]).
     Assets(u64),
     /// See [`Scene::zooms`].
@@ -844,6 +879,7 @@ impl Scene {
             Update::CameraFocus(focus) => self.camera_focus = focus,
             Update::CameraArrival(arrival) => self.camera_arrival = arrival,
             Update::MapWheelStep(step) => self.map_wheel_step = step,
+            Update::Minimap(m) => self.minimap = m,
             Update::Assets(n) => self.assets = n,
             Update::Zooms(z) => self.zooms = z,
             Update::Settings(s) => self.settings = Some(s),
@@ -954,6 +990,9 @@ impl Scene {
         if self.map_wheel_step != old.map_wheel_step {
             out.push(Update::MapWheelStep(self.map_wheel_step));
         }
+        if self.minimap != old.minimap {
+            out.push(Update::Minimap(self.minimap));
+        }
         if self.focus != old.focus {
             out.push(Update::Focus(self.focus));
         }
@@ -1046,6 +1085,12 @@ pub enum Input {
     MouseMove { x: i32, y: i32 },
     MouseButton { button: Button, down: bool, x: i32, y: i32 },
     Wheel { delta: i32, x: i32, y: i32 },
+    /// A scroll's own motion along both axes, as the window reported it
+    /// (viewer-local; the renderer pans its map with it and never passes it
+    /// on). `dx`, `dy` in thousandths of a line, or of a window pixel if
+    /// `pixels` (a trackpad); positive moves the content right and down.
+    /// The `Wheel` notches it makes for the driver's interface follow it.
+    Scroll { dx: i32, dy: i32, pixels: bool, x: i32, y: i32 },
     /// A key, as a Windows virtual-key code (the de-facto lingua franca of
     /// keyboard input), with the character it produced, if any.
     Key { vk: u32, down: bool, text: Option<char> },

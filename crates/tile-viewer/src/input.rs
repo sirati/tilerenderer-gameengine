@@ -58,6 +58,16 @@ impl InputState {
             MouseScrollDelta::PixelDelta(p) => (p.y / self.wheel_scale.unwrap_or(1.0) / 40.0, true),
         };
         if !amount.is_finite() { return vec![] }
+        // Both axes as reported, unrounded, for the map (`Layout`; pixels
+        // in the window's, as the pointer's); the notches below stay as
+        // they were for the driver's interface.
+        let (sx, sy) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (f64::from(*x), f64::from(*y)),
+            MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
+        };
+        let milli = |v: f64| if v.is_finite() { (v * 1000.0).round().clamp(-1e9, 1e9) as i32 } else { 0 };
+        let scroll = (milli(sx), milli(sy));
+        let scroll = (scroll != (0, 0)).then_some(Input::Scroll { dx: scroll.0, dy: scroll.1, pixels, x: self.cursor.0, y: self.cursor.1 });
         if pixels != self.wheel_pixels { self.wheel_rest = 0.0; }
         self.wheel_pixels = pixels;
         self.wheel_rest += amount;
@@ -69,7 +79,7 @@ impl InputState {
         let delta = if whole < 0.0 { -120 } else { 120 };
         // Discard pathological event excess instead of allocating or
         // replaying an unbounded backlog. Keep only the fractional part.
-        (0..whole.abs().min(32.0) as usize).map(|_| Input::Wheel { delta, x: self.cursor.0, y: self.cursor.1 }).collect()
+        scroll.into_iter().chain((0..whole.abs().min(32.0) as usize).map(|_| Input::Wheel { delta, x: self.cursor.0, y: self.cursor.1 })).collect()
     }
 
     /// The driver's screen is now shown so in the window: pointer positions
@@ -268,28 +278,52 @@ mod tests {
         WindowEvent::MouseWheel { device_id: DeviceId::dummy(), delta, phase: TouchPhase::Moved }
     }
 
+    impl InputState {
+        /// What `event` makes for the driver's interface: its `Wheel`
+        /// notches (not the map's `Scroll`).
+        fn wheels(&mut self, event: &WindowEvent) -> Vec<Input> {
+            self.translate(event).into_iter().filter(|i| !matches!(i, Input::Scroll { .. })).collect()
+        }
+    }
+
+    #[test]
+    fn a_scroll_reports_both_axes_unrounded_before_its_notches() {
+        let mut input = InputState::default();
+        input.set_wheel_scale(2.0);
+        // A trackpad, diagonally: window pixels as reported, no notch yet.
+        let out = input.translate(&wheel_event(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(-3.5, 1.25))));
+        assert_eq!(out, [Input::Scroll { dx: -3500, dy: 1250, pixels: true, x: 0, y: 0 }]);
+        // A tilt wheel: sideways lines only (no notch for the interface).
+        let out = input.translate(&wheel_event(MouseScrollDelta::LineDelta(1.0, 0.0)));
+        assert_eq!(out, [Input::Scroll { dx: 1000, dy: 0, pixels: false, x: 0, y: 0 }]);
+        // A wheel: its lines, then its notches.
+        let out = input.translate(&wheel_event(MouseScrollDelta::LineDelta(0.0, -2.0)));
+        assert_eq!(out, [Input::Scroll { dx: 0, dy: -2000, pixels: false, x: 0, y: 0 }, Input::Wheel { delta: -120, x: 0, y: 0 }, Input::Wheel { delta: -120, x: 0, y: 0 }]);
+        assert!(input.translate(&wheel_event(MouseScrollDelta::LineDelta(0.0, 0.0))).is_empty());
+    }
+
     #[test]
     fn trackpad_subpixels_accumulate_without_a_row_per_message() {
         let mut input = InputState::default();
         for _ in 0..159 {
-            assert!(input.translate(&wheel_event(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 0.25)))).is_empty());
+            assert!(input.wheels(&wheel_event(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 0.25)))).is_empty());
         }
-        assert_eq!(input.translate(&wheel_event(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 0.25)))), [Input::Wheel { delta: 120, x: 0, y: 0 }]);
-        assert_eq!(input.translate(&wheel_event(MouseScrollDelta::LineDelta(0.0, -3.0))), vec![Input::Wheel { delta: -120, x: 0, y: 0 }; 3]);
+        assert_eq!(input.wheels(&wheel_event(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 0.25)))), [Input::Wheel { delta: 120, x: 0, y: 0 }]);
+        assert_eq!(input.wheels(&wheel_event(MouseScrollDelta::LineDelta(0.0, -3.0))), vec![Input::Wheel { delta: -120, x: 0, y: 0 }; 3]);
     }
 
     #[test]
     fn wheel_event_work_is_bounded_and_nonfinite_input_does_not_poison_fractions() {
         let mut input = InputState::default();
         for delta in [f64::MAX, -f64::MAX] {
-            assert_eq!(input.translate(&wheel_event(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, delta)))).len(), 32);
+            assert_eq!(input.wheels(&wheel_event(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, delta)))).len(), 32);
         }
         for delta in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert!(input.translate(&wheel_event(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, delta)))).is_empty());
+            assert!(input.wheels(&wheel_event(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, delta)))).is_empty());
         }
-        assert!(input.translate(&wheel_event(MouseScrollDelta::LineDelta(0.0, 0.5))).is_empty());
-        assert_eq!(input.translate(&wheel_event(MouseScrollDelta::LineDelta(0.0, 0.5))).len(), 1);
-        assert!(input.translate(&wheel_event(MouseScrollDelta::LineDelta(0.0, 0.0))).is_empty());
+        assert!(input.wheels(&wheel_event(MouseScrollDelta::LineDelta(0.0, 0.5))).is_empty());
+        assert_eq!(input.wheels(&wheel_event(MouseScrollDelta::LineDelta(0.0, 0.5))).len(), 1);
+        assert!(input.wheels(&wheel_event(MouseScrollDelta::LineDelta(0.0, 0.0))).is_empty());
     }
 
     #[test]
@@ -298,8 +332,8 @@ mod tests {
             let mut input = InputState::default();
             input.set_wheel_scale(scale);
             let delta = wheel_event(MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(0.0, 20.0 * scale)));
-            assert!(input.translate(&delta).is_empty());
-            assert_eq!(input.translate(&delta), [Input::Wheel { delta: 120, x: 0, y: 0 }]);
+            assert!(input.wheels(&delta).is_empty());
+            assert_eq!(input.wheels(&delta), [Input::Wheel { delta: 120, x: 0, y: 0 }]);
         }
     }
 
@@ -311,22 +345,22 @@ mod tests {
             rect: [0, 0, 100, 100], kind: scene::InteractableKind::List { scroll: [0, 0, 90, 100], step: 20 } });
         input.sync_wheel_context(&scene, Some((10, 10)), false);
         let half = wheel_event(MouseScrollDelta::LineDelta(0.0, 0.5));
-        assert!(input.translate(&half).is_empty());
+        assert!(input.wheels(&half).is_empty());
         scene.seq += 1;
         input.sync_wheel_context(&scene, Some((20, 20)), false);
-        assert_eq!(input.translate(&half).len(), 1);
-        assert!(input.translate(&half).is_empty());
+        assert_eq!(input.wheels(&half).len(), 1);
+        assert!(input.wheels(&half).is_empty());
         input.sync_wheel_context(&scene, Some((200, 200)), false);
-        assert!(input.translate(&half).is_empty());
+        assert!(input.wheels(&half).is_empty());
         scene.interface.popup = Some(9);
         input.sync_wheel_context(&scene, Some((200, 200)), false);
-        assert!(input.translate(&half).is_empty());
+        assert!(input.wheels(&half).is_empty());
         input.sync_wheel_context(&scene, Some((200, 200)), true);
-        assert!(input.translate(&half).is_empty());
+        assert!(input.wheels(&half).is_empty());
         input.translate(&WindowEvent::Focused(false));
-        assert!(input.translate(&half).is_empty());
+        assert!(input.wheels(&half).is_empty());
         input.key(KeyCode::AltLeft, true, None);
-        assert!(input.translate(&half).is_empty());
+        assert!(input.wheels(&half).is_empty());
     }
 
     #[test]
@@ -341,7 +375,7 @@ mod tests {
         assert_eq!(input.translate(&WindowEvent::MouseInput {
             device_id: DeviceId::dummy(), state: ElementState::Pressed, button: MouseButton::Left,
         }), vec![Input::MouseButton { button: Button::Left, down: true, x: at.0, y: at.1 }]);
-        assert_eq!(input.translate(&WindowEvent::MouseWheel {
+        assert_eq!(input.wheels(&WindowEvent::MouseWheel {
             device_id: DeviceId::dummy(), delta: MouseScrollDelta::LineDelta(0.0, 1.0), phase: TouchPhase::Moved,
         }), vec![Input::Wheel { delta: 120, x: at.0, y: at.1 }]);
         // A later physical motion replaces the hinted position normally.

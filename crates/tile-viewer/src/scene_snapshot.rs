@@ -13,7 +13,7 @@ pub(crate) fn update(shown: &mut Scene, latest: &Scene, changes: &Changes) -> Wo
     // Keep this exhaustive so a new Scene control field cannot be silently
     // omitted from an adopted immutable snapshot.
     let Scene { seq, tick, shape, layers, slots, bindings, sprites, sprite_lifetimes,
-        views, zooms, assets, focus, camera_focus, camera_arrival, map_wheel_step, patches, settings, settings_preview,
+        views, zooms, assets, focus, camera_focus, camera_arrival, map_wheel_step, minimap, patches, settings, settings_preview,
         interface, interactables, cursor, screen_size, looks } = latest;
     let mut work = Work::default();
     if changes.world || shown.shape != *shape || shown.layers.len() != layers.len() {
@@ -58,6 +58,7 @@ pub(crate) fn update(shown: &mut Scene, latest: &Scene, changes: &Changes) -> Wo
     shown.camera_focus = *camera_focus;
     shown.camera_arrival = *camera_arrival;
     shown.map_wheel_step = *map_wheel_step;
+    shown.minimap = *minimap;
     shown.patches.clone_from(patches);
     shown.settings.clone_from(settings);
     shown.settings_preview = *settings_preview;
