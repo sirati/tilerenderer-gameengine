@@ -491,6 +491,10 @@ pub struct Frame {
     pub popup_places: Vec<(u32, ((i32, i32), (u32, u32)))>,
     /// Generic menus retain their requested scale in their opening view.
     pub menu_region: Option<[i32; 4]>,
+    /// The area of the view the per-view interface (the corner's buttons,
+    /// the hint in their place) shows in ([`Layout::view_area`], canvas
+    /// pixels): scaled no larger than fits it and kept inside it.
+    pub view_ui_region: Option<[i32; 4]>,
     pub copies: Vec<ScreenCopy>,
     pub markers: Vec<Marker>,
     /// The divider's line where it is closed: per piece, the camera
@@ -698,6 +702,11 @@ pub struct Layout {
     /// Whether button snapping is on (see [`Layout::set_snapping`]).
     snapping: bool,
     moved: Vec<([i32; 4], (i32, i32))>,
+    /// The window rectangles of the per-view interface the last frame drew
+    /// (the corner's buttons or the hint in their place, as large as the
+    /// HUD's scale shows them), laid out in [`Layout::view_area`]: the
+    /// floating zoom boxes keep clear of them.
+    view_ui: Vec<[i32; 4]>,
     /// Whether the last frame showed the magnifier (it may be left out, or
     /// be under a screen fitted into a pane).
     magnifier_shown: bool,
@@ -889,6 +898,7 @@ impl Default for Layout {
             focus_after_scale: None,
             snapping: false,
             moved: Vec::new(),
+            view_ui: Vec::new(),
             magnifier_shown: true,
             world_shown: true,
             magnifier_center: None,
@@ -1758,6 +1768,18 @@ impl Layout {
         }
     }
 
+    /// The rectangle a view's own interface is laid out in (the corner's
+    /// buttons, the hint shown in their place, and whatever else belongs
+    /// with that view): the view's pane after every reservation the views
+    /// give room to (a zoom strip; the split's divider). Without a split
+    /// there is one view, A.
+    pub(crate) fn view_area(&self, side: Side) -> [i32; 4] {
+        match (side, self.panes()) {
+            (Side::B, (_, Some(b))) if self.split.is_some() => b,
+            (_, (a, _)) => a,
+        }
+    }
+
     /// The panes in `area`.
     fn panes_in(&self, [x, y, w, h]: [i32; 4]) -> ([i32; 4], Option<[i32; 4]>) {
         if !self.world_shown { return ([x, y, w, h], None); }
@@ -1960,6 +1982,20 @@ impl Layout {
         // region's height, or the window's aspect ratio on Auto.
         let width = |region: [i32; 4], n: u32| (region[2] as i64 * n.max(1) as i64 / (n.max(1) as i64 + 2)) as i32;
         let (ww, wh) = (self.window.0.max(1) as i64, self.window.1 as i64);
+        // A floating box keeps clear of the views' own interface (the
+        // corner's buttons in their view, `view_ui`), its frame too: one
+        // that would cover it goes below it, cut to its region's bottom.
+        let framed = |b: [i32; 4]| [b[0] - GAP, b[1] - GAP, b[2] + 2 * GAP, b[3] + 2 * GAP];
+        let ui_hit = |b: [i32; 4]| self.view_ui.iter().any(|&u| overlap(framed(b), u));
+        let clear = |mut b: [i32; 4], r: [i32; 4]| {
+            for &u in &self.view_ui {
+                let top = (u[1] + u[3] + GAP).max(b[1]);
+                if overlap(framed(b), u) && top < r[1] + r[3] {
+                    b = [b[0], top, b[2], b[3].min(r[1] + r[3] - top)];
+                }
+            }
+            b
+        };
         match m.place {
             ZoomPlace::Beside => {}
             ZoomPlace::Box(n, thousandths) => {
@@ -1967,13 +2003,13 @@ impl Layout {
                 let w = width(r, n);
                 let h = if thousandths == 0 { w as i64 * wh / ww } else { r[3] as i64 * thousandths as i64 / 1000 };
                 let h = h.min(r[3] as i64) as i32;
-                let (x, y) = (r[0] + (r[2] - w) / 2, r[1] + (r[3] - h) / 2);
+                let [x, y, w, h] = clear([r[0] + (r[2] - w) / 2, r[1] + (r[3] - h) / 2, w, h], r);
                 let p = if self.locked { self.cursor_on_window().unwrap_or(self.pointer) } else { self.pointer };
                 if (!self.zoom_box_block_pointer || self.locked) && self.interface_at(p).is_none() && inside([x - GAP, y - GAP, w + 2 * GAP, h + 2 * GAP], p) {
                     // The centred box moves below a pointer entering it.
                     // Try the other sides when the full box will not fit.
                     for (bx, by) in [(x, p.1 + POINTER_CLEARANCE), (x, p.1 - GAP - h), (p.0 + POINTER_CLEARANCE, y), (p.0 - GAP - w, y)] {
-                        if bx >= r[0] && by >= r[1] && bx + w <= r[0] + r[2] && by + h <= r[1] + r[3] {
+                        if bx >= r[0] && by >= r[1] && bx + w <= r[0] + r[2] && by + h <= r[1] + r[3] && !ui_hit([bx, by, w, h]) {
                             return ([bx, by, w, h], None);
                         }
                     }
@@ -1982,10 +2018,10 @@ impl Layout {
                     // than covering the map pixel the user is pointing at.
                     let below = p.1 + POINTER_CLEARANCE;
                     if below < r[1] + r[3] {
-                        return ([x, below, w, h.min(r[1] + r[3] - below)], None);
+                        return (clear([x, below, w, h.min(r[1] + r[3] - below)], r), None);
                     }
                     let height = h.min((p.1 - GAP - r[1]).max(1));
-                    return ([x, p.1 - GAP - height, w, height], None);
+                    return (clear([x, p.1 - GAP - height, w, height], r), None);
                 }
                 return ([x, y, w, h], None);
             }
@@ -2000,9 +2036,9 @@ impl Layout {
                 let (px, py) = if self.locked { self.cursor_on_window().unwrap_or(self.pointer) } else { self.pointer };
                 let x = (px - w / 2).clamp(r[0], (r[0] + r[2] - w).max(r[0]));
                 let above = py - GAP - h;
-                let y = if above >= r[1] { above } else { py + POINTER_CLEARANCE };
+                let y = if above >= r[1] && !ui_hit([x, above, w, h]) { above } else { py + POINTER_CLEARANCE };
                 let y = y.clamp(r[1], (r[1] + r[3] - h).max(r[1]));
-                return ([x, y, w, h], None);
+                return (clear([x, y, w, h], r), None);
             }
             ZoomPlace::Strip(_) => return (self.strip().map_or([0, 0, 0, 0], |(s, _)| s), None),
         }
@@ -2331,6 +2367,7 @@ impl Layout {
         self.shown.clear();
         self.driver_rects.clear();
         self.moved.clear();
+        self.view_ui.clear();
         let menu_region = following_menu.then(|| if self.menu_side == Some(Side::B) { pane_rect.unwrap_or(main_rect) } else { main_rect });
         let mut frame = Frame { view_cameras: vec![None; scene.views.len()], popup_region: popup.filter(|_| !over_menu).and_then(|_| self.popup_region()), menu_region, ..Default::default() };
         // A modal popup over the menu (`over_menu`) keeps out of the screen
@@ -2425,6 +2462,8 @@ impl Layout {
                 let world_rect = if fit.hit == Hit::Main { pane_rect } else { Some(main_rect) };
                 if let Some(r) = world_rect.filter(|_| self.split.is_some()) {
                     let (d, camera) = ((r[0], r[1]), base[i]);
+                    frame.view_ui_region = Some(r);
+                    self.view_ui.push(self.view_ui_rect(rect_of(&camera), d, r));
                     over.push((i, Camera { origin: (camera.origin.0 + d.0, camera.origin.1 + d.1), screen_shift: d, ..camera }));
                 }
             }
@@ -2438,7 +2477,11 @@ impl Layout {
                 self.shown.push((Hit::Main, camera));
             }
         } else {
-            let roaming_shift = self.roaming_shift(pane_rect);
+            let roaming_shift = self.roaming_shift();
+            let ui_area = self.view_area(self.active_side());
+            if roaming.is_some() || hint.is_some() {
+                frame.view_ui_region = Some(ui_area);
+            }
             // (A modal one is placed over its menu: `scaling::MODAL_TOP`.)
             let popup_shift = popup.map(|i| if modal.is_some() || on_screen { (0, 0) } else { self.popup_shift(rect_of(&base[i]), main_rect) });
             let screen_shift = screen_part.map(|i| Some(self.screen_shift(rect_of(&base[i]))));
@@ -2468,6 +2511,9 @@ impl Layout {
                     // A part of the interface drawn on its own, where it goes.
                     let Some(d) = shift else { continue };
                     let r = rect_of(camera);
+                    if Some(i) == roaming || Some(i) == hint {
+                        self.view_ui.push(self.view_ui_rect(r, d, ui_area));
+                    }
                     self.moved.push(([r[0] + d.0, r[1] + d.1, r[2], r[3]], d));
                     let moved = Camera { origin: (camera.origin.0 + d.0, camera.origin.1 + d.1), screen_shift: d, ..*camera };
                     if popup_layers.contains(&i) && modal.is_some() { on_top.push((i, moved)) } else { over.push((i, moved)) }
@@ -2737,6 +2783,7 @@ impl Layout {
         self.shown.clear();
         self.driver_rects.clear();
         self.moved.clear();
+        self.view_ui.clear();
         self.interface = interface;
         self.interface_shown = None;
         self.insets_shown = 0;
@@ -2961,15 +3008,25 @@ impl Layout {
         self.side.unwrap_or(Side::A)
     }
 
-    /// How far the driver's roaming controls move: to the same place in B
-    /// as they have in the window while B is the active view; in A they are
-    /// where the driver put them (over a zoom strip too, which lies under
-    /// the interface). They show in the active view only.
-    fn roaming_shift(&self, pane_rect: Option<[i32; 4]>) -> Option<(i32, i32)> {
-        Some(match (self.active_side(), pane_rect) {
-            (Side::B, Some(b)) if self.split.is_some() => (b[0], b[1]),
-            _ => (0, 0),
-        })
+    /// How far the driver's roaming controls move: to the same place in
+    /// the active view's area ([`Layout::view_area`]: below a zoom strip,
+    /// in A as in B) as the driver gives them in its window. They show in
+    /// the active view only.
+    fn roaming_shift(&self) -> Option<(i32, i32)> {
+        let r = self.view_area(self.active_side());
+        Some((r[0], r[1]))
+    }
+
+    /// The window rectangle of per-view interface `r` (driver pixels) moved
+    /// by `d` into view area `area`, as `scaling::arrange` draws it: at the
+    /// HUD's scale about its top-left, smaller where that does not fit the
+    /// area, moved as little as needed to lie inside it.
+    fn view_ui_rect(&self, r: [i32; 4], d: (i32, i32), area: [i32; 4]) -> [i32; 4] {
+        let (n, m) = crate::scaling::fit_at_most(self.hud_scale, Some(r), (area[2].max(1) as u32, area[3].max(1) as u32));
+        let s = |v: i32| (v as i64 * n.max(1) as i64 / m.max(1) as i64) as i32;
+        let (w, h) = (s(r[2]), s(r[3]));
+        let into = |at: i32, len: i32, lo: i32, side: i32| if len <= side { at.clamp(lo, lo + side - len) } else { at };
+        [into(r[0] + d.0, w, area[0], area[2]), into(r[1] + d.1, h, area[1], area[3]), w, h]
     }
 
     /// A popup at `rect` opened. One the driver opened where a click went
@@ -6877,12 +6934,92 @@ mod tests {
         assert_eq!(l.active_side(), Side::B);
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (404, 0));
-        // With a zoom strip, over it where the driver put them (the strip
-        // lies under the interface).
+        // With a zoom strip (150 high), in A's own area below it, not over
+        // the strip; clicks there reach them where the driver has them.
         let mut l = arranged(&settings(|s| s.zoom = Zoom::TopStrip));
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (0, 0));
-        assert!(f.view_cameras[2].unwrap() as usize > f.cameras.iter().position(|c| c.zoom == (2, 1)).unwrap());
+        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (0, 154));
+        assert_eq!(click(&mut l, (30, 174))[0], Input::MouseButton { button: Button::Left, down: true, x: 30, y: 20 });
+        // The same in A as in B with the strip over both views.
+        let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, Zoom::TopStrip, Place::Floating)));
+        mv(&mut l, (100, 380));
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (0, 154));
+        mv(&mut l, (600, 380));
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (404, 154));
+    }
+
+    /// Every split, zoom kind, zoom place, box height and HUD scale, the
+    /// pointer in each view (free, near the corner, and captured with the
+    /// hint in the buttons' place): the views' own interface (the corner's
+    /// buttons, the hint) lies inside the active view's area
+    /// (`view_area`), that area inside its pane, and neither meets the
+    /// zoom box or strip (nor its frame).
+    #[test]
+    fn per_view_interface_lies_in_its_view_and_clear_of_every_zoom_area() {
+        let mut s = with_parts(None);
+        s.views.push(ViewState { id: 259, view: View { interface_only: true, origin: (8, 8), viewport: (133, 38), ..Default::default() }, overlay: vec![] });
+        s.interface.capture_hint = Some(259);
+        let (roaming, hint) = (2, 3);
+        let grown = |r: [i32; 4]| [r[0] - GAP / 2, r[1] - GAP / 2, r[2] + GAP, r[3] + GAP];
+        let within = |inner: [i32; 4], outer: [i32; 4]| inner[0] >= outer[0] && inner[1] >= outer[1] && inner[0] + inner[2] <= outer[0] + outer[2] && inner[1] + inner[3] <= outer[1] + outer[3];
+        let mut checked = 0;
+        for split in [S::Standard, S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
+            for zoom in [Zoom::Off, Zoom::Floating131, Zoom::Floating171, Zoom::Mouse111, Zoom::Mouse131, Zoom::TopStrip] {
+                for place in [Place::Floating, Place::LeftOrBottom, Place::RightOrTop] {
+                    for (box_height, strip) in [(0.0, 0.05), (0.25, 0.25), (1.0, 0.5)] {
+                        for hud in [(1, 1), (2, 1)] {
+                            for side in [Side::A, Side::B] {
+                                for (near_corner, captured) in [(false, false), (true, false), (false, true)] {
+                                    let what = format!("{split:?} {zoom:?} {place:?} box {box_height} strip {strip} hud {hud:?} {side:?} near corner {near_corner} captured {captured}");
+                                    let mut l = arranged(&settings(|s| {
+                                        (s.split, s.zoom, s.zoom_place, s.zoom_box_height, s.zoom_strip) = (split, zoom, place, box_height, strip);
+                                        s.roles = if captured { Roles::UnitMouse } else { Roles::Free };
+                                    }));
+                                    l.hud_scale = hud;
+                                    // (One view: no B. Captured: B, which follows the world cursor.)
+                                    if (side == Side::B && split == S::Standard) || (captured && side == Side::A) { continue; }
+                                    let (a, b) = l.panes();
+                                    let pane = if side == Side::A { a } else { b.unwrap() };
+                                    let middle = (pane[0] + pane[2] / 2, pane[1] + pane[3] / 2);
+                                    let p = if near_corner { (pane[0] + 170, pane[1] + 20) } else { middle };
+                                    // (Into the view through the divider's open stretch.)
+                                    let vertical = matches!(split, S::Vertical1To1 | S::Vertical2To1);
+                                    let (lo, hi) = if vertical { (pane[1], pane[1] + pane[3]) } else { (pane[0], pane[0] + pane[2]) };
+                                    let along = l.open_spans().iter().map(|&(a, b)| (a.max(lo), b.min(hi))).find(|(a, b)| b > a).map_or((lo + hi) / 2, |(a, b)| (a + b) / 2);
+                                    mv(&mut l, if vertical { (middle.0, along) } else { (along, middle.1) });
+                                    if captured {
+                                        // UnitMouse: B captures; A: let go in A.
+                                        if side == Side::B { click(&mut l, p); } else { mv(&mut l, p); }
+                                    } else {
+                                        mv(&mut l, p);
+                                    }
+                                    let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+                                    assert_eq!(l.active_side(), side, "{what}: locked {} side {:?} pointer {:?} pane {pane:?}", l.locked, l.side, l.pointer);
+                                    let area = l.view_area(side);
+                                    assert!(within(area, pane), "{what}: area {area:?} in its pane {pane:?}");
+                                    let shown = if l.locked { hint } else { roaming };
+                                    let c = f.cameras[f.view_cameras[shown].unwrap_or_else(|| panic!("{what}: not shown")) as usize];
+                                    let ui = l.view_ui_rect(rect(&c), (0, 0), area);
+                                    assert!(within(ui, area), "{what}: per-view interface {ui:?} in its view's area {area:?}");
+                                    assert_eq!(l.view_ui, vec![ui], "{what}");
+                                    if let Some((_, z)) = l.shown.iter().find(|(h, _)| *h == Hit::Magnifier) {
+                                        let z = grown(rect(z));
+                                        assert!(!overlap(ui, z), "{what}: per-view interface {ui:?} under the zoom area {z:?}");
+                                        if matches!(zoom, Zoom::TopStrip) {
+                                            assert!(!overlap(area, z), "{what}: area {area:?} under the strip {z:?}");
+                                        }
+                                    }
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "{checked}");
     }
 
     #[test]

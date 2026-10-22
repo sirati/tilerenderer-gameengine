@@ -104,7 +104,7 @@ fn fit(inner: (u32, u32), outer: (u32, u32)) -> Ratio {
 }
 
 /// Keep the requested ratio unless the actual content would be clipped.
-fn fit_at_most(zoom: Ratio, bounds: Option<[i32; 4]>, region: (u32, u32)) -> Ratio {
+pub(crate) fn fit_at_most(zoom: Ratio, bounds: Option<[i32; 4]>, region: (u32, u32)) -> Ratio {
     let Some([_, _, w, h]) = bounds.filter(|r| r[2] > 0 && r[3] > 0) else { return zoom };
     let most = fit((w as u32, h as u32), region);
     if zoom.0 as u64 * most.1 as u64 > most.0 as u64 * zoom.1 as u64 { most } else { zoom }
@@ -560,6 +560,12 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let into = |at: i32, len: i32, side: u32| if len <= side as i32 { at.clamp(0, side as i32 - len) - at } else { 0 };
         Affine { to: (piece.to.0 + into(x, w, canvas.0), piece.to.1 + into(y, h, canvas.1)), ..piece }
     };
+    // (The same, inside region `[x, y, w, h]` of the canvas.)
+    let kept_in = |piece: Affine, r: [i32; 4], region: [i32; 4]| {
+        let [x, y, w, h] = piece.rect(r);
+        let into = |at: i32, len: i32, lo: i32, side: i32| if len <= side { at.clamp(lo, lo + side - len) - at } else { 0 };
+        Affine { to: (piece.to.0 + into(x, w, region[0], region[2]), piece.to.1 + into(y, h, region[1], region[3])), ..piece }
+    };
     let menu_rects: Vec<[i32; 4]> = scene.views.iter().enumerate().filter(|(i, v)| v.view.interface_only && v.view.menu && frame.view_cameras.get(*i).copied().flatten().is_some_and(|c| !frame.placed.contains(&c))).map(|(_, v)| v).flat_map(|v| v.overlay.iter().filter_map(&rect_of)).collect();
     let menu_box = content_bounds(&menu_rects, plan.screen);
     // (About the middle, but moved as little as needed to be whole on the
@@ -680,9 +686,13 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             // kept on the canvas.
             let piece = screen_piece(place_camera, parts.is_popup_view(v.id), place_id);
             if parts.is_popup_view(v.id) && (anchored(place_id).is_some() || modal.is_some()) { piece } else { panned(piece) }
-        } else if parts.roaming == Some(v.id) {
+        } else if parts.roaming == Some(v.id) || parts.capture_hint == Some(v.id) {
+            // The view's own interface (the corner's buttons, the hint in
+            // their place): at the frame's scale where it fits the area of
+            // the view it is in, inside that area.
             let r = [o.0, o.1, size.0 as i32, size.1 as i32];
-            kept(about(o, fitting(plan.frame, Some(r))), r)
+            let region = frame.view_ui_region.unwrap_or(canvas_rect);
+            kept_in(about(o, fit_at_most(fitting(plan.frame, Some(r)), Some(r), (region[2].max(1) as u32, region[3].max(1) as u32))), r, region)
         } else if v.view.menu {
             menu
         } else {
