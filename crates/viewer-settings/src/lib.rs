@@ -439,7 +439,7 @@ pub struct Input {
 
 impl Default for Input {
     fn default() -> Self {
-        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 1.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false }
+        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 3.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false }
     }
 }
 
@@ -669,7 +669,7 @@ mod tests {
     fn capture_sensitivity_defaults_for_older_files_and_round_trips() {
         for text in ["", "[input]\nsnap_updates_per_second = 5.0\n"] {
             let settings: Settings = toml::from_str(text).unwrap();
-            assert_eq!(settings.input.capture_sensitivity, 1.0);
+            assert_eq!(settings.input.capture_sensitivity, 3.0);
         }
         let settings: Settings = toml::from_str("[input]\ncapture_sensitivity = 2.5\n").unwrap();
         assert_eq!(settings.input.capture_sensitivity, 2.5);

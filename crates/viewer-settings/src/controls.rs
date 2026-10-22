@@ -57,7 +57,7 @@ pub const SNAP_RATE_RANGE: Range = Range { min: 1.0, max: 30.0, step: 1.0 };
 /// How often the snapping cursor's ghost follows, per second.
 pub const SNAP_GHOST_RANGE: Range = Range { min: 1.0, max: 120.0, step: 1.0 };
 /// Additional sensitivity for captured world-cursor motion.
-pub const CAPTURE_SENSITIVITY_RANGE: Range = Range { min: 0.1, max: 5.0, step: 0.1 };
+pub const CAPTURE_SENSITIVITY_RANGE: Range = Range { min: 0.1, max: 10.0, step: 0.1 };
 
 /// Fighting animation speed in quarter steps.
 pub const COMBAT_SPEED_RANGE: Range = Range { min: 1.0, max: 4.0, step: 0.25 };
@@ -554,8 +554,8 @@ mod tests {
         let before = s.input.clone();
         assert!(s.set_control("input.capture_sensitivity", &ControlValue::Number(2.53)));
         assert_eq!(s.input.capture_sensitivity, 2.5);
-        assert!(s.set_control("input.capture_sensitivity", &ControlValue::Number(8.0)));
-        assert_eq!(s.input.capture_sensitivity, 5.0);
+        assert!(s.set_control("input.capture_sensitivity", &ControlValue::Number(12.0)));
+        assert_eq!(s.input.capture_sensitivity, 10.0);
         assert!(s.set_control("input.capture_sensitivity", &ControlValue::Number(-1.0)));
         assert_eq!(s.input.capture_sensitivity, 0.1);
         assert!(!s.set_control("input.capture_sensitivity", &ControlValue::Number(f32::NAN)));
