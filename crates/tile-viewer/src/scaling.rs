@@ -697,12 +697,16 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             menu
         } else {
             // The frame's panels, each anchored at its side or corner.
-            let (anchors, of_sprite) = panels(plan.screen, &v.overlay, &rect_of);
+            let (anchors, mut of_sprite) = panels(plan.screen, &v.overlay, &rect_of);
             // (Each no larger than the canvas.)
-            let anchors: Vec<(Affine, [i32; 4])> = anchors.into_iter().map(|(a, r)| {
+            let mut anchors: Vec<(Affine, [i32; 4])> = anchors.into_iter().map(|(a, r)| {
                 let piece = plan.frame_piece(a);
                 (kept(Affine { zoom: fitting(piece.zoom, Some(r)), ..piece }, r).at((r[0], r[1])), r)
             }).collect();
+            // The unit's order buttons where the layout puts them.
+            if let (Some(place), Some(orders)) = (frame.unit_orders, parts.reachable) {
+                place_unit_orders(place, orders, &v.overlay, &rect_of, &mut anchors, &mut of_sprite);
+            }
             if anchors.len() > 1 || anchors.first().is_some_and(|a| a.0.zoom != (1, 1) || a.0.from != a.0.to) {
                 for (s, &k) in v.overlay.iter().zip(&of_sprite) {
                     shown.extend(rect_of(s).map(|r| (anchors[k].0, r, (0, 0), None)));
@@ -927,6 +931,59 @@ fn drawn_boxed(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: 
     }).collect();
     let (copies, present) = if k > 1 { (copies.iter().map(|c| c.boxed(k)).collect(), present.at_target()) } else { (copies.to_vec(), present) };
     Drawn { cameras, copies, present, pixel_box: k }
+}
+
+/// The unit's order buttons (the sprites inside `orders`, the driver's
+/// pixels) placed as the layout says (`layout::UnitOrdersPlace`): panels of
+/// their own added to the frame's `anchors` (each sprite's in
+/// `of_sprite`). Split at a side by side split's gap, those left of its
+/// middle are moved left of it and the others right of it, as little as
+/// that takes; or all of them go into the active view's area, as large as
+/// they are elsewhere where that fits it, centred across, at the same
+/// height where that is inside it.
+fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, anchors: &mut Vec<(Affine, [i32; 4])>, of_sprite: &mut [usize]) {
+    let within = |r: &[i32; 4]| r[2] > 0 && r[3] > 0 && r[0] >= orders[0] && r[1] >= orders[1] && r[0] + r[2] <= orders[0] + orders[2] && r[1] + r[3] <= orders[1] + orders[3];
+    let members: Vec<(usize, [i32; 4])> = sprites.iter().enumerate().filter_map(|(i, s)| rect_of(s).filter(within).map(|r| (i, r))).collect();
+    if members.is_empty() { return; }
+    let shown: Vec<[i32; 4]> = members.iter().map(|&(i, r)| anchors[of_sprite[i]].0.rect(r)).collect();
+    let zoom_before = anchors[of_sprite[members[0].0]].0.zoom;
+    // A group of them (indices into `members`) as one panel more, its map
+    // from the driver's pixels made from the one of its panel so far.
+    let mut add = |group: Vec<usize>, map: &dyn Fn(Affine) -> Affine, anchors: &mut Vec<(Affine, [i32; 4])>| {
+        let mut bases: Vec<usize> = group.iter().map(|&m| of_sprite[members[m].0]).collect();
+        bases.sort_unstable();
+        bases.dedup();
+        for k in bases {
+            let part: Vec<usize> = group.iter().copied().filter(|&m| of_sprite[members[m].0] == k).collect();
+            let Some(r) = bounding(&part.iter().map(|&m| members[m].1).collect::<Vec<_>>()) else { continue };
+            let at = anchors.len();
+            anchors.push((map(anchors[k].0).at((r[0], r[1])), r));
+            for m in part {
+                of_sprite[members[m].0] = at;
+            }
+        }
+    };
+    match place {
+        layout::UnitOrdersPlace::Gap((g0, g1)) => {
+            let (left, right): (Vec<usize>, Vec<usize>) = (0..members.len()).partition(|&m| 2 * shown[m][0] + shown[m][2] < g0 + g1);
+            let dl = left.iter().map(|&m| shown[m][0] + shown[m][2]).max().map_or(0, |end| (g0 - end).min(0));
+            let dr = right.iter().map(|&m| shown[m][0]).min().map_or(0, |start| (g1 - start).max(0));
+            for (group, d) in [(left, dl), (right, dr)] {
+                if d != 0 && !group.is_empty() {
+                    add(group, &|a: Affine| Affine { to: (a.to.0 + d, a.to.1), ..a }, anchors);
+                }
+            }
+        }
+        layout::UnitOrdersPlace::In(area) => {
+            let (Some(drawn), Some(driver)) = (bounding(&shown), bounding(&members.iter().map(|m| m.1).collect::<Vec<_>>())) else { return };
+            let zoom = fit_at_most(zoom_before, Some(driver), (area[2].max(1) as u32, area[3].max(1) as u32));
+            let (w, h) = (scaled(driver[2] as i64, zoom) as i32, scaled(driver[3] as i64, zoom) as i32);
+            let x = if w <= area[2] { area[0] + (area[2] - w) / 2 } else { area[0] };
+            let y = drawn[1].clamp(area[1], (area[1] + area[3] - h).max(area[1]));
+            let map = Affine { from: (driver[0], driver[1]), to: (x, y), zoom };
+            add((0..members.len()).collect(), &|_| map, anchors);
+        }
+    }
 }
 
 /// The smallest rectangle holding `rects`.
@@ -1865,6 +1922,103 @@ mod tests {
         }
     }
 
+    /// The unit's order buttons (eight 32-pixel buttons across the middle
+    /// of a 1920 × 1080 screen) for every split, both settings, frame
+    /// scales, zoom kinds and active views: with one view (and spanning a
+    /// stacked split) where the frame's scale puts them; spanning a side
+    /// by side split, split at the divider with its gap clear of them and
+    /// open where they are drawn (the pointer crosses there, also at
+    /// rows they reach only scaled); in the active view, inside its area,
+    /// the divider open alongside them. Never under the zoom box or strip,
+    /// nor the corner's buttons; clicks reach each button.
+    #[test]
+    fn unit_buttons_leave_the_divider_open_or_go_into_the_active_view() {
+        use viewer_settings::{Split as S, UnitButtons, Zoom};
+        let (mut scene, base_rect) = game_scene();
+        scene.views[1].overlay.retain(|s| (s.x, s.y) != (836, 1030));
+        let buttons: Vec<[i32; 4]> = (0..8).map(|k| [832 + 32 * k, 1030, 32, 32]).collect();
+        for b in &buttons {
+            scene.views[1].overlay.push(FreeSprite { x: b[0], y: b[1], screen: true, after_pass: u32::MAX, ..Default::default() });
+        }
+        scene.interface.reachable = Some([832, 1030, 256, 32]);
+        let rect_of = move |s: &FreeSprite| if s.y == 1030 { Some([s.x, s.y, 32, 32]) } else { base_rect(s) };
+        let canvas = (1920, 1080);
+        let overlaps = |a: [i32; 4], b: [i32; 4]| a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3];
+        let mut checked = 0;
+        for split in [S::Standard, S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
+            for mode in [UnitButtons::Spanning, UnitButtons::ActiveView] {
+                for frame_scale in [1.0, 1.5] {
+                    for (zoom, box_height) in [(Zoom::Off, 0.0), (Zoom::TopStrip, 0.0), (Zoom::Floating131, 1.0), (Zoom::Mouse131, 0.0)] {
+                        for b_active in [false, true] {
+                            if b_active && split == S::Standard { continue; }
+                            let what = format!("{split:?} {mode:?} frame ×{frame_scale} {zoom:?} {}", if b_active { "B" } else { "A" });
+                            let p = fixed_plan(canvas, (1920, 1080), (1, 1.0, frame_scale, 1.0));
+                            let mut layout = layout::Layout::default();
+                            layout.apply_settings(&viewer_settings::Layout { split, unit_buttons: mode, zoom, zoom_box_height: box_height, ..Default::default() });
+                            layout.driver_screen = Some(p.screen);
+                            layout.frame(&scene, canvas, (0, 0, 0, 0), vec![], None);
+                            let area = layout.view_area(if b_active { layout::Side::B } else { layout::Side::A });
+                            let start = (area[0] + area[2] / 2, area[1] + area[3] / 2);
+                            layout.route(scene::Input::MouseMove { x: start.0, y: start.1 });
+                            let mut shown = Vec::new();
+                            for _ in 0..3 {
+                                let mut f = layout.frame(&scene, canvas, (0, 0, 0, 0), vec![], None);
+                                shown = arrange(&p, &scene, &mut f, &rect_of).shown.unwrap();
+                                layout.set_interface_shown(Some(shown.clone()));
+                            }
+                            assert_eq!(layout.active_side(), if b_active { layout::Side::B } else { layout::Side::A }, "{what}");
+                            let drawn: Vec<_> = buttons.iter().map(|b| *shown.iter().find(|s| s.driver == *b).unwrap_or_else(|| panic!("{what}: {b:?} shown"))).collect();
+                            let all = drawn.iter().map(|s| s.rect).reduce(|a, b| {
+                                let (x, y) = (a[0].min(b[0]), a[1].min(b[1]));
+                                [x, y, (a[0] + a[2]).max(b[0] + b[2]) - x, (a[1] + a[3]).max(b[1] + b[3]) - y]
+                            }).unwrap();
+                            for (b, s) in buttons.iter().zip(&drawn) {
+                                // Clicks reach each one.
+                                let back = s.to_driver((s.rect[0] + s.rect[2] / 2, s.rect[1] + s.rect[3] / 2));
+                                assert!((back.0 - (b[0] + 16)).abs() <= 1 && (back.1 - (b[1] + 16)).abs() <= 1, "{what}: {b:?} -> {back:?}");
+                                if let Some(z) = layout.zoom_area() {
+                                    let z = [z[0] - 2, z[1] - 2, z[2] + 4, z[3] + 4];
+                                    assert!(!overlaps(s.rect, z), "{what}: {b:?} at {:?} under the zoom area {z:?}", s.rect);
+                                }
+                            }
+                            let spanning_unmoved = split == S::Standard || split == S::Horizontal1To1 && mode == UnitButtons::Spanning;
+                            if spanning_unmoved {
+                                for (b, s) in buttons.iter().zip(&drawn) {
+                                    let at = p.frame_piece((1, 2)).rect(*b);
+                                    assert!((0..4).all(|i| (s.rect[i] - at[i]).abs() <= 1), "{what}: {b:?} at {:?}, not {at:?}", s.rect);
+                                }
+                            } else if mode == UnitButtons::Spanning {
+                                let ((g0, g1), _) = layout.gap().unwrap();
+                                for s in &drawn {
+                                    assert!(s.rect[0] + s.rect[2] <= g0 || s.rect[0] >= g1, "{what}: {:?} in the gap {g0}..{g1}", s.rect);
+                                }
+                                // (Across the middle of a 1:1 split: on both sides of it.)
+                                if split == S::Vertical1To1 {
+                                    assert!(drawn.iter().any(|s| s.rect[0] < g0) && drawn.iter().any(|s| s.rect[0] >= g1), "{what}: on both sides");
+                                }
+                            } else {
+                                assert!(all[0] >= area[0] && all[1] >= area[1] && all[0] + all[2] <= area[0] + area[2] && all[1] + all[3] <= area[1] + area[3], "{what}: {all:?} in {area:?}");
+                            }
+                            // (Spanning a 2:1 split they stay in A, clear of its gap.)
+                            if split == S::Vertical1To1 || (split == S::Vertical2To1 && mode == UnitButtons::ActiveView) {
+                                // The divider is open at their rows as drawn: the pointer crosses there.
+                                let row = all[1] + all[3] / 2;
+                                assert!(layout.open_spans().iter().any(|&(a, b)| a <= all[1] && b >= all[1] + all[3]), "{what}: rows {all:?} open in {:?}", layout.open_spans());
+                                let ((g0, g1), _) = layout.gap().unwrap();
+                                let (from, to) = if b_active { ((g1 + 10, row), (g0 - 10, row)) } else { ((g0 - 10, row), (g1 + 10, row)) };
+                                layout.route(scene::Input::MouseMove { x: from.0, y: from.1 });
+                                layout.route(scene::Input::MouseMove { x: to.0, y: to.1 });
+                                assert_eq!(layout.pointer_in_window(), to, "{what}: crossing at row {row}");
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked >= 100, "{checked}");
+    }
+
     #[test]
     fn a_scaled_split_keeps_worker_panels_and_optional_views_separate() {
         // Worker orders cross the divider near the bottom, opening a
@@ -1908,7 +2062,8 @@ mod tests {
                     if canvas == (1920, 1080) {
                         // (Besides the cameras kept for mirrored cursors under the
                         // interface, one per world view below it.)
-                        assert_eq!(f.cameras.len() - f.cursor_slots.len(), if optional_views { 25 } else { 17 }, "the worker layout exceeds the former 16-view limit: {what}");
+                        // (One more for the orders, moved right of the gap they crossed.)
+                        assert_eq!(f.cameras.len() - f.cursor_slots.len(), if optional_views { 26 } else { 18 }, "the worker layout exceeds the former 16-view limit: {what}");
                         assert!((2..=4).contains(&f.cursor_slots.len()), "{what}: {:?}", f.cursor_slots);
                     }
                     let (_, cameras) = arranged.overlay_cameras.iter().find(|(view, _)| *view == 1).expect("the HUD keeps its panel cameras");
@@ -1923,7 +2078,11 @@ mod tests {
                         let piece = shown.iter().find(|s| s.driver == driver).expect("every HUD panel remains interactive");
                         // (The pixels drawn of it, from its camera's rounded
                         // origin: within a pixel of its anchor's map.)
-                        let anchored = p.frame_piece(anchor).rect(driver);
+                        let mut anchored = p.frame_piece(anchor).rect(driver);
+                        if driver == [836, 1030, 256, 32] {
+                            // The orders (one piece here) start right of the divider's gap.
+                            anchored[0] = layout.gap().unwrap().0.1;
+                        }
                         assert!((0..4).all(|i| (piece.rect[i] - anchored[i]).abs() <= 1), "{what}: panel {driver:?}: {:?} vs {anchored:?}", piece.rect);
                         let at = (piece.rect[0] + piece.rect[2] / 2, piece.rect[1] + piece.rect[3] / 2);
                         let back = piece.to_driver(at);

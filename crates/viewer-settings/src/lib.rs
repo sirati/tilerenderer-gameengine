@@ -288,6 +288,19 @@ pub enum Roles {
     UnitMouse,
 }
 
+/// Where the active unit's order buttons go while there are two views
+/// (one view: where the game puts them).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnitButtons {
+    /// Where the game puts them, across both views at the bottom, split at
+    /// the divider with a gap there for the pointer to cross.
+    #[default]
+    Spanning,
+    /// Inside the view the pointer is in (its area below a zoom strip),
+    /// moving with the pointer to the other view.
+    ActiveView,
+}
+
 /// A screen of the game that can be placed (named by the driver, e.g.
 /// "F1".."F8", "City", "Palace", "Spy", "Menu", "Help").
 pub type ScreenKind = String;
@@ -338,6 +351,8 @@ pub struct Layout {
     /// tiles.
     pub smooth_world_movement: bool,
     pub roles: Roles,
+    /// Where the unit's order buttons go with two views.
+    pub unit_buttons: UnitButtons,
 }
 
 impl Default for Layout {
@@ -353,6 +368,7 @@ impl Default for Layout {
             screen_place: ScreenPlace::default(),
             smooth_world_movement: false,
             roles: Roles::Free,
+            unit_buttons: UnitButtons::Spanning,
         }
     }
 }
@@ -589,6 +605,15 @@ mod tests {
         s.layout.zoom_box_block_pointer = true;
         let saved = toml::to_string(&s).unwrap();
         assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), s);
+    }
+
+    #[test]
+    fn unit_buttons_span_in_older_configs_and_the_setting_round_trips() {
+        let old: Settings = toml::from_str("[layout]\nsplit = 'Vertical1To1'\n").unwrap();
+        assert_eq!(old.layout.unit_buttons, UnitButtons::Spanning);
+        let explicit: Settings = toml::from_str("[layout]\nunit_buttons = 'ActiveView'\n").unwrap();
+        assert_eq!(explicit.layout.unit_buttons, UnitButtons::ActiveView);
+        assert_eq!(toml::from_str::<Settings>(&toml::to_string(&explicit).unwrap()).unwrap(), explicit);
     }
 
     #[test]

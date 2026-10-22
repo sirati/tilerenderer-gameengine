@@ -121,7 +121,7 @@ mod city_screen_tests;
 mod cursor_screen_tests;
 pub use pan::{DRAG_THRESHOLD, Momentum, Tracker};
 use tile_render::{Camera, ScreenCopy};
-use viewer_settings::{Place, Roles, ScreenPlace};
+use viewer_settings::{Place, Roles, ScreenPlace, UnitButtons};
 
 /// Zoom steps, screen pixels per world pixel.
 mod arrival;
@@ -495,6 +495,9 @@ pub struct Frame {
     /// the hint in their place) shows in ([`Layout::view_area`], canvas
     /// pixels): scaled no larger than fits it and kept inside it.
     pub view_ui_region: Option<[i32; 4]>,
+    /// Where the unit's order buttons (`scene::Interface::reachable`) go
+    /// with two views (`scaling::arrange` moves their sprites).
+    pub unit_orders: Option<UnitOrdersPlace>,
     pub copies: Vec<ScreenCopy>,
     pub markers: Vec<Marker>,
     /// The divider's line where it is closed: per piece, the camera
@@ -512,6 +515,19 @@ pub struct Frame {
     /// those cursors (one a world view drawn below it), for the window to
     /// fill (`crate::cursor::compose`).
     pub cursor_slots: Vec<u32>,
+}
+
+/// Where the unit's order buttons go while there are two views
+/// ([`UnitButtons`]), in canvas pixels.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UnitOrdersPlace {
+    /// Where the driver put them, those left of the middle of the side by
+    /// side split's gap (from, to: canvas x) kept left of it and the others
+    /// right of it, so the gap stays clear for the pointer.
+    Gap((i32, i32)),
+    /// Inside this view area (the active view's), at the same height where
+    /// that is inside it, centred across.
+    In([i32; 4]),
 }
 
 /// Where a point of the window shows the world.
@@ -622,6 +638,9 @@ pub struct Layout {
     pub smooth: bool,
     /// What the views follow (from the settings).
     pub roles: Roles,
+    /// Where the unit's order buttons go with two views
+    /// ([`Frame::unit_orders`]).
+    pub unit_buttons: UnitButtons,
     /// Where every screen and popup goes (from the settings; click-anchored
     /// popups excepted).
     pub screen_place: ScreenPlace,
@@ -861,6 +880,7 @@ impl Default for Layout {
             screen_content: None,
             smooth: false,
             roles: Roles::Free,
+            unit_buttons: UnitButtons::Spanning,
             screen_place: ScreenPlace::default(),
             menu_follows_pointer: true,
             menu_side: None,
@@ -1290,6 +1310,7 @@ impl Layout {
         self.menu_follows_pointer = s.menu_follows_pointer;
         self.smooth = s.smooth_world_movement;
         self.roles = s.roles;
+        self.unit_buttons = s.unit_buttons;
         // Nothing follows the world cursor any more: the mouse goes free.
         if self.locked && !self.follows_pointer() {
             self.release("the layout changed");
@@ -1367,9 +1388,9 @@ impl Layout {
                 }
             }
         }
-        if let Some(r) = self.reachable {
+        if let Some(r) = self.orders_shown() {
             let (lo, hi, a0, a1) = spans([r[0] - GAP, r[1] - GAP, r[2] + 2 * GAP, r[3] + 2 * GAP]);
-            if lo < g1 && hi > g0 {
+            if (lo < g1 && hi > g0) || self.unit_buttons == UnitButtons::ActiveView {
                 open.push((a0, a1));
             }
         }
@@ -1780,6 +1801,37 @@ impl Layout {
         }
     }
 
+    /// Where the unit's order buttons go (none: where the driver put them,
+    /// as with one view): split at a side by side split's gap, or inside
+    /// the active view's area (`UnitButtons`).
+    fn unit_orders_place(&self) -> Option<UnitOrdersPlace> {
+        let split = self.split.filter(|_| self.world_shown && self.reachable.is_some())?;
+        match self.unit_buttons {
+            UnitButtons::Spanning if split.axis == Axis::Vertical => self.gap().map(|(across, _)| UnitOrdersPlace::Gap(across)),
+            UnitButtons::Spanning => None,
+            UnitButtons::ActiveView => Some(UnitOrdersPlace::In(self.view_area(self.active_side()))),
+        }
+    }
+
+    /// The unit's order buttons (`scene::Interface::reachable`) where they
+    /// are drawn (canvas pixels): their pieces as shown, the scale of the
+    /// game's frame and the place `unit_orders_place` gave them applied;
+    /// where the driver put them before the interface was arranged.
+    fn orders_shown(&self) -> Option<[i32; 4]> {
+        let r = self.reachable?;
+        let within = |d: [i32; 4]| d[2] > 0 && d[3] > 0 && d[0] >= r[0] && d[1] >= r[1] && d[0] + d[2] <= r[0] + r[2] && d[1] + d[3] <= r[1] + r[3];
+        let drawn = self.interface_shown.iter().flatten().filter(|s| within(s.driver)).map(|s| s.rect).reduce(|a, b| {
+            let (x, y) = (a[0].min(b[0]), a[1].min(b[1]));
+            [x, y, (a[0] + a[2]).max(b[0] + b[2]) - x, (a[1] + a[3]).max(b[1] + b[3]) - y]
+        });
+        Some(drawn.unwrap_or(r))
+    }
+
+    /// The zoom box or strip as the last frame showed it (canvas pixels).
+    pub(crate) fn zoom_area(&self) -> Option<[i32; 4]> {
+        self.shown.iter().find(|(h, _)| *h == Hit::Magnifier).map(|(_, c)| rect_of(c))
+    }
+
     /// The panes in `area`.
     fn panes_in(&self, [x, y, w, h]: [i32; 4]) -> ([i32; 4], Option<[i32; 4]>) {
         if !self.world_shown { return ([x, y, w, h], None); }
@@ -1801,7 +1853,7 @@ impl Layout {
     /// The gap between the panes across the split's axis (from, to:
     /// window x for side by side, y for stacked), and its extent along the
     /// divider (from, to).
-    fn gap(&self) -> Option<((i32, i32), (i32, i32))> {
+    pub(crate) fn gap(&self) -> Option<((i32, i32), (i32, i32))> {
         let split = self.split?;
         let (a, b) = self.panes();
         let b = b?;
@@ -1814,20 +1866,22 @@ impl Layout {
     /// The stretches along the divider (from, to) where the pointer passes
     /// from one view to the other: its middle third while the mouse is not
     /// captured, and where the driver's always reachable controls are.
-    fn open_spans(&self) -> Vec<(i32, i32)> {
+    pub(crate) fn open_spans(&self) -> Vec<(i32, i32)> {
         let Some((across, (s0, s1))) = self.gap() else { return vec![] };
         let mut spans = Vec::new();
         if !self.locked {
             let third = (s1 - s0) / 3;
             spans.push((s0 + third, s1 - third));
         }
-        if let (Some([x, y, w, h]), Some(split)) = (self.reachable, self.split) {
-            // Only where it reaches over the gap.
+        if let (Some([x, y, w, h]), Some(split)) = (self.orders_shown(), self.split) {
+            // Where they are drawn: only where they reach over the gap
+            // (split there, the gap between their halves); in the active
+            // view, alongside them, to cross to the other view there.
             let (lo, hi, a0, a1) = match split.axis {
                 Axis::Vertical => (x, x + w, y, y + h),
                 Axis::Horizontal => (y, y + h, x, x + w),
             };
-            if lo < across.1 && hi > across.0 && a1 > a0 {
+            if ((lo < across.1 && hi > across.0) || self.unit_buttons == UnitButtons::ActiveView) && a1 > a0 {
                 spans.push((a0.max(s0), a1.min(s1)));
             }
         }
@@ -1902,7 +1956,7 @@ impl Layout {
         let (fa, fb, ta, tb) = if vertical { (from.0, from.1, to.0, to.1) } else { (from.1, from.0, to.1, to.0) };
         let spans = self.open_spans();
         let in_span = |v: i32| spans.iter().any(|&(a, b)| v >= a && v < b);
-        let reachable = self.reachable.is_some_and(|r| {
+        let reachable = self.orders_shown().is_some_and(|r| {
             let grown = [r[0] - GAP, r[1] - GAP, r[2] + 2 * GAP, r[3] + 2 * GAP];
             inside(grown, from) || inside(grown, to)
         });
@@ -1985,13 +2039,22 @@ impl Layout {
         // A floating box keeps clear of the views' own interface (the
         // corner's buttons in their view, `view_ui`), its frame too: one
         // that would cover it goes below it, cut to its region's bottom.
+        // (The unit's order buttons as drawn too.)
+        let avoid: Vec<[i32; 4]> = self.view_ui.iter().copied().chain(self.orders_shown()).collect();
         let framed = |b: [i32; 4]| [b[0] - GAP, b[1] - GAP, b[2] + 2 * GAP, b[3] + 2 * GAP];
-        let ui_hit = |b: [i32; 4]| self.view_ui.iter().any(|&u| overlap(framed(b), u));
+        let ui_hit = |b: [i32; 4]| avoid.iter().any(|&u| overlap(framed(b), u));
+        // Below what it meets, or above it, whichever leaves it taller.
         let clear = |mut b: [i32; 4], r: [i32; 4]| {
-            for &u in &self.view_ui {
+            for &u in &avoid {
+                if !overlap(framed(b), u) { continue; }
                 let top = (u[1] + u[3] + GAP).max(b[1]);
-                if overlap(framed(b), u) && top < r[1] + r[3] {
-                    b = [b[0], top, b[2], b[3].min(r[1] + r[3] - top)];
+                let below = b[3].min(r[1] + r[3] - top);
+                let bottom = (u[1] - GAP).min(b[1] + b[3]);
+                let above = b[3].min(bottom - r[1]);
+                if below >= above && below > 0 {
+                    b = [b[0], top, b[2], below];
+                } else if above > 0 {
+                    b = [b[0], bottom - above, b[2], above];
                 }
             }
             b
@@ -2482,6 +2545,7 @@ impl Layout {
             if roaming.is_some() || hint.is_some() {
                 frame.view_ui_region = Some(ui_area);
             }
+            frame.unit_orders = self.unit_orders_place();
             // (A modal one is placed over its menu: `scaling::MODAL_TOP`.)
             let popup_shift = popup.map(|i| if modal.is_some() || on_screen { (0, 0) } else { self.popup_shift(rect_of(&base[i]), main_rect) });
             let screen_shift = screen_part.map(|i| Some(self.screen_shift(rect_of(&base[i]))));

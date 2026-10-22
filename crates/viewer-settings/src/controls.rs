@@ -8,7 +8,7 @@
 //! Choices are named like the enum variants they stand for (`"Vertical2To1"`,
 //! `"LeftOrBottom"`); the pixel scale by its number (`"1"` .. `"6"`).
 
-use crate::{BackgroundSampling, Layout, MapMovement, Place, Resolution, Roles, Settings, Split, Zoom};
+use crate::{BackgroundSampling, Layout, MapMovement, Place, Resolution, Roles, Settings, Split, UnitButtons, Zoom};
 
 /// A control's value.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,7 +68,7 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 28] = [
+pub const KEYS: [&str; 29] = [
     "resolution.pixel_scale",
     "resolution.scale_menus",
     "resolution.menu_scale_percent",
@@ -85,6 +85,7 @@ pub const KEYS: [&str; 28] = [
     "layout.screen_place",
     "layout.smooth_world_movement",
     "layout.roles",
+    "layout.unit_buttons",
     "input.snap_updates_per_second",
     "input.snap_ghost_fps",
     "input.capture_sensitivity",
@@ -157,6 +158,10 @@ impl Named for Roles {
     const ALL: &'static [(Self, &'static str)] = &[(Roles::Free, "Free"), (Roles::UnitMouse, "UnitMouse")];
 }
 
+impl Named for UnitButtons {
+    const ALL: &'static [(Self, &'static str)] = &[(UnitButtons::Spanning, "Spanning"), (UnitButtons::ActiveView, "ActiveView")];
+}
+
 impl Named for BackgroundSampling {
     const ALL: &'static [(Self, &'static str)] = &[
         (BackgroundSampling::Dither, "Dither"),
@@ -220,6 +225,7 @@ impl Settings {
             "layout.menu_follows_pointer" => Some(ControlValue::On(l.menu_follows_pointer)),
             "layout.smooth_world_movement" => Some(ControlValue::On(l.smooth_world_movement)),
             "layout.roles" => choice(l.roles),
+            "layout.unit_buttons" => choice(l.unit_buttons),
             "layout.orientation" => Some(ControlValue::Choice(if horizontal(l) { "horizontal" } else { "vertical" }.into())),
             "layout.screen_place" => choice(l.screen_place.for_split(l.split)),
             "input.snap_updates_per_second" => Some(ControlValue::Number(i.snap_updates_per_second)),
@@ -305,6 +311,7 @@ impl Settings {
                     _ => false,
                 },
                 "layout.roles" => set_choice(&mut l.roles, value),
+                "layout.unit_buttons" => set_choice(&mut l.unit_buttons, value),
                 "input.snap_updates_per_second" => set_number(&mut i.snap_updates_per_second, key, value),
                 "input.snap_ghost_fps" => set_number(&mut i.snap_ghost_fps, key, value),
                 "input.capture_sensitivity" => set_number(&mut i.capture_sensitivity, key, value),
@@ -467,6 +474,7 @@ mod tests {
             ("layout.menu_follows_pointer", ControlValue::On(false)),
             ("layout.smooth_world_movement", ControlValue::On(true)),
             ("layout.roles", ControlValue::Choice("UnitMouse".into())),
+            ("layout.unit_buttons", ControlValue::Choice("ActiveView".into())),
             ("input.snap_updates_per_second", ControlValue::Number(7.0)),
             ("input.capture_sensitivity", ControlValue::Number(2.5)),
             ("display.show_fps", ControlValue::On(true)),
