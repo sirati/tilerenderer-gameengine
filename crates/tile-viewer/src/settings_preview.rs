@@ -12,6 +12,8 @@ pub struct Preview {
     settled: Option<((u64, u64), u32)>,
     keys: BTreeSet<u32>,
     press: Option<bool>,
+    /// The countdown last drawn (`Preview::drew`).
+    drawn: Option<u64>,
 }
 impl Preview {
     pub fn active(&self) -> bool {
@@ -92,9 +94,21 @@ impl Preview {
             deadline.saturating_duration_since(now).as_secs_f64().ceil() as u64
         })
     }
+    /// When the countdown next changes (or the lease runs out): what it
+    /// shows changes once a second, so it wakes the viewer no more often.
     pub fn wake(&self, now: Instant) -> Option<Instant> {
-        self.active
-            .map(|(_, deadline)| deadline.min(now + Duration::from_millis(100)))
+        let (_, deadline) = self.active?;
+        let seconds = self.seconds(now).unwrap_or(0);
+        Some(deadline.checked_sub(Duration::from_secs(seconds.saturating_sub(1))).unwrap_or(deadline).max(now))
+    }
+    /// Whether a frame must be drawn for the confirmation: it appeared,
+    /// its countdown changed or it went (not while it waits unchanged).
+    pub fn needs_frame(&self, now: Instant) -> bool {
+        self.seconds(now) != self.drawn
+    }
+    /// The countdown the frame being drawn shows (`None`: no confirmation).
+    pub fn drew(&mut self, seconds: Option<u64>) {
+        self.drawn = seconds;
     }
     /// Physical window coordinates keep buttons fixed across multiplier changes.
     pub fn input(
@@ -200,19 +214,31 @@ fn buttons(window: (u32, u32)) -> [[i32; 4]; 2] {
     ]
 }
 
-/// Commands are in physical window pixels. The camera removes the final
-/// presentation border origin so the output transform restores it exactly.
+/// The confirmation over a frame shown as `present` says: drawn onto the
+/// window after the picture (`Camera::on_target`), in its physical pixels
+/// (readable at any pixel scale) whatever size the picture was composed
+/// at, so it costs the GPU its panel's pixels only.
 pub fn compose_presented(
     compiled: &render_desc::Compiled,
     present: tile_render::Present,
     seconds: u64,
     view: u32,
 ) -> (tile_render::Camera, Vec<tile_render::PlacedSprite>) {
-    let (mut camera, sprites) = compose(compiled, present.target, seconds, view);
-    camera.viewport = present.canvas;
-    camera.screen_shift = (-present.at.0, -present.at.1);
-    (camera, sprites)
+    let (camera, sprites) = compose(compiled, present.target, seconds, view);
+    (tile_render::Camera { on_target: true, ..camera }, sprites)
 }
+
+/// The window pixels the confirmation draws (its panel and frame): all a
+/// frame showing it costs more.
+pub fn drawn_rect(window: (u32, u32)) -> [i32; 4] {
+    let [x, y, w, h] = panel(window);
+    let (x0, y0) = ((x - FRAME).max(0), (y - FRAME).max(0));
+    let (x1, y1) = ((x + w + FRAME).min(window.0 as i32), (y + h + FRAME).min(window.1 as i32));
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+/// The panel's frame, in window pixels (where the window has room).
+const FRAME: i32 = 2;
 
 pub fn compose(
     compiled: &render_desc::Compiled,
@@ -232,10 +258,10 @@ pub fn compose(
         }),
         ..PlacedSprite::new(tile_render::SpriteSetId::EMPTY, x, y)
     };
-    out.push(solid(
-        [0, 0, window.0 as i32, window.1 as i32],
-        [0, 0, 0, 150],
-    ));
+    // No dimming of the whole window: shading every window pixel cost a
+    // full frame's GPU time (some 2.6 ms at 3258×1904). A light frame
+    // sets the panel off instead.
+    out.push(solid(drawn_rect(window), [150, 150, 160, 255]));
     let rect = panel(window);
     let [x, y, w, h] = rect;
     out.push(solid(rect, [40, 40, 45, 255]));
@@ -577,26 +603,27 @@ mod review_tests {
                         zoomed_art,
                         ..Camera::new(canvas)
                     };
-                    let drawn =
-                        crate::scaling::drawn_physical(&[camera], &[], source, |_| zoomed_art);
-                    assert_eq!(drawn.present.zoom, (1, 1));
+                    // The frame composed at the canvas as ever; the dialog on
+                    // the window after it, in its pixels.
+                    let drawn = crate::scaling::drawn(&[camera], &[], source, |_| zoomed_art);
+                    assert_eq!(drawn.present, source);
                     let (modal, commands) = compose_presented(&compiled, drawn.present, 10, 1);
-                    assert_eq!(modal.zoom, (1, 1));
+                    assert_eq!(
+                        (modal.on_target, modal.cells, modal.zoom, modal.viewport, modal.origin, modal.screen_shift),
+                        (true, false, (1, 1), window, (0, 0), (0, 0))
+                    );
                     for (i, button) in commands
                         .iter()
                         .filter(|s| s.solid.is_some_and(|r| r.rgba == [85, 85, 95, 255]))
                         .enumerate()
                     {
                         let rect = button.solid.unwrap();
-                        // Screen sprites receive camera.screen_shift before final Present.
-                        // Derive bounds from the commands sent to the renderer, not buttons().
-                        let canvas_x = button.x + modal.screen_shift.0;
-                        let canvas_y = button.y + modal.screen_shift.1;
-                        assert!(canvas_x >= 0 && canvas_y >= 0);
-                        assert!(canvas_x + rect.width as i32 <= modal.viewport.0 as i32);
-                        assert!(canvas_y + rect.height as i32 <= modal.viewport.1 as i32);
-                        let x = canvas_x + drawn.present.at.0;
-                        let y = canvas_y + drawn.present.at.1;
+                        // Derive bounds from the commands sent to the renderer,
+                        // not buttons(): window pixels, drawn as they are.
+                        let (x, y) = (button.x, button.y);
+                        assert!(x >= 0 && y >= 0);
+                        assert!(x + rect.width as i32 <= window.0 as i32);
+                        assert!(y + rect.height as i32 <= window.1 as i32);
                         let pointer = (x + rect.width as i32 / 2, y + rect.height as i32 / 2);
                         let mut preview = Preview::default();
                         preview.observe(
@@ -684,5 +711,37 @@ mod review_tests {
         assert!(p.input(&key(false), (0, 0), (500, 400)).0);
         assert!(p.active());
         assert!(p.input(&key(true), (0, 0), (500, 400)).1.is_some());
+    }
+    /// The countdown asks for a frame when it appears, once a second as
+    /// its number changes, and when it goes; not while it waits unchanged.
+    #[test]
+    fn countdown_draws_once_a_second_not_every_wake() {
+        let start = Instant::now();
+        let mut p = Preview::default();
+        assert!(!p.needs_frame(start));
+        p.observe(Some(SettingsPreview { session: 1, id: 1, pixel_scale: 6, previous_pixel_scale: 1 }), start);
+        assert!(p.needs_frame(start), "it appears");
+        p.drew(p.seconds(start));
+        assert_eq!(p.seconds(start), Some(10));
+        let mut frames = 0;
+        let mut at = start;
+        for step in 1..=99u64 {
+            let now = start + Duration::from_millis(100 * step);
+            if p.needs_frame(now) {
+                frames += 1;
+                p.drew(p.seconds(now));
+            }
+            assert!(p.wake(at).is_some_and(|w| w > at && w <= start + TIMEOUT), "{step}");
+            at = now;
+        }
+        assert_eq!(frames, 9, "10 → 1 seconds: one frame per change");
+        // It wakes when the number next changes, not sooner.
+        let half = start + Duration::from_millis(2500);
+        assert_eq!(p.wake(half), Some(start + Duration::from_secs(3)));
+        assert_eq!(p.wake(start), Some(start + Duration::from_secs(1)));
+        p.resolve(true);
+        assert!(p.needs_frame(start + TIMEOUT), "it goes");
+        p.drew(None);
+        assert!(!p.needs_frame(start + TIMEOUT));
     }
 }

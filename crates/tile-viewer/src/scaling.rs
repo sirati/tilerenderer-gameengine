@@ -885,16 +885,6 @@ pub fn drawn(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: Pr
     drawn_boxed(cameras, copies, present, outlines, 1)
 }
 
-/// The settings preview's confirmation only: the canvas composed at the
-/// window's resolution (`Present::at_target`, every camera
-/// `Camera::boxed`, art as the boxes showed it) so the viewer-owned
-/// dialog over it is drawn at physical pixels, readable at any pixel
-/// scale, for the few seconds it shows. Base art keeps its original
-/// outline/zoomed-art selection.
-pub fn drawn_physical(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: Present, outlines: impl Fn(Ratio) -> bool) -> Drawn {
-    drawn_boxed(cameras, copies, present, outlines, present.pixel_box().unwrap_or(1))
-}
-
 fn drawn_boxed(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: Present, outlines: impl Fn(Ratio) -> bool, k: u32) -> Drawn {
     // (A stacked view is drawn at its group's zoom.)
     let mut group = None;

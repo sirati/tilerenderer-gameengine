@@ -16,7 +16,7 @@ mod system_cursor;
 pub mod fps;
 mod startup_ready;
 pub mod host_status;
-mod settings_preview;
+pub mod settings_preview;
 mod input;
 pub mod layout;
 pub mod looks;
@@ -731,6 +731,7 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
                 background_sampling: tile_render::BackgroundSampling::Dither,
                 // (Its own fog of war, say: the slots its binding names.)
                 binding: v.binding,
+                on_target: false,
             }
         })
         .collect()
@@ -3630,12 +3631,13 @@ impl App {
             self.latency.begin(id, since, started);
         }
         self.next_frame_id += 1;
-        let mut drawn = if self.settings_preview.active() {
-            scaling::drawn_physical(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
-        } else {
-            scaling::drawn(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom))
-        };
-        if let Some(seconds) = self.settings_preview.seconds(Instant::now()) {
+        let mut drawn = scaling::drawn(&cameras, &arranged.copies, plan.present, |zoom| self.layout.zoomed_art(zoom));
+        // The pixel scale's confirmation: drawn onto the window at its
+        // resolution after the frame composed as ever (its panel's pixels
+        // only), not by composing the whole frame at the window's.
+        let preview_seconds = self.settings_preview.seconds(Instant::now());
+        self.settings_preview.drew(preview_seconds);
+        if let Some(seconds) = preview_seconds {
             if drawn.cameras.len() < tile_render::MAX_VIEWS {
                 let (camera, sprites) = settings_preview::compose_presented(&self.compiled, drawn.present, seconds, drawn.cameras.len() as u32);
                 markers.extend(sprites);
@@ -3861,7 +3863,8 @@ impl ApplicationHandler for App {
             }
         }
         let expired = self.settings_preview.tick(Instant::now());
-        changed |= self.settings_preview.active() || expired.is_some();
+        // (Only when what the confirmation shows changes: once a second.)
+        changed |= self.settings_preview.needs_frame(Instant::now()) || expired.is_some();
         self.resolve_settings_preview(expired);
         let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
         let snapped_inputs = if self.settings_preview.active() { Vec::new() } else {
