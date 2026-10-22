@@ -651,3 +651,75 @@ fn check_opaque_modal_stack(gpu: Option<&tile_render::Headless>) {
         }
     }
 }
+
+/// The Science Advisor's "need direction" with its tech combo box open
+/// (`civ3_bridge::interface_parts`): the dialog (its head above its frame
+/// included, the bridge's part) and the list the box opened, a modal layer
+/// of its own on top, attached to the dialog (`Interface::modal_attached`).
+/// As in the game, the list's view has the lower id (canvas addresses).
+/// Over the map (Neo's case), an advisor and the menu, wherever they are
+/// placed and at any pixel and menu scale: the list is drawn over the
+/// dialog, moved and scaled exactly as the dialog (so it stays under its
+/// box), and takes the clicks on it, also where it reaches past the dialog.
+#[test]
+fn a_combo_box_list_opened_in_a_popup_goes_with_it_over_it_and_takes_its_clicks() {
+    use viewer_settings::{Place, ScreenPlace};
+    const DIALOG: u32 = 0x9B_7784;
+    const LIST: u32 = 0x22_72D0;
+    let dialog = [634, 3, 370, 356];
+    let list = [608, 250, 376, 231];
+    let inside = |r: [i32; 4], (x, y): (i32, i32)| x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3];
+    let compiled = compiled();
+    for kind in ["map", "F6", "Menu"] {
+        let mut s = if kind == "map" { map_scene(&compiled) } else { advisor_scene(&compiled, kind) };
+        s.screen_size = SCREEN;
+        let art = panel(&compiled, dialog).into_iter().map(|p| FreeSprite { set: compiled.set("Shade/0").unwrap().0.raw(), ..p }).collect();
+        s.views.push(ViewState { id: DIALOG, view: View { interface_only: true, origin: (dialog[0], dialog[1]), viewport: (dialog[2] as u32, dialog[3] as u32), ..Default::default() }, overlay: art });
+        let mut marks = Vec::new();
+        for y in (list[1]..list[1] + list[3] - 15).step_by(16) {
+            for x in (list[0]..list[0] + list[2] - 15).step_by(16) {
+                marks.push(screen_sprite(&compiled, "Mark/0", x, y));
+            }
+        }
+        s.views.push(ViewState { id: LIST, view: View { interface_only: true, origin: (list[0], list[1]), viewport: (list[2] as u32, list[3] as u32), ..Default::default() }, overlay: marks });
+        s.views.sort_by_key(|view| view.id);
+        s.interface.popup = Some(LIST);
+        s.interface.modal_stack = scene::ModalStack([Some(DIALOG), Some(LIST), None, None]);
+        s.interface.modal_attached = [false, true, false, false];
+        for place in [Place::Floating, Place::RightOrTop] {
+            for (pixel_scale, scale_menus) in [(1, false), (2, true)] {
+                let context = format!("{kind} {place:?} pixel scale {pixel_scale}");
+                let plan = scaling::plan((1280, 800), SCREEN, &viewer_settings::Resolution {
+                    pixel_scale, scale_menus, menu_scale_percent: 75.0, ..Default::default()
+                }).for_scene(&s, |sp| sprite_rect(&compiled, sp));
+                let mut layout = Layout::default();
+                layout.apply_settings(&Settings { split: Split::Vertical1To1, screen_place: ScreenPlace { vertical: place, horizontal: place }, ..Default::default() });
+                layout.driver_screen = Some(SCREEN);
+                let mut image = None;
+                for _ in 0..2 {
+                    layout.screen_content = named_screen_content(&compiled, &s);
+                    let mut frame = layout.frame(&s, plan.canvas(), (0, 0, 0, 0), interface_rects(&compiled, &s), Some(world_bounds(&compiled, &s)));
+                    let arranged = scaling::arrange_panned(&plan, &s, &mut frame, &mut layout.menu_pan, |sp| sprite_rect(&compiled, sp));
+                    layout.set_interface_shown(arranged.shown);
+                    let world = scene_world_arranged(&compiled, &s, &frame.view_cameras, &arranged.overlay_cameras);
+                    image = Some(tile_render::reference::render_views(&world, &compiled.atlas, &frame.cameras, plan.canvas(), 0, BACKGROUND));
+                }
+                let image = image.unwrap();
+                let shown = layout.interface_shown.clone().unwrap_or_default();
+                let piece = |r: [i32; 4]| shown.iter().find(|p| p.driver == r).unwrap_or_else(|| panic!("{context}: {r:?} is shown"));
+                // The list is placed with the dialog: the same map from the
+                // game's pixels as the dialog's (not centred on its own).
+                assert_eq!(piece(list).to_canvas(list), piece(dialog).to_canvas(list), "{context}: the list is moved and scaled as its dialog");
+                // A mark of the list over the dialog, and one past its bottom.
+                for (mark, over) in [((640, 266), true), ((640, 378), false)] {
+                    assert_eq!(inside(dialog, mark), over);
+                    let [x, y, w, h] = piece(dialog).to_canvas([mark.0, mark.1, 16, 16]);
+                    let at = ((x + w / 2.0) as i32, (y + h / 2.0) as i32);
+                    assert_eq!(image.get(at.0 as u32, at.1 as u32), MARK, "{context}: the list is drawn over its dialog at {mark:?}");
+                    let driver = layout.route_window(at).unwrap_or_else(|| panic!("{context}: the list takes the pointer at {mark:?}"));
+                    assert!(inside([mark.0, mark.1, 16, 16], driver), "{context}: a click on the list's {mark:?} reaches the game at {driver:?}");
+                }
+            }
+        }
+    }
+}

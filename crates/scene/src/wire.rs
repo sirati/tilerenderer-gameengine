@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, Button, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 51;
+pub const VERSION: u32 = 52;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -486,6 +486,9 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     w.bool(view.is_some());
                     w.u32(view.unwrap_or_default());
                 }
+                for attached in i.modal_attached {
+                    w.bool(attached);
+                }
                 for rect in [i.reachable, i.focus_control] {
                     w.bool(rect.is_some());
                     for v in rect.unwrap_or_default() {
@@ -710,6 +713,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 };
                 let (roaming, popup, screen_view, capture_hint) = (view()?, view()?, view()?, view()?);
                 let modal_stack = crate::ModalStack([view()?, view()?, view()?, view()?]);
+                let modal_attached = [r.bool()?, r.bool()?, r.bool()?, r.bool()?];
                 let mut rect = || -> Result<Option<[i32; 4]>, WireError> {
                     let some = r.bool()?;
                     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
@@ -746,6 +750,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     capture_hint,
                     popup,
                     modal_stack,
+                    modal_attached,
                     screen_view,
                     reachable,
                     focus_control,
@@ -1214,6 +1219,7 @@ mod tests {
             capture_hint: Some(259),
             popup: Some(261),
             modal_stack: crate::ModalStack([Some(257), Some(259), Some(260), Some(261)]),
+            modal_attached: [false, false, true, false],
             screen_view: Some(258),
             reachable: Some([-1, 2, 300, 40]),
             focus_control: Some([5, 6, 7, 8]),

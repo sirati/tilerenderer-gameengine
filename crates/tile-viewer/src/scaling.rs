@@ -587,7 +587,10 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     // screen garrison unit's menu) is no modal: it stays where the driver
     // put it on that screen, placed and scaled with it.
     let on_screen = parts.popup_on_screen && parts.screen.is_some() && parts.screen_view.is_none();
-    let modal = parts.popup.filter(|_| popup_at.is_none() && !on_screen && (parts.screen.is_some() || parts.screen_view.is_some() || menu_box.is_some()));
+    // (The popup placed: the dialog on top, with what is attached to it,
+    // its combo box's open list: `scene::Interface::placed_popup`.)
+    let placed_popup = parts.placed_popup();
+    let modal = placed_popup.filter(|_| popup_at.is_none() && !on_screen && (parts.screen.is_some() || parts.screen_view.is_some() || menu_box.is_some()));
     let camera_of = |id: u32| scene.views.iter().position(|v| v.id == id)
         .and_then(|i| frame.view_cameras.get(i).copied().flatten())
         .map(|c| frame.cameras[c as usize])
@@ -609,7 +612,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         Affine { from: o, to: modal_place((scaled(w as i64, zoom) as i32, scaled(h as i64, zoom) as i32), modal_region), zoom }
     };
     let anchored = |id| frame.popup_places.iter().find(|(view, _)| *view == id).map(|(_, place)| *place)
-        .or_else(|| popup_at.filter(|_| parts.popup == Some(id)));
+        .or_else(|| popup_at.filter(|_| placed_popup == Some(id)));
     let screen_piece = |camera: Camera, popup: bool, id: u32| {
         // A popup the layout anchored at a click: exactly where it says.
         if let Some((at, zoom)) = anchored(id).filter(|_| popup) {
@@ -631,9 +634,9 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     };
     // (An anchored popup may reach past the canvas: nothing pans for it. A
     // modal one over a menu fits: the menu under it keeps its pan.)
-    let active = parts.popup.filter(|_| popup_at.is_none() && modal.is_none() && !on_screen).or(parts.screen_view);
+    let active = placed_popup.filter(|_| popup_at.is_none() && modal.is_none() && !on_screen).or(parts.screen_view);
     let active_rect = active.and_then(camera_of)
-        .map(|c| screen_piece(c, active == parts.popup, active.unwrap_or(u32::MAX)).rect([c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32]))
+        .map(|c| screen_piece(c, active == placed_popup, active.unwrap_or(u32::MAX)).rect([c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32]))
         .or_else(|| menu_box.map(|r| menu.rect(r)));
     let offset = if frame.placed.is_empty() {
         pan.place_in((parts.screen.clone(), active), active_rect, popup_region.or(menu_region).unwrap_or(canvas_rect))
@@ -662,15 +665,21 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let (o, size) = (camera.origin, camera.viewport);
         // (Where the layout put it: moved parts about their own place.)
         let about = |from: (i32, i32), zoom: Ratio| Affine { from, to: from, zoom };
-        let piece = if on_screen && parts.popup == Some(v.id) {
+        // A popup attached to the one under it (a combo box's open list) is
+        // placed as that one: the very same map, so that it shows, and takes
+        // the pointer, exactly where that dialog's place puts it, and is no
+        // piece apart from the modal (`ShownPiece::under_modal`).
+        let (place_id, place_camera) = Some(parts.popup_root(v.id)).filter(|&r| r != v.id && parts.is_popup_view(v.id))
+            .and_then(|r| camera_of(r).map(|c| (r, c))).unwrap_or((v.id, camera));
+        let piece = if on_screen && placed_popup == Some(parts.popup_root(v.id)) && parts.is_popup_view(v.id) {
             // As the screen it was opened on: the game's place on it.
             menu
         } else if parts.is_popup_view(v.id) || parts.screen_view == Some(v.id) {
             // A popup, or a screen part (an advisor): about its middle,
             // placed as the menus are (and moved as the layout moved it),
             // kept on the canvas.
-            let piece = screen_piece(camera, parts.is_popup_view(v.id), v.id);
-            if parts.is_popup_view(v.id) && (anchored(v.id).is_some() || modal.is_some()) { piece } else { panned(piece) }
+            let piece = screen_piece(place_camera, parts.is_popup_view(v.id), place_id);
+            if parts.is_popup_view(v.id) && (anchored(place_id).is_some() || modal.is_some()) { piece } else { panned(piece) }
         } else if parts.roaming == Some(v.id) {
             let r = [o.0, o.1, size.0 as i32, size.1 as i32];
             kept(about(o, fitting(plan.frame, Some(r))), r)
@@ -693,9 +702,9 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             }
             Affine::IDENTITY
         };
-        let piece = piece.at(o);
+        let piece = piece.at(place_camera.origin);
         pieces[c] = Some(piece);
-        clips[c] = if parts.is_popup_view(v.id) { if anchored(v.id).is_some() { None } else if modal.is_some() { menu_region } else { popup_region.or(menu_region) } } else if parts.screen_view == Some(v.id) || v.view.menu { menu_region } else { None };
+        clips[c] = if parts.is_popup_view(v.id) { if anchored(place_id).is_some() { None } else if modal.is_some() { menu_region } else { popup_region.or(menu_region) } } else if parts.screen_view == Some(v.id) || v.view.menu { menu_region } else { None };
         let d = camera.screen_shift;
         // A popup or screen part takes the pointer on all of its body, not
         // only on its sprites: a click between them (its plain body, around
@@ -832,18 +841,26 @@ fn arrange_beside(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan: &m
         vec![ShownPiece { rect: [x, y, right - x, bottom - y], clip: beside.region, driver: beside.source, piece, shift: (0, 0), under_modal: None, modal: false }]
     } else { Vec::new() };
     let mut top_driver = None;
-    for id in scene.interface.popup_views() {
-        let Some(index) = scene.views.iter().position(|view| view.id == id) else { continue };
+    // Each popup's body before any is placed: one attached to the popup
+    // under it (a combo box's open list) is placed as that one.
+    let bodies: Vec<(u32, usize, [i32; 4])> = scene.interface.popup_views().filter_map(|id| {
+        let index = scene.views.iter().position(|view| view.id == id)?;
+        let camera = frame.cameras[frame.view_cameras[index]? as usize];
+        Some((id, index, [camera.origin.0, camera.origin.1, camera.viewport.0 as i32, camera.viewport.1 as i32]))
+    }).collect();
+    let placed_popup = scene.interface.placed_popup();
+    for &(id, index, body) in &bodies {
         let Some(camera) = frame.view_cameras[index] else { continue };
         let camera = &mut frame.cameras[camera as usize];
-        let body = [camera.origin.0, camera.origin.1, camera.viewport.0 as i32, camera.viewport.1 as i32];
-        let zoom = fit_at_most(piece.zoom, Some(body), (beside.region[2].max(1) as u32, beside.region[3].max(1) as u32));
-        let at = modal_place((scaled(body[2] as i64, zoom) as i32, scaled(body[3] as i64, zoom) as i32), beside.region);
-        let modal_piece = Affine { from: (body[0], body[1]), to: at, zoom };
+        let root = scene.interface.popup_root(id);
+        let place = bodies.iter().find(|b| b.0 == root).map_or(body, |b| b.2);
+        let zoom = fit_at_most(piece.zoom, Some(place), (beside.region[2].max(1) as u32, beside.region[3].max(1) as u32));
+        let at = modal_place((scaled(place[2] as i64, zoom) as i32, scaled(place[3] as i64, zoom) as i32), beside.region);
+        let modal_piece = Affine { from: (place[0], place[1]), to: at, zoom };
         *camera = overlaid(modal_piece.camera(camera));
         camera.target_clip = Some([beside.region[0], beside.region[1], beside.region[0] + beside.region[2], beside.region[1] + beside.region[3]]);
-        let modal = scene.interface.popup == Some(id);
-        if modal { top_driver = Some(body); }
+        let modal = placed_popup == Some(root);
+        if modal && root == id { top_driver = Some(body); }
         shown.push(ShownPiece { rect: modal_piece.rect(body), clip: beside.region, driver: body, piece: modal_piece, shift: (0, 0), under_modal: None, modal });
     }
     for shown in shown.iter_mut().filter(|shown| !shown.modal) { shown.under_modal = top_driver; }

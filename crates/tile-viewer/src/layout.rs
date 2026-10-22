@@ -2120,7 +2120,10 @@ impl Layout {
         // The parts of the driver's interface the viewer arranges.
         let parts = &scene.interface;
         let part = |id: Option<u32>| id.and_then(|id| scene.views.iter().position(|v| v.id == id && v.view.interface_only));
-        let (roaming, popup, screen_part, hint) = (part(parts.roaming), part(parts.popup), part(parts.screen_view), part(parts.capture_hint));
+        // (The popup: the dialog on top, with what is attached to it, e.g.
+        // its combo box's open list, `scene::Interface::placed_popup`.)
+        let placed_popup = parts.placed_popup();
+        let (roaming, popup, screen_part, hint) = (part(parts.roaming), part(placed_popup), part(parts.screen_view), part(parts.capture_hint));
         let popup_layers: Vec<usize> = parts.popup_views().filter_map(|id| part(Some(id))).collect();
         // While the mouse is captured the corner's buttons cannot be used:
         // the hint how to let it go shows in their place, in the view
@@ -2161,13 +2164,13 @@ impl Layout {
         let over_menu = parts.screen.is_some() || screen_part.is_some() || scene.views.iter().any(|v| v.view.interface_only && v.view.menu && !v.overlay.is_empty());
         let previous_popup = self.popup_view;
         if let (Some(id), Some((anchor, press))) = (previous_popup, self.anchored) {
-            if Some(id) != parts.popup && parts.modal_stack.contains(id) {
+            if Some(id) != placed_popup && parts.modal_stack.contains(id) {
                 self.anchored_popup_layers.retain(|(view, _, _)| *view != id);
                 self.anchored_popup_layers.push((id, anchor, press));
             }
         }
         self.anchored_popup_layers.retain(|(id, _, _)| parts.is_popup_view(*id));
-        self.popup_view = parts.popup;
+        self.popup_view = placed_popup;
         self.popup_body = popup.map(|i| rect_of(&base[i]));
         if popup.is_some() != self.popup_shown {
             self.popup_shown = popup.is_some();
@@ -2186,8 +2189,8 @@ impl Layout {
                 None => (self.anchored, self.popup_anchor_seen) = (None, None),
             }
         }
-        if previous_popup != parts.popup && self.anchored.is_none() {
-            if let Some(index) = self.anchored_popup_layers.iter().position(|(id, _, _)| Some(*id) == parts.popup) {
+        if previous_popup != placed_popup && self.anchored.is_none() {
+            if let Some(index) = self.anchored_popup_layers.iter().position(|(id, _, _)| Some(*id) == placed_popup) {
                 let (_, anchor, press) = self.anchored_popup_layers.remove(index);
                 self.anchored = Some((anchor, press));
             }
@@ -2369,7 +2372,7 @@ impl Layout {
             scene.views.iter().enumerate().filter_map(|(i, v)| {
                 if Some(i) == main || Some(i) == roaming || Some(i) == hint || (popup_layers.contains(&i) && modal.is_some()) { return None; }
                 let city_map = self.screen.as_deref() == Some("City") && !v.view.interface_only && v.view.viewport.0 > 0 && v.view.viewport.1 > 0;
-                let ui = v.view.interface_only && (self.screen.as_deref() == Some("City") || (!dedicated && screen_part.is_none()) || (screen_part.is_none() && v.view.menu) || Some(i) == screen_part || (Some(i) == popup && modal.is_none()));
+                let ui = v.view.interface_only && (self.screen.as_deref() == Some("City") || (!dedicated && screen_part.is_none()) || (screen_part.is_none() && v.view.menu) || Some(i) == screen_part || (popup.is_some() && popup_layers.contains(&i) && part(Some(parts.popup_root(v.id))) == popup && modal.is_none()));
                 (ui || city_map).then_some(i)
             }).collect()
         } else { Vec::new() };
@@ -2448,7 +2451,10 @@ impl Layout {
                 } else if Some(i) == hint {
                     Some(roaming_shift.filter(|_| hinting))
                 } else if popup_layers.contains(&i) {
-                    Some(if modal.is_some() { Some((0, 0)) } else if Some(i) == popup { popup_shift } else { Some(self.popup_shift(rect_of(camera), main_rect)) })
+                    // (One attached to the dialog under it, a combo box's list: as
+                    // that dialog.)
+                    let root = part(Some(parts.popup_root(v.id))).unwrap_or(i);
+                    Some(if modal.is_some() { Some((0, 0)) } else if Some(root) == popup { popup_shift } else { Some(self.popup_shift(rect_of(&base[root]), main_rect)) })
                 } else if Some(i) == screen_part {
                     screen_shift
                 } else {
@@ -2472,6 +2478,11 @@ impl Layout {
                     }
                 }
             }
+            // The popups in the driver's order, bottom to top (a combo box's
+            // open list over its dialog), not in the order of their views' ids.
+            let layer = |&(i, _): &(usize, Camera)| popup_layers.iter().position(|&l| l == i).map_or(0, |k| k + 1);
+            over.sort_by_key(layer);
+            on_top.sort_by_key(layer);
         }
         // The viewer's own views, as many as the renderer draws (the second
         // pane first, then the magnifier, then the insets in order, then
@@ -2580,7 +2591,8 @@ impl Layout {
             // Internal world views, such as the City's surroundings, go
             // under the panel's art, while both world panes stay independent.
             let mut named = named;
-            named.sort_by_key(|&i| (scene.views[i].view.interface_only, i));
+            // (A popup's attached combo box list over it.)
+            named.sort_by_key(|&i| (scene.views[i].view.interface_only, popup_layers.iter().position(|&l| l == i).map_or(0, |k| k + 1), i));
             for i in named {
                 let camera = base[i];
                 let stacked = Camera {

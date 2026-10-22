@@ -389,6 +389,13 @@ pub struct Interface {
     pub popup: Option<u32>,
     /// Independently placed modal views, bottom to top. `popup` is the top.
     pub modal_stack: ModalStack,
+    /// Per entry of `modal_stack`: the view is part of the one under it,
+    /// not placed on its own (e.g. the list a combo box in a dialog
+    /// opened, which the driver shows as a form of its own just below the
+    /// box, reaching past the dialog). A renderer draws it right above that
+    /// view, moved and scaled exactly as that view (`Interface::popup_root`),
+    /// and maps pointer input on it back the same way.
+    pub modal_attached: [bool; 4],
     /// An interface-only view holding the named screen (`screen`) where it
     /// lies over the window, smaller than it, and what is drawn over it
     /// (its `origin` and `viewport` are its rectangle; the other interface
@@ -431,6 +438,20 @@ impl Interface {
     pub fn is_popup_view(&self, id: u32) -> bool { self.popup == Some(id) || self.modal_stack.contains(id) }
     pub fn popup_views(&self) -> impl Iterator<Item = u32> + '_ {
         self.modal_stack.iter().chain(self.popup.filter(|id| !self.modal_stack.contains(*id)))
+    }
+    /// The popup view placed for `id`: `id` itself, or for a view attached
+    /// to the one under it (`modal_attached`), that one's (repeatedly).
+    pub fn popup_root(&self, id: u32) -> u32 {
+        let Some(mut k) = self.modal_stack.0.iter().position(|v| *v == Some(id)) else { return id };
+        while k > 0 && self.modal_attached[k] && self.modal_stack.0[k - 1].is_some() {
+            k -= 1;
+        }
+        self.modal_stack.0[k].unwrap_or(id)
+    }
+    /// The popup a renderer places: `popup`'s root (`popup_root`), e.g. the
+    /// dialog whose combo box list is open on top of it.
+    pub fn placed_popup(&self) -> Option<u32> {
+        self.popup.map(|id| self.popup_root(id))
     }
 }
 
