@@ -1,15 +1,23 @@
 //! Pixel scrolling for the driver's row-based lists. Wheel messages reach
 //! the driver normally. When stable row ids confirm a scroll, its old and
 //! new drawings slide through the list's clip rectangle. Input follows the
-//! visible row's id, including while a click is held across a scroll.
+//! visible row's id, including while a click is held across a scroll. The
+//! driver's pointer highlight stays on the row under the pointer
+//! ([`highlight`]).
 
 use scene::{Button, Input, InteractableKind, Scene};
 use tile_render::PlacedSprite;
 
 use crate::looks::Span;
 
+mod highlight;
+use highlight::Highlight;
+
 /// Seconds for a confirmed row movement to settle.
 const DURATION: f64 = 0.14;
+/// Seconds after a slide that the highlight is kept under the pointer
+/// until the driver's own drawing shows it there.
+const SETTLE: f64 = 0.3;
 
 type Rect = [i32; 4]; // left, top, right, bottom
 
@@ -35,6 +43,8 @@ struct Picture {
     rect: Rect,
     rows: Vec<Row>,
     sprites: Vec<PlacedSprite>,
+    /// Each sprite's extent (unclipped), to tell the rows' own sprites.
+    extents: Vec<Rect>,
     cameras: Vec<u32>,
 }
 
@@ -63,20 +73,22 @@ impl Picture {
             // statistics and cells represented as buttons.
             if rows.is_empty() { return None }
             let mut sprites = Vec::new();
+            let mut extents = Vec::new();
             let mut cameras = Vec::new();
             // Overlays are the driver's screen pixels; world sprites are
             // excluded, even when the city map lies behind its list.
             for s in free.iter().filter(|s| s.screen && !s.except_view && s.view.is_some_and(|v| overlay_cameras.contains(&v))) {
-                if rect_of(s).is_some_and(|r| intersect(bounds(r), rect).is_some()) {
+                if let Some(extent) = rect_of(s).map(bounds).filter(|r| intersect(*r, rect).is_some()) {
                     if let Some(s) = clipped(*s, rect) {
                         if let Some(camera) = s.view {
                             if !cameras.contains(&camera) { cameras.push(camera); }
                         }
                         sprites.push(s);
+                        extents.push(extent);
                     }
                 }
             }
-            Some(Picture { id: list.id, rect, rows, sprites, cameras })
+            Some(Picture { id: list.id, rect, rows, sprites, extents, cameras })
         }).collect()
     }
 
@@ -117,32 +129,43 @@ impl Slide {
         (old, old - self.dy)
     }
 
-    /// The old drawing fills the scroll rectangle except for the edge
-    /// just exposed. The new drawing fills that edge without alpha overlap.
+    /// (old drawing's region, new drawing's region). The new drawing fills
+    /// the scroll rectangle except for the edge whose rows have already
+    /// left the driver's list; the old drawing fills only that edge,
+    /// without alpha overlap. What the driver redraws during a slide (its
+    /// highlight) shows at once.
     fn regions(&self, now: f64) -> (Option<Rect>, Option<Rect>) {
-        let (old, _) = self.offsets(now);
+        let (_, new) = self.offsets(now);
         let r = self.to.rect;
         if self.dy < 0 {
-            let seam = r[3] + old;
+            let seam = r[1] + new;
             (intersect(r, [r[0], r[1], r[2], seam]), intersect(r, [r[0], seam, r[2], r[3]]))
         } else {
-            let seam = r[1] + old;
+            let seam = r[3] + new;
             (intersect(r, [r[0], seam, r[2], r[3]]), intersect(r, [r[0], r[1], r[2], seam]))
         }
     }
 
-    fn picture(&self, now: f64) -> Picture {
+    /// The drawing shown at `now`; with `style`, the driver's highlight
+    /// moved to that row in both drawings.
+    fn picture(&self, now: f64, style: Option<(&Highlight, u64)>) -> Picture {
         let (old, new) = self.offsets(now);
         let (old_clip, new_clip) = self.regions(now);
+        let restyled = |p: &Picture| style.and_then(|(h, want)| highlight::restyle(p, h, want));
+        let (from, to) = (restyled(&self.from), restyled(&self.to));
         let mut sprites = Vec::new();
+        let mut extents = Vec::new();
         let mut rows = Vec::new();
-        for (picture, dy, clip) in [(&self.from, old, old_clip), (&self.to, new, new_clip)] {
+        for (picture, dy, clip) in [(from.as_ref().unwrap_or(&self.from), old, old_clip), (to.as_ref().unwrap_or(&self.to), new, new_clip)] {
             let Some(clip) = clip else { continue };
-            for s in &picture.sprites {
+            for (s, extent) in picture.sprites.iter().zip(&picture.extents) {
                 let mut s = *s;
                 s.y += dy;
                 s.clip = s.clip.map(|r| shifted(r, dy));
-                if let Some(s) = clipped(s, clip) { sprites.push(s); }
+                if let Some(s) = clipped(s, clip) {
+                    sprites.push(s);
+                    extents.push(shifted(*extent, dy));
+                }
             }
             for row in &picture.rows {
                 let rect = shifted(row.rect, dy);
@@ -151,7 +174,7 @@ impl Slide {
                 }
             }
         }
-        Picture { id: self.to.id, rect: self.to.rect, cameras: self.to.cameras.clone(), sprites, rows }
+        Picture { id: self.to.id, rect: self.to.rect, cameras: self.to.cameras.clone(), sprites, extents, rows }
     }
 
     fn row_at(&self, point: (i32, i32), now: f64) -> Option<&Row> {
@@ -183,6 +206,21 @@ pub struct SmoothMenus {
     hover: Option<(i32, i32)>,
     /// Input uses the pixels of the last drawn frame, even with a low FPS cap.
     shown_at: f64,
+    /// Each list's pointer highlight, as learned from the driver's drawing.
+    highlights: Vec<(u64, Highlight)>,
+    /// Lists whose highlight is kept under the pointer after a slide, until
+    /// (seconds) or until the driver shows it there.
+    settling: Vec<(u64, f64)>,
+    /// A button or key reached the driver since the last frame: a change
+    /// of its highlight may be a selection rather than the pointer's.
+    interacted: bool,
+}
+
+/// The highlight of `slide`'s list, moved to the row its drawing shows
+/// under `pointer` at `now`.
+fn style<'a>(highlights: &'a [(u64, Highlight)], slide: &Slide, pointer: Option<(i32, i32)>, now: f64) -> Option<(&'a Highlight, u64)> {
+    let (_, h) = highlights.iter().find(|(id, _)| *id == slide.to.id)?;
+    Some((h, slide.row_at(pointer?, now)?.id))
 }
 
 /// Hover refresh while a list moves under a stationary mouse.
@@ -194,7 +232,7 @@ pub enum PointerRefresh {
 
 impl SmoothMenus {
     /// Includes the last frame that restores the unmodified drawing.
-    pub fn running(&self) -> bool { !self.slides.is_empty() }
+    pub fn running(&self) -> bool { !self.slides.is_empty() || !self.settling.is_empty() }
 
     /// Clear a held gesture on focus loss. List pictures are retained so
     /// the next frame can restore an animation's ordinary drawing.
@@ -202,23 +240,38 @@ impl SmoothMenus {
 
     /// Interpolate the current, unanimated free sprites. `generation`
     /// invalidates saved sprite ids when the renderer replaces its atlas.
-    pub fn draw(&mut self, scene: &Scene, free: &[PlacedSprite], spans: &[Span], now: f64, enabled: bool, generation: u64, rect_of: impl Fn(&PlacedSprite) -> Option<[i32; 4]>) -> Option<Vec<PlacedSprite>> {
+    /// `pointer` is where the pointer reaches the driver's window (its
+    /// pixels), if it does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(&mut self, scene: &Scene, free: &[PlacedSprite], spans: &[Span], now: f64, enabled: bool, generation: u64, pointer: Option<(i32, i32)>, rect_of: impl Fn(&PlacedSprite) -> Option<[i32; 4]>) -> Option<Vec<PlacedSprite>> {
         self.shown_at = now;
         let key = (generation, scene.interface.screen.clone(), scene.interface.popup);
         if !enabled || self.key.as_ref() != Some(&key) {
             self.pictures.clear();
             self.slides.clear();
             self.pressed.clear();
+            self.highlights.clear();
+            self.settling.clear();
             self.key = Some(key);
         }
         if !enabled { return None }
         let current = Picture::take(scene, free, spans, &rect_of);
+        // The driver lit the row its pointer moved onto: its highlight.
+        if let (false, Some(hover)) = (std::mem::take(&mut self.interacted), self.hover) {
+            for picture in &current {
+                let Some(old) = self.pictures.iter().find(|p| p.id == picture.id) else { continue };
+                if let Some(h) = highlight::learn(old, picture, hover) {
+                    self.highlights.retain(|(id, _)| *id != picture.id);
+                    self.highlights.push((picture.id, h));
+                }
+            }
+        }
         let mut slides = Vec::new();
         for picture in &current {
             let Some(old) = self.pictures.iter().find(|p| p.id == picture.id) else { continue };
             let previous = self.slides.iter().find(|s| s.to.id == picture.id);
             if let Some(dy) = picture.displacement_from(old) {
-                let from = previous.map_or_else(|| old.clone(), |s| s.picture(now));
+                let from = previous.map_or_else(|| old.clone(), |s| s.picture(now, style(&self.highlights, s, pointer, now)));
                 // Repeated notches keep the currently visible position.
                 if let Some(displacement) = picture.displacement_from(&from) {
                     slides.push(Slide { from, to: picture.clone(), dy: displacement, at: now });
@@ -232,20 +285,47 @@ impl SmoothMenus {
         }
         self.pictures = current;
         self.slides = slides;
-        if self.slides.is_empty() { return None }
-        let mut result = free.to_vec();
+        // What each list shows in place of the driver's drawing.
+        let mut patches: Vec<(Rect, Vec<u32>, Vec<PlacedSprite>)> = Vec::new();
         for slide in &self.slides {
+            let shown = slide.picture(now, style(&self.highlights, slide, pointer, now));
+            patches.push((slide.to.rect, slide.to.cameras.clone(), shown.sprites));
+            if self.highlights.iter().any(|(id, _)| *id == slide.to.id) {
+                self.settling.retain(|(id, _)| *id != slide.to.id);
+                self.settling.push((slide.to.id, slide.at + DURATION + SETTLE));
+            }
+        }
+        // After a slide the highlight stays under the pointer until the
+        // driver, which got the pointer over that row, shows it there too.
+        let mut settled = Vec::new();
+        for &(id, until) in &self.settling {
+            if self.slides.iter().any(|s| s.to.id == id) { continue }
+            let held = (now < until).then_some(()).and_then(|()| {
+                let picture = self.pictures.iter().find(|p| p.id == id)?;
+                let (_, h) = self.highlights.iter().find(|(list, _)| *list == id)?;
+                let want = picture.row_at(pointer?)?.id;
+                highlight::restyle(picture, h, want)
+            });
+            match held {
+                Some(shown) => patches.push((shown.rect, shown.cameras, shown.sprites)),
+                None => settled.push(id),
+            }
+        }
+        self.settling.retain(|(id, _)| !settled.contains(id));
+        if patches.is_empty() { return None }
+        let mut result = free.to_vec();
+        for (rect, cameras, shown) in patches {
             let mut outside = Vec::new();
             for s in result {
-                if !s.screen || s.except_view || !s.view.is_some_and(|v| slide.to.cameras.contains(&v))
-                    || !rect_of(&s).is_some_and(|r| intersect(bounds(r), slide.to.rect).is_some()) {
+                if !s.screen || s.except_view || !s.view.is_some_and(|v| cameras.contains(&v))
+                    || !rect_of(&s).is_some_and(|r| intersect(bounds(r), rect).is_some()) {
                     outside.push(s);
                     continue;
                 }
                 // Preserve the same sprite outside the list. Rectangular
                 // subtraction also retains a spanning popup background.
                 let r = s.clip.unwrap_or([-tile_render::world::CLIP_LIMIT, -tile_render::world::CLIP_LIMIT, tile_render::world::CLIP_LIMIT, tile_render::world::CLIP_LIMIT]);
-                let Some(cut) = intersect(r, slide.to.rect) else { outside.push(s); continue };
+                let Some(cut) = intersect(r, rect) else { outside.push(s); continue };
                 for keep in [[r[0], r[1], r[2], cut[1]], [r[0], cut[3], r[2], r[3]],
                     [r[0], cut[1], cut[0], cut[3]], [cut[2], cut[1], r[2], cut[3]]] {
                     if rect_of(&s).is_some_and(|actual| intersect(bounds(actual), keep).is_some()) {
@@ -253,7 +333,7 @@ impl SmoothMenus {
                     }
                 }
             }
-            outside.extend(slide.picture(now).sprites);
+            outside.extend(shown);
             result = outside;
         }
         Some(result)
@@ -263,6 +343,7 @@ impl SmoothMenus {
     /// already left the driver's list cannot be selected accidentally.
     /// Button releases retain the id chosen on the corresponding press.
     pub fn route(&mut self, input: Input, _now: f64) -> Option<Input> {
+        if matches!(input, Input::MouseButton { .. } | Input::Key { .. }) { self.interacted = true; }
         let result = self.map_input(input, self.shown_at);
         if let Some(Input::MouseMove { x, y }) = result { self.hover = Some((x, y)); }
         result
@@ -379,7 +460,7 @@ mod tests {
 
     fn draw(state: &mut SmoothMenus, first: u64, now: f64, enabled: bool) -> Vec<PlacedSprite> {
         let (scene, free, spans) = frame(first);
-        state.draw(&scene, &free, &spans, now, enabled, 1, rect).unwrap_or(free)
+        state.draw(&scene, &free, &spans, now, enabled, 1, None, rect).unwrap_or(free)
     }
 
     fn pixel(sprites: &[PlacedSprite], at: (i32, i32)) -> Option<u32> {
@@ -510,15 +591,15 @@ mod tests {
         assert!(state.pressed.is_empty());
         let (mut scene, free, spans) = frame(2);
         scene.interface.popup = Some(123);
-        assert!(state.draw(&scene, &free, &spans, 1.01, true, 1, rect).is_none());
+        assert!(state.draw(&scene, &free, &spans, 1.01, true, 1, None, rect).is_none());
         assert!(!state.running());
         let (mut scene, free, spans) = frame(3);
         scene.interface.popup = Some(123);
-        assert!(state.draw(&scene, &free, &spans, 1.02, true, 1, rect).is_some());
+        assert!(state.draw(&scene, &free, &spans, 1.02, true, 1, None, rect).is_some());
         // App disables menu interpolation while Alt snapping owns input.
-        assert!(state.draw(&scene, &free, &spans, 1.03, false, 1, rect).is_none());
+        assert!(state.draw(&scene, &free, &spans, 1.03, false, 1, None, rect).is_none());
         assert!(!state.running());
-        assert!(state.draw(&scene, &free, &spans, 1.04, true, 1, rect).is_none());
+        assert!(state.draw(&scene, &free, &spans, 1.04, true, 1, None, rect).is_none());
     }
 
     #[test]
@@ -527,12 +608,12 @@ mod tests {
         draw(&mut state, 1, 0.0, true);
         draw(&mut state, 2, 1.0, true);
         let (mut scene, free, spans) = frame(20);
-        assert!(state.draw(&scene, &free, &spans, 1.01, true, 1, rect).is_none());
+        assert!(state.draw(&scene, &free, &spans, 1.01, true, 1, None, rect).is_none());
         scene.interface.screen = Some("Different menu".into());
-        assert!(state.draw(&scene, &free, &spans, 1.02, true, 1, rect).is_none());
-        assert!(state.draw(&scene, &free, &spans, 1.03, true, 2, rect).is_none());
+        assert!(state.draw(&scene, &free, &spans, 1.02, true, 1, None, rect).is_none());
+        assert!(state.draw(&scene, &free, &spans, 1.03, true, 2, None, rect).is_none());
         scene.interactables.clear();
-        assert!(state.draw(&scene, &free, &spans, 1.04, true, 2, rect).is_none());
+        assert!(state.draw(&scene, &free, &spans, 1.04, true, 2, None, rect).is_none());
     }
 
     #[test]
@@ -542,10 +623,10 @@ mod tests {
         let world = PlacedSprite { view: None, screen: false, ..free[0] };
         let button = PlacedSprite { x: 150, y: 150, clip: Some([150, 150, 250, 170]), zoom_art: ZoomArt::Any, ..free[0] };
         free.extend([world, button]);
-        state.draw(&scene, &free, &spans, 0.0, true, 1, rect);
+        state.draw(&scene, &free, &spans, 0.0, true, 1, None, rect);
         let (scene, mut free, spans) = frame(2);
         free.extend([world, button]);
-        let animated = state.draw(&scene, &free, &spans, 1.0, true, 1, rect).unwrap();
+        let animated = state.draw(&scene, &free, &spans, 1.0, true, 1, None, rect).unwrap();
         assert!(animated.contains(&world));
         assert!(animated.contains(&button));
     }
@@ -676,11 +757,11 @@ mod tests {
             (scene, sprites, spans)
         };
         let (scene, free, spans) = table(1);
-        state.draw(&scene, &free, &spans, 0.0, true, 1, rect);
+        state.draw(&scene, &free, &spans, 0.0, true, 1, None, rect);
         let (scene, free, spans) = table(2);
-        state.draw(&scene, &free, &spans, 1.0, true, 1, rect);
+        state.draw(&scene, &free, &spans, 1.0, true, 1, None, rect);
         let now = 1.0 + DURATION / 2.0;
-        let shown = state.draw(&scene, &free, &spans, now, true, 1, rect).unwrap();
+        let shown = state.draw(&scene, &free, &spans, now, true, 1, None, rect).unwrap();
         for x in [20, 50, 80, 105] {
             assert_eq!(pixel(&shown, (x, 25)), Some(2), "column {x}");
             assert_eq!(state.route(Input::MouseMove { x, y: 25 }, now), Some(Input::MouseMove { x, y: 15 }));
@@ -697,7 +778,7 @@ mod tests {
             for item in &mut scene.interactables {
                 if item.kind == InteractableKind::ListItem { item.rect[3] = 16; }
             }
-            state.draw(&scene, &free, &spans, now, true, 1, rect);
+            state.draw(&scene, &free, &spans, now, true, 1, None, rect);
         }
         // Old row 2 occupies y20..36, then a four-pixel gap. Native
         // row 3 already occupies y30..46 at this same coordinate.
@@ -746,11 +827,130 @@ mod tests {
                 if let InteractableKind::List { scroll, .. } = &mut item.kind { scroll[2] = 80; }
             }
             free.push(side);
-            let output = state.draw(&scene, &free, &spans, at, true, 1, rect);
+            let output = state.draw(&scene, &free, &spans, at, true, 1, None, rect);
             if first == 2 { assert!(output.unwrap().contains(&side)); }
         }
         let input = Input::MouseButton { button: Button::Left, down: true, x: 100, y: 20 };
         assert_eq!(state.route(input.clone(), 1.01), Some(input));
     }
 
+    const PLAIN: [u8; 3] = [0, 0, 0];
+    const LIT: [u8; 3] = [0, 112, 184];
+
+    /// [`frame`] with the driver's highlight on row `lit`: a fill under it
+    /// and its text in another colour.
+    fn lit_frame(first: u64, lit: Option<u64>) -> (Scene, Vec<PlacedSprite>, Vec<Span>) {
+        let (scene, free, _) = frame(first);
+        let mut out = Vec::new();
+        for s in free {
+            let on = lit == Some(u64::from(s.set.raw()));
+            if on {
+                let fill = tile_render::SolidRect { width: 100, height: 20, rgba: [40, 40, 120, 255] };
+                out.push(PlacedSprite { set: SpriteSetId::from_raw(0), solid: Some(fill), ..s });
+            }
+            out.push(PlacedSprite { blend: tile_render::Blend::Subpixel { color: if on { LIT } else { PLAIN } }, ..s });
+        }
+        let spans = vec![Span { view: 7, start: 0, len: out.len(), cameras: vec![0; out.len()] }];
+        (scene, out, spans)
+    }
+
+    fn lit_draw(state: &mut SmoothMenus, first: u64, lit: Option<u64>, now: f64, pointer: Option<(i32, i32)>) -> Option<Vec<PlacedSprite>> {
+        let (scene, free, spans) = lit_frame(first, lit);
+        state.draw(&scene, &free, &spans, now, true, 1, pointer, rect)
+    }
+
+    /// Where the highlight shows: the fills' visible rows, and the rows
+    /// whose text has the highlight's colour.
+    fn highlight_shown(sprites: &[PlacedSprite]) -> (Vec<[i32; 2]>, Vec<u32>) {
+        let fills = sprites.iter().filter(|s| s.solid.is_some()).filter_map(rect).map(|r| [r[1], r[1] + r[3]]).collect();
+        let mut text: Vec<u32> = sprites.iter().filter(|s| s.blend == tile_render::Blend::Subpixel { color: LIT }).map(|s| s.set.raw()).collect();
+        text.dedup();
+        (fills, text)
+    }
+
+    /// The driver lights row 2 as its pointer reaches it (y 35).
+    fn learned() -> SmoothMenus {
+        let mut state = SmoothMenus::default();
+        lit_draw(&mut state, 1, None, 0.0, Some((20, 35)));
+        state.route(Input::MouseMove { x: 20, y: 35 }, 0.0);
+        assert!(lit_draw(&mut state, 1, Some(2), 0.1, Some((20, 35))).is_none());
+        assert_eq!(state.highlights.len(), 1);
+        state
+    }
+
+    #[test]
+    fn the_highlight_stays_under_a_stationary_pointer_in_every_frame_of_a_slide() {
+        for (pointer, step) in [((20, 35), 2), ((20, 35), 0), ((20, 61), 2), ((20, 61), 0), ((20, 14), 2), ((20, 14), 0)] {
+            let mut state = learned();
+            // A wheel notch down: rows move up by one. The driver still
+            // lights row 2, now one slot higher.
+            let (first, lit) = if step == 2 { (2, Some(2)) } else { (0, Some(2)) };
+            for k in 0..=20 {
+                let now = 1.0 + DURATION * k as f64 / 20.0;
+                let shown = lit_draw(&mut state, first, lit, now, Some(pointer)).unwrap_or_else(|| lit_frame(first, lit).1);
+                let (fills, text) = highlight_shown(&shown);
+                let under = state.slides.first().and_then(|s| s.row_at(pointer, now)).map(|r| r.id)
+                    .or_else(|| state.pictures[0].row_at(pointer).map(|r| r.id));
+                let under = under.expect("the pointer is over a row");
+                assert_eq!(text, vec![under as u32], "pointer {pointer:?}, frame {k}");
+                assert!(!fills.is_empty() && fills.iter().all(|f| f[0] <= pointer.1 && pointer.1 < f[1]),
+                    "pointer {pointer:?}, frame {k}: fills {fills:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn after_a_slide_the_highlight_waits_for_the_driver_then_hands_back_without_a_jump() {
+        let mut state = learned();
+        lit_draw(&mut state, 2, Some(2), 1.0, Some((20, 35)));
+        let end = 1.0 + DURATION + 0.01;
+        // The driver has not drawn its pointer's new row yet.
+        let shown = lit_draw(&mut state, 2, Some(2), end, Some((20, 35))).unwrap();
+        assert_eq!(highlight_shown(&shown), (vec![[30, 50]], vec![3]));
+        assert!(state.running());
+        // Clicks go where the highlight is: native row 3.
+        assert_eq!(state.route(Input::MouseMove { x: 20, y: 35 }, end), Some(Input::MouseMove { x: 20, y: 35 }));
+        // The driver shows it: its own drawing again, the same pixels.
+        assert!(lit_draw(&mut state, 2, Some(3), end + 0.02, Some((20, 35))).is_none());
+        assert!(!state.running());
+        // A driver that never catches up gets its drawing back in time.
+        let mut state = learned();
+        lit_draw(&mut state, 2, Some(2), 1.0, Some((20, 35)));
+        assert!(lit_draw(&mut state, 2, Some(2), end, Some((20, 35))).is_some());
+        assert!(lit_draw(&mut state, 2, Some(2), 1.0 + DURATION + SETTLE + 0.01, Some((20, 35))).is_none());
+        assert!(!state.running());
+    }
+
+    #[test]
+    fn a_highlight_changed_by_a_click_or_away_from_the_pointer_is_not_moved() {
+        // Selected by a click: a selection, which need not follow the pointer.
+        let mut state = SmoothMenus::default();
+        lit_draw(&mut state, 1, None, 0.0, Some((20, 35)));
+        state.route(Input::MouseMove { x: 20, y: 35 }, 0.0);
+        state.route(Input::MouseButton { button: Button::Left, down: true, x: 20, y: 35 }, 0.0);
+        lit_draw(&mut state, 1, Some(2), 0.1, Some((20, 35)));
+        assert!(state.highlights.is_empty());
+        // Lit away from the driver's pointer (keyboard or the driver's own choice).
+        let mut state = SmoothMenus::default();
+        lit_draw(&mut state, 1, None, 0.0, Some((20, 35)));
+        state.route(Input::MouseMove { x: 20, y: 55 }, 0.0);
+        lit_draw(&mut state, 1, Some(2), 0.1, Some((20, 55)));
+        assert!(state.highlights.is_empty());
+        // Unlearned, a slide shows the driver's newest drawing as it is.
+        lit_draw(&mut state, 2, Some(2), 1.0, Some((20, 35)));
+        let shown = lit_draw(&mut state, 2, Some(2), 1.0 + DURATION * 0.75, Some((20, 35))).unwrap();
+        let (fills, text) = highlight_shown(&shown);
+        assert_eq!(text, vec![2]);
+        assert!(fills.iter().all(|f| f[1] <= 35), "the driver's highlight moves with its row: {fills:?}");
+    }
+
+    #[test]
+    fn a_pointer_outside_the_rows_leaves_the_drivers_highlight_alone() {
+        let mut state = learned();
+        lit_draw(&mut state, 2, Some(2), 1.0, Some((200, 35)));
+        let shown = lit_draw(&mut state, 2, Some(2), 1.0 + DURATION / 2.0, Some((200, 35))).unwrap();
+        assert_eq!(highlight_shown(&shown).1, vec![2]);
+        let shown = lit_draw(&mut state, 2, Some(2), 1.0 + DURATION / 2.0, None).unwrap();
+        assert_eq!(highlight_shown(&shown).1, vec![2]);
+    }
 }

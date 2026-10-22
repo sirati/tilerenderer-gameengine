@@ -3455,8 +3455,10 @@ impl App {
         }
         self.drawn_looks = self.feedback.drawn().to_vec();
         drop(replacements);
+        let menu_pointer = (self.pointer_inside && !self.layout.captured() && !self.snap.snap_mode_active())
+            .then(|| self.layout.route_window(self.layout.pointer_in_window())).flatten();
         if let Some(scrolled) = self.menu_scroll.draw(scene, &self.world.as_ref().expect("built above").free, &self.spans,
-            now, self.settings.input.smooth_menu_scrolling && !self.snap.snap_mode_active(), self.whole_version, |s| placed_rect(&self.compiled, s)) {
+            now, self.settings.input.smooth_menu_scrolling && !self.snap.snap_mode_active(), self.whole_version, menu_pointer, |s| placed_rect(&self.compiled, s)) {
             Arc::make_mut(self.world.as_mut().expect("built above")).free = scrolled;
             looks_changed = true;
         }
