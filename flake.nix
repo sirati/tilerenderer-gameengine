@@ -8,6 +8,18 @@
 
   outputs = { self, nixpkgs, nixpkgs-darwin }:
     {
+      # Microsoft's DirectPlay files for the game's network play
+      # (tools/install-directplay). Unfree but redistributable; allowed here
+      # by name only. Built on Linux for the macOS deploy too: the files are
+      # x86 Windows DLLs, the same on every host.
+      packages = nixpkgs.lib.genAttrs [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
+      let
+        pkgs = import (if system == "x86_64-darwin" then nixpkgs-darwin else nixpkgs) {
+          inherit system;
+          config.allowUnfreePredicate = p: nixpkgs.lib.getName p == "directplay-redist";
+        };
+      in { directplay = pkgs.callPackage ./nix/directplay.nix { }; });
+
       devShells = nixpkgs.lib.genAttrs [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
       let
         pkgs = import (if system == "x86_64-darwin" then nixpkgs-darwin else nixpkgs) { inherit system; };
