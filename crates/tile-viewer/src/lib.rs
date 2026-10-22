@@ -760,8 +760,8 @@ fn world_bounds(compiled: &Compiled, scene: &Scene) -> layout::WorldBounds {
 /// Sprite sets the viewer draws its markers with, if the description has
 /// them (anchored at the point they mark).
 pub const CURSOR_SPRITE: &str = "Viewer@cursor/0";
-/// The divider's line, light, drawn over the dark gap where it is closed
-/// (side by side: a column; stacked: a row); its top-left at the anchor.
+/// A light line two pixels wide (the keyboard focus's outline; once the
+/// divider's): a column or a row, its top-left at the anchor.
 pub const DIVIDER_SPRITE: &str = "Viewer@divider_v/0";
 pub const DIVIDER_ROW_SPRITE: &str = "Viewer@divider_h/0";
 pub const ARROW_SPRITE: &str = "Viewer@arrow/0";
@@ -789,9 +789,41 @@ fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u3
         .collect()
 }
 
-/// The divider's line over its closed stretches (`layout::Frame::divider`):
-/// a light line two pixels wide in the middle of the dark four-pixel gap,
-/// seen on any background; nothing without the art.
+/// The divider's glass (`layout::Frame::divider`, `layout::glass`): one
+/// translucent strip a pixel across the gap each, tiled along it, in the
+/// camera of the half of the gap it lies in; nothing without the art.
+fn glass_sprites(compiled: &Compiled, strips: &[(u32, [i32; 4], bool, layout::Shade)]) -> Vec<tile_render::PlacedSprite> {
+    let mut out = Vec::new();
+    for &(camera, [x, y, w, h], vertical, shade) in strips {
+        let Some((set, _)) = compiled.set(glass_sprite(shade, vertical)) else { continue };
+        let clip = Some([x, y, x + w, y + h]);
+        let len = if vertical { h } else { w };
+        for k in (0..len).step_by(GLASS_TILE as usize) {
+            let (px, py) = if vertical { (x, y + k) } else { (x + k, y) };
+            out.push(tile_render::PlacedSprite { screen: true, view: Some(camera), clip, ..tile_render::PlacedSprite::new(set, px, py) });
+        }
+    }
+    out
+}
+
+/// How long a glass strip's art is along the divider.
+const GLASS_TILE: i32 = 64;
+
+/// The sprite set of a glass strip (side by side: a column; stacked: a
+/// row), its top-left at the anchor.
+pub fn glass_sprite(shade: layout::Shade, vertical: bool) -> &'static str {
+    match (shade, vertical) {
+        (layout::Shade::Light, true) => "Viewer@glass_light_v/0",
+        (layout::Shade::Frost, true) => "Viewer@glass_frost_v/0",
+        (layout::Shade::Shadow, true) => "Viewer@glass_shadow_v/0",
+        (layout::Shade::Light, false) => "Viewer@glass_light_h/0",
+        (layout::Shade::Frost, false) => "Viewer@glass_frost_h/0",
+        (layout::Shade::Shadow, false) => "Viewer@glass_shadow_h/0",
+    }
+}
+
+/// Light lines two pixels wide (the keyboard focus's outline), seen on
+/// any background; nothing without the art.
 fn divider_sprites(compiled: &Compiled, pieces: &[(u32, [i32; 4], bool)]) -> Vec<tile_render::PlacedSprite> {
     let mut out = Vec::new();
     for &(camera, [x, y, w, h], vertical) in pieces {
@@ -3478,7 +3510,7 @@ impl App {
         }
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
-        markers.extend(divider_sprites(&self.compiled, &arranged.divider));
+        markers.extend(glass_sprites(&self.compiled, &arranged.divider));
         // The cursor where the viewer draws it, in a camera of its own on
         // top (only when there is one: the frame is as before otherwise).
         let captured = self.layout.captured();
@@ -3867,6 +3899,9 @@ impl ApplicationHandler for App {
         changed |= self.settings_preview.needs_frame(Instant::now()) || expired.is_some();
         self.resolve_settings_preview(expired);
         let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
+        // The Alt mode by itself in menus, only for the window in front.
+        let focused = self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus());
+        self.snap.set_alt_in_menus(self.settings.input.alt_in_menus && focused);
         let snapped_inputs = if self.settings_preview.active() { Vec::new() } else {
             self.snap.tick(&mut self.layout, &self.shown_scene, now, rates)
         };

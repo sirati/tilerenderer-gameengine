@@ -1512,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn a_view_following_the_world_cursor_drags_the_cursor_and_a_click_still_captures() {
+    fn a_view_following_the_world_cursor_drags_the_cursor_and_a_click_is_the_worlds() {
         let mut l = split(MapMovement::Drag, Roles::UnitMouse);
         // (Once the driver's view settled, the world cursor stays put.)
         for _ in 0..=super::super::SETTLE_FRAMES {
@@ -1526,16 +1526,31 @@ mod tests {
         assert!(!l.captured());
         tick(&mut l, 16);
         assert_eq!(b(&l), (cursor.0 - 50, cursor.1 + 10));
-        // A click captures the mouse; captured, nothing is dragged.
+        // A click is a click on the world there: Drag captures nothing
+        // (the window's edges do nothing, the pointer may leave it).
         mv(&mut l, (600, 300));
-        left(&mut l, true, (600, 300));
-        left(&mut l, false, (600, 300));
-        assert!(l.captured());
+        assert!(left(&mut l, true, (600, 300)).is_empty(), "held back until it is a click or a drag");
+        let out = left(&mut l, false, (600, 300));
+        assert!(!l.captured());
+        // (Press and release for the game, through its window or its map.)
+        let press = |down: bool| out.iter().any(|i| matches!(*i, Input::WorldButton { button: Button::Left, down: d, .. } | Input::MouseButton { button: Button::Left, down: d, .. } if d == down));
+        assert!(press(true) && press(false), "{out:?}");
+        assert_ne!(l.take_pointer_icon(), Some(super::super::PointerIcon::Capture), "no crosshair: a click does not capture");
+        // Ctrl+Shift+Space does not capture either; the divider holds
+        // nothing back and the system confines nothing.
+        l.route(Input::Key { vk: 0x11, down: true, text: None });
+        l.route(Input::Key { vk: 0x10, down: true, text: None });
+        l.route(Input::Key { vk: 0x20, down: true, text: None });
+        l.route(Input::Key { vk: 0x20, down: false, text: None });
+        l.route(Input::Key { vk: 0x10, down: false, text: None });
+        l.route(Input::Key { vk: 0x11, down: false, text: None });
+        assert!(!l.captured());
+        assert_eq!(l.pointer_walls(), None);
+        // Back to edge scrolling, the click captures again.
+        l.set_map_movement(MapMovement::EdgeScroll);
         tick(&mut l, 16);
         left(&mut l, true, (600, 300));
-        assert!(l.pan.press.is_none() && l.pan.grab.is_none());
-        assert!(mv(&mut l, (700, 300)).is_empty());
-        left(&mut l, false, (700, 300));
+        left(&mut l, false, (600, 300));
         assert!(l.captured());
     }
 

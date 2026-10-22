@@ -81,22 +81,126 @@ const LAYOUTS: [&str; 5] = [
 ];
 
 #[test]
-fn the_capture_view_alone_has_an_attractor_at_its_middle_in_every_layout() {
+fn each_view_of_a_split_has_an_attractor_at_its_middle_in_every_layout() {
     let s = scene();
     for spec in LAYOUTS {
         let l = layout(spec, &s);
         let (rect, at) = l.capture_view().unwrap_or_else(|| panic!("{spec}: no capture view"));
         let captures: Vec<Target> = SnapInput::targets(&s, &l).into_iter().filter(Target::is_capture).collect();
-        assert_eq!(captures.len(), 1, "{spec}: one attractor, the capture view's");
+        let split = spec.starts_with("split");
+        assert_eq!(captures.len(), if split { 2 } else { 1 }, "{spec}: one attractor a view");
+        // The capture view's first, with the id of old.
         let c = captures[0].center();
         assert_eq!((c.0 as i32, c.1 as i32), middle(rect), "{spec}");
         assert_eq!(at, middle(rect), "{spec}");
-        assert_eq!(captures[0].rect, [rect[0] as f64, rect[1] as f64, rect[2] as f64, rect[3] as f64], "{spec}: on the capture view only");
+        assert_eq!(captures[0].id, CAPTURE_ID, "{spec}");
+        assert_eq!(captures[0].rect, [rect[0] as f64, rect[1] as f64, rect[2] as f64, rect[3] as f64], "{spec}: the capture view's");
+        let attractors = l.attractors();
+        assert!(attractors[0].captures, "{spec}");
+        if split {
+            // The other view's, at its middle; a click there does not capture.
+            let other = attractors[1];
+            assert!(!other.captures, "{spec}");
+            assert_eq!(other.at, middle(other.rect), "{spec}");
+            assert_ne!(other.rect, rect, "{spec}");
+            assert_eq!(captures[1].id, CAPTURE_ID - 1, "{spec}");
+            assert_eq!(captures[1].center(), (other.at.0 as f64, other.at.1 as f64), "{spec}");
+        }
     }
-    // No view following the world cursor: none.
+    // One view not following the world cursor: none; split, both views.
     let l = layout("main=focus", &s);
     assert!(l.capture_view().is_none());
     assert!(!SnapInput::targets(&s, &l).iter().any(Target::is_capture));
+    let l = layout("split=vertical,main=focus,pane=focus", &s);
+    assert_eq!(l.attractors().iter().filter(|a| !a.captures).count(), 2);
+}
+
+/// Alt pressed with the pointer at the strip's button B: the mode on (it
+/// starts on the driver's element nearest, never on an attractor), then
+/// one motion from there to window pixel `to`, an attractor's point: the
+/// pointer at rest there by 2 s.
+fn alt_at(l: &mut Layout, s: &Scene, to: (i32, i32)) -> SnapInput {
+    l.route(Input::MouseMove { x: 330, y: 535 });
+    let mut snap = SnapInput::default();
+    snap.route(key(ALT, true), l, s, 0.0, Rates::default());
+    snap.route(key(ALT, false), l, s, 0.0, Rates::default());
+    assert!(snap.active());
+    steer(&mut snap, l, s, 0.0, 1.0, (0.0, 0.0), 0.0);
+    snap_to(&mut snap, l, s, 1.0, to);
+    assert_eq!(snap.snapper.target(), Some((to.0 as f64, to.1 as f64)));
+    snap
+}
+
+/// One motion from where the pointer is to `to`, as long and as far as
+/// that (picks the element there, `pick`), then a second at rest.
+fn snap_to(snap: &mut SnapInput, l: &mut Layout, s: &Scene, now: f64, to: (i32, i32)) -> Vec<Input> {
+    let from = snap.snapper.target().unwrap();
+    assert_eq!(snap.motion(((to.0 as f64 - from.0) / MOTION_GAIN, (to.1 as f64 - from.1) / MOTION_GAIN)), Some(vec![]));
+    steer(snap, l, s, now, now + 1.0, (0.0, 0.0), 0.0)
+}
+
+#[test]
+fn the_other_views_attractor_puts_the_free_pointer_there_and_nothing_goes_to_the_game() {
+    let s = scene();
+    for spec in ["split=vertical,main=focus,pane=pointer", "split=horizontal,main=pointer,pane=focus"] {
+        let mut l = layout(spec, &s);
+        let other = l.attractors()[1];
+        let mut snap = alt_at(&mut l, &s, other.at);
+        assert_eq!(snap.snapper.target_id(), Some(CAPTURE_ID - 1), "{spec}");
+        let _ = l.take_warp();
+        let out = click(&mut snap, &mut l, &s, 2.5);
+        assert!(out.is_empty(), "{spec}: {out:?}");
+        assert!(!l.captured() && !snap.active() && !l.snapping(), "{spec}");
+        assert_eq!(l.take_warp(), Some(other.at), "{spec}: the system pointer there");
+        // Ticks after: nothing for the game, no attractors drawn.
+        assert!(no_world(&steer(&mut snap, &mut l, &s, 2.6, 3.0, (0.0, 0.0), 0.0)));
+        assert!(snap.attractor_points().is_empty(), "{spec}");
+    }
+}
+
+#[test]
+fn with_drag_or_under_a_popup_the_capture_views_attractor_does_not_capture() {
+    let s = scene();
+    // Drag: the free pointer goes there.
+    let mut l = layout("split=vertical,main=focus,pane=pointer", &s);
+    l.set_map_movement(viewer_settings::MapMovement::Drag);
+    frame(&mut l, &s);
+    let (rect, _) = l.capture_view().unwrap();
+    assert!(!l.attractors()[0].captures);
+    let mut snap = alt_at(&mut l, &s, middle(rect));
+    let _ = l.take_warp();
+    assert!(click(&mut snap, &mut l, &s, 2.5).is_empty());
+    assert!(!l.captured() && !snap.active());
+    assert_eq!(l.take_warp(), Some(middle(rect)));
+}
+
+#[test]
+fn attractors_are_drawn_while_the_mode_is_on_and_the_mouse_free() {
+    let s = scene();
+    let mut l = layout("split=vertical,main=focus,pane=pointer", &s);
+    let points: Vec<(i32, i32)> = l.attractors().iter().map(|a| a.at).collect();
+    l.route(Input::MouseMove { x: 330, y: 560 });
+    let mut snap = SnapInput::default();
+    snap.route(key(ALT, true), &mut l, &s, 0.0, Rates::default());
+    snap.route(key(ALT, false), &mut l, &s, 0.0, Rates::default());
+    steer(&mut snap, &mut l, &s, 0.0, 1.0, (0.0, 0.0), 0.0);
+    let drawn: Vec<(i32, i32)> = snap.attractor_points().iter().map(|&((x, y), _)| (x as i32, y as i32)).collect();
+    assert_eq!(drawn, points);
+    assert_eq!(snap.attractor_points().iter().map(|a| a.1).collect::<Vec<_>>(), [true, false], "B's captures, A's not");
+    // Off: none.
+    snap.route(key(ALT, true), &mut l, &s, 1.5, Rates::default());
+    snap.route(key(ALT, false), &mut l, &s, 1.5, Rates::default());
+    steer(&mut snap, &mut l, &s, 1.5, 2.5, (0.0, 0.0), 0.0);
+    assert!(snap.attractor_points().is_empty());
+    // On while captured: none drawn (the capture view is still a target).
+    let (rect, _) = l.capture_view().unwrap();
+    l.route(Input::MouseButton { button: Button::Left, down: true, x: middle(rect).0, y: middle(rect).1 });
+    l.route(Input::MouseButton { button: Button::Left, down: false, x: middle(rect).0, y: middle(rect).1 });
+    assert!(l.captured());
+    snap.route(key(ALT, true), &mut l, &s, 3.0, Rates::default());
+    snap.route(key(ALT, false), &mut l, &s, 3.0, Rates::default());
+    steer(&mut snap, &mut l, &s, 3.0, 3.5, (0.0, 0.0), 0.0);
+    assert!(snap.active() && snap.attractor_points().is_empty());
 }
 
 #[test]
@@ -142,16 +246,14 @@ fn clicking_the_attractor_recaptures_and_nothing_goes_to_the_world() {
         snap.route(key(ALT, false), &mut l, &s, 0.0, Rates::default());
         assert!(snap.active(), "{spec}");
         steer(&mut snap, &mut l, &s, 0.0, 1.0, (0.0, 0.0), 0.0);
-        // Towards the capture view's middle.
-        let from = snap.snapper.target().unwrap();
+        // Towards the capture view's middle (as far: in a split the other
+        // view's attractor may lie the same way).
         let to = middle(rect);
-        let d = (to.0 as f64 - from.0, to.1 as f64 - from.1);
-        let n = d.0.hypot(d.1);
-        let out = steer(&mut snap, &mut l, &s, 1.0, 2.0, (d.0 / n * 8.0, d.1 / n * 8.0), 1.05);
+        let out = snap_to(&mut snap, &mut l, &s, 1.0, to);
         assert_eq!(snap.snapper.target_id(), Some(CAPTURE_ID), "{spec}");
         assert_eq!(snap.snapper.target(), Some((to.0 as f64, to.1 as f64)), "{spec}");
         assert!(no_world(&out), "{spec}: {out:?}");
-        let out = click(&mut snap, &mut l, &s, 2.0);
+        let out = click(&mut snap, &mut l, &s, 2.5);
         assert!(out.is_empty(), "{spec}: {out:?}");
         assert!(l.captured() && !snap.active() && !l.snapping(), "{spec}");
         assert_eq!(l.take_grab(), Some(true), "{spec}");

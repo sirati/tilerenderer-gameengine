@@ -36,8 +36,7 @@ impl Layout {
         }
         self.last_world_pointer = self.last_world_pointer.map(point);
         self.magnifier_center = self.magnifier_center.map(point);
-        self.recapture = self.recapture.map(point);
-        self.recapture_screen = self.recapture_screen.map(point);
+        self.resume.at = self.resume.at.map(point);
         for pressed in &mut self.world_pressed { *pressed = pressed.map(point); }
         if let Some(explore) = &mut self.explore { explore.center = point(explore.center); }
         // Input still consults the last shown cameras before this frame's

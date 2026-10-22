@@ -37,12 +37,18 @@
 //! only on an element. Only at rest does the driver get the pointer there
 //! (the element shows its hover).
 //!
-//! **Clicks** go to the element snapped to, never to the world. The view
-//! a click captures the mouse in (the one following the world cursor) is
-//! an element too ([`TargetKind::Capture`], from the layout, not the
-//! driver), snapped to at its middle, which draws the pointer from afar
-//! ([`ATTRACTION`]): clicking it ends the mode and captures the mouse
-//! (again), the click going nowhere else. A command given in the mode (a
+//! **Clicks** go to the element snapped to, never to the world. Each view
+//! of a split (a single view if it follows the world cursor) has an
+//! attractor, an element too ([`TargetKind::Capture`], from the layout,
+//! `Layout::attractors`, not the driver), snapped to at its middle, which
+//! draws the pointer from afar ([`ATTRACTION`]) and is drawn there while
+//! the mouse is free ([`ATTRACTOR_SPRITES`]): clicking it ends the mode
+//! and goes back into the game in that view, capturing the mouse in the
+//! one following the world cursor where it may be (else the free pointer
+//! put there), the press and its release going nowhere else. With
+//! `viewer_settings::Input::alt_in_menus` the mode comes on by itself
+//! while a menu is open and goes with the last ([`SnapInput::set_alt_in_menus`]).
+//! A command given in the mode (a
 //! click on its button, or its key) that waits for a place of the world
 //! (`scene::Interface::targeting`, e.g. a go-to's destination) ends the
 //! mode the same way: the mouse is captured again, the view and the world
@@ -150,6 +156,9 @@ pub const ARROW_SPRITE: &str = "Viewer@cursors/0";
 pub const ARROW_GHOST_SPRITE: &str = "Viewer@cursor_ghost/0";
 pub const POINTER_SPRITE: &str = "Viewer@pointer/0";
 pub const GHOST_SPRITE: &str = "Viewer@pointer_ghost/0";
+/// The attractors (a click there goes back into the game): the game's
+/// crosshair, translucent (else the opaque crosshair, else the ghost).
+pub const ATTRACTOR_SPRITES: &str = "Viewer@attractor/";
 
 /// The id of the capture view's target (no driver's element has it).
 pub const CAPTURE_ID: u64 = u64::MAX;
@@ -1099,6 +1108,17 @@ pub struct SnapInput {
     /// Arrow keys whose press stepped a slider (their releases are ours).
     stepped_keys: Vec<u32>,
     shift: bool,
+    /// The mode comes on by itself while a menu is open
+    /// (`viewer_settings::Input::alt_in_menus`, [`SnapInput::set_alt_in_menus`]).
+    alt_in_menus: bool,
+    /// The mode is on because a menu is open (it goes off with the last).
+    by_menu: bool,
+    /// The player turned the mode off while menus were open: not on again
+    /// by itself until they are all closed.
+    menu_declined: bool,
+    /// The attractors drawn (window pixels; whether a click captures), as
+    /// of the last update: while the mode is on and the mouse is free.
+    attractors: Vec<(Point, bool)>,
 }
 
 /// An action as the driver gets it (nothing for a point it does not take
@@ -1166,14 +1186,17 @@ impl SnapInput {
             scene.interactables.iter().find(|item| item.id == target.id)
                 .and_then(|item| layout.driver_target_clip(item.rect))
         });
-        if let Some((rect, at)) = layout.capture_view() {
-            out.push(Target::capture(rect, at));
+        // Each view's attractor (A's and B's in a split), the capturing ones
+        // first; the first keeps the one id of old.
+        for (k, a) in layout.attractors().into_iter().enumerate() {
+            out.push(Target { id: CAPTURE_ID - k as u64, ..Target::capture(a.rect, a.at) });
         }
         out
     }
 
-    /// The actions as the driver gets them; a click on the capture view
-    /// ends the mode and captures the mouse.
+    /// The actions as the driver gets them; a click on an attractor ends
+    /// the mode and goes back to playing in its view (the mouse captured
+    /// there where it may be), nothing going to the driver.
     fn perform(&mut self, actions: Vec<Action>, layout: &mut Layout) -> Vec<Input> {
         let mut out = Vec::new();
         for a in actions {
@@ -1181,10 +1204,8 @@ impl SnapInput {
                 Action::Capture(p) => {
                     self.snapper.stop();
                     let p = (p.0.round() as i32, p.1.round() as i32);
-                    if !layout.captured() {
-                        layout.capture_at(p);
-                    }
-                    log::debug!("snap: the capture view clicked: off, the mouse captured at {p:?}");
+                    layout.attractor_clicked(p);
+                    log::debug!("snap: an attractor clicked: off, the mouse {} at {p:?}", if layout.captured() { "captured" } else { "free" });
                 }
                 a => out.extend(to_input(a, layout)),
             }
@@ -1473,6 +1494,16 @@ impl SnapInput {
                 self.alt = false;
                 if std::mem::take(&mut self.alt_sent) { layout.route(input) } else { vec![] }
             }
+            // On by itself for a menu, Esc is the menu's (it closes it, as
+            // without the mode); the mode goes with the last menu.
+            Input::Key { vk: VK_ESCAPE, .. } if self.by_menu && layout.menu_open() => layout
+                .route(input)
+                .into_iter()
+                .map(|i| match i {
+                    Input::WorldKey { vk, down, text, .. } => Input::Key { vk, down, text },
+                    i => i,
+                })
+                .collect(),
             Input::Key { vk: VK_ESCAPE, down: true, .. } if self.snapper.snapping() => {
                 self.esc = true;
                 self.leave(layout, "Esc")
@@ -1507,7 +1538,14 @@ impl SnapInput {
             // pointer is the pointer.)
             Input::MouseMove { .. } if self.active() => vec![],
             Input::MouseButton { button, down, x, y } => match self.snapper.click(button, down) {
-                Some(actions) => self.perform(actions, layout),
+                Some(actions) => {
+                    // (An attractor's click is the viewer's: its release
+                    // goes nowhere either.)
+                    if down && actions.iter().any(|a| matches!(a, Action::Capture(_))) {
+                        self.swallowed_buttons[button_index(button)] = true;
+                    }
+                    self.perform(actions, layout)
+                }
                 None => layout.route(Input::MouseButton { button, down, x, y }),
             },
             Input::Wheel { .. } if self.slider.is_some() => vec![],
@@ -1556,6 +1594,59 @@ impl SnapInput {
 
     /// Time `now`: the pointer moves on; what goes to the driver.
     pub fn tick(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
+        let mut out = self.menu_mode(layout, scene, now, rates);
+        out.extend(self.tick_mode(layout, scene, now, rates));
+        // (Drawn while the mode is on and the mouse free.)
+        self.attractors = if self.active() && !layout.captured() {
+            layout.attractors().into_iter().map(|a| ((a.at.0 as f64, a.at.1 as f64), a.captures)).collect()
+        } else {
+            Vec::new()
+        };
+        out
+    }
+
+    /// Whether the mode comes on by itself while a menu is open
+    /// (`viewer_settings::Input::alt_in_menus`; false while the window does
+    /// not have the focus, so that nothing holds the pointer of a window in
+    /// the background).
+    pub fn set_alt_in_menus(&mut self, on: bool) {
+        self.alt_in_menus = on;
+    }
+
+    /// The attractors to draw: window pixels, and whether a click there
+    /// captures the mouse.
+    pub fn attractor_points(&self) -> &[(Point, bool)] {
+        &self.attractors
+    }
+
+    /// With [`SnapInput::set_alt_in_menus`]: a menu opening turns the mode
+    /// on (where it has something to snap to), the last one closing turns
+    /// it off again, a mode the player had turned on stays as it is. The
+    /// player turning it off (Alt, Ctrl, an attractor, focus) keeps it off
+    /// until the menus are all closed.
+    fn menu_mode(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
+        let menu = layout.menu_open();
+        if self.by_menu && !self.snapper.snapping() {
+            self.by_menu = false;
+            self.menu_declined = menu;
+            log::debug!("snap: the mode a menu turned on was turned off");
+        }
+        if !menu {
+            self.menu_declined = false;
+            if std::mem::take(&mut self.by_menu) {
+                return self.leave(layout, "the menus closed");
+            }
+            return vec![];
+        }
+        if self.alt_in_menus && !self.by_menu && !self.menu_declined && !self.snapper.snapping() && !self.alt && Self::targets(scene, layout).iter().any(|t| !t.is_capture()) {
+            self.by_menu = true;
+            log::debug!("snap: a menu is open: button snapping on by itself");
+            return self.enter(layout, scene, now, rates);
+        }
+        vec![]
+    }
+
+    fn tick_mode(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
         // A command given in the mode (its button clicked, or its key)
         // waits for a place of the world: the next click is the world's,
         // so the mode ends and the mouse is captured for it.
@@ -1633,13 +1724,20 @@ impl SnapInput {
         // (Under the pointer it would not be seen.)
         let ghost = self.snapper.ghost().filter(|g| (g.0 - pointer.0).hypot(g.1 - pointer.1) >= 2.0).map(|g| (set(&[ARROW_GHOST_SPRITE, GHOST_SPRITE]), g));
         let solid = Some((set(&[ARROW_SPRITE, POINTER_SPRITE, crate::CURSOR_SPRITE]), pointer));
-        for (set, (x, y)) in ghost.into_iter().chain(solid) {
+        // Under them, the attractors: the translucent crosshair (a click
+        // there goes back into the game), in each view's middle.
+        let prefixed = |prefix: &str| compiled.sets_with_prefix(prefix).map(|(_, s)| s).next();
+        let attractor = prefixed(ATTRACTOR_SPRITES).or_else(|| prefixed(crate::cursor::CAPTURE_SPRITES)).or_else(|| set(&[ARROW_GHOST_SPRITE, GHOST_SPRITE]));
+        let attractors = self.attractors.iter().map(|&(at, _)| (attractor, at));
+        let reserve = |is_attractor: bool| if is_attractor { 2 } else { 0 };
+        for (k, (set, (x, y))) in attractors.chain(ghost).chain(solid).enumerate() {
             let Some(art) = set.and_then(|set| crate::cursor::SetArt::of(compiled, set)) else { continue };
             let marks = crate::cursor::Marks { window: vec![(x.round() as i32, y.round() as i32)], ..Default::default() };
             let c = crate::cursor::compose(art, &marks, &[], &[], scale, window, overlay, (0, 0));
-            // Its own cameras after those taken already.
+            // Its own cameras after those taken already (an attractor only
+            // where the ghost and the pointer still find theirs).
             let first = next + out.top.len() as u32;
-            if !c.top.is_empty() && (first as usize + c.top.len()) > tile_render::MAX_VIEWS {
+            if !c.top.is_empty() && (first as usize + c.top.len() + reserve(k < self.attractors.len())) > tile_render::MAX_VIEWS {
                 continue;
             }
             out.sprites.extend(c.sprites.into_iter().map(|mut s| {
@@ -1672,6 +1770,10 @@ mod status_controls;
 #[cfg(test)]
 #[path = "snap/targeting.rs"]
 mod targeting;
+
+#[cfg(test)]
+#[path = "snap/menus.rs"]
+mod menus;
 
 #[cfg(test)]
 #[path = "snap/cursor_size.rs"]

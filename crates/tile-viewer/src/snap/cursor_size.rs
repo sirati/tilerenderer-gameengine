@@ -63,6 +63,9 @@ fn the_snapping_pointer_is_the_sprite_cursors_size_and_hot_spot() {
     let mut snap = SnapInput::default();
     snap.route(Input::Key { vk: 0x12, down: true, text: None }, &mut l, &s, 0.0, Rates::default());
     snap.tick(&mut l, &s, 1.0, Rates::default());
+    // (The pointer alone: the attractor's art is `targeting`'s.)
+    assert_eq!(snap.attractors.len(), 1);
+    snap.attractors.clear();
     let at = snap.snapper.pointer().unwrap();
     let at = (at.0.round() as i32, at.1.round() as i32);
     let set = compiled.set(ARROW_SPRITE).unwrap().0;

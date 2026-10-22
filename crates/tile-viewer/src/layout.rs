@@ -86,10 +86,12 @@
 //!
 //! # The divider
 //!
-//! While the mouse is not captured the divider between A and B is a wall
-//! except in its middle third (drawn without the line there) and where the
-//! driver's always reachable controls are (`Interface::reachable`, e.g. the
-//! unit's orders): the pointer pushed against it stays in its view (the
+//! The divider is a band of frosted glass (`glass`). While the mouse is not
+//! captured it is a wall except in its middle third (no glass there) and
+//! along the rows of the driver's always reachable controls
+//! (`Interface::reachable`, e.g. the unit's orders, reaching over the gap
+//! or cut there); with Drag map movement nowhere (`capture`). The pointer
+//! pushed against it stays in its view (the
 //! window is asked to move the system pointer back, [`Layout::take_warp`],
 //! or the system holds it out of [`Layout::pointer_walls`], [`Walls`])
 //! and scrolls that view instead through the viewer's pixel-based camera
@@ -107,6 +109,10 @@ use scene::{Button, Input, Scene};
 
 #[path = "pan.rs"]
 mod pan;
+#[path = "glass.rs"]
+mod glass;
+#[path = "capture.rs"]
+mod capture;
 #[path = "world_rescale.rs"]
 mod world_rescale;
 #[path = "unit_orders.rs"]
@@ -122,6 +128,8 @@ mod city_screen_tests;
 #[path = "cursor_screen_tests.rs"]
 mod cursor_screen_tests;
 pub use pan::{DRAG_THRESHOLD, Momentum, Tracker};
+pub use capture::{Attractor, RESUME_AFTER};
+pub use glass::Shade;
 use tile_render::{Camera, ScreenCopy};
 use viewer_settings::{Place, Roles, ScreenPlace, UnitButtons};
 
@@ -502,11 +510,11 @@ pub struct Frame {
     pub unit_orders: Option<UnitOrdersPlace>,
     pub copies: Vec<ScreenCopy>,
     pub markers: Vec<Marker>,
-    /// The divider's line where it is closed: per piece, the camera
-    /// (clearing the gap there) to draw it in, the gap's rectangle there
-    /// (x, y, w, h), and whether the split is side by side. A light core in
-    /// a dark gap, seen on any background (`crate::DIVIDER_SPRITE`).
-    pub divider: Vec<(u32, [i32; 4], bool)>,
+    /// The divider's glass (`glass`): per strip one pixel across the gap,
+    /// the camera of the half of the gap it lies in (the pane's picture
+    /// going on there) to draw it in, its rectangle (x, y, w, h), whether
+    /// the split is side by side, and its shade (`crate::glass_sprite`).
+    pub divider: Vec<(u32, [i32; 4], bool, Shade)>,
     /// Where the cursor drawn in a view the pointer is not in (the world
     /// cursor mirrored there) goes in the drawing order: before this camera,
     /// the first of the driver's interface over the world views, so that
@@ -712,10 +720,9 @@ pub struct Layout {
     popup_pan: Option<(Hit, (i32, i32))>,
     /// The world's period where it wraps (world pixels; 0: no wrap).
     world_period: (i32, i32),
-    /// The world cursor to capture the mouse at again once the popup that
-    /// let it go closes; the screen likewise.
-    recapture: Option<(i32, i32)>,
-    recapture_screen: Option<(i32, i32)>,
+    /// A capture a menu interrupted, taken up again once no menu is open
+    /// (`capture`).
+    resume: capture::Resume,
     /// The pointer goes to the screen just opened (this frame), or to the
     /// popup.
     pointer_to_screen: bool,
@@ -921,8 +928,7 @@ impl Default for Layout {
             dismissed: [false; 3],
             popup_pan: None,
             world_period: (0, 0),
-            recapture: None,
-            recapture_screen: None,
+            resume: capture::Resume::default(),
             pointer_to_screen: false,
             pointer_to_popup: false,
             focus_after_scale: None,
@@ -1382,7 +1388,7 @@ impl Layout {
     /// reaches across the gap (and the always reachable controls, a little
     /// around them), as [`Layout::constrain`] lets the pointer through.
     fn divider_pointer_walls(&self) -> Option<Vec<[i32; 4]>> {
-        if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping {
+        if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping || self.pointer_free_everywhere() {
             return None;
         }
         let (((g0, g1), _), split) = (self.gap()?, self.split?);
@@ -1421,7 +1427,7 @@ impl Layout {
     /// strips include the gap below them, so the pointer stops on the map's
     /// top row. Interface controls drawn over a zoom remain reachable.
     pub fn pointer_walls(&self) -> Option<Vec<[i32; 4]>> {
-        if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping {
+        if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping || self.pointer_free_everywhere() {
             return None;
         }
         let mut walls = self.divider_pointer_walls().unwrap_or_default();
@@ -1513,7 +1519,7 @@ impl Layout {
 
     /// The pointer the window is to show, when that changed.
     pub fn take_pointer_icon(&mut self) -> Option<PointerIcon> {
-        let icon = if !self.locked && self.capture_hit(self.pointer).is_some() { PointerIcon::Capture } else { PointerIcon::Default };
+        let icon = if !self.locked && self.capture_hit(self.pointer).is_some_and(|h| self.capture_refused(h).is_none()) { PointerIcon::Capture } else { PointerIcon::Default };
         (icon != self.icon).then(|| {
             self.icon = icon;
             icon
@@ -1668,6 +1674,8 @@ impl Layout {
         self.cancel_unit_order();
         self.last_world_pointer = None;
         self.menu_pan.cancel_drag();
+        // (Back in the window a click captures it: nothing pending does.)
+        self.forget_resume();
         if self.locked {
             self.release("the window lost the mouse");
         }
@@ -1950,7 +1958,7 @@ impl Layout {
         self.against = None;
         // (Where the system pointer cannot be moved back, a wall would hold
         // the pointer where it is not seen: it passes.)
-        if self.walls == Walls::Open {
+        if self.walls == Walls::Open || self.pointer_free_everywhere() {
             self.side = self.side_of(to);
             return to;
         }
@@ -2251,23 +2259,13 @@ impl Layout {
             }
             // A screen opening lets go of a captured mouse, the pointer on
             // its main control (below, once it is placed); captured again
-            // when it closes.
-            match (&parts.screen, &self.screen) {
-                (Some(_), None) if self.locked => {
-                    self.recapture_screen = Some(self.cursor);
+            // once no menu is open (`settle_capture`, below).
+            if let (Some(_), None) = (&parts.screen, &self.screen) {
+                if self.locked {
+                    self.suspend_capture();
                     self.release_here("a screen opened");
                     self.pointer_to_screen = true;
                 }
-                (None, Some(_)) => {
-                    if let Some(cursor) = self.recapture_screen.take().filter(|_| self.follows_pointer() && !self.locked) {
-                        self.cursor = cursor;
-                        self.locked = true;
-                        self.grab = Some(true);
-                        self.against = None;
-                        log::info!("viewer: mouse captured again (the screen closed)");
-                    }
-                }
-                _ => {}
             }
         }
         self.clock += dt;
@@ -2309,6 +2307,9 @@ impl Layout {
             }
         }
         self.screen = parts.screen.clone();
+        // With the screen and popups known: no capture under a menu, and
+        // one a menu interrupted taken up once all are gone (`capture`).
+        self.settle_capture();
         self.focus = scene.focus;
         // Where the views look (from what the last frame showed). (While a
         // view follows the world cursor it stays where the mouse was let
@@ -2665,21 +2666,19 @@ impl Layout {
             push(&mut frame, camera);
             self.shown.push((Hit::Pane, camera));
         }
-        // The divider's open stretches show no line: each pane's picture
-        // goes on into its half of the gap there.
-        let fillers: Vec<Camera> = self.fillers();
-        for filler in fillers.into_iter().filter(|_| take(1)) {
-            push(&mut frame, filler);
-        }
-        // The divider's line where it is closed (all of it while the mouse
-        // is captured): the gap cleared there, its line drawn over it.
-        for (rect, vertical) in self.divider_pieces() {
+        // Each pane's picture goes on under its half of the gap; the glass
+        // over it where the divider is shown (`glass`).
+        let mut halves = Vec::new();
+        for (rect, camera) in self.gap_halves() {
             if !take(1) {
                 break;
             }
-            let camera = Camera { zoom: (2, 1), origin: (rect[0], rect[1]), cells: false, ..Camera::new((rect[2].max(1) as u32, rect[3].max(1) as u32)) };
-            let index = push(&mut frame, camera);
-            frame.divider.push((index, rect, vertical));
+            halves.push((rect, push(&mut frame, camera)));
+        }
+        for (rect, vertical, shade) in self.glass_strips() {
+            if let Some(&(_, index)) = halves.iter().find(|(h, _)| inside(*h, (rect[0], rect[1]))) {
+                frame.divider.push((index, rect, vertical, shade));
+            }
         }
         for (k, inset) in self.insets.iter().enumerate().take(insets) {
             push(&mut frame, frame_of(inset.rect));
@@ -2908,8 +2907,7 @@ impl Layout {
         self.popup_anchor_seen = None;
         self.chain_press = None;
         self.popup_pan = None;
-        self.recapture = None;
-        self.recapture_screen = None;
+        self.forget_resume();
         self.pointer_to_screen = false;
         self.pointer_to_popup = false;
         self.against = None;
@@ -2972,8 +2970,7 @@ impl Layout {
         self.focus = None;
         self.magnifier_shown = false;
         self.menu_side = None;
-        self.recapture = None;
-        self.recapture_screen = None;
+        self.forget_resume();
         if self.locked && self.explore.is_none() { self.release("a preview screen opened"); }
         let [sx, sy, sw, sh] = beside.screen;
         let scaled = |v: i32| (v as i64 * self.menu_scale.0.max(1) as i64).div_euclid(self.menu_scale.1.max(1) as i64) as i32;
@@ -3166,7 +3163,7 @@ impl Layout {
             }
             log::info!("viewer: the popup opened at the world click {:?} ({:?})", press.world, press.hit);
             if self.locked {
-                self.recapture = Some(self.cursor);
+                self.suspend_capture();
                 self.release_here("a popup is open");
             }
             return;
@@ -3179,7 +3176,7 @@ impl Layout {
             log::info!("viewer: the popup opened at the click: moved by {d:?}");
         }
         if self.locked {
-            self.recapture = Some(self.cursor);
+            self.suspend_capture();
             self.release_here("a popup is open");
             // (On the popup, where it shows: below, once it is placed.)
             self.pointer_to_popup = self.popup_anchor.is_none();
@@ -3210,7 +3207,8 @@ impl Layout {
         }
     }
 
-    /// The popup closed: a mouse let go for it is captured again.
+    /// The popup closed (a mouse let go for it is captured again once no
+    /// menu is open: `settle_capture`).
     fn popup_closed(&mut self) {
         self.popup_anchor = None;
         self.chain_press = self.anchored.map(|(_, p)| (p, self.clock));
@@ -3218,13 +3216,6 @@ impl Layout {
         self.popup_anchor_seen = None;
         self.popup_pan = None;
         self.popup_side = None;
-        if let Some(cursor) = self.recapture.take().filter(|_| self.follows_pointer() && !self.locked) {
-            self.cursor = cursor;
-            self.locked = true;
-            self.grab = Some(true);
-            self.against = None;
-            log::info!("viewer: mouse captured again (the popup closed)");
-        }
     }
 
     /// The opening view's current bounds, retained while the popup is open.
@@ -3336,31 +3327,6 @@ impl Layout {
     /// frame): their window rectangle and how far they were moved.
     pub fn moved_parts(&self) -> &[([i32; 4], (i32, i32))] {
         if self.fit.is_some() { &[] } else { &self.moved }
-    }
-
-    /// What shows the panes' pictures in the divider's open stretches: for
-    /// each pane showing the world (not a fitted screen), its camera cut to
-    /// its half of the gap there.
-    fn fillers(&self) -> Vec<Camera> {
-        let (Some(((g0, g1), _)), Some(split)) = (self.gap(), self.split) else { return vec![] };
-        let fitted = self.fit.map(|f| f.hit);
-        let half = (g1 - g0) / 2;
-        let mut out = Vec::new();
-        for (a, b) in self.open_spans() {
-            for (hit, from, to) in [(Hit::Main, g0, g0 + half), (Hit::Pane, g0 + half, g1)] {
-                let Some((_, c)) = self.shown.iter().find(|(h, _)| *h == hit && Some(hit) != fitted) else { continue };
-                if to <= from || c.stacked {
-                    continue;
-                }
-                let (at, size) = match split.axis {
-                    Axis::Vertical => ((from, a), ((to - from) as u32, (b - a) as u32)),
-                    Axis::Horizontal => ((a, from), ((b - a) as u32, (to - from) as u32)),
-                };
-                let (x, y) = world_at_floor(c, at);
-                out.push(Camera { x, y, origin: at, viewport: size, ..*c });
-            }
-        }
-        out
     }
 
     /// The driver's main view as the main pane shows it: following the
@@ -3725,6 +3691,18 @@ impl Layout {
             self.raw_pointer = middle;
             self.warp = Some(middle);
             self.side = self.side_of(middle);
+            // Where it may not be captured (Drag, a menu): the free pointer
+            // there, the command's target the tile under it.
+            if let Some(why) = self.capture_refused(hit) {
+                log::info!("viewer: a command waits for a place of the world: the pointer goes to {hit:?} ({why})");
+                let out = match self.route_world(self.world_under(middle).unwrap_or(self.cursor)) {
+                    Ok((x, y)) => vec![Input::MouseMove { x, y }],
+                    Err(Some((x, y))) if self.explore.is_none() => vec![Input::WorldMove { x, y }],
+                    Err(_) => vec![],
+                };
+                self.remember_world_inputs(&out);
+                return Some(out);
+            }
             // (`capture` without moving the world cursor to the middle.)
             self.locked = true;
             self.grab = Some(true);
@@ -3768,16 +3746,15 @@ impl Layout {
     }
 
     /// Captures the mouse at window pixel `p` as a click there would (the
-    /// snapping pointer's click on [`Layout::capture_view`]); whether it did.
+    /// snapping pointer's click on an attractor, [`Layout::attractors`]);
+    /// whether it did: not where no view following the world cursor is,
+    /// nor where Drag or a menu refuses it (a popup opened at a world click
+    /// is dismissed, the mouse captured once it is gone; `capture`).
     pub fn capture_at(&mut self, p: (i32, i32)) -> bool {
         let Some(hit) = self.capture_hit(p).filter(|_| !self.locked) else { return false };
         self.pointer = p;
         self.raw_pointer = p;
-        self.capture(hit, p);
-        if self.click_popup_open() {
-            self.unit_order_events_push(Input::DismissPopup);
-        }
-        true
+        self.player_capture(hit, p)
     }
 
     /// The system has finished placing the free pointer at `p`. A hint may
@@ -4212,9 +4189,9 @@ impl Layout {
 
     /// A press at `p` while a popup anchored at a world click is open: if it
     /// is outside its body (or the mouse is captured), it dismisses
-    /// the popup, capturing the mouse where a left click into a view
-    /// following the world cursor would; `None`: a press like any other
-    /// (on the popup).
+    /// the popup; made where a left click into a view following the world
+    /// cursor captures the mouse, it is captured there once the popup is
+    /// gone (`capture`); `None`: a press like any other (on the popup).
     fn dismissing_press(&mut self, button: Button, p: (i32, i32)) -> Option<Vec<Input>> {
         if !self.locked {
             let on_popup = if let Some(shown) = self.interface_shown.as_deref() {
@@ -4230,8 +4207,9 @@ impl Layout {
         }
         self.dismissed[button_index(button)] = true;
         if button == Button::Left && !self.locked {
+            // (Not under the popup: once it is gone, `capture`.)
             if let Some(into) = self.capture_hit(p) {
-                self.capture(into, p);
+                self.capture_after_dismissal(into);
             }
         }
         log::info!("viewer: a press beside the popup opened at a world click dismisses it");
@@ -4295,8 +4273,9 @@ impl Layout {
                 return vec![];
             }
             // Clicking into a view that follows the world cursor captures
-            // the mouse there.
-            (Button::Left, _) if !self.locked && self.capture_hit(p).is_some() => {
+            // the mouse there (where it may: no menu over it, no Drag; else
+            // it is a click on the world there, `capture`).
+            (Button::Left, _) if !self.locked && self.capture_hit(p).is_some_and(|h| self.capture_refused(h).is_none()) => {
                 let into = self.capture_hit(p).expect("checked");
                 self.capture(into, p);
                 return vec![];
@@ -4508,10 +4487,7 @@ impl Layout {
                 if self.locked {
                     self.release_here("Ctrl+Shift+Space");
                 } else if let Some(into) = self.capture_hit(p) {
-                    self.capture(into, p);
-                    if self.click_popup_open() {
-                        self.unit_order_events_push(Input::DismissPopup);
-                    }
+                    self.player_capture(into, p);
                 } else {
                     log::info!("viewer: mouse stays free (no view under the pointer follows the world cursor)");
                 }
@@ -4568,6 +4544,12 @@ impl Layout {
 mod tests {
     include!("layout/capture_focus_tests.rs");
     use super::*;
+
+    /// The mouse capture across menus and modes (`capture`).
+    mod capture_menus {
+        use super::*;
+        include!("layout/capture_tests.rs");
+    }
     use scene::{View, ViewState};
 
     fn scene() -> Scene {
@@ -4585,6 +4567,17 @@ mod tests {
 
     fn frame(l: &mut Layout, interface: Vec<[i32; 4]>) -> Frame {
         l.frame(&scene(), (800, 600), (0, 0, 0, 0), interface, BOUNDS)
+    }
+
+    /// Frames of `s` (no menu in it) until a capture a menu interrupted is
+    /// taken up again ([`capture::RESUME_AFTER`]): not in the first.
+    fn menus_gone(l: &mut Layout, s: &Scene) {
+        l.frame(s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(!l.captured(), "not at once: another menu may follow");
+        for _ in 0..3 {
+            l.advance(std::time::Duration::from_millis(100));
+            l.frame(s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        }
     }
 
     fn click(l: &mut Layout, p: (i32, i32)) -> Vec<Input> {
@@ -4690,13 +4683,13 @@ mod tests {
         assert!(ctrl_shift(&mut l, 0x53).is_empty());
         l.split.as_mut().unwrap().view = FreeView { center: (5000, 2000), ..FreeView::new((0, 0), ONE, Follow::Free) };
         let f = frame(&mut l, vec![]);
-        // The panes, the pictures going on into the divider's open middle
-        // third, its line above and below that, the interface.
-        assert_eq!(f.cameras.len(), 7);
+        // The panes, the pictures going on into the divider's halves (the
+        // glass drawn in them), the interface.
+        assert_eq!(f.cameras.len(), 5);
         assert_eq!(f.cameras[0].viewport, (400, 600));
         assert_eq!(f.cameras[1].origin, (404, 0));
-        assert_eq!((f.cameras[2].origin, f.cameras[2].viewport), ((400, 200), (2, 200)));
-        assert_eq!((f.cameras[3].origin, f.cameras[3].viewport), ((402, 200), (2, 200)));
+        assert_eq!((f.cameras[2].origin, f.cameras[2].viewport), ((400, 0), (2, 600)));
+        assert_eq!((f.cameras[3].origin, f.cameras[3].viewport), ((402, 0), (2, 600)));
         // A click there: the driver is asked to look, and told of the
         // press and release on that world pixel.
         let out = click(&mut l, (600, 300));
@@ -5212,11 +5205,9 @@ mod tests {
             }
             assert_eq!(l.insets.len(), MAX_INSETS);
             let f = frame(&mut l, vec![]);
-            // (The pictures going on into the divider's middle third: the
-            // pane's, and the main pane's unless it is the fitted screen.)
-            let fillers = if ui == "pane" { 1 } else { 2 };
-            // (And the divider's line above and below its open middle.)
-            assert_eq!(f.cameras.len(), 2 + 1 + 2 * MAX_INSETS + 2 + fillers + 2, "ui={ui}");
+            // (The divider's two halves: the panes' pictures going on under
+            // the glass, a block of the background beside a fitted screen.)
+            assert_eq!(f.cameras.len(), 2 + 1 + 2 * MAX_INSETS + 2 + 2, "ui={ui}");
             assert!(f.cameras.len() <= tile_render::MAX_VIEWS);
             // The interface on top of the viewer's own views (bar the
             // magnifier), or in the pane.
@@ -6723,21 +6714,23 @@ mod tests {
     }
 
     #[test]
-    fn the_divider_is_open_in_its_middle_third_and_drawn_without_a_line_there() {
+    fn the_divider_is_open_in_its_middle_third_and_drawn_without_glass_there() {
         let mut l = split_1to1();
         assert_eq!(l.gap(), Some(((400, 404), (0, 600))));
         assert_eq!(l.open_spans(), [(200, 400)]);
         let f = frame(&mut l, vec![]);
         let fillers: Vec<_> = f.cameras.iter().filter(|c| c.viewport.0 == 2).map(|c| (c.origin, c.viewport, (c.x, c.y))).collect();
         // A's picture goes on two pixels into the gap, B's from the other
-        // side, the same world pixels as next to them.
+        // side, the same world pixels as next to them, the whole gap long
+        // (under the glass too); no glass over the open third.
         let b = camera_at(&f, (404, 0));
-        assert_eq!(fillers, [((400, 200), (2, 200), (1600, 700)), ((402, 200), (2, 200), (b.x - 2, b.y + 200))]);
+        assert_eq!(fillers, [((400, 0), (2, 600), (1600, 500)), ((402, 0), (2, 600), (b.x - 2, b.y))]);
+        assert!(f.divider.iter().all(|d| d.1[1] + d.1[3] <= 200 || d.1[1] >= 400), "{:?}", f.divider);
         // Horizontal: the same across.
         let mut h = arranged(&settings(|s| s.split = S::Horizontal1To1));
         assert_eq!(h.open_spans(), [(266, 534)]);
         let f = frame(&mut h, vec![]);
-        assert!(f.cameras.iter().any(|c| c.origin == (266, 300) && c.viewport == (268, 2)), "{:?}", f.cameras);
+        assert!(f.cameras.iter().any(|c| c.origin == (0, 300) && c.viewport == (800, 2)), "{:?}", f.cameras);
     }
 
     #[test]
@@ -6993,7 +6986,8 @@ mod tests {
         l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!(l.open_spans(), [(200, 400), (520, 584)]);
-        assert_eq!(f.cameras.iter().filter(|c| c.viewport == (2, 64) && c.origin.1 == 520).count(), 2);
+        // No glass over their rows.
+        assert!(f.divider.iter().all(|d| d.1[1] + d.1[3] <= 520 || d.1[1] >= 584), "{:?}", f.divider);
         // From A into them and on into B.
         mv(&mut l, (300, 540));
         mv(&mut l, (420, 540));
@@ -7009,11 +7003,19 @@ mod tests {
         mv(&mut l, (600, 595));
         mv(&mut l, (100, 595));
         assert_eq!(l.pointer, (404, 595));
-        // Not reaching over the gap: no gap of their own.
+        // Not reaching over the gap (the strip cut at the divider, or all
+        // in one view): their rows are open all the same, the pointer
+        // crosses from one view to the other there, both ways.
         let mut s = scene();
         s.interface.reachable = Some([100, 520, 128, 64]);
         l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(l.open_spans(), [(200, 400)]);
+        assert_eq!(l.open_spans(), [(200, 400), (520, 584)]);
+        assert!(l.pointer_walls().unwrap_or_default().iter().all(|w| w[1] + w[3] <= 520 - GAP || w[1] >= 584 + GAP), "{:?}", l.pointer_walls());
+        mv(&mut l, (300, 540));
+        mv(&mut l, (500, 540));
+        assert_eq!((l.pointer, l.side), ((500, 540), Some(Side::B)));
+        mv(&mut l, (300, 570));
+        assert_eq!((l.pointer, l.side), ((300, 570), Some(Side::A)));
     }
 
     #[test]
@@ -7355,7 +7357,7 @@ mod tests {
         assert_eq!(click(&mut l, row)[0], Input::MouseButton { button: Button::Left, down: true, x: qx + 20, y: qy + 30 });
         // Closed: captured again, at the world cursor it had.
         let cursor = l.cursor;
-        l.frame(&with_parts(None), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        menus_gone(&mut l, &with_parts(None));
         assert!(l.captured());
         assert_eq!((l.take_grab(), l.cursor), (Some(true), cursor));
     }
@@ -7386,7 +7388,7 @@ mod tests {
         // (A is 400 wide: the 800x600 screen at 1/2.)
         assert_eq!(l2.take_warp(), Some((250, 200)));
         // Closed: captured again at the world cursor it had.
-        l.frame(&scene(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        menus_gone(&mut l, &scene());
         assert!(l.captured());
         assert_eq!((l.take_grab(), l.cursor), (Some(true), BOUNDS.unwrap().clamp_point(cursor)));
         // A screen opening with the mouse free leaves the pointer alone.
@@ -7417,21 +7419,54 @@ mod tests {
     }
 
     #[test]
-    fn the_divider_is_drawn_where_it_is_closed() {
+    fn the_divider_is_glass_where_it_is_closed() {
+        use glass::Shade::{Frost, Light, Shadow};
+        let shades = [Light, Frost, Frost, Shadow];
+        // Free, edge scrolling: the closed thirds, one strip a column, the
+        // light edge on A's side and the shadow on B's.
         let mut l = split_1to1();
         let f = frame(&mut l, vec![]);
-        let pieces: Vec<[i32; 4]> = f.divider.iter().map(|d| d.1).collect();
-        assert_eq!(pieces, [[400, 0, 4, 200], [400, 400, 4, 200]]);
-        assert!(f.divider.iter().all(|&(c, r, vertical)| vertical && f.cameras[c as usize].origin == (r[0], r[1]) && !f.cameras[c as usize].cells));
+        let strips: Vec<([i32; 4], bool, Shade)> = f.divider.iter().map(|d| (d.1, d.2, d.3)).collect();
+        let mut expected = Vec::new();
+        for y in [(0, 200), (400, 200)] {
+            for k in 0..4 {
+                expected.push(([400 + k, y.0, 1, y.1], true, shades[k as usize]));
+            }
+        }
+        assert_eq!(strips, expected);
+        // Each drawn in the half of the gap it lies in, over that pane's
+        // picture going on there (a world camera, the whole gap long).
+        for &(c, r, _, _) in &f.divider {
+            let cam = f.cameras[c as usize];
+            assert!(cam.cells, "the world shows through");
+            let half = if r[0] < 402 { (400, 0) } else { (402, 0) };
+            assert_eq!((cam.origin, cam.viewport), (half, (2, 600)), "{r:?}");
+        }
         // Captured: all of it.
         let mut l = arranged(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse)));
         click(&mut l, (600, 300));
         let f = frame(&mut l, vec![]);
-        assert_eq!(f.divider.iter().map(|d| d.1).collect::<Vec<_>>(), [[400, 0, 4, 600]]);
-        // Stacked: across.
+        assert_eq!(f.divider.iter().map(|d| d.1).collect::<Vec<_>>(), (0..4).map(|k| [400 + k, 0, 1, 600]).collect::<Vec<_>>());
+        // Drag: the pointer passes everywhere, the glass is all of it.
+        let mut l = split_1to1();
+        l.set_map_movement(viewer_settings::MapMovement::Drag);
+        let f = frame(&mut l, vec![]);
+        assert_eq!(f.divider.iter().map(|d| (d.1, d.3)).collect::<Vec<_>>(), (0..4).map(|k| ([400 + k, 0, 1, 600], shades[k as usize])).collect::<Vec<_>>());
+        // Stacked: rows across.
         let mut h = arranged(&settings(|s| s.split = S::Horizontal1To1));
         let f = frame(&mut h, vec![]);
-        assert_eq!(f.divider.iter().map(|d| (d.1, d.2)).collect::<Vec<_>>(), [([0, 300, 266, 4], false), ([534, 300, 266, 4], false)]);
+        let rows: Vec<_> = f.divider.iter().map(|d| (d.1, d.2)).collect();
+        let mut expected = Vec::new();
+        for x in [(0, 266), (534, 266)] {
+            for k in 0..4 {
+                expected.push(([x.0, 300 + k, x.1, 1], false));
+            }
+        }
+        assert_eq!(rows, expected);
+        // The shades of other widths: never a shadow without a light edge.
+        assert_eq!((0..1).map(|k| glass::Shade::at(k, 1)).collect::<Vec<_>>(), [Frost]);
+        assert_eq!((0..2).map(|k| glass::Shade::at(k, 2)).collect::<Vec<_>>(), [Light, Frost]);
+        assert_eq!((0..3).map(|k| glass::Shade::at(k, 3)).collect::<Vec<_>>(), [Light, Frost, Shadow]);
     }
 
     #[test]
@@ -7557,6 +7592,11 @@ mod tests {
             // world cursor. Its absolute mapping must not be multiplied.
             click(&mut slow, (600, 300));
             click(&mut fast, (600, 300));
+            if movement == viewer_settings::MapMovement::Drag {
+                // (Drag captures nothing: `capture`.)
+                assert!(!slow.captured() && !fast.captured());
+                continue;
+            }
             assert!(slow.captured() && fast.captured());
             assert_eq!(slow.pointer_to((700, 400)), fast.pointer_to((700, 400)));
             assert_eq!(slow.cursor, fast.cursor);
@@ -8387,15 +8427,13 @@ mod tests {
         // world press, no look), its release goes nowhere.
         assert_eq!(l.route(Input::MouseButton { button: Button::Right, down: true, x: 100, y: 300 }), vec![Input::DismissPopup]);
         assert!(l.route(Input::MouseButton { button: Button::Right, down: false, x: 100, y: 300 }).is_empty());
-        // Recapturing (a left click into B) dismisses it as well.
+        // Recapturing (a left click into B) dismisses it as well; the mouse
+        // is captured once it is gone, never under it (`capture`).
         assert_eq!(click(&mut l, (600, 420)), vec![Input::DismissPopup]);
-        assert!(l.captured());
-        // Until it is gone the captured mouse does not move the world cursor.
+        assert!(!l.captured());
+        menus_gone(&mut l, &s);
+        assert!(l.captured() && !l.click_popup_open());
         let c = l.cursor;
-        assert!(l.motion((40.0, 0.0)).is_empty());
-        assert_eq!(l.cursor, c);
-        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert!(!l.click_popup_open());
         l.motion((40.0, 0.0));
         assert_ne!(l.cursor, c, "closed: the mouse plays again");
         // Ctrl+Shift+Space capturing it again dismisses it too.
@@ -8403,8 +8441,10 @@ mod tests {
         open_at_cursor(&mut l);
         mv(&mut l, (600, 300));
         let out = ctrl_shift(&mut l, 0x20);
-        assert!(l.captured());
+        assert!(!l.captured());
         assert_eq!(out.iter().filter(|i| **i == Input::DismissPopup).count(), 1, "{out:?}");
+        menus_gone(&mut l, &s);
+        assert!(l.captured());
         // A dialog the driver does not anchor is no such popup.
         l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         let mut dialog = open_at_cursor(&mut l);
@@ -8536,12 +8576,21 @@ mod tests {
                         other => panic!("{what}: the click on the popup went to {other:?}"),
                     }
                 }
-                // B's world beside the popup: captured.
+                // B's world beside the popup: no capture while a menu is
+                // open (`capture`); once it closes, the capture it let go of
+                // is taken up again.
                 let world = (b[0] + 8, b[1] + b[3] - 8);
                 assert!(!overlap([c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32], [world.0, world.1, 1, 1]), "{what}");
                 mv(&mut l, world);
-                assert!(click(&mut l, world).is_empty(), "{what}");
-                assert!(l.captured(), "{what}: a click on B's uncovered world captures");
+                click(&mut l, world);
+                assert!(!l.captured(), "{what}: a click on B's uncovered world does not capture under a popup");
+                l.frame(&scene(), plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
+                assert!(!l.captured(), "{what}: not at once");
+                for _ in 0..3 {
+                    l.advance(std::time::Duration::from_millis(100));
+                    l.frame(&scene(), plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
+                }
+                assert!(l.captured(), "{what}: captured again once the popup is gone");
             }
             sides.sort_by_key(|s| *s == Side::B);
             assert_eq!(sides, [Side::A, Side::B], "{split:?}");
