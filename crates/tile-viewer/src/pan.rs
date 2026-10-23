@@ -872,8 +872,13 @@ impl Layout {
         let enabled = self.pan.mode == MapMovement::EdgeScroll || self.unit_order_dragging();
         // (Not under a popup opened at a world click: the map stays put.)
         let active = enabled && self.pan.inside && !self.locked && !self.snapping && self.drag.is_none() && self.pan.grab.is_none() && !self.click_popup_open();
+        // Over the interface (the minimap, the HUD) only the game's own thin
+        // edge scrolls: the wider zone would move the map under its controls.
+        let over_interface = self.interface_at(self.pointer).is_some();
+        let thin = |d: i32| if over_interface && d.abs() > scene::EDGE_ZONE { 0 } else { d };
         let target = self
             .view_edge(self.pointer)
+            .map(|(hit, e)| (hit, (thin(e.0), thin(e.1))))
             .filter(|&(hit, e)| active && e != (0, 0) && fitted != Some(hit));
         let sign = |(h, e): (Hit, (i32, i32))| (h, (e.0.signum(), e.1.signum()));
         if target.map(sign) != self.pan.edge_view {
