@@ -102,8 +102,8 @@ pub struct Resolution {
     /// Fractional scale of the world map.
     pub world_scale: f32,
     /// How menu background art is sampled when a menu is drawn larger or
-    /// smaller than its art. Text, controls, borders and world art keep
-    /// their existing sharp rendering.
+    /// smaller than its art, including background frames and tiles.
+    /// Text, controls and world art keep their existing sharp rendering.
     pub background_sampling: BackgroundSampling,
 }
 

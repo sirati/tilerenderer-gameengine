@@ -3581,7 +3581,7 @@ impl App {
             log::info!("viewer: world cursor centred again: drawn, the system pointer captured (locked: {locked})");
         }
         let mut cameras = arranged.cameras.clone();
-        // Only UI background sprites drawn smaller than their art use it.
+        // All scaled UI background sprites use it, including magnified art.
         let background = background_sampling(self.settings.resolution.background_sampling);
         for camera in &mut cameras {
             camera.background_sampling = background;
