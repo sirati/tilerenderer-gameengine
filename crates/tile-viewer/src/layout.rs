@@ -854,6 +854,9 @@ pub struct Layout {
     /// The world rectangles of the viewer's own views as last told to the
     /// driver.
     reported_views: [(i32, i32, i32, i32); 4],
+    /// The world downscale `reported_views` and `reported_main` were in.
+    reported_views_downscale: u32,
+    reported_main_downscale: u32,
     /// The main pane's world rectangle as last told to the driver.
     reported_main: (i32, i32, i32, i32),
     /// Zooms the scene has zoomed art (text) for, from the last frame ((0, 0):
@@ -951,6 +954,8 @@ impl Default for Layout {
             reported_zooms: [(0, 0); 8],
             art_zooms: Vec::new(),
             reported_views: [(0, 0, 0, 0); 4],
+            reported_views_downscale: 1,
+            reported_main_downscale: 1,
             reported_main: (0, 0, 0, 0),
             sharp_text: true,
             ui_in_pane: false,
@@ -1650,10 +1655,19 @@ impl Layout {
             }
             _ => (0, 0, 0, 0),
         };
-        (rect != self.reported_main).then(|| {
+        let downscale = self.reported_downscale();
+        (rect != self.reported_main || (rect.2 > 0 && downscale != self.reported_main_downscale)).then(|| {
             self.reported_main = rect;
+            self.reported_main_downscale = downscale;
             rect
         })
+    }
+
+    /// How many times smaller the views of the last frame showed the world
+    /// (their world pixels, those of `take_main_view_change` and
+    /// `take_views_change`).
+    pub fn reported_downscale(&self) -> u32 {
+        self.world_downscale.unwrap_or(1).max(1)
     }
 
     /// The world rectangles the split pane and the insets show (as of the
@@ -1671,8 +1685,11 @@ impl Layout {
             let (w, h) = c.world_size();
             *slot = (c.x, c.y, w as i32, h as i32);
         }
-        (views != self.reported_views).then(|| {
+        let downscale = self.reported_downscale();
+        let used = views.iter().any(|v| v.2 > 0);
+        (views != self.reported_views || (used && downscale != self.reported_views_downscale)).then(|| {
             self.reported_views = views;
+            self.reported_views_downscale = downscale;
             views
         })
     }
@@ -5791,6 +5808,34 @@ mod tests {
             frame(&mut l, vec![]);
             assert_eq!(l.take_main_view_change(), Some((0, 0, 0, 0)));
         }
+    }
+
+    #[test]
+    fn after_the_games_zoom_key_the_marks_reported_before_it_rescale_to_what_the_views_show() {
+        // A split at full size: A crops the driver's view, B shows its own.
+        let mut l = arranged(&settings(|s| s.split = S::Vertical1To1));
+        let main = l.take_main_view_change().unwrap();
+        let views = l.take_views_change().unwrap();
+        assert_eq!(l.reported_downscale(), 1);
+        // The game zooms out (Z): the scene's world is half size, its camera
+        // round the same middle in half-size pixels. The driver draws its
+        // minimap for this frame with what was reported before it.
+        let mut s = scene();
+        s.views[0].view.downscale = 2;
+        (s.views[0].view.camera_x, s.views[0].view.camera_y) = (300, 100);
+        let predicted_main = scene::rescale_view_rect(main, 1, 2);
+        let predicted_b = scene::rescale_view_rect(views[0], 1, 2);
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        // What the views then show is what the driver took them to.
+        assert_eq!(l.reported_downscale(), 2);
+        assert_eq!(l.take_main_view_change(), Some(predicted_main));
+        assert_eq!(l.take_views_change().map(|v| v[0]), Some(predicted_b));
+        // And back (Z again).
+        let (main, b) = (predicted_main, predicted_b);
+        l.frame(&scene(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(l.reported_downscale(), 1);
+        assert_eq!(l.take_main_view_change(), Some(scene::rescale_view_rect(main, 2, 1)));
+        assert_eq!(l.take_views_change().map(|v| v[0]), Some(scene::rescale_view_rect(b, 2, 1)));
     }
 
     #[test]

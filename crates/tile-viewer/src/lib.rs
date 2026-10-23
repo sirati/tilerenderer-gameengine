@@ -3543,13 +3543,16 @@ impl App {
         };
         mark(&mut self.profile, "layout", &mut t);
         // Views following something move without input: tell the driver.
+        // (In this frame's world pixels: the driver takes them to its zoom
+        // if that changed meanwhile, e.g. the game's zoom key.)
+        let downscale = self.layout.reported_downscale();
         if let Some((x, y, w, h)) = self.layout.take_main_view_change() {
-            log::debug!("viewer: own A now shows ({x}, {y}, {w}, {h})");
-            frame_input(&mut self.preparing_inputs, &self.display, Input::MainView { x, y, w, h });
+            log::debug!("viewer: own A now shows ({x}, {y}, {w}, {h}) at 1/{downscale}");
+            frame_input(&mut self.preparing_inputs, &self.display, Input::MainView { x, y, w, h, downscale });
         }
         if let Some(views) = self.layout.take_views_change() {
-            log::debug!("viewer: own views now show {views:?}");
-            frame_input(&mut self.preparing_inputs, &self.display, Input::Views(views));
+            log::debug!("viewer: own views now show {views:?} at 1/{downscale}");
+            frame_input(&mut self.preparing_inputs, &self.display, Input::Views { views, downscale });
         }
         if future_layout.is_none() { self.drawable_scene = None; }
         let render_scene = future_layout.as_ref().map(|future| {

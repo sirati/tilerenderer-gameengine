@@ -997,13 +997,14 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
-            Input::Views(views) => {
+            Input::Views { views, downscale } => {
                 w.u8(8);
                 for (x, y, ww, h) in views {
                     for v in [x, y, ww, h] {
                         w.i32(v);
                     }
                 }
+                w.u32(downscale);
             }
             Input::Zooms(zooms) => {
                 w.u8(7);
@@ -1032,11 +1033,12 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
-            Input::MainView { x, y, w: ww, h } => {
+            Input::MainView { x, y, w: ww, h, downscale } => {
                 w.u8(12);
                 for v in [x, y, ww, h] {
                     w.i32(v);
                 }
+                w.u32(downscale);
             }
             Input::Window { width, height, scale_milli } => {
                 w.u8(13);
@@ -1113,14 +1115,14 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
                 Input::UnitOrder { action, x: r.i32()?, y: r.i32()? }
             }
             11 => Input::Edge { x: r.i32()?, y: r.i32()? },
-            12 => Input::MainView { x: r.i32()?, y: r.i32()?, w: r.i32()?, h: r.i32()? },
+            12 => Input::MainView { x: r.i32()?, y: r.i32()?, w: r.i32()?, h: r.i32()?, downscale: r.u32()? },
             13 => Input::Window { width: r.u32()?, height: r.u32()?, scale_milli: r.u32()? },
             8 => {
                 let mut views = [(0, 0, 0, 0); 4];
                 for v in &mut views {
                     *v = (r.i32()?, r.i32()?, r.i32()?, r.i32()?);
                 }
-                Input::Views(views)
+                Input::Views { views, downscale: r.u32()? }
             }
             7 => {
                 let mut zooms = [(0, 0); 8];
@@ -1397,8 +1399,8 @@ mod tests {
             Input::UnitOrder { action: UnitOrderAction::Confirm, x: 1234, y: -555 },
             Input::UnitOrder { action: UnitOrderAction::Cancel, x: 0, y: 0 },
             Input::Zooms([(3, 2), (2, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]),
-            Input::Views([(10, -20, 300, 200), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]),
-            Input::MainView { x: 5, y: -6, w: 700, h: 400 },
+            Input::Views { views: [(10, -20, 300, 200), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)], downscale: 2 },
+            Input::MainView { x: 5, y: -6, w: 700, h: 400, downscale: 1 },
             Input::WorldButton { button: Button::Right, down: true, x: -64, y: 4096 },
             Input::WorldButton { button: Button::Middle, down: false, x: 0, y: 0 },
             Input::WorldKey { vk: 0x66, down: true, text: Some('6'), x: 130, y: -2 },

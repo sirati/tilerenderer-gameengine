@@ -1120,14 +1120,19 @@ pub enum Input {
     Quit,
     /// The world rectangles (x, y, w, h; w 0: unused) the renderer shows in
     /// views of its own besides the driver's main view (a split pane,
-    /// insets): a driver may mark them (e.g. on a minimap).
-    Views([(i32, i32, i32, i32); 4]),
+    /// insets): a driver may mark them (e.g. on a minimap). They are in
+    /// the world pixels of views shown `downscale` times smaller
+    /// ([`View::downscale`], 0 or 1: full size), as of the renderer's frame:
+    /// a driver whose zoom changed since takes them to its own (the same
+    /// size in view pixels, the centre scaled; [`rescale_view_rect`]).
+    Views { views: [(i32, i32, i32, i32); 4], downscale: u32 },
     /// The world rectangle (x, y, w, h) the renderer shows of the driver's
     /// main view where that is not all of it, as the driver has it (a split
     /// or a zoom strip crops it, a zoom shows less or more, it follows
     /// something else); w 0: all of it. A driver may mark that rather than
-    /// its own view (e.g. on a minimap).
-    MainView { x: i32, y: i32, w: i32, h: i32 },
+    /// its own view (e.g. on a minimap). In the world pixels of views
+    /// shown `downscale` times smaller, as [`Input::Views`].
+    MainView { x: i32, y: i32, w: i32, h: i32, downscale: u32 },
     /// The renderer shows the world at these zooms (`(num, den)` reduced;
     /// `(0, 0)`: unused): a driver may make art for them (e.g. text at that
     /// size, `FreeSprite::zoom_art` 2) and list them in `Scene::zooms`.
@@ -1722,5 +1727,40 @@ mod delta_predecessor_tests {
         assert!(display.take_changes_from(1).0.is_empty());
         assert_eq!(display.scene().tick, 17);
         assert!(display.take_changes_from(2).0.is_empty());
+    }
+}
+
+/// World rectangle `rect` (x, y, w, h) a renderer reported for views shown
+/// `from` times smaller ([`Input::Views`], [`Input::MainView`]) as it shows
+/// once they are shown `to` times smaller: a renderer keeps a view's centre
+/// on the same place of the world and its size on the screen, so the centre
+/// scales by `from / to` and the size stays (w 0: unused, as it is).
+pub fn rescale_view_rect(rect: (i32, i32, i32, i32), from: u32, to: u32) -> (i32, i32, i32, i32) {
+    let (from, to) = (from.max(1) as i64, to.max(1) as i64);
+    let (x, y, w, h) = rect;
+    if from == to || w <= 0 || h <= 0 {
+        return rect;
+    }
+    // (Twice the centre, so odd sizes round as the renderer's centres do.)
+    let centre2 = |p: i32, len: i32| (2 * p as i64 + len as i64) * from / to;
+    let place = |c2: i64, len: i32| ((c2 - len as i64).div_euclid(2)) as i32;
+    (place(centre2(x, w), w), place(centre2(y, h), h), w, h)
+}
+
+#[cfg(test)]
+mod rescale_view_rect_tests {
+    use super::rescale_view_rect;
+
+    #[test]
+    fn a_view_keeps_its_centre_and_screen_size_across_a_zoom() {
+        // Full size to half size: the centre halves, the size stays.
+        assert_eq!(rescale_view_rect((1000, 400, 800, 600), 1, 2), (300, 50, 800, 600));
+        // And back again.
+        assert_eq!(rescale_view_rect((300, 50, 800, 600), 2, 1), (1000, 400, 800, 600));
+        // 0 is full size; nothing changes at the same zoom or unused.
+        assert_eq!(rescale_view_rect((1000, 400, 800, 600), 0, 1), (1000, 400, 800, 600));
+        assert_eq!(rescale_view_rect((0, 0, 0, 0), 1, 2), (0, 0, 0, 0));
+        // Negative coordinates (round the wrap) keep their centre.
+        assert_eq!(rescale_view_rect((-400, -300, 200, 100), 1, 2), (-250, -175, 200, 100));
     }
 }

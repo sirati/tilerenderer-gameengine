@@ -144,7 +144,7 @@ mod tests {
             mapping: Mapping::capture(&app), started: Instant::now(), main_prepare: std::time::Duration::ZERO,
             frame: layout::Frame::default(),
             picture: CachedPicture { plan: scaling::plan((100, 100), (100, 100), &app.settings.resolution), copies: vec![], pixel_box: 1 },
-            inputs: vec![scene::Input::MainView { x: 20, y: 30, w: 40, h: 50 }],
+            inputs: vec![scene::Input::MainView { x: 20, y: 30, w: 40, h: 50, downscale: 1 }],
         };
         let mut pending = Some(candidate());
         assert!(matches!(complete(&mut pending, 7, Some(3)), Completion::Unrelated));
@@ -154,7 +154,7 @@ mod tests {
         pending = Some(candidate());
         app.shown_scene = old;
         let Completion::Presented(accepted) = complete(&mut pending, 8, Some(3)) else { panic!("matching frame was rejected") };
-        assert_eq!(accepted.inputs, [scene::Input::MainView { x: 20, y: 30, w: 40, h: 50 }]);
+        assert_eq!(accepted.inputs, [scene::Input::MainView { x: 20, y: 30, w: 40, h: 50, downscale: 1 }]);
         let _ = accepted.mapping.activate(&mut app, true);
         assert_eq!(app.shown_scene.seq, 99);
         assert!(pending.is_none());
