@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, Button, DetachedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 54;
+pub const VERSION: u32 = 55;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -385,6 +385,20 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u8(2);
                 w.sprites(sprites);
             }
+            Update::Motions(motions) => {
+                w.u8(29);
+                w.u32(motions.len() as u32);
+                for m in motions {
+                    w.u32(m.serial as u32);
+                    w.u32((m.serial >> 32) as u32);
+                    w.u32(m.sprites.0);
+                    w.u32(m.sprites.1);
+                    w.i32(m.way.0);
+                    w.i32(m.way.1);
+                    w.u32(m.duration_ms);
+                    w.u32(m.elapsed_ms);
+                }
+            }
             Update::View { id, view } => {
                 w.u8(3);
                 w.u32(*id);
@@ -687,6 +701,15 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 Update::SpriteLifetimes(lifetimes)
             }
             2 => Update::Sprites(r.sprites()?),
+            29 => {
+                let n = r.len(32)?;
+                let mut motions = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let serial = u64::from(r.u32()?) | (u64::from(r.u32()?) << 32);
+                    motions.push(crate::Motion { serial, sprites: (r.u32()?, r.u32()?), way: (r.i32()?, r.i32()?), duration_ms: r.u32()?, elapsed_ms: r.u32()? });
+                }
+                Update::Motions(motions)
+            }
             3 => {
                 let id = r.u32()?;
                 let view = if r.bool()? { Some(r.view()?) } else { None };
@@ -1262,6 +1285,20 @@ mod tests {
         assert_eq!(received.sprite_lifetimes, after.sprite_lifetimes);
         let clear = crate::Scene::default().updates_since(&received);
         assert!(clear.contains(&Update::SpriteLifetimes(Vec::new())));
+    }
+
+    #[test]
+    fn motions_round_trip_diff_and_apply() {
+        let mut after = crate::Scene::default();
+        after.motions = vec![crate::Motion { serial: 0x0123_4567_89AB_CDEF, sprites: (3, 9), way: (-64, 32), duration_ms: 75, elapsed_ms: 12 }];
+        let updates = after.updates_since(&crate::Scene::default());
+        assert_eq!(updates, vec![Update::Motions(after.motions.clone())]);
+        assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
+        let mut received = crate::Scene::default();
+        for update in updates { received.apply(update); }
+        assert_eq!(received.motions, after.motions);
+        assert!(after.updates_since(&received).is_empty(), "an unchanged motion is not sent again");
+        assert_eq!(crate::Scene::default().updates_since(&received), vec![Update::Motions(Vec::new())]);
     }
 
     #[test]

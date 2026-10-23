@@ -4,6 +4,7 @@
 //! Nothing here knows which game it is showing.
 
 mod sprite_lifetimes;
+mod unit_motions;
 mod scene_prefix;
 mod scene_snapshot;
 mod ui_submission;
@@ -1232,6 +1233,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         shown_scene: Arc::new(Scene::default()),
         camera_arrival_reported: None,
         sprite_lifetimes: sprite_lifetimes::SpriteLifetimes::default(),
+        unit_motions: unit_motions::UnitMotions::default(),
         pending_scene: None,
         future_metadata: None,
         drawable_scene: None,
@@ -1481,6 +1483,7 @@ struct App {
     shown_scene: Arc<Scene>,
     camera_arrival_reported: Option<u64>,
     sprite_lifetimes: sprite_lifetimes::SpriteLifetimes,
+    unit_motions: unit_motions::UnitMotions,
     /// One immutable future snapshot prevents later optional art generations
     /// from moving the adoption target. Display keeps coalescing newer work.
     pending_scene: Option<PendingScene>,
@@ -3672,6 +3675,19 @@ impl App {
                     }
                     smooth_menus::PointerRefresh::Gone => self.feedback.pointer_gone(now),
                     smooth_menus::PointerRefresh::Unchanged => {}
+                }
+            }
+        }
+        // Units sliding to the next tile (`unit_motions`), where this
+        // frame's time has them: the driver tells each slide once.
+        if let Some(offsets) = self.unit_motions.offsets(scene, started, full || free_changed || looks_changed, |serial| self.display.motion_arrival(serial)) {
+            if !offsets.is_empty() {
+                unit_motions::apply(&mut Arc::make_mut(self.world.as_mut().expect("built above")).free, &scene.sprites, &offsets);
+                looks_changed = true;
+                // (A frame-timing trace of the slides: `TILE_VIEWER_MOTION_TRACE=1`.)
+                static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| profile::env_on("TILE_VIEWER_MOTION_TRACE"));
+                if *TRACE {
+                    log::info!("viewer: motion at {:.1} ms: {offsets:?}", started.duration_since(self.started).as_secs_f64() * 1000.0);
                 }
             }
         }
