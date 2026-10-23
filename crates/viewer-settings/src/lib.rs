@@ -260,8 +260,11 @@ pub enum Place {
 pub enum Zoom {
     #[default]
     Off,
-    /// A floating box centred in its region, `1:3:1` of the width, its height
-    /// from [`Layout::zoom_box_height`], or the window's aspect ratio on Auto.
+    /// A box at the top of its region, centred across, `1:3:1` of the
+    /// width, [`Layout::zoom_strip`] of the height, its top
+    /// [`Layout::zoom_box_top`] below the region's top. When the pointer
+    /// comes to it, it drops to [`Layout::zoom_box_drop`] below the
+    /// pointer (or holds the pointer out, [`Layout::zoom_box_block_pointer`]).
     Floating131,
     /// As `Floating131`, `1:7:1`.
     Floating171,
@@ -329,16 +332,30 @@ pub struct Layout {
     /// Where the zoom box goes in a vertical split (else unused).
     pub zoom_place: Place,
     pub zoom: Zoom,
-    /// Height of [`Zoom::TopStrip`] and of the boxes at the mouse
-    /// ([`Zoom::Mouse111`], [`Zoom::Mouse131`]) as a fraction of the window
-    /// (or of the view they are in), 0.05..=0.5.
+    /// Height of every zoom ([`Zoom::TopStrip`], the floating boxes and the
+    /// boxes at the mouse) as a fraction of the window (or of the view it
+    /// is in), 0.05..=0.5, default 0.2.
     pub zoom_strip: f32,
-    /// Height of floating boxes ([`Zoom::Floating131`], [`Zoom::Floating171`])
-    /// as a fraction of their region, 0.05..=1.0. Zero keeps their automatic
-    /// height at the window's aspect ratio.
+    /// The floating boxes ([`Zoom::Floating131`], [`Zoom::Floating171`]):
+    /// the space between their region's top and their top, as a fraction
+    /// of the region's height, 0..=0.2, default 0.025.
+    pub zoom_box_top: f32,
+    /// How far below the pointer a floating box's top goes when the
+    /// pointer comes to it, as a fraction of the region's height, 0..=0.5,
+    /// default 0.3.
+    pub zoom_box_drop: f32,
+    /// How much the zoom box or strip enlarges the world: one of
+    /// [`Layout::MAGNIFICATIONS`] (another value counts as the nearest),
+    /// default 2.
+    pub zoom_magnification: f32,
+    /// Unused: the floating boxes' own height (or Auto) in older settings
+    /// files. Read so they still load, never written;
+    /// [`Layout::zoom_strip`] sizes every zoom now.
+    #[serde(skip_serializing)]
     pub zoom_box_height: f32,
     /// Hold the pointer outside floating zoom boxes instead of moving the
-    /// box clear of it. Top strips always hold the pointer below them.
+    /// box down out of its way. Top strips always hold the pointer below
+    /// them.
     pub zoom_box_block_pointer: bool,
     /// With a floating [`Layout::screen_place`]: open the generic menu and
     /// popups in the view that held the mouse when they opened.
@@ -361,7 +378,10 @@ impl Default for Layout {
             split: Split::Standard,
             zoom_place: Place::Floating,
             zoom: Zoom::Off,
-            zoom_strip: 0.25,
+            zoom_strip: 0.2,
+            zoom_box_top: 0.025,
+            zoom_box_drop: 0.3,
+            zoom_magnification: 2.0,
             zoom_box_height: 0.0,
             zoom_box_block_pointer: false,
             menu_follows_pointer: true,
@@ -374,6 +394,16 @@ impl Default for Layout {
 }
 
 impl Layout {
+    /// The zoom's magnifications to choose from ([`Layout::zoom_magnification`]).
+    pub const MAGNIFICATIONS: [f32; 4] = [1.5, 2.0, 3.0, 4.0];
+
+    /// The index into [`Layout::MAGNIFICATIONS`] of the zoom's magnification
+    /// (the nearest one; the default for a value that is not a number).
+    pub fn zoom_magnification_step(&self) -> usize {
+        let m = if self.zoom_magnification.is_finite() { self.zoom_magnification } else { 2.0 };
+        (0..Self::MAGNIFICATIONS.len()).min_by(|&a, &b| (Self::MAGNIFICATIONS[a] - m).abs().total_cmp(&(Self::MAGNIFICATIONS[b] - m).abs())).unwrap_or(1)
+    }
+
     /// The screens older settings files placed one by one, in the order
     /// their places are migrated ([`Layout::migrated_place`]).
     pub const SCREENS: [&'static str; 13] = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "City", "Palace", "Spy", "Menu", "Help"];
@@ -599,16 +629,27 @@ mod tests {
     }
 
     #[test]
-    fn older_top_boxes_keep_auto_height_and_explicit_height_round_trips() {
-        let old = "[layout]\nzoom = 'Floating131'\nzoom_strip = 0.35\n";
-        let mut s: Settings = toml::from_str(old).unwrap();
-        assert_eq!(s.layout.zoom_box_height, 0.0);
-        assert!(!s.layout.zoom_box_block_pointer);
-        assert_eq!(s.layout.zoom_strip, 0.35);
-        s.layout.zoom_box_height = 0.6;
-        s.layout.zoom_box_block_pointer = true;
+    fn every_zoom_is_a_fifth_high_and_older_floating_box_settings_still_load() {
+        let l = Settings::default().layout;
+        assert_eq!((l.zoom_strip, l.zoom_box_top, l.zoom_box_drop), (0.2, 0.025, 0.3));
+        let old = "[layout]\nzoom = 'Floating131'\nzoom_strip = 0.35\nzoom_box_height = 0.6\nzoom_box_block_pointer = true\n";
+        let s: Settings = toml::from_str(old).unwrap();
+        assert_eq!((s.layout.zoom, s.layout.zoom_strip, s.layout.zoom_box_block_pointer), (Zoom::Floating131, 0.35, true));
+        assert_eq!((s.layout.zoom_box_top, s.layout.zoom_box_drop), (0.025, 0.3));
+        // The magnification: 2× unless set, the nearest of the choices.
+        assert_eq!((s.layout.zoom_magnification, s.layout.zoom_magnification_step()), (2.0, 1));
+        for (m, step) in [(1.0, 0), (1.5, 0), (2.4, 1), (2.6, 2), (3.0, 2), (9.0, 3), (f32::NAN, 1)] {
+            assert_eq!(Layout { zoom_magnification: m, ..Layout::default() }.zoom_magnification_step(), step, "{m}");
+        }
+        let four: Settings = toml::from_str("[layout]\nzoom_magnification = 4.0\n").unwrap();
+        assert_eq!(four.layout.zoom_magnification_step(), 3);
+        // The old height is read and ignored, and not written back.
         let saved = toml::to_string(&s).unwrap();
-        assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), s);
+        assert!(!saved.contains("zoom_box_height"), "{saved}");
+        let mut back = toml::from_str::<Settings>(&saved).unwrap();
+        assert_eq!(back.layout.zoom_box_height, 0.0);
+        back.layout.zoom_box_height = 0.6;
+        assert_eq!(back, s);
     }
 
     #[test]

@@ -58,16 +58,21 @@
 //!
 //! - **Split**: one view, A beside B (1:1, or A twice as wide), or A above B.
 //! - **Zoom box**: a world magnifier over the window (or, in a vertical
-//!   split, over A or B, `zoom_place`; it stays inside that region): a box
-//!   in its middle sized 1:3:1 or 1:7:1 across the width (margin : box :
-//!   margin; `zoom_box_height` of the region's height, or the window's
-//!   aspect ratio on Auto); a
-//!   box at the pointer, 1:1:1 or 1:3:1 across, `zoom_strip` of the
-//!   region's height, above the pointer (below where there is no room);
-//!   or a strip across the top of that region (`zoom_strip` of its height)
-//!   that the views give room to. The pointer stops below a strip and
-//!   scrolls upwards there. A floating box moves below the pointer when
-//!   entered, or holds the pointer out with `zoom_box_block_pointer`.
+//!   split, over A or B, `zoom_place`; it stays inside that region): a
+//!   floating box at the top of the region, centred across, 1:3:1 or 1:7:1
+//!   of its width (margin : box : margin), its top `zoom_box_top` (2.5%)
+//!   of the region's height below the region's top; a box at the pointer,
+//!   1:1:1 or 1:3:1 across, above the pointer (below where there is no
+//!   room); or a strip across the top of that region that the views give
+//!   room to. All of them are `zoom_strip` of the region's height (one
+//!   slider, default 20%). The pointer stops below a strip and scrolls
+//!   upwards there. A floating box the pointer comes to drops, its top
+//!   `zoom_box_drop` (30%) of the region's height below the pointer, or
+//!   holds the pointer out with `zoom_box_block_pointer`. Boxes do not
+//!   dodge the views' own interface (corner buttons, unit orders): they
+//!   lie under it, and it keeps its clicks. Every zoom magnifies
+//!   `zoom_magnification` (1.5×, 2×, 3×, 4×; default 2×); Ctrl+wheel over
+//!   it changes that within those steps until the setting changes.
 //! - **Screens**: a screen the driver names (`Scene::interface`) goes over
 //!   the window, or its panel is fitted over A or B. Both world panes keep
 //!   their own cameras. Generic menus instead keep their requested size
@@ -440,10 +445,11 @@ pub enum ZoomPlace {
     /// Beside the pointer, `Magnifier::size` (Ctrl+Shift+M).
     #[default]
     Beside,
-    /// A box in the middle of its region, `1 : n : 1` of its width (margin :
-    /// box : margin). Its height is the second value in thousandths of
-    /// the region's height, or zero for the window's aspect ratio.
-    Box(u32, u32),
+    /// A box at the top of its region, centred across, `1 : n : 1` of its
+    /// width (margin : box : margin), [`ZoomBox::height`] of its height,
+    /// [`ZoomBox::top`] below its top; it drops [`ZoomBox::drop`] below
+    /// the pointer when the pointer comes to it.
+    Box(u32, ZoomBox),
     /// A box at the pointer (the world cursor while the mouse is captured):
     /// above it, else below it, centred on it across, kept inside its
     /// region; `1 : n : 1` of the region's width, and this many
@@ -452,6 +458,18 @@ pub enum ZoomPlace {
     /// A strip across the top of its region, this many thousandths of its
     /// height; the views below give it room.
     Strip(u32),
+}
+
+/// A floating zoom box's sizes, in thousandths of its region's height.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ZoomBox {
+    /// Its height (`zoom_strip`).
+    pub height: u32,
+    /// The space between its region's top and its top (`zoom_box_top`).
+    pub top: u32,
+    /// How far below the pointer its top goes when the pointer comes to
+    /// it (`zoom_box_drop`).
+    pub drop: u32,
 }
 
 /// A sprite the viewer adds to the world.
@@ -629,6 +647,9 @@ pub struct Layout {
     pub magnifier: Option<Magnifier>,
     /// Floating zoom boxes hold the pointer out instead of moving aside.
     pub zoom_box_block_pointer: bool,
+    /// The zoom box's or strip's zoom the settings last asked for: it stays
+    /// as the wheel changed it until they ask for another.
+    zoom_box_zoom: Option<usize>,
     /// Map detail independently for A, B and the world magnifier.
     pub clean_map: viewer_settings::clean_map::CleanMap,
     /// Whether to draw the arrow at the driver's point of interest.
@@ -877,6 +898,7 @@ impl Default for Layout {
             insets: Vec::new(),
             magnifier: None,
             zoom_box_block_pointer: false,
+            zoom_box_zoom: None,
             clean_map: Default::default(),
             focus_arrow: false,
             window: (1, 1),
@@ -1280,8 +1302,10 @@ impl Layout {
     }
 
     const MAGNIFIER: Magnifier = Magnifier { mode: MagnifierMode::Screen, zoom: ONE + 3, size: (240, 160), place: ZoomPlace::Beside, region: Place::Floating };
-    /// The zoom box's zoom to start with (2/1).
-    const ZOOM_BOX_ZOOM: usize = ONE + 2;
+    /// The zoom box's or strip's zooms ([`ZOOMS`] indices): 3/2, 2/1, 3/1,
+    /// 4/1, as `viewer_settings::Layout::MAGNIFICATIONS` (by its step); the
+    /// wheel over it stays within them.
+    const ZOOM_BOX_ZOOMS: std::ops::RangeInclusive<usize> = ONE + 1..=ONE + 4;
 
     /// Arranges the views as the user's settings say: the split, the zoom
     /// box, where named screens go, what the views follow and whether they
@@ -1312,16 +1336,22 @@ impl Layout {
             self.main_view.follow = main_follow;
             self.main_view.hand_focus = None;
         }
-        let zoom = self.magnifier.filter(|m| m.place != ZoomPlace::Beside).map_or(Self::ZOOM_BOX_ZOOM, |m| m.zoom);
-        // (`zoom_strip`: the height of the strip and of a box at the mouse.)
-        let strip = (s.zoom_strip.clamp(0.05, 0.5) * 1000.0).round() as u32;
-        let box_height = if s.zoom_box_height > 0.0 {
-            (s.zoom_box_height.clamp(0.05, 1.0) * 1000.0).round() as u32
-        } else { 0 };
+        // The magnification asked for; kept as the wheel changed it while
+        // the setting stays the same.
+        let wanted = Self::ZOOM_BOX_ZOOMS.start() + s.zoom_magnification_step();
+        let zoom = match self.magnifier.filter(|m| m.place != ZoomPlace::Beside) {
+            Some(m) if self.zoom_box_zoom == Some(wanted) => m.zoom,
+            _ => wanted,
+        };
+        self.zoom_box_zoom = Some(wanted);
+        // (`zoom_strip`: the height of every zoom, strip or box.)
+        let thousandths = |v: f32, max: f32| (v.clamp(0.0, max) * 1000.0).round() as u32;
+        let strip = thousandths(s.zoom_strip, 0.5).max(50);
+        let floating = ZoomBox { height: strip, top: thousandths(s.zoom_box_top, 0.2), drop: thousandths(s.zoom_box_drop, 0.5) };
         let place = match s.zoom {
             Zoom::Off => None,
-            Zoom::Floating131 => Some(ZoomPlace::Box(3, box_height)),
-            Zoom::Floating171 => Some(ZoomPlace::Box(7, box_height)),
+            Zoom::Floating131 => Some(ZoomPlace::Box(3, floating)),
+            Zoom::Floating171 => Some(ZoomPlace::Box(7, floating)),
             Zoom::Mouse111 => Some(ZoomPlace::AboutPointer(1, strip)),
             Zoom::Mouse131 => Some(ZoomPlace::AboutPointer(3, strip)),
             Zoom::TopStrip => Some(ZoomPlace::Strip(strip)),
@@ -2059,59 +2089,39 @@ impl Layout {
     /// shows itself or its frame). A zoom box or strip shows the world.
     fn magnifier_geometry(&self, m: &Magnifier) -> ([i32; 4], Option<[i32; 4]>) {
         // A box's width: `1 : n : 1` of its region's width (margin : box :
-        // margin). A floating box uses its selected fraction of the
-        // region's height, or the window's aspect ratio on Auto.
+        // margin); its height `zoom_strip` of the region's.
         let width = |region: [i32; 4], n: u32| (region[2] as i64 * n.max(1) as i64 / (n.max(1) as i64 + 2)) as i32;
-        let (ww, wh) = (self.window.0.max(1) as i64, self.window.1 as i64);
-        // A floating box keeps clear of the views' own interface (the
-        // corner's buttons in their view, `view_ui`), its frame too: one
-        // that would cover it goes below it, cut to its region's bottom.
-        // (The unit's order buttons as drawn too.)
-        let avoid: Vec<[i32; 4]> = self.view_ui.iter().copied().chain(self.orders_shown()).collect();
-        let framed = |b: [i32; 4]| [b[0] - GAP, b[1] - GAP, b[2] + 2 * GAP, b[3] + 2 * GAP];
-        let ui_hit = |b: [i32; 4]| avoid.iter().any(|&u| overlap(framed(b), u));
-        // Below what it meets, or above it, whichever leaves it taller.
-        let clear = |mut b: [i32; 4], r: [i32; 4]| {
-            for &u in &avoid {
-                if !overlap(framed(b), u) { continue; }
-                let top = (u[1] + u[3] + GAP).max(b[1]);
-                let below = b[3].min(r[1] + r[3] - top);
-                let bottom = (u[1] - GAP).min(b[1] + b[3]);
-                let above = b[3].min(bottom - r[1]);
-                if below >= above && below > 0 {
-                    b = [b[0], top, b[2], below];
-                } else if above > 0 {
-                    b = [b[0], bottom - above, b[2], above];
-                }
-            }
-            b
-        };
+        let part = |region: [i32; 4], thousandths: u32| ((region[3] as i64 * thousandths as i64 / 1000) as i32).clamp(0, region[3]);
+        // A box does not dodge the views' own interface (the corner's
+        // buttons, the unit's orders): it lies under it, which stays drawn
+        // on top and takes its clicks (`Layout::hit`).
         match m.place {
             ZoomPlace::Beside => {}
-            ZoomPlace::Box(n, thousandths) => {
+            ZoomPlace::Box(n, zb) => {
+                // At the top of its region, `top` below it, centred across.
                 let r = self.zoom_region(m);
-                let w = width(r, n);
-                let h = if thousandths == 0 { w as i64 * wh / ww } else { r[3] as i64 * thousandths as i64 / 1000 };
-                let h = h.min(r[3] as i64) as i32;
-                let [x, y, w, h] = clear([r[0] + (r[2] - w) / 2, r[1] + (r[3] - h) / 2, w, h], r);
+                let (w, h) = (width(r, n), part(r, zb.height));
+                let top = (r[1] + part(r, zb.top)).min(r[1] + r[3] - h);
+                let [x, y] = [r[0] + (r[2] - w) / 2, top];
                 let p = if self.locked { self.cursor_on_window().unwrap_or(self.pointer) } else { self.pointer };
                 if (!self.zoom_box_block_pointer || self.locked) && self.interface_at(p).is_none() && inside([x - GAP, y - GAP, w + 2 * GAP, h + 2 * GAP], p) {
-                    // The centred box moves below a pointer entering it.
-                    // Try the other sides when the full box will not fit.
-                    for (bx, by) in [(x, p.1 + POINTER_CLEARANCE), (x, p.1 - GAP - h), (p.0 + POINTER_CLEARANCE, y), (p.0 - GAP - w, y)] {
-                        if bx >= r[0] && by >= r[1] && bx + w <= r[0] + r[2] && by + h <= r[1] + r[3] && !ui_hit([bx, by, w, h]) {
-                            return ([bx, by, w, h], None);
-                        }
-                    }
-                    // At very large height settings no full-size position
-                    // can clear the pointer. Clip the box below it rather
-                    // than covering the map pixel the user is pointing at.
+                    // The pointer came to it: it drops, its top `drop`
+                    // below the pointer (at least clear of its arrow), as
+                    // far as its region's bottom lets it.
                     let below = p.1 + POINTER_CLEARANCE;
+                    let by = (p.1 + part(r, zb.drop)).max(below).min(r[1] + r[3] - h);
+                    if by >= below {
+                        return ([x, by, w, h], None);
+                    }
+                    // No room for all of it below the pointer (a tall box
+                    // in a short region): cut it to what is below rather
+                    // than covering the map pixel the user is pointing at,
+                    // else to what is above.
                     if below < r[1] + r[3] {
-                        return (clear([x, below, w, h.min(r[1] + r[3] - below)], r), None);
+                        return ([x, below, w, r[1] + r[3] - below], None);
                     }
                     let height = h.min((p.1 - GAP - r[1]).max(1));
-                    return (clear([x, p.1 - GAP - height, w, height], r), None);
+                    return ([x, p.1 - GAP - height, w, height], None);
                 }
                 return ([x, y, w, h], None);
             }
@@ -2119,16 +2129,16 @@ impl Layout {
                 // Its height `zoom_strip` of its region's. Above the pointer
                 // (the world cursor while the mouse is captured), else below
                 // it, clear of its arrow; centred on it across; inside its
-                // region.
+                // region; under the views' interface rather than dodging it.
                 let r = self.zoom_region(m);
                 let w = width(r, n);
                 let h = ((r[3] as i64 * thousandths as i64 / 1000) as i32).clamp(0, r[3]);
                 let (px, py) = if self.locked { self.cursor_on_window().unwrap_or(self.pointer) } else { self.pointer };
                 let x = (px - w / 2).clamp(r[0], (r[0] + r[2] - w).max(r[0]));
                 let above = py - GAP - h;
-                let y = if above >= r[1] && !ui_hit([x, above, w, h]) { above } else { py + POINTER_CLEARANCE };
+                let y = if above >= r[1] { above } else { py + POINTER_CLEARANCE };
                 let y = y.clamp(r[1], (r[1] + r[3] - h).max(r[1]));
-                return (clear([x, y, w, h], r), None);
+                return ([x, y, w, h], None);
             }
             ZoomPlace::Strip(_) => return (self.strip().map_or([0, 0, 0, 0], |(s, _)| s), None),
         }
@@ -4434,7 +4444,9 @@ impl Layout {
         match hit {
             Some(Hit::Magnifier) => {
                 if let Some(m) = &mut self.magnifier {
-                    m.zoom = next(m.zoom).max(ONE);
+                    // (A zoom box or strip: within the settings' choices.)
+                    let (lo, hi) = if m.place == ZoomPlace::Beside { (ONE, ZOOMS.len() - 1) } else { Self::ZOOM_BOX_ZOOMS.into_inner() };
+                    m.zoom = next(m.zoom).clamp(lo, hi);
                 }
             }
             Some(Hit::Beside) => {}
@@ -5429,7 +5441,7 @@ mod tests {
     #[test]
     fn world_magnifiers_keep_full_detail_and_driver_input_at_every_game_scale() {
         for downscale in [1, 2, 4] {
-            for place in [ZoomPlace::Beside, ZoomPlace::Box(3, 250), ZoomPlace::Box(7, 250), ZoomPlace::AboutPointer(3, 250), ZoomPlace::Strip(250)] {
+            for place in [ZoomPlace::Beside, ZoomPlace::Box(3, ZoomBox { height: 250, top: 25, drop: 300 }), ZoomPlace::Box(7, ZoomBox { height: 250, top: 25, drop: 300 }), ZoomPlace::AboutPointer(3, 250), ZoomPlace::Strip(250)] {
                 let mut s = scene();
                 s.views[0].view.downscale = downscale;
                 s.zooms = vec![(0, 0)];
@@ -5655,7 +5667,7 @@ mod tests {
     }
 
     #[test]
-    fn zoom_boxes_float_or_hover_about_the_pointer() {
+    fn zoom_boxes_sit_at_the_top_or_hover_about_the_pointer() {
         let geometry = |s: &Settings, pointer: (i32, i32)| {
             let mut l = arranged(s);
             mv(&mut l, pointer);
@@ -5669,56 +5681,64 @@ mod tests {
             assert_eq!((c.zoom, rect(&c)), ((2, 1), r));
             r
         };
-        // 1:3:1 and 1:7:1 across the window, in its middle, at the window's
-        // aspect ratio.
-        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Floating131), (10, 10)), [160, 120, 480, 360]);
-        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Floating171), (10, 10)), [89, 67, 622, 466]);
+        // 1:3:1 and 1:7:1 across the window, centred, at its top (2.5 %
+        // of its height, 15, above it), `zoom_strip` (a fifth) high.
+        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Floating131), (10, 10)), [160, 15, 480, 120]);
+        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Floating171), (10, 10)), [89, 15, 622, 120]);
+        // Never in the middle, whatever the split.
+        for split in [S::Standard, S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
+            for zoom in [Zoom::Floating131, Zoom::Floating171] {
+                let r = geometry(&settings(|s| (s.split, s.zoom) = (split, zoom)), (10, 590));
+                assert_eq!((r[1], r[3]), (15, 120), "{split:?} {zoom:?}");
+            }
+        }
         // In a vertical split, over A or B as `zoom_place` says: 1:3:1 of
-        // that view's width, as high as the window's shape makes it.
+        // that view's width, at its top.
         let left = settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, Zoom::Floating131, Place::LeftOrBottom));
-        assert_eq!(geometry(&left, (10, 10)), [80, 210, 240, 180]);
+        assert_eq!(geometry(&left, (10, 10)), [80, 15, 240, 120]);
         let right = Settings { zoom_place: Place::RightOrTop, ..left.clone() };
-        assert_eq!(geometry(&right, (10, 10)), [483, 211, 237, 177]);
+        assert_eq!(geometry(&right, (10, 10)), [483, 15, 237, 120]);
         let over = Settings { zoom_place: Place::Floating, ..left.clone() };
-        assert_eq!(geometry(&over, (10, 10)), [160, 120, 480, 360]);
+        assert_eq!(geometry(&over, (10, 10)), [160, 15, 480, 120]);
         // (Not in a horizontal split.)
         let stacked = Settings { split: S::Horizontal1To1, ..right.clone() };
-        assert_eq!(geometry(&stacked, (10, 10)), [160, 120, 480, 360]);
-        // At the pointer: 1:1:1, 1:3:1 across, `zoom_strip` (a quarter) of
+        assert_eq!(geometry(&stacked, (10, 10)), [160, 15, 480, 120]);
+        // At the pointer: 1:1:1, 1:3:1 across, `zoom_strip` (a fifth) of
         // the height, above the pointer, centred on it across.
-        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse111), (400, 300)), [267, 146, 266, 150]);
-        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse131), (400, 300)), [160, 146, 480, 150]);
+        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse111), (400, 300)), [267, 176, 266, 120]);
+        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse131), (400, 300)), [160, 176, 480, 120]);
         // No room above: below it, clear of its arrow; inside the window.
-        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse111), (790, 5)), [534, 29, 266, 150]);
+        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse111), (790, 5)), [534, 29, 266, 120]);
         let mouse_right = Settings { zoom: Zoom::Mouse111, ..right };
-        assert_eq!(geometry(&mouse_right, (420, 590)), [404, 436, 132, 150]);
+        assert_eq!(geometry(&mouse_right, (420, 590)), [404, 466, 132, 120]);
     }
 
     #[test]
-    fn top_box_height_resizes_its_camera_within_the_selected_region() {
+    fn floating_boxes_take_the_zoom_height_and_their_top_margin_in_their_region() {
         for split in [S::Standard, S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
             for place in [Place::Floating, Place::LeftOrBottom, Place::RightOrTop] {
                 for zoom in [Zoom::Floating131, Zoom::Floating171] {
                     let mut s = settings(|s| (s.split, s.zoom_place, s.zoom) = (split, place, zoom));
                     let mut l = arranged(&s);
                     let m = l.magnifier.unwrap();
-                    let automatic = l.magnifier_geometry(&m).0;
+                    let initial = l.magnifier_geometry(&m).0;
                     let region = l.zoom_region(&m);
-                    for height in [0.05, 0.25, 0.5, 1.0] {
-                        s.zoom_box_height = height;
+                    for (height, top) in [(0.05, 0.0), (0.2, 0.025), (0.5, 0.2), (0.25, 0.1)] {
+                        (s.zoom_strip, s.zoom_box_top) = (height, top);
+                        // (An old file's own height: ignored.)
+                        s.zoom_box_height = 1.0;
                         l.apply_settings(&s);
+                        // (The pointer off the box: it stays.)
+                        l.place_pointer((region[0] + 2, region[1] + region[3] - 2));
                         let f = frame(&mut l, vec![]);
                         let r = l.magnifier_geometry(&l.magnifier.unwrap()).0;
-                        assert_eq!((r[0], r[2]), (automatic[0], automatic[2]), "{split:?} {place:?} {zoom:?}");
-                        let thousandths = (height * 1000.0).round() as i64;
-                        assert_eq!(r[3], (region[3] as i64 * thousandths / 1000) as i32);
-                        assert_eq!(r[1], region[1] + (region[3] - r[3]) / 2);
-                        assert!(r[1] >= region[1] && r[1] + r[3] <= region[1] + region[3]);
-                        assert_eq!(rect(&camera_at(&f, (r[0], r[1]))), r);
+                        let what = format!("{split:?} {place:?} {zoom:?} {height} {top}");
+                        assert_eq!((r[0], r[2]), (initial[0], initial[2]), "{what}");
+                        assert_eq!(r[0], region[0] + (region[2] - r[2]) / 2, "{what}");
+                        let part = |v: f32| (region[3] as i64 * (v * 1000.0).round() as i64 / 1000) as i32;
+                        assert_eq!((r[1], r[3]), (region[1] + part(top), part(height)), "{what}");
+                        assert_eq!(rect(&camera_at(&f, (r[0], r[1]))), r, "{what}");
                     }
-                    s.zoom_box_height = 0.0;
-                    l.apply_settings(&s);
-                    assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, automatic);
                 }
             }
         }
@@ -5748,7 +5768,7 @@ mod tests {
                     assert!(within(r, b), "{zoom:?} {roles:?} right at {x}: {r:?}");
                     assert!(within(o, [0, 0, 800, 600]), "{zoom:?} {roles:?} floating at {x}: {o:?}");
                     for g in [l, r, o] {
-                        assert_eq!((g[1], g[3]), (146, 150), "{zoom:?} {roles:?} at {x}: above the pointer");
+                        assert_eq!((g[1], g[3]), (176, 120), "{zoom:?} {roles:?} at {x}: above the pointer");
                     }
                     if let Some((pl, pr, po)) = last {
                         assert!(l[0] >= pl && r[0] >= pr && o[0] >= po, "{zoom:?} at {x}: it follows the mouse");
@@ -5760,18 +5780,18 @@ mod tests {
         let mouse = settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, Zoom::Mouse111, Place::LeftOrBottom));
         // Centred on the pointer in its view; at its side with the pointer in
         // the other view.
-        assert_eq!(geometry(&mouse, (200, 300)), [134, 146, 133, 150]);
-        assert_eq!(geometry(&mouse, (600, 300)), [267, 146, 133, 150]);
+        assert_eq!(geometry(&mouse, (200, 300)), [134, 176, 133, 120]);
+        assert_eq!(geometry(&mouse, (600, 300)), [267, 176, 133, 120]);
         let mouse_right = Settings { zoom_place: Place::RightOrTop, ..mouse.clone() };
-        assert_eq!(geometry(&mouse_right, (100, 300)), [404, 146, 132, 150]);
-        assert_eq!(geometry(&mouse_right, (600, 300)), [534, 146, 132, 150]);
+        assert_eq!(geometry(&mouse_right, (100, 300)), [404, 176, 132, 120]);
+        assert_eq!(geometry(&mouse_right, (600, 300)), [534, 176, 132, 120]);
         // Floating: over the divider.
         let floating = Settings { zoom_place: Place::Floating, ..mouse };
-        assert_eq!(geometry(&floating, (420, 300)), [287, 146, 266, 150]);
+        assert_eq!(geometry(&floating, (420, 300)), [287, 176, 266, 120]);
     }
 
     #[test]
-    fn zoom_strip_sizes_the_strip_and_the_boxes_at_the_mouse_not_the_floating_ones() {
+    fn zoom_strip_sizes_every_zoom() {
         let geometry = |s: &Settings, pointer: (i32, i32)| {
             let mut l = arranged(s);
             mv(&mut l, pointer);
@@ -5781,9 +5801,13 @@ mod tests {
         for split in [S::Standard, S::Vertical1To1] {
             for place in [Place::LeftOrBottom, Place::RightOrTop, Place::Floating] {
                 for zoom in [Zoom::Floating131, Zoom::Floating171] {
-                    let at = |h: f32| geometry(&settings(|s| (s.split, s.zoom, s.zoom_place, s.zoom_strip) = (split, zoom, place, h)), (300, 300));
-                    assert_eq!(at(0.05), at(0.5), "{split:?} {place:?} {zoom:?}");
-                    assert_eq!(at(0.25), at(0.5), "{split:?} {place:?} {zoom:?}");
+                    // (The pointer at the bottom left, off the box.)
+                    let at = |h: f32| geometry(&settings(|s| (s.split, s.zoom, s.zoom_place, s.zoom_strip) = (split, zoom, place, h)), (2, 590));
+                    for (h, px) in [(0.05, 30), (0.25, 150), (0.5, 300), (0.01, 30), (0.9, 300)] {
+                        let r = at(h);
+                        assert_eq!((r[1], r[3]), (15, px), "{split:?} {place:?} {zoom:?} {h}");
+                        assert_eq!((r[0], r[2]), (at(0.2)[0], at(0.2)[2]), "{split:?} {place:?} {zoom:?} {h}");
+                    }
                 }
             }
         }
@@ -5803,22 +5827,97 @@ mod tests {
     }
 
     #[test]
-    fn a_floating_zoom_box_moves_aside_so_clicks_reach_the_map_under_the_pointer() {
+    fn a_floating_zoom_box_drops_below_the_pointer_so_clicks_reach_the_map_under_it() {
         let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
-        mv(&mut l, (400, 300));
+        // The pointer into the box at the top: it drops, its top 30 % of
+        // the window's height (180) below the pointer.
+        mv(&mut l, (400, 60));
         let f = frame(&mut l, vec![]);
         let r = l.magnifier_geometry(&l.magnifier.unwrap()).0;
+        assert_eq!(r, [160, 240, 480, 120]);
         assert!(!inside(r, l.pointer));
         let c = camera_at(&f, (r[0], r[1]));
         let (w, h) = c.world_size();
-        assert_eq!((c.x + w as i32 / 2, c.y + h as i32 / 2), (1400, 800));
-        assert_eq!(click(&mut l, (400, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 400, y: 300 });
+        assert_eq!(Some((c.x + w as i32 / 2, c.y + h as i32 / 2)), l.world_under((400, 60)));
+        assert_eq!(click(&mut l, (400, 60))[0], Input::MouseButton { button: Button::Left, down: true, x: 400, y: 60 });
+        // Its drop setting; as far as the window's bottom lets it.
+        let mut l = arranged(&settings(|s| (s.zoom, s.zoom_box_drop) = (Zoom::Floating131, 0.1)));
+        mv(&mut l, (400, 60));
+        assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, [160, 120, 480, 120]);
+        let mut l = arranged(&settings(|s| (s.zoom, s.zoom_strip, s.zoom_box_top, s.zoom_box_drop) = (Zoom::Floating131, 0.5, 0.2, 0.5)));
+        mv(&mut l, (400, 200));
+        assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, [160, 300, 480, 300]);
+        // No room for it all below the pointer: cut to what is below.
+        mv(&mut l, (400, 400));
+        assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, [160, 424, 480, 176]);
+        // Away from it: back at the top.
+        mv(&mut l, (10, 590));
+        assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, [160, 120, 480, 300]);
+    }
+
+    #[test]
+    fn the_zoom_magnifies_as_set_and_ctrl_wheel_stays_within_the_choices() {
+        let shown_zoom = |l: &Layout| l.shown.iter().find(|(h, _)| *h == Hit::Magnifier).unwrap().1.zoom;
+        for zoom in [Zoom::TopStrip, Zoom::Floating131, Zoom::Mouse111] {
+            for (magnification, expected) in [(1.5, (3, 2)), (2.0, (2, 1)), (3.0, (3, 1)), (4.0, (4, 1)), (2.5, (2, 1))] {
+                let l = arranged(&settings(|s| (s.zoom, s.zoom_magnification) = (zoom, magnification)));
+                assert_eq!((ZOOMS[l.magnifier.unwrap().zoom], shown_zoom(&l)), (expected, expected), "{zoom:?} {magnification}");
+            }
+        }
+        // Ctrl+wheel over the strip: up to 4×, down to 1.5×.
+        let s = settings(|s| s.zoom = Zoom::TopStrip);
+        let mut l = arranged(&s);
+        l.set_walls(Walls::Open);
+        mv(&mut l, (400, 50));
+        key(&mut l, VK_CONTROL, true);
+        let wheel = |l: &mut Layout, delta| { l.route(Input::Wheel { delta, x: 400, y: 50 }); ZOOMS[l.magnifier.unwrap().zoom] };
+        assert_eq!([wheel(&mut l, 120), wheel(&mut l, 120), wheel(&mut l, 120)], [(3, 1), (4, 1), (4, 1)]);
+        assert_eq!([wheel(&mut l, -120), wheel(&mut l, -120), wheel(&mut l, -120), wheel(&mut l, -120)], [(3, 1), (2, 1), (3, 2), (3, 2)]);
+        key(&mut l, VK_CONTROL, false);
+        // Kept while the setting stays (other settings changing); the
+        // setting changed: as it says.
+        l.apply_settings(&Settings { zoom_strip: 0.3, ..s.clone() });
+        assert_eq!(ZOOMS[l.magnifier.unwrap().zoom], (3, 2));
+        l.apply_settings(&Settings { zoom_magnification: 3.0, ..s });
+        assert_eq!(ZOOMS[l.magnifier.unwrap().zoom], (3, 1));
+    }
+
+    #[test]
+    fn zoom_boxes_lie_under_the_corner_buttons_and_leave_them_their_clicks() {
+        // The corner buttons at A's top-left (0..150 x 0..50).
+        let s = with_parts(None);
+        let boxed = |f: &Frame, r: [i32; 4]| f.cameras.iter().position(|c| c.cells && c.origin == (r[0], r[1]) && c.zoom == (2, 1)).unwrap();
+        // A floating box over A, at its top: over the buttons, not moved.
+        let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, Zoom::Floating131, Place::LeftOrBottom)));
+        mv(&mut l, (100, 400));
+        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let r = l.magnifier_geometry(&l.magnifier.unwrap()).0;
+        assert_eq!(r, [80, 15, 240, 120]);
+        assert!(f.view_cameras[2].unwrap() as usize > boxed(&f, r), "the buttons are drawn over the box");
+        // A click on a button over the box reaches it; the box stays.
+        assert_eq!(click(&mut l, (100, 30))[0], Input::MouseButton { button: Button::Left, down: true, x: 100, y: 30 });
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, r);
+        // Beside the buttons, the box's world.
+        assert_eq!(l.hit((200, 30)), Hit::Magnifier);
+        // A box at the mouse: above the pointer, over the buttons, not
+        // moved below them.
+        for zoom in [Zoom::Mouse111, Zoom::Mouse131] {
+            let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, zoom, Place::LeftOrBottom)));
+            mv(&mut l, (100, 140));
+            let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            let r = l.magnifier_geometry(&l.magnifier.unwrap()).0;
+            assert_eq!((r[0], r[1], r[3]), (if zoom == Zoom::Mouse111 { 34 } else { 0 }, 16, 120), "{zoom:?}");
+            assert!(f.view_cameras[2].unwrap() as usize > boxed(&f, r), "{zoom:?}: the buttons are drawn over the box");
+            assert_ne!(l.hit((30, 20)), Hit::Magnifier, "{zoom:?}");
+            assert_eq!(l.hit((60, 100)), Hit::Magnifier, "{zoom:?}");
+        }
     }
 
     #[test]
     fn the_drivers_interface_stays_over_a_zoom_box_or_strip_and_takes_its_clicks() {
         // A screen of the driver's over the middle of the window, partly
-        // over the box (1:3:1: 160..640 x 120..480).
+        // over the box (1:3:1: 160..640 x 15..135).
         let screen = vec![[100, 100, 300, 200]];
         for zoom in [Zoom::Floating131, Zoom::TopStrip] {
             let mut l = arranged(&settings(|s| s.zoom = zoom));
@@ -5830,14 +5929,16 @@ mod tests {
             // Beside it, the box's world.
             assert_ne!(click(&mut l, (500, 130))[0], Input::MouseButton { button: Button::Left, down: true, x: 500, y: 130 }, "{zoom:?}");
         }
-        // Not over the driver's screen fitted into the view it is in.
+        // Under the driver's screen placed in the view it is in (404..800 x
+        // 0..297), which takes the clicks there.
         let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, Zoom::Floating131, Place::RightOrTop)));
         l.screen_place = ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating };
         let mut s = scene();
         s.interface.screen = Some("F1".into());
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert!(!f.cameras.iter().any(|c| c.cells && c.zoom == (2, 1) && c.origin == (483, 120)), "{:?}", f.cameras);
-        assert_eq!(l.hit((600, 300)), Hit::Magnifier);
+        let boxed = f.cameras.iter().position(|c| c.cells && c.zoom == (2, 1) && c.origin == (483, 15)).unwrap();
+        assert!(f.placed.iter().all(|&at| at as usize > boxed), "{:?}", f.cameras);
+        assert_eq!(l.hit((600, 60)), Hit::Screen);
     }
 
     #[test]
@@ -5976,12 +6077,12 @@ mod tests {
         assert_eq!(click(&mut l, (300, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 300, y: 246 });
         // Its top, under the strip where it was: the strip's world.
         assert!(!matches!(click(&mut l, (300, 120))[0], Input::MouseButton { x: 300, y: 120, .. }));
-        // A box in the middle leaves no room below: it stays, over the box.
+        // Below a box at the top (15..135) too.
         let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(screen_camera(&f).screen_shift, (0, 0));
-        assert!(f.view_cameras[2].unwrap() as usize > f.cameras.iter().position(|c| c.zoom == (2, 1) && c.origin == (160, 120)).unwrap());
-        assert_eq!(click(&mut l, (300, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 300, y: 300 });
+        assert_eq!((screen_camera(&f).origin, screen_camera(&f).screen_shift), ((100, 139), (0, 39)));
+        assert!(f.view_cameras[2].unwrap() as usize > f.cameras.iter().position(|c| c.zoom == (2, 1) && c.origin == (160, 15)).unwrap());
+        assert_eq!(click(&mut l, (300, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 300, y: 261 });
         // No zoom box: where the driver put it.
         let mut l = arranged(&Settings::default());
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
@@ -5989,33 +6090,21 @@ mod tests {
     }
 
     #[test]
-    fn a_screen_goes_below_a_floating_zoom_boxs_real_bottom_whatever_zoom_strip_says() {
+    fn a_screen_goes_below_a_floating_zoom_box_its_height_and_clicks_with_it() {
         let mut s = with_screen("F1");
         let part = scene::ViewState { id: 258, view: scene::View { interface_only: true, origin: (420, 150), viewport: (300, 200), ..Default::default() }, overlay: vec![] };
         s.views.push(part);
         s.interface.screen_view = Some(258);
         let screen_camera = |f: &Frame| f.cameras[f.view_cameras[2].unwrap() as usize];
-        for strip in [0.05, 0.25, 0.5] {
-            // The box over B: 483..720 x 211..388; the screen goes to 392.
+        // The box over B: 483..720 x 15.., `zoom_strip` of 600 high; the
+        // screen (150..350) below it where they meet.
+        for (strip, top, click_at, driver_y) in [(0.05, 150, 300, 300), (0.25, 169, 300, 281), (0.5, 319, 400, 231)] {
             let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place, s.zoom_strip) = (S::Vertical1To1, Zoom::Floating131, Place::RightOrTop, strip)));
             let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-            assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, [483, 211, 237, 177]);
-            assert_eq!((screen_camera(&f).origin, screen_camera(&f).screen_shift), ((420, 392), (0, 242)), "zoom_strip {strip}");
-            assert_eq!(click(&mut l, (500, 400))[0], Input::MouseButton { button: Button::Left, down: true, x: 500, y: 158 });
+            assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, [483, 15, 237, (600.0 * strip) as i32]);
+            assert_eq!((screen_camera(&f).origin, screen_camera(&f).screen_shift), ((420, top), (0, top - 150)), "zoom_strip {strip}");
+            assert_eq!(click(&mut l, (500, click_at))[0], Input::MouseButton { button: Button::Left, down: true, x: 500, y: driver_y }, "zoom_strip {strip}");
         }
-    }
-
-    #[test]
-    fn top_box_height_moves_a_screen_and_its_clicks_to_the_new_bottom() {
-        let mut s = with_screen("F1");
-        s.views.push(scene::ViewState { id: 258, view: scene::View { interface_only: true, origin: (420, 150), viewport: (300, 200), ..Default::default() }, overlay: vec![] });
-        s.interface.screen_view = Some(258);
-        let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place, s.zoom_box_height) = (S::Vertical1To1, Zoom::Floating131, Place::RightOrTop, 0.3)));
-        let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, [483, 210, 237, 180]);
-        let c = f.cameras[f.view_cameras[2].unwrap() as usize];
-        assert_eq!((c.origin, c.screen_shift), ((420, 394), (0, 244)));
-        assert_eq!(click(&mut l, (500, 400))[0], Input::MouseButton { button: Button::Left, down: true, x: 500, y: 156 });
     }
 
     #[test]
@@ -6604,23 +6693,26 @@ mod tests {
     }
 
     #[test]
-    fn floating_boxes_stay_centred_then_move_below_the_pointer_or_block_entry() {
+    fn floating_boxes_sit_at_the_top_then_drop_below_the_pointer_or_block_entry() {
         for split in [S::Standard, S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
             for place in [Place::Floating, Place::LeftOrBottom, Place::RightOrTop] {
                 for zoom in [Zoom::Floating131, Zoom::Floating171] {
-                    let mut s = settings(|s| (s.split, s.zoom, s.zoom_place, s.zoom_box_height) = (split, zoom, place, 0.2));
+                    let mut s = settings(|s| (s.split, s.zoom, s.zoom_place) = (split, zoom, place));
                     let mut l = arranged(&s);
                     let m = l.magnifier.unwrap();
                     let initial = l.magnifier_geometry(&m).0;
                     let region = l.zoom_region(&m);
-                    assert_eq!((initial[0], initial[1]), (region[0] + (region[2] - initial[2]) / 2, region[1] + (region[3] - initial[3]) / 2));
+                    // 2.5 % of its region's height below its top, 20 % high.
+                    let part = |thousandths: i64| (region[3] as i64 * thousandths / 1000) as i32;
+                    assert_eq!(initial, [region[0] + (region[2] - initial[2]) / 2, region[1] + part(25), initial[2], part(200)]);
                     let p = (initial[0] + initial[2] / 3, initial[1] + initial[3] - 1);
                     // Start in this region without crossing a divider wall.
                     l.place_pointer((p.0, initial[1] + initial[3] + GAP));
                     l.take_warp();
                     mv(&mut l, p);
+                    // Its top 30 % of the region's height below the pointer.
                     let moved = l.magnifier_geometry(&m).0;
-                    assert_eq!(moved, [initial[0], p.1 + POINTER_CLEARANCE, initial[2], initial[3]]);
+                    assert_eq!(moved, [initial[0], p.1 + part(300), initial[2], initial[3]]);
                     assert_eq!(l.pointer, p);
                     assert!(!inside(moved, p));
                     assert!(l.zoom_pointer_walls().is_empty());
@@ -6651,9 +6743,9 @@ mod tests {
             mv(&mut l, (300, 300));
             l.route(Input::MouseButton { button: Button::Middle, down: true, x: 300, y: 300 });
             let out = mv(&mut l, (300, 50));
-            assert_eq!(l.pointer, (300, 154));
+            assert_eq!(l.pointer, (300, 124));
             assert_eq!(l.raw_pointer, (300, 50));
-            assert_eq!(l.take_warp(), (walls == Walls::Warp).then_some((300, 154)));
+            assert_eq!(l.take_warp(), (walls == Walls::Warp).then_some((300, 124)));
             assert!(out.iter().all(|e| !matches!(e, Input::MouseMove { y: 50, .. })));
             l.route(Input::MouseButton { button: Button::Middle, down: false, x: 300, y: 50 });
         }
@@ -6680,34 +6772,36 @@ mod tests {
     #[test]
     fn zoom_walls_stop_fast_crossings_and_keep_clicks_on_the_held_map_pixel() {
         let mut l = arranged(&settings(|s| {
-            (s.zoom, s.zoom_box_height, s.zoom_box_block_pointer) = (Zoom::Floating131, 0.2, true);
+            (s.zoom, s.zoom_box_block_pointer) = (Zoom::Floating131, true);
         }));
-        mv(&mut l, (100, 300));
-        mv(&mut l, (700, 300));
-        assert_eq!(l.pointer, (157, 300));
-        assert_eq!(l.take_warp(), Some((157, 300)));
-        assert_eq!(click(&mut l, (700, 300))[0], Input::MouseButton { button: Button::Left, down: true, x: 157, y: 300 });
-        assert_eq!(l.route(Input::Wheel { delta: 120, x: 700, y: 300 }), [Input::Wheel { delta: 120, x: 157, y: 300 }]);
+        // (Across the box at the top, 15..135.)
+        mv(&mut l, (100, 60));
+        mv(&mut l, (700, 60));
+        assert_eq!(l.pointer, (157, 60));
+        assert_eq!(l.take_warp(), Some((157, 60)));
+        assert_eq!(click(&mut l, (700, 60))[0], Input::MouseButton { button: Button::Left, down: true, x: 157, y: 60 });
+        assert_eq!(l.route(Input::Wheel { delta: 120, x: 700, y: 60 }), [Input::Wheel { delta: 120, x: 157, y: 60 }]);
     }
 
     #[test]
     fn a_zoom_wall_keeps_the_pointer_on_its_original_side_of_an_open_divider() {
         let mut l = arranged(&settings(|s| {
-            (s.split, s.zoom, s.zoom_box_height, s.zoom_box_block_pointer) = (S::Vertical1To1, Zoom::Floating131, 0.2, true);
+            (s.split, s.zoom, s.zoom_box_block_pointer) = (S::Vertical1To1, Zoom::Floating131, true);
         }));
-        mv(&mut l, (100, 300));
-        mv(&mut l, (700, 300));
-        assert_eq!((l.pointer, l.side), ((157, 300), Some(Side::A)));
+        mv(&mut l, (100, 60));
+        mv(&mut l, (700, 60));
+        assert_eq!((l.pointer, l.side), ((157, 60), Some(Side::A)));
     }
 
     #[test]
-    fn even_full_height_floating_boxes_move_clear_of_the_free_and_captured_pointer() {
-        for height in [0.0, 0.05, 0.5, 1.0] {
-            let mut l = arranged(&settings(|s| (s.split, s.roles, s.zoom, s.zoom_place, s.zoom_box_height) = (S::Vertical1To1, Roles::UnitMouse, Zoom::Floating171, Place::RightOrTop, height)));
-            l.place_pointer((600, 300));
+    fn even_the_tallest_floating_boxes_move_clear_of_the_free_and_captured_pointer() {
+        for (height, top) in [(0.05, 0.0), (0.2, 0.025), (0.5, 0.2)] {
+            let mut l = arranged(&settings(|s| (s.split, s.roles, s.zoom, s.zoom_place, s.zoom_strip, s.zoom_box_top) = (S::Vertical1To1, Roles::UnitMouse, Zoom::Floating171, Place::RightOrTop, height, top)));
+            let at = (600, 20 + (600.0 * top) as i32);
+            l.place_pointer(at);
             frame(&mut l, vec![]);
             assert!(!inside(l.magnifier_geometry(&l.magnifier.unwrap()).0, l.pointer));
-            click(&mut l, (600, 300));
+            click(&mut l, at);
             assert!(l.captured());
             frame(&mut l, vec![]);
             assert!(!inside(l.magnifier_geometry(&l.magnifier.unwrap()).0, l.cursor_on_window().unwrap()));
@@ -7088,30 +7182,30 @@ mod tests {
         assert_eq!(l.active_side(), Side::B);
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (404, 0));
-        // With a zoom strip (150 high), in A's own area below it, not over
+        // With a zoom strip (120 high), in A's own area below it, not over
         // the strip; clicks there reach them where the driver has them.
         let mut l = arranged(&settings(|s| s.zoom = Zoom::TopStrip));
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (0, 154));
-        assert_eq!(click(&mut l, (30, 174))[0], Input::MouseButton { button: Button::Left, down: true, x: 30, y: 20 });
+        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (0, 124));
+        assert_eq!(click(&mut l, (30, 144))[0], Input::MouseButton { button: Button::Left, down: true, x: 30, y: 20 });
         // The same in A as in B with the strip over both views.
         let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, Zoom::TopStrip, Place::Floating)));
         mv(&mut l, (100, 380));
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (0, 154));
+        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (0, 124));
         mv(&mut l, (600, 380));
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (404, 154));
+        assert_eq!(f.cameras[f.view_cameras[2].unwrap() as usize].origin, (404, 124));
     }
 
-    /// Every split, zoom kind, zoom place, box height and HUD scale, the
+    /// Every split, zoom kind, zoom place, zoom height and HUD scale, the
     /// pointer in each view (free, near the corner, and captured with the
     /// hint in the buttons' place): the views' own interface (the corner's
     /// buttons, the hint) lies inside the active view's area
-    /// (`view_area`), that area inside its pane, and neither meets the
-    /// zoom box or strip (nor its frame).
+    /// (`view_area`), that area inside its pane; neither meets a zoom
+    /// strip (nor its frame), and a zoom box lies under that interface.
     #[test]
-    fn per_view_interface_lies_in_its_view_and_clear_of_every_zoom_area() {
+    fn per_view_interface_lies_in_its_view_clear_of_the_strip_and_over_a_box() {
         let mut s = with_parts(None);
         s.views.push(ViewState { id: 259, view: View { interface_only: true, origin: (8, 8), viewport: (133, 38), ..Default::default() }, overlay: vec![] });
         s.interface.capture_hint = Some(259);
@@ -7122,13 +7216,13 @@ mod tests {
         for split in [S::Standard, S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
             for zoom in [Zoom::Off, Zoom::Floating131, Zoom::Floating171, Zoom::Mouse111, Zoom::Mouse131, Zoom::TopStrip] {
                 for place in [Place::Floating, Place::LeftOrBottom, Place::RightOrTop] {
-                    for (box_height, strip) in [(0.0, 0.05), (0.25, 0.25), (1.0, 0.5)] {
+                    for strip in [0.05, 0.25, 0.5] {
                         for hud in [(1, 1), (2, 1)] {
                             for side in [Side::A, Side::B] {
                                 for (near_corner, captured) in [(false, false), (true, false), (false, true)] {
-                                    let what = format!("{split:?} {zoom:?} {place:?} box {box_height} strip {strip} hud {hud:?} {side:?} near corner {near_corner} captured {captured}");
+                                    let what = format!("{split:?} {zoom:?} {place:?} strip {strip} hud {hud:?} {side:?} near corner {near_corner} captured {captured}");
                                     let mut l = arranged(&settings(|s| {
-                                        (s.split, s.zoom, s.zoom_place, s.zoom_box_height, s.zoom_strip) = (split, zoom, place, box_height, strip);
+                                        (s.split, s.zoom, s.zoom_place, s.zoom_strip) = (split, zoom, place, strip);
                                         s.roles = if captured { Roles::UnitMouse } else { Roles::Free };
                                     }));
                                     l.hud_scale = hud;
@@ -7160,9 +7254,13 @@ mod tests {
                                     assert_eq!(l.view_ui, vec![ui], "{what}");
                                     if let Some((_, z)) = l.shown.iter().find(|(h, _)| *h == Hit::Magnifier) {
                                         let z = grown(rect(z));
-                                        assert!(!overlap(ui, z), "{what}: per-view interface {ui:?} under the zoom area {z:?}");
                                         if matches!(zoom, Zoom::TopStrip) {
+                                            // The strip: the views give it room.
+                                            assert!(!overlap(ui, z), "{what}: per-view interface {ui:?} under the strip {z:?}");
                                             assert!(!overlap(area, z), "{what}: area {area:?} under the strip {z:?}");
+                                        } else {
+                                            // A box: under the interface, which is drawn over it.
+                                            assert!(f.view_cameras[shown].unwrap() >= f.cursor_layer.unwrap(), "{what}: per-view interface drawn under the box");
                                         }
                                     }
                                     checked += 1;

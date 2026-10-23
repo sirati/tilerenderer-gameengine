@@ -47,11 +47,16 @@ impl Range {
 pub const SCALE_RANGE: Range = Range { min: 0.5, max: 3.0, step: 0.05 };
 /// Standard menu height relative to the visible canvas.
 pub const MENU_SCALE_PERCENT_RANGE: Range = Range { min: 25.0, max: 100.0, step: 1.0 };
-/// The height of the zoom strip and of the boxes at the mouse
-/// ([`Layout::zoom_strip`]).
+/// The height of every zoom: the strip, the floating boxes and the boxes
+/// at the mouse ([`Layout::zoom_strip`]).
 pub const ZOOM_STRIP_RANGE: Range = Range { min: 0.05, max: 0.5, step: 0.05 };
-/// Height of a floating box; zero selects its automatic aspect-ratio height.
-pub const ZOOM_BOX_HEIGHT_RANGE: Range = Range { min: 0.0, max: 1.0, step: 0.05 };
+/// A floating box's space below its region's top ([`Layout::zoom_box_top`]).
+pub const ZOOM_BOX_TOP_RANGE: Range = Range { min: 0.0, max: 0.2, step: 0.005 };
+/// How far below the pointer a floating box drops ([`Layout::zoom_box_drop`]).
+pub const ZOOM_BOX_DROP_RANGE: Range = Range { min: 0.0, max: 0.5, step: 0.025 };
+/// The zoom's magnification as an index into [`Layout::MAGNIFICATIONS`]
+/// (`"layout.zoom_magnification_step"`).
+pub const ZOOM_MAGNIFICATION_STEP_RANGE: Range = Range { min: 0.0, max: (Layout::MAGNIFICATIONS.len() - 1) as f32, step: 1.0 };
 /// How often the snapping cursor's target is recomputed, per second.
 pub const SNAP_RATE_RANGE: Range = Range { min: 1.0, max: 30.0, step: 1.0 };
 /// How often the snapping cursor's ghost follows, per second.
@@ -68,7 +73,7 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 30] = [
+pub const KEYS: [&str; 32] = [
     "resolution.pixel_scale",
     "resolution.scale_menus",
     "resolution.menu_scale_percent",
@@ -79,7 +84,9 @@ pub const KEYS: [&str; 30] = [
     "layout.zoom_place",
     "layout.zoom",
     "layout.zoom_strip",
-    "layout.zoom_box_height",
+    "layout.zoom_box_top",
+    "layout.zoom_box_drop",
+    "layout.zoom_magnification_step",
     "layout.zoom_box_block_pointer",
     "layout.menu_follows_pointer",
     "layout.screen_place",
@@ -107,7 +114,9 @@ pub fn range(key: &str) -> Option<Range> {
         "resolution.menu_scale_percent" => Some(MENU_SCALE_PERCENT_RANGE),
         "resolution.frame_scale" | "resolution.world_scale" => Some(SCALE_RANGE),
         "layout.zoom_strip" => Some(ZOOM_STRIP_RANGE),
-        "layout.zoom_box_height" => Some(ZOOM_BOX_HEIGHT_RANGE),
+        "layout.zoom_box_top" => Some(ZOOM_BOX_TOP_RANGE),
+        "layout.zoom_box_drop" => Some(ZOOM_BOX_DROP_RANGE),
+        "layout.zoom_magnification_step" => Some(ZOOM_MAGNIFICATION_STEP_RANGE),
         "input.snap_updates_per_second" => Some(SNAP_RATE_RANGE),
         "input.snap_ghost_fps" => Some(SNAP_GHOST_RANGE),
         "input.capture_sensitivity" => Some(CAPTURE_SENSITIVITY_RANGE),
@@ -221,7 +230,9 @@ impl Settings {
             "layout.zoom_place" => choice(l.zoom_place),
             "layout.zoom" => choice(l.zoom),
             "layout.zoom_strip" => Some(ControlValue::Number(l.zoom_strip)),
-            "layout.zoom_box_height" => Some(ControlValue::Number(l.zoom_box_height)),
+            "layout.zoom_box_top" => Some(ControlValue::Number(l.zoom_box_top)),
+            "layout.zoom_box_drop" => Some(ControlValue::Number(l.zoom_box_drop)),
+            "layout.zoom_magnification_step" => Some(ControlValue::Number(l.zoom_magnification_step() as f32)),
             "layout.zoom_box_block_pointer" => Some(ControlValue::On(l.zoom_box_block_pointer)),
             "layout.menu_follows_pointer" => Some(ControlValue::On(l.menu_follows_pointer)),
             "layout.smooth_world_movement" => Some(ControlValue::On(l.smooth_world_movement)),
@@ -290,7 +301,16 @@ impl Settings {
                 "layout.zoom_place" => set_choice(&mut l.zoom_place, value),
                 "layout.zoom" => set_choice(&mut l.zoom, value),
                 "layout.zoom_strip" => set_number(&mut l.zoom_strip, key, value),
-                "layout.zoom_box_height" => set_number(&mut l.zoom_box_height, key, value),
+                "layout.zoom_box_top" => set_number(&mut l.zoom_box_top, key, value),
+                "layout.zoom_box_drop" => set_number(&mut l.zoom_box_drop, key, value),
+                "layout.zoom_magnification_step" => {
+                    let mut step = l.zoom_magnification_step() as f32;
+                    let set = set_number(&mut step, key, value);
+                    if set {
+                        l.zoom_magnification = Layout::MAGNIFICATIONS[step as usize];
+                    }
+                    set
+                }
                 "layout.zoom_box_block_pointer" => match value {
                     ControlValue::On(on) => {
                         l.zoom_box_block_pointer = *on;
@@ -478,7 +498,9 @@ mod tests {
             ("layout.zoom_place", ControlValue::Choice("RightOrTop".into())),
             ("layout.zoom", ControlValue::Choice("TopStrip".into())),
             ("layout.zoom_strip", ControlValue::Number(0.35)),
-            ("layout.zoom_box_height", ControlValue::Number(0.6)),
+            ("layout.zoom_box_top", ControlValue::Number(0.05)),
+            ("layout.zoom_box_drop", ControlValue::Number(0.425)),
+            ("layout.zoom_magnification_step", ControlValue::Number(3.0)),
             ("layout.zoom_box_block_pointer", ControlValue::On(true)),
             ("layout.menu_follows_pointer", ControlValue::On(false)),
             ("layout.smooth_world_movement", ControlValue::On(true)),
@@ -583,16 +605,34 @@ mod tests {
     }
 
     #[test]
-    fn top_box_height_has_its_own_range_and_auto_value() {
+    fn floating_boxes_have_no_own_height_but_a_top_margin_and_a_drop() {
         let mut s = Settings::default();
-        assert!(s.set_control("layout.zoom_box_height", &ControlValue::Number(0.62)));
-        assert_eq!(s.layout.zoom_box_height, 0.6);
-        assert!(s.set_control("layout.zoom_box_height", &ControlValue::Number(2.0)));
-        assert_eq!(s.layout.zoom_box_height, 1.0);
-        assert!(s.set_control("layout.zoom_box_height", &ControlValue::Number(-1.0)));
-        assert_eq!(s.layout.zoom_box_height, 0.0);
-        assert!(!s.set_control("layout.zoom_box_height", &ControlValue::Number(f32::NAN)));
-        assert_eq!(s.layout.zoom_strip, 0.25);
+        assert!(!KEYS.contains(&"layout.zoom_box_height"));
+        assert_eq!(s.control("layout.zoom_box_height"), None);
+        assert!(!s.set_control("layout.zoom_box_height", &ControlValue::Number(0.6)));
+        assert_eq!(s, Settings::default());
+        assert!(s.set_control("layout.zoom_box_top", &ControlValue::Number(0.0124)));
+        assert_eq!(s.layout.zoom_box_top, 0.01);
+        assert!(s.set_control("layout.zoom_box_top", &ControlValue::Number(0.9)));
+        assert_eq!(s.layout.zoom_box_top, 0.2);
+        assert!(s.set_control("layout.zoom_box_drop", &ControlValue::Number(0.41)));
+        assert_eq!(s.layout.zoom_box_drop, 0.4);
+        assert!(s.set_control("layout.zoom_box_drop", &ControlValue::Number(-1.0)));
+        assert_eq!(s.layout.zoom_box_drop, 0.0);
+        assert!(!s.set_control("layout.zoom_box_drop", &ControlValue::Number(f32::NAN)));
+        assert_eq!(s.layout.zoom_strip, 0.2);
+    }
+
+    #[test]
+    fn the_zoom_magnification_is_chosen_by_step() {
+        let mut s = Settings::default();
+        assert_eq!(s.control("layout.zoom_magnification_step"), Some(ControlValue::Number(1.0)));
+        for (step, magnification) in [(0.0, 1.5), (2.4, 3.0), (3.0, 4.0), (9.0, 4.0), (-1.0, 1.5)] {
+            assert!(s.set_control("layout.zoom_magnification_step", &ControlValue::Number(step)) || s.layout.zoom_magnification == magnification, "{step}");
+            assert_eq!(s.layout.zoom_magnification, magnification, "{step}");
+        }
+        assert!(!s.set_control("layout.zoom_magnification_step", &ControlValue::Number(f32::NAN)));
+        assert_eq!(s.layout.zoom_magnification, 1.5);
     }
 
     #[test]

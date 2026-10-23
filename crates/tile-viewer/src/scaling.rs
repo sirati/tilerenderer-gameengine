@@ -1981,13 +1981,13 @@ mod tests {
         for split in [S::Standard, S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
             for mode in [UnitButtons::Spanning, UnitButtons::ActiveView] {
                 for frame_scale in [1.0, 1.5] {
-                    for (zoom, box_height) in [(Zoom::Off, 0.0), (Zoom::TopStrip, 0.0), (Zoom::Floating131, 1.0), (Zoom::Mouse131, 0.0)] {
+                    for (zoom, strip) in [(Zoom::Off, 0.2), (Zoom::TopStrip, 0.2), (Zoom::Floating131, 0.5), (Zoom::Mouse131, 0.2)] {
                         for b_active in [false, true] {
                             if b_active && split == S::Standard { continue; }
                             let what = format!("{split:?} {mode:?} frame ×{frame_scale} {zoom:?} {}", if b_active { "B" } else { "A" });
                             let p = fixed_plan(canvas, (1920, 1080), (1, 1.0, frame_scale, 1.0));
                             let mut layout = layout::Layout::default();
-                            layout.apply_settings(&viewer_settings::Layout { split, unit_buttons: mode, zoom, zoom_box_height: box_height, ..Default::default() });
+                            layout.apply_settings(&viewer_settings::Layout { split, unit_buttons: mode, zoom, zoom_strip: strip, ..Default::default() });
                             layout.driver_screen = Some(p.screen);
                             layout.frame(&scene, canvas, (0, 0, 0, 0), vec![], None);
                             let area = layout.view_area(if b_active { layout::Side::B } else { layout::Side::A });
@@ -2009,7 +2009,8 @@ mod tests {
                                 // Clicks reach each one.
                                 let back = s.to_driver((s.rect[0] + s.rect[2] / 2, s.rect[1] + s.rect[3] / 2));
                                 assert!((back.0 - (b[0] + 16)).abs() <= 1 && (back.1 - (b[1] + 16)).abs() <= 1, "{what}: {b:?} -> {back:?}");
-                                if let Some(z) = layout.zoom_area() {
+                                // (A zoom box lies under them instead.)
+                                if let Some(z) = layout.zoom_area().filter(|_| zoom == Zoom::TopStrip) {
                                     let z = [z[0] - 2, z[1] - 2, z[2] + 4, z[3] + 4];
                                     assert!(!overlaps(s.rect, z), "{what}: {b:?} at {:?} under the zoom area {z:?}", s.rect);
                                 }
