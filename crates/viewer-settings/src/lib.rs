@@ -290,10 +290,11 @@ pub enum Zoom {
     Off,
     /// A box at the top of its region, centred across, `1:3:1` of the
     /// width, [`Layout::zoom_strip`] of the height, its top
-    /// [`Layout::zoom_box_top`] below the region's top. While the pointer
-    /// is where it rests, it moves (gliding) below that place, its top
-    /// [`Layout::zoom_box_drop`] below that place's bottom (or holds the
-    /// pointer out, [`Layout::zoom_box_block_pointer`]).
+    /// [`Layout::zoom_box_top`] below the region's top. Once the pointer
+    /// comes within 5% of the height of where it rests, it moves (gliding)
+    /// below that place, its top [`Layout::zoom_box_drop`] below that
+    /// place's bottom (or holds the pointer out,
+    /// [`Layout::zoom_box_block_pointer`]).
     Floating131,
     /// As `Floating131`, `1:7:1`.
     Floating171,
