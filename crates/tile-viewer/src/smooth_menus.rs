@@ -34,6 +34,21 @@ fn clipped(mut s: PlacedSprite, r: Rect) -> Option<PlacedSprite> {
     Some(s)
 }
 
+/// `rect` (a list's scroll rectangle) without the scroll bars reaching
+/// into it (the game's `Scroll_Bar`s, sliders to the scene): only the
+/// list's content glides; a bar's track, arrows and thumb stay where the
+/// driver draws them. Each bar cuts off the side of `rect` it is on.
+fn without_scroll_bars(scene: &Scene, mut rect: Rect) -> Rect {
+    for bar in scene.interactables.iter().filter(|i| matches!(i.kind, InteractableKind::Slider { .. })) {
+        let bar = bounds(bar.rect);
+        if intersect(bar, rect).is_none() { continue }
+        if bar[3] - bar[1] >= bar[2] - bar[0] {
+            if bar[0] + bar[2] >= rect[0] + rect[2] { rect[2] = rect[2].min(bar[0]) } else { rect[0] = rect[0].max(bar[2]) }
+        } else if bar[1] + bar[3] >= rect[1] + rect[3] { rect[3] = rect[3].min(bar[1]) } else { rect[1] = rect[1].max(bar[3]) }
+    }
+    rect
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Row { id: u64, rect: Rect }
 
@@ -56,7 +71,7 @@ impl Picture {
         }
         scene.interactables.iter().filter_map(|list| {
             let InteractableKind::List { scroll, .. } = list.kind else { return None };
-            let rect = bounds(scroll);
+            let rect = without_scroll_bars(scene, bounds(scroll));
             if rect[2] <= rect[0] || rect[3] <= rect[1] { return None }
             let rows: Vec<Row> = scene.interactables.iter().filter(|row| row.kind == InteractableKind::ListItem)
                 .filter(|row| {
@@ -614,6 +629,35 @@ mod tests {
         assert!(state.draw(&scene, &free, &spans, 1.03, true, 2, None, rect).is_none());
         scene.interactables.clear();
         assert!(state.draw(&scene, &free, &spans, 1.04, true, 2, None, rect).is_none());
+    }
+
+    /// A scroll bar inside the list's scroll rectangle (the F1 advisor's,
+    /// right of its rows): its track and thumb stay exactly where the
+    /// driver draws them (the thumb at the game's position) while the rows
+    /// glide.
+    #[test]
+    fn a_scroll_bar_in_the_list_stays_put_while_the_rows_glide() {
+        let bar = |thumb_y: i32, first: u64| {
+            let (mut scene, mut free, _) = frame(first);
+            scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None, id: 500, rect: [96, 10, 14, 60], kind: InteractableKind::Slider { track: [96, 24, 14, 32], value: 0 } });
+            let track = PlacedSprite { screen: true, view: Some(0), clip: Some([96, 10, 110, 70]), ..PlacedSprite::new(SpriteSetId::from_raw(900), 96, 10) };
+            let thumb = PlacedSprite { screen: true, view: Some(0), clip: Some([96, thumb_y, 110, thumb_y + 10]), ..PlacedSprite::new(SpriteSetId::from_raw(901), 96, thumb_y) };
+            free.extend([track, thumb]);
+            let spans = vec![Span { view: 7, start: 0, len: free.len(), cameras: vec![0; free.len()] }];
+            (scene, free, spans, [track, thumb])
+        };
+        let mut state = SmoothMenus::default();
+        let (scene, free, spans, _) = bar(20, 1);
+        state.draw(&scene, &free, &spans, 0.0, true, 1, None, rect);
+        let (scene, free, spans, still) = bar(30, 2);
+        for at in [1.0 + DURATION / 3.0, 1.0 + DURATION / 2.0] {
+            let animated = state.draw(&scene, &free, &spans, at, true, 1, None, rect).expect("slides");
+            // The rows glide (the old first row still partly shown) ...
+            assert_eq!(pixel(&animated, (20, 15)), Some(1), "rows glide at {at}");
+            // ... the bar's sprites are exactly the driver's.
+            for s in still { assert!(animated.contains(&s), "{s:?} unchanged at {at}"); }
+            assert!(!animated.iter().any(|s| matches!(s.set.raw(), 900 | 901) && !still.contains(s)), "a moved copy of the bar at {at}");
+        }
     }
 
     #[test]
