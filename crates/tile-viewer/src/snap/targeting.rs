@@ -19,8 +19,8 @@ fn scene() -> Scene {
         views: vec![ViewState { id: 0, view: main, overlay: vec![] }, ViewState { id: 255, view: ui, overlay: vec![] }],
         shape: scene::WorldShape { cols: 62, rows: 125, wrap_x: true, wrap_y: false },
         interactables: vec![
-            Interactable { alt_right_click: false, anchor: None, rect: [100, 520, 60, 30], kind: InteractableKind::Button, id: 1 },
-            Interactable { alt_right_click: false, anchor: None, rect: [300, 520, 60, 30], kind: InteractableKind::Button, id: 2 },
+            Interactable { region: None, alt_right_click: false, anchor: None, rect: [100, 520, 60, 30], kind: InteractableKind::Button, id: 1 },
+            Interactable { region: None, alt_right_click: false, anchor: None, rect: [300, 520, 60, 30], kind: InteractableKind::Button, id: 2 },
         ],
         ..Default::default()
     }
@@ -226,7 +226,7 @@ fn the_attractor_stays_in_the_middle_while_the_world_cursor_is_off_it() {
 fn the_attractor_draws_the_pointer_past_elements_off_the_way() {
     // From B up towards the middle of the view, C lies near but 42° off
     // the motion, the middle 17° off and far: the middle is picked.
-    let mut t = targets(&[Interactable { alt_right_click: false, anchor: None, rect: [270, 470, 20, 20], kind: InteractableKind::Button, id: 3 }], ((0, 0), (1, 1)), (800, 600));
+    let mut t = targets(&[Interactable { region: None, alt_right_click: false, anchor: None, rect: [270, 470, 20, 20], kind: InteractableKind::Button, id: 3 }], ((0, 0), (1, 1)), (800, 600));
     t.push(Target::capture([0, 0, 800, 600], (400, 300)));
     assert_eq!(pick(&t, (330.0, 535.0), Some(2), (0.0, -60.0)).map(|k| t[k].id), Some(CAPTURE_ID));
     // As a button there it would lose to C.

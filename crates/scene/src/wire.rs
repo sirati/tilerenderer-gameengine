@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, Button, DetachedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 52;
+pub const VERSION: u32 = 53;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -551,9 +551,13 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     for v in i.rect {
                         w.i32(v);
                     }
-                    // Bit 0: an anchor follows; bit 1: Alt left click is right.
-                    w.u8(u8::from(i.anchor.is_some()) | u8::from(i.alt_right_click) << 1);
+                    // Bit 0: an anchor follows; bit 1: Alt left click is
+                    // right; bit 2: a region follows.
+                    w.u8(u8::from(i.anchor.is_some()) | u8::from(i.alt_right_click) << 1 | u8::from(i.region.is_some()) << 2);
                     for v in i.anchor.unwrap_or_default() {
+                        w.i32(v);
+                    }
+                    for v in i.region.unwrap_or_default() {
                         w.i32(v);
                     }
                     w.u32(i.id as u32);
@@ -625,7 +629,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
 }
 
 /// Bytes of one encoded [`Interactable`].
-const INTERACTABLE_BYTES: usize = 16 + 1 + 8 + 8 + 1 + 16 + 4;
+const INTERACTABLE_BYTES: usize = 16 + 1 + 8 + 16 + 8 + 1 + 16 + 4;
 /// One `DetachedPopup`: view, serial, anchor and click, `world_scaled`.
 const DETACHED_BYTES: usize = 4 + 8 + 6 * 4 + 1;
 
@@ -811,12 +815,14 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 for _ in 0..n {
                     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
                     let flags = r.u8()?;
-                    if flags > 3 {
+                    if flags > 7 {
                         return Err(WireError::Tag(flags));
                     }
-                    let (has_anchor, alt_right_click) = (flags & 1 != 0, flags & 2 != 0);
+                    let (has_anchor, alt_right_click, has_region) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
                     let point = [r.i32()?, r.i32()?];
                     let anchor = has_anchor.then_some(point);
+                    let region = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                    let region = has_region.then_some(region);
                     let id = r.u32()? as u64 | (r.u32()? as u64) << 32;
                     let tag = r.u8()?;
                     let scroll = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
@@ -828,7 +834,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                         3 => InteractableKind::Slider { track: scroll, value: step },
                         t => return Err(WireError::Tag(t)),
                     };
-                    items.push(Interactable { alt_right_click, anchor, rect, kind, id });
+                    items.push(Interactable { alt_right_click, anchor, region, rect, kind, id });
                 }
                 Update::Interactables(items)
             }
@@ -1314,10 +1320,10 @@ mod tests {
             snap_to_tiles: true,
         };
         s.interactables = vec![
-            Interactable { alt_right_click: false, anchor: None, rect: [10, 20, 100, 24], kind: InteractableKind::Button, id: 0x1_0000_0002 },
-            Interactable { alt_right_click: false, anchor: None, rect: [5, 50, 200, 300], kind: InteractableKind::List { scroll: [5, 60, 190, 280], step: 20 }, id: 7 },
-            Interactable { alt_right_click: true, anchor: Some([193, 69]), rect: [5, 60, 190, 20], kind: InteractableKind::ListItem, id: 8 },
-            Interactable { alt_right_click: false, anchor: None, rect: [10, 20, 200, 24], kind: InteractableKind::Slider { track: [20, 32, 180, 1], value: 123_456 }, id: 9 },
+            Interactable { alt_right_click: false, anchor: Some([12, 30]), region: Some([10, 20, 160, 24]), rect: [10, 20, 16, 24], kind: InteractableKind::Button, id: 0x1_0000_0002 },
+            Interactable { region: None, alt_right_click: false, anchor: None, rect: [5, 50, 200, 300], kind: InteractableKind::List { scroll: [5, 60, 190, 280], step: 20 }, id: 7 },
+            Interactable { region: None, alt_right_click: true, anchor: Some([193, 69]), rect: [5, 60, 190, 20], kind: InteractableKind::ListItem, id: 8 },
+            Interactable { region: None, alt_right_click: false, anchor: None, rect: [10, 20, 200, 24], kind: InteractableKind::Slider { track: [20, 32, 180, 1], value: 123_456 }, id: 9 },
         ];
         s.screen_size = (1920, 1080);
         let hover = LookState { pointer: PointerState::Hover, selected: false };

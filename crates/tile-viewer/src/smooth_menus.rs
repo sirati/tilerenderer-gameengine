@@ -440,12 +440,12 @@ mod tests {
     fn frame(first: u64) -> (Scene, Vec<PlacedSprite>, Vec<Span>) {
         let mut scene = Scene::default();
         scene.views.push(ViewState { id: 7, ..Default::default() });
-        scene.interactables.push(Interactable { alt_right_click: false, anchor: None, id: 99, rect: [10, 10, 100, 60], kind: InteractableKind::List { scroll: [10, 10, 100, 60], step: 20 } });
+        scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None, id: 99, rect: [10, 10, 100, 60], kind: InteractableKind::List { scroll: [10, 10, 100, 60], step: 20 } });
         let mut free = Vec::new();
         for k in 0..3 {
             let id = first + k;
             let y = 10 + k as i32 * 20;
-            scene.interactables.push(Interactable { alt_right_click: false, anchor: None, id, rect: [10, y, 100, 20], kind: InteractableKind::ListItem });
+            scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None, id, rect: [10, y, 100, 20], kind: InteractableKind::ListItem });
             free.push(PlacedSprite { screen: true, view: Some(0), clip: Some([10, 10, 110, 70]), ..PlacedSprite::new(SpriteSetId::from_raw(id as u32), 10, y) });
         }
         let spans = vec![Span { view: 7, start: 0, len: free.len(), cameras: vec![0; free.len()] }];
@@ -749,7 +749,7 @@ mod tests {
                 if item.kind == InteractableKind::ListItem { item.rect[2] = 25; }
             }
             for row in 0..3 {
-                scene.interactables.push(Interactable { alt_right_click: false, anchor: None,
+                scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None,
                     id: 1000 + first + row, rect: [65, 10 + row as i32 * 20, 30, 20], kind: InteractableKind::Button });
             }
             // Each row sprite spans names, statistics and clickable cells.
@@ -791,7 +791,7 @@ mod tests {
     fn multicolumn_lists_keep_distinct_native_row_targets() {
         let (mut scene, free, spans) = frame(1);
         for row in scene.interactables.iter_mut().filter(|i| i.kind == InteractableKind::ListItem) { row.rect[2] = 40; }
-        scene.interactables.push(Interactable { alt_right_click: false, anchor: None, id: 500,
+        scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None, id: 500,
             rect: [65, 10, 40, 20], kind: InteractableKind::ListItem });
         let picture = Picture::take(&scene, &free, &spans, &rect).remove(0);
         assert_eq!(picture.row_at((20, 15)).map(|r| r.id), Some(1));

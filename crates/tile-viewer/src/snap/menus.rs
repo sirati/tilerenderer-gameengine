@@ -18,8 +18,8 @@ fn scene(screen: Option<&str>) -> Scene {
         views: vec![ViewState { id: 0, view: main, overlay: vec![] }, ViewState { id: 255, view: ui, overlay: vec![] }],
         shape: scene::WorldShape { cols: 62, rows: 125, wrap_x: true, wrap_y: false },
         interactables: vec![
-            Interactable { alt_right_click: false, anchor: None, rect: [100, 520, 60, 30], kind: InteractableKind::Button, id: 1 },
-            Interactable { alt_right_click: false, anchor: None, rect: [300, 520, 60, 30], kind: InteractableKind::Button, id: 2 },
+            Interactable { region: None, alt_right_click: false, anchor: None, rect: [100, 520, 60, 30], kind: InteractableKind::Button, id: 1 },
+            Interactable { region: None, alt_right_click: false, anchor: None, rect: [300, 520, 60, 30], kind: InteractableKind::Button, id: 2 },
         ],
         ..Default::default()
     };

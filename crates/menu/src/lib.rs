@@ -391,7 +391,7 @@ impl Menus {
         menu.items
             .iter()
             .filter_map(|item| match item {
-                Item::Button { id, at, size, .. } => Some(scene::Interactable { alt_right_click: false, anchor: None,
+                Item::Button { id, at, size, .. } => Some(scene::Interactable { region: None, alt_right_click: false, anchor: None,
                     rect: [ox + at.0, oy + at.1, size.0 as i32, size.1 as i32],
                     kind: scene::InteractableKind::Button,
                     id: id_hash(&menu.name, id),

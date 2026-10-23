@@ -1130,7 +1130,30 @@ impl Panels {
             let select = if matches!(select, scene::Select::Pick { .. } | scene::Select::Toggle) && item.control().is_some_and(|key| panel.content_controls.contains(key)) {
                 scene::Select::None
             } else { select };
-            out.push(ControlLooks { id: id_hash(&panel.name, &n.to_string()), rect, kind, select, shown, draws, states });
+            // A check box is the box and its label to a person: the label
+            // draws button snapping too, which points at the box.
+            let (anchor, region) = match &item.kind {
+                Kind::Checkbox { .. } => {
+                    let (bw, bh) = item.normal.as_ref().and_then(|a| self.art_named(a, state)).and_then(|a| a.size).unwrap_or((16, 16));
+                    let anchor = [rect[0] + (bw as i32).min(rect[2]) / 2, rect[1] + (bh as i32).min(rect[3]) / 2];
+                    let [mut l, mut t, mut r, mut b] = [rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]];
+                    for d in &draws {
+                        if let Draw::Text(text) = d {
+                            let m = measure(&text.style, &text.text);
+                            let [cl, ct, cr, cb] = text.clip;
+                            let (tl, tt) = (text.x.max(cl), (text.y - m.ascent).max(ct));
+                            let (tr, tb) = ((text.x + m.width).min(cr), (text.y + m.descent).min(cb));
+                            if tr > tl && tb > tt {
+                                (l, t, r, b) = (l.min(tl), t.min(tt), r.max(tr), b.max(tb));
+                            }
+                        }
+                    }
+                    let region = [l, t, r - l, b - t];
+                    (Some(anchor), (region != rect).then_some(region))
+                }
+                _ => (None, None),
+            };
+            out.push(ControlLooks { id: id_hash(&panel.name, &n.to_string()), rect, anchor, region, kind, select, shown, draws, states });
 
         }
         out
@@ -1252,6 +1275,12 @@ impl Panels {
 pub struct ControlLooks {
     pub id: u64,
     pub rect: [i32; 4],
+    /// Where a pointer goes on it (`scene::Interactable::anchor`): a check
+    /// box's box.
+    pub anchor: Option<[i32; 2]>,
+    /// All of it as a person sees it, when more than `rect`
+    /// (`scene::Interactable::region`): a check box with its label.
+    pub region: Option<[i32; 4]>,
     pub kind: scene::InteractableKind,
     pub select: scene::Select,
     pub shown: scene::LookState,
@@ -1705,6 +1734,30 @@ mod tests {
         assert_eq!(r[1].events, [PanelEvent::Toggled { control: "smooth".into(), on: true }]);
         let r = click(&panels, p, &mut s, 215, 225);
         assert_eq!(r[1].events, [PanelEvent::Toggled { control: "smooth".into(), on: false }]);
+    }
+
+    #[test]
+    fn a_checkbox_points_at_its_box_and_spans_its_label() {
+        let panels = Panels::parse(PANELS).unwrap();
+        let p = panels.panel("p").unwrap();
+        let s = state("two");
+        let looks = panels.looks(p, &s, AREA, &estimate);
+        let check = looks.iter().find(|l| l.select == scene::Select::Toggle).unwrap();
+        let [x, y, w, h] = check.rect;
+        let [ax, ay] = check.anchor.unwrap();
+        // On the box (its art at the item's corner), inside the hit area.
+        assert!(ax >= x && ax < x + 16 && ay >= y && ay < y + h, "{:?} {:?}", check.anchor, check.rect);
+        // The region holds the hit area and every bit of the label's text.
+        let [rx, ry, rw, rh] = check.region.unwrap_or(check.rect);
+        assert!(rx <= x && ry <= y && rx + rw >= x + w && ry + rh >= y + h);
+        for d in &check.draws {
+            if let Draw::Text(t) = d {
+                let m = estimate(&t.style, &t.text);
+                assert!(rx <= t.x && rx + rw >= (t.x + m.width).min(t.clip[2]) && ry <= t.y - m.ascent, "{:?} {t:?}", check.region);
+            }
+        }
+        // Other controls: neither.
+        assert!(looks.iter().filter(|l| l.select != scene::Select::Toggle).all(|l| l.anchor.is_none() && l.region.is_none()));
     }
 
     #[test]

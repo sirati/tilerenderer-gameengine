@@ -1935,7 +1935,7 @@ mod shown_scene_tests {
             },
             Update::View { id: 5, view: Some(View::default()) },
             Update::Overlay { view: 5, sprites: vec![FreeSprite { set: 10, ..Default::default() }] },
-            Update::Interactables(vec![Interactable { alt_right_click: false, anchor: None, id: 1, rect: [10, 10, 20, 20], kind: InteractableKind::Button }]),
+            Update::Interactables(vec![Interactable { region: None, alt_right_click: false, anchor: None, id: 1, rect: [10, 10, 20, 20], kind: InteractableKind::Button }]),
             Update::Looks(vec![Looks {
                 id: 1,
                 views: vec![ViewLooks { view: 5, sprites: (0, 1), states: vec![(hover, vec![FreeSprite { set: 11, ..Default::default() }])] }],
@@ -4126,7 +4126,7 @@ mod snap_hover_tests {
         // Two menu rows; the driver shows row 2 hovered (the snapping
         // pointer landed there and the driver got it).
         let hover = LookState { pointer: PointerState::Hover, selected: false };
-        let row = |id: u64, y: i32| Interactable { alt_right_click: false, rect: [0, y, 100, 20], anchor: None, kind: InteractableKind::Button, id };
+        let row = |id: u64, y: i32| Interactable { region: None, alt_right_click: false, rect: [0, y, 100, 20], anchor: None, kind: InteractableKind::Button, id };
         let looks_of = |id: u64, shown: LookState, sprites: (u32, u32)| Looks {
             id,
             select: scene::Select::None,

@@ -7,7 +7,7 @@ fn setup() -> (SnapInput, Layout, Scene) {
     let scene = Scene {
         seq: 1,
         views: vec![ViewState { id: 0, view: View { interface_only: true, ..Default::default() }, overlay: vec![] }],
-        interactables: vec![Interactable { alt_right_click: false, anchor: None, id: ID, rect: [100, 100, 220, 24], kind: InteractableKind::Slider { track: [110, 112, 200, 1], value: 250_000 } }],
+        interactables: vec![Interactable { region: None, alt_right_click: false, anchor: None, id: ID, rect: [100, 100, 220, 24], kind: InteractableKind::Slider { track: [110, 112, 200, 1], value: 250_000 } }],
         ..Default::default()
     };
     let mut layout = Layout::default();
@@ -116,7 +116,7 @@ fn vertical_sliders_use_only_vertical_motion_and_clamp_both_ends() {
 
 fn plain() -> (SnapInput, Layout, Scene) {
     let (_, layout, mut scene) = setup();
-    scene.interactables.push(Interactable { alt_right_click: false, anchor: None, id: 7, rect: [100, 300, 80, 20], kind: InteractableKind::Button });
+    scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None, id: 7, rect: [100, 300, 80, 20], kind: InteractableKind::Button });
     (SnapInput::default(), layout, scene)
 }
 fn step(value: i32) -> Input { Input::Slider { id: ID, action: SliderAction::Step, value } }
@@ -235,7 +235,7 @@ fn native_keyboard_focus_border_tracks_selection_and_defers_to_hover_art() {
 #[test]
 fn keyboard_focus_changes_on_the_same_tick_as_the_snapped_target() {
     let (mut snap, mut layout, mut scene) = setup();
-    scene.interactables.push(Interactable {
+    scene.interactables.push(Interactable { region: None,
         alt_right_click: false, anchor: None, id: 7,
         rect: [500, 100, 80, 24], kind: InteractableKind::Button,
     });

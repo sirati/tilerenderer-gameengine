@@ -8,15 +8,15 @@ const TICK: f64 = 1.0 / 120.0;
 const D: f64 = 4.0 / 9.0;
 
 fn button(id: u64, rect: [i32; 4]) -> Interactable {
-    Interactable { alt_right_click: false, anchor: None, rect, kind: InteractableKind::Button, id }
+    Interactable { region: None, alt_right_click: false, anchor: None, rect, kind: InteractableKind::Button, id }
 }
 
 fn item(id: u64, rect: [i32; 4]) -> Interactable {
-    Interactable { alt_right_click: false, anchor: None, rect, kind: InteractableKind::ListItem, id }
+    Interactable { region: None, alt_right_click: false, anchor: None, rect, kind: InteractableKind::ListItem, id }
 }
 
 fn list(id: u64, rect: [i32; 4], step: i32) -> Interactable {
-    Interactable { alt_right_click: false, anchor: None, rect, kind: InteractableKind::List { scroll: rect, step }, id }
+    Interactable { region: None, alt_right_click: false, anchor: None, rect, kind: InteractableKind::List { scroll: rect, step }, id }
 }
 
 /// A 20×20 button with its middle at (x, y).

@@ -1105,7 +1105,7 @@ mod tests {
                     origin: if preferences { (source[0], source[1]) } else { (0, 0) },
                     viewport: if preferences { (1024, 768) } else { (0, 0) }, ..Default::default()
                 }, overlay: vec![FreeSprite { set: background.raw(), x: source[0], y: source[1], screen: true, ..Default::default() }] }],
-                interactables: buttons.iter().enumerate().map(|(i, &rect)| Interactable { alt_right_click: false, id: i as u64, rect, anchor: None, kind: InteractableKind::Button }).collect(),
+                interactables: buttons.iter().enumerate().map(|(i, &rect)| Interactable { region: None, alt_right_click: false, id: i as u64, rect, anchor: None, kind: InteractableKind::Button }).collect(),
                 ..Default::default()
             };
             scene.views[0].overlay.extend(buttons.iter().map(|r| FreeSprite { set: button.raw(), x: r[0], y: r[1], screen: true, ..Default::default() }));
@@ -1259,7 +1259,7 @@ mod tests {
                 views: vec![ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() },
                     overlay: vec![FreeSprite { set: backdrop.raw(), x: 0, y: 0, screen: true, ..Default::default() },
                         FreeSprite { set: background.raw(), x: source[0], y: source[1], screen: true, ..Default::default() }] }],
-                interactables: buttons.iter().enumerate().map(|(i, &rect)| Interactable { alt_right_click: false, id: i as u64, rect, anchor: None, kind: InteractableKind::Button }).collect(),
+                interactables: buttons.iter().enumerate().map(|(i, &rect)| Interactable { region: None, alt_right_click: false, id: i as u64, rect, anchor: None, kind: InteractableKind::Button }).collect(),
                 ..Default::default()
             };
             scene.views[0].overlay.extend(buttons.iter().map(|r| FreeSprite { set: button.raw(), x: r[0], y: r[1], screen: true, ..Default::default() }));
@@ -1477,7 +1477,7 @@ mod tests {
                     interface: scene::Interface { menu_fit: true, ..Default::default() },
                     views: vec![ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() },
                         overlay: vec![FreeSprite { set: background.raw(), x: source[0], y: source[1], screen: true, ..Default::default() }] }],
-                    interactables: controls.iter().enumerate().map(|(i, &rect)| Interactable { alt_right_click: false, id: i as u64, rect, anchor: None, kind: InteractableKind::Button }).collect(),
+                    interactables: controls.iter().enumerate().map(|(i, &rect)| Interactable { region: None, alt_right_click: false, id: i as u64, rect, anchor: None, kind: InteractableKind::Button }).collect(),
                     ..Default::default()
                 };
                 scene.views[0].overlay.extend(controls.iter().zip(&art).map(|(r, a)| FreeSprite { set: a.raw(), x: r[0], y: r[1], screen: true, ..Default::default() }));
@@ -1578,7 +1578,7 @@ mod tests {
                             scene.interface.screen = Some("Menu".into());
                             scene.interface.menu_fit = !scale_menus;
                             let control = [448 + 480, 156 + 360, 64, 48];
-                            scene.interactables = vec![Interactable { alt_right_click: false, id: 1, rect: control, anchor: None, kind: InteractableKind::Button }];
+                            scene.interactables = vec![Interactable { region: None, alt_right_click: false, id: 1, rect: control, anchor: None, kind: InteractableKind::Button }];
                             let p = initial.for_scene(&scene, &rect_of);
                             let mut frame = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
                             // (Preferences, `menu_fit`: fitted as at the
@@ -1621,7 +1621,7 @@ mod tests {
                 ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() },
                     overlay: vec![FreeSprite { set: set.raw(), x: button_rect[0], y: button_rect[1], screen: true, ..Default::default() }] }],
             interface: scene::Interface { screen: Some("Load Scenario".into()), beside: Some(scene::Beside { screen: source, edge: scene::Edge::Left, world: None }), ..Default::default() },
-            interactables: vec![Interactable { alt_right_click: false, id: 11, rect: button_rect, anchor: None, kind: InteractableKind::Button }],
+            interactables: vec![Interactable { region: None, alt_right_click: false, id: 11, rect: button_rect, anchor: None, kind: InteractableKind::Button }],
             ..Default::default()
         };
         let rect_of = |s: &FreeSprite| Some([s.x, s.y, 32, 24]);
@@ -1691,7 +1691,7 @@ mod tests {
                     ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() }, overlay: vec![FreeSprite { x: button[0], y: button[1], screen: true, ..Default::default() }] },
                 ],
                 interface: scene::Interface { screen: Some("Load Scenario".into()), beside: Some(scene::Beside { screen: source, edge: scene::Edge::Left, world: None }), ..Default::default() },
-                interactables: vec![Interactable { alt_right_click: false, id: 99, rect: button, anchor: None, kind: InteractableKind::Button }],
+                interactables: vec![Interactable { region: None, alt_right_click: false, id: 99, rect: button, anchor: None, kind: InteractableKind::Button }],
                 screen_size: p.screen,
                 ..Default::default()
             };
@@ -1856,7 +1856,7 @@ mod tests {
         // (No game menu over the world.)
         scene.views.retain(|v| v.id != 255);
         let menu = [800, 400, 320, 200];
-        let rows: Vec<Interactable> = (0..8).map(|k| Interactable { alt_right_click: false, rect: [menu[0], menu[1] + 4 + 24 * k, menu[2], 24], anchor: None, kind: InteractableKind::Button, id: 0x900 + k as u64 }).collect();
+        let rows: Vec<Interactable> = (0..8).map(|k| Interactable { region: None, alt_right_click: false, rect: [menu[0], menu[1] + 4 + 24 * k, menu[2], 24], anchor: None, kind: InteractableKind::Button, id: 0x900 + k as u64 }).collect();
         let split = viewer_settings::Layout { split: viewer_settings::Split::Vertical1To1, ..Default::default() };
         let bounds = layout::WorldBounds { size: (8000, 4000), wrap: (true, false) };
         for pixel_scale in [1, 2, 3] {
@@ -2367,7 +2367,7 @@ mod tests {
                 with.interface.popup = Some(257);
                 with.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (popup[0], popup[1]), viewport: (500, 300), ..Default::default() },
                     overlay: vec![sprite(info, (popup[0], popup[1])), sprite(button, (ok[0], ok[1]))] });
-                with.interactables = vec![Interactable { alt_right_click: false, id: 7, rect: ok, anchor: None, kind: InteractableKind::Button }];
+                with.interactables = vec![Interactable { region: None, alt_right_click: false, id: 7, rect: ok, anchor: None, kind: InteractableKind::Button }];
                 for scale_menus in [false, true] {
                     for menu_scale_percent in [60.0, 100.0] {
                         let settings = Resolution { pixel_scale, scale_menus, menu_scale_percent, ..Default::default() };
@@ -2511,8 +2511,8 @@ mod tests {
                     shape: scene::WorldShape { cols: 60, rows: 62, wrap_x: true, wrap_y: false },
                     interface: scene::Interface { screen: Some("Menu".into()), menu_fit: true, screen_view: Some(258), popup: with.then_some(257), ..Default::default() },
                     interactables: vec![
-                        Interactable { alt_right_click: false, id: 1, rect: control, anchor: None, kind: InteractableKind::Button },
-                        Interactable { alt_right_click: false, id: 2, rect: ok, anchor: None, kind: InteractableKind::Button },
+                        Interactable { region: None, alt_right_click: false, id: 1, rect: control, anchor: None, kind: InteractableKind::Button },
+                        Interactable { region: None, alt_right_click: false, id: 2, rect: ok, anchor: None, kind: InteractableKind::Button },
                     ].into_iter().take(if with { 2 } else { 1 }).collect(),
                     ..Default::default()
                 }

@@ -3,7 +3,7 @@ use scene::{FreeSprite, Scene, View, ViewState};
 
 #[test]
 fn city_worked_tile_alt_target_clicks_the_same_native_tile_across_splits_and_scales() {
-    let item = Interactable { alt_right_click: false, rect: [1056, 460, 64, 32], anchor: Some([1088, 476]),
+    let item = Interactable { region: None, alt_right_click: false, rect: [1056, 460, 64, 32], anchor: Some([1088, 476]),
         kind: InteractableKind::Button, id: 0x740C34_0F000002 };
     let scene = Scene {
         screen_size: (1920, 1080),

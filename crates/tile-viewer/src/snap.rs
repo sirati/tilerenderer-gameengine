@@ -25,7 +25,11 @@
 //! far more than the distance) at about the distance the mouse moved.
 //! Motion shorter than [`DEAD_ZONE`] picks nothing (jitter does not make it
 //! flip); without an element within the cone it stays. The first update
-//! after the mouse rested comes at once.
+//! after the mouse rested comes at once. A control a person sees as more
+//! than where it takes clicks (a check box with its label,
+//! `scene::Interactable::region`; a slider or scroll bar's whole bar)
+//! draws the pointer from all of it, and the pointer still lands where a
+//! click works: on the box, on the slider's knob.
 //!
 //! **How it moves.** Every move is a flight ([`Flight`]) from where the
 //! pointer is to the element's middle, lasting exactly [`FLIGHT`] update
@@ -175,8 +179,13 @@ const VK_C: u32 = 0x43;
 /// Something to snap to, in window pixels.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Target {
-    /// x, y, width, height.
+    /// x, y, width, height: where it takes clicks.
     pub rect: [f64; 4],
+    /// The whole control as a person sees it (`rect` and more: a check
+    /// box's label; `Interactable::region`), placed the same way: the
+    /// snapping pointer is drawn to it from anywhere in it, and lands on
+    /// [`Target::center`] all the same.
+    pub area: [f64; 4],
     /// Preferred pointer tip, transformed with the same affine as `rect`.
     pub anchor: Option<Point>,
     pub kind: TargetKind,
@@ -209,28 +218,48 @@ impl Target {
     /// The capture view `rect` (window pixels), the world cursor at `at`.
     pub fn capture(rect: [i32; 4], at: (i32, i32)) -> Self {
         let [x, y, w, h] = rect;
-        Self { rect: [x as f64, y as f64, w as f64, h as f64], anchor: None, kind: TargetKind::Capture { at: (at.0 as f64, at.1 as f64) }, id: CAPTURE_ID, alt_right_click: false }
+        let rect = [x as f64, y as f64, w as f64, h as f64];
+        Self { rect, area: rect, anchor: None, kind: TargetKind::Capture { at: (at.0 as f64, at.1 as f64) }, id: CAPTURE_ID, alt_right_click: false }
     }
 
-    /// Where the pointer goes on it.
+    /// Where the pointer goes on it: a slider's (or scroll bar's) knob,
+    /// as where a person grabs it.
     pub fn center(&self) -> Point {
-        if let TargetKind::Capture { at } = self.kind {
-            return at;
-        }
+        let knob = match self.kind {
+            TargetKind::Capture { at } => return at,
+            TargetKind::Slider { track: [tx, ty, tw, th], value } => {
+                let t = value.clamp(0, 1_000_000) as f64 / 1_000_000.0;
+                // (A tall track is vertical, as `InteractableKind::Slider`.)
+                Some(if th > tw { (tx + tw / 2.0, ty + t * th) } else { (tx + t * tw, ty + th / 2.0) })
+            }
+            _ => None,
+        };
         let [x, y, w, h] = self.rect;
         // Whole pixels strictly inside the visible hit rectangle. A text
         // or icon anchor never changes the entry's actual hit area.
-        let (px, py) = self.anchor.unwrap_or((x + w / 2.0, y + h / 2.0));
+        let (px, py) = self.anchor.or(knob).unwrap_or((x + w / 2.0, y + h / 2.0));
         (px.floor().clamp(x.ceil(), ((x + w).ceil() - 1.0).max(x.ceil())),
          py.floor().clamp(y.ceil(), ((y + h).ceil() - 1.0).max(y.ceil())))
     }
 
-    /// How far `p` is from the rectangle (0 inside).
-    fn distance(&self, (px, py): Point) -> f64 {
-        let [x, y, w, h] = self.rect;
-        let dx = (x - px).max(px - (x + w)).max(0.0);
-        let dy = (y - py).max(py - (y + h)).max(0.0);
-        dx.hypot(dy)
+    /// How far `p` is from the whole control (0 inside).
+    fn distance(&self, p: Point) -> f64 {
+        let q = self.closest(p);
+        (q.0 - p.0).hypot(q.1 - p.1)
+    }
+
+    /// Seen by [`pick`] as all of its [`Target::area`], not a point: a
+    /// control larger than where it takes the pointer (a check box with
+    /// its label), and a slider or scroll bar (the pointer goes on its
+    /// knob, the whole bar is the control).
+    fn spread(&self) -> bool {
+        !self.is_capture() && (self.area != self.rect || matches!(self.kind, TargetKind::Slider { .. }))
+    }
+
+    /// The point of the whole control ([`Target::area`]) nearest `p`.
+    fn closest(&self, (px, py): Point) -> Point {
+        let [x, y, w, h] = self.area;
+        (px.clamp(x, x + w), py.clamp(y, y + h))
     }
 
     fn snappable(&self) -> bool {
@@ -271,6 +300,16 @@ pub fn targets_mapped(items: &[Interactable], map: impl Fn([i32; 4]) -> [f64; 4]
         .map(|i| Target {
             alt_right_click: i.alt_right_click,
             rect: map(i.rect),
+            // (The same affine as the control's, as its anchor.)
+            area: i.region.map_or_else(|| map(i.rect), |[x, y, w, h]| {
+                let shown = map(i.rect);
+                let (sx, sy) = (shown[2] / i.rect[2].max(1) as f64, shown[3] / i.rect[3].max(1) as f64);
+                let [l, t] = [shown[0] + (x - i.rect[0]) as f64 * sx, shown[1] + (y - i.rect[1]) as f64 * sy];
+                // (Never less than the control itself.)
+                let (r, b) = ((l + w as f64 * sx).max(shown[0] + shown[2]), (t + h as f64 * sy).max(shown[1] + shown[3]));
+                let (l, t) = (l.min(shown[0]), t.min(shown[1]));
+                [l, t, r - l, b - t]
+            }),
             anchor: i.anchor.map(|[x, y]| {
                 // Choose the affine from the full control rectangle. An
                 // anchor on the other side of an overlap must not select
@@ -348,6 +387,7 @@ fn clip_targets(targets: &mut Vec<Target>, clip: impl Fn(&Target) -> Option<[f64
         let Some(clip) = clip(target) else { return false };
         let Some(rect) = intersection(target.rect, clip) else { return false };
         target.rect = rect;
+        target.area = intersection(target.area, clip).unwrap_or(rect);
         if let TargetKind::List { scroll, .. } = &mut target.kind {
             *scroll = intersection(*scroll, clip).unwrap_or(rect);
         }
@@ -367,7 +407,8 @@ fn clip_targets(targets: &mut Vec<Target>, clip: impl Fn(&Target) -> Option<[f64
 }
 
 /// The driver's element to snap to from `p`: the nearest (by distance to
-/// its rectangle, then to its middle). Not the capture view.
+/// the whole control, [`Target::area`], then to where the pointer goes on
+/// it). Not the capture view.
 pub fn nearest(targets: &[Target], p: Point) -> Option<usize> {
     let key = |t: &Target| {
         let c = t.center();
@@ -388,18 +429,25 @@ pub fn nearest(targets: &[Target], p: Point) -> Option<usize> {
 /// at from `from` (the element snapped to, `current`): within [`CONE`] of
 /// its direction, the angle weighing heavily, at about the distance moved.
 /// None for motion within the [`DEAD_ZONE`], or nothing within the cone.
+/// An element is seen where it takes the pointer ([`Target::center`]); one
+/// a person sees as more than that ([`Target::spread`]: a check box with
+/// its label, a scroll bar's whole length) where that comes nearest where
+/// the motion leads, so all of it draws the pointer. Of those the motion
+/// leads into alike, the one whose pointer spot is nearest.
 pub fn pick(targets: &[Target], from: Point, current: Option<u64>, moved: Point) -> Option<usize> {
     let reach = moved.0.hypot(moved.1);
     if reach < DEAD_ZONE {
         return None;
     }
     let dir = (moved.0 / reach, moved.1 / reach);
+    let aim = (from.0 + moved.0, from.1 + moved.1);
     targets
         .iter()
         .enumerate()
         .filter(|(_, t)| t.snappable() && Some(t.id) != current)
         .filter_map(|(k, t)| {
-            let c = t.center();
+            let spot = t.center();
+            let c = if t.spread() { t.closest(aim) } else { spot };
             let d = (c.0 - from.0, c.1 - from.1);
             let dist = d.0.hypot(d.1);
             if dist < 1.0 {
@@ -413,10 +461,10 @@ pub fn pick(targets: &[Target], from: Point, current: Option<u64>, moved: Point)
             // counts as near as the edge of its disc of attraction.)
             let near = if t.is_capture() { (dist - ATTRACTION * t.rect[2].min(t.rect[3])).max(0.0) } else { dist };
             let off = (near - reach).abs() + DISTANCE_WEIGHT * near + 1.0;
-            Some((k, off * (1.0 + ANGLE_WEIGHT * (angle / CONE).powi(2))))
+            Some((k, off * (1.0 + ANGLE_WEIGHT * (angle / CONE).powi(2)), (spot.0 - aim.0).hypot(spot.1 - aim.1)))
         })
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(k, _)| k)
+        .min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
+        .map(|(k, _, _)| k)
 }
 
 /// The angle (degrees) between `moved` and the way from `from` to `to`.
@@ -1168,6 +1216,8 @@ impl SnapInput {
                 if let Some((_, (dx, dy))) = moved {
                     t.rect[0] += *dx as f64;
                     t.rect[1] += *dy as f64;
+                    t.area[0] += *dx as f64;
+                    t.area[1] += *dy as f64;
                     if let Some(at) = &mut t.anchor {
                         at.0 += *dx as f64;
                         at.1 += *dy as f64;
@@ -1796,3 +1846,7 @@ mod cursor_size;
 #[cfg(test)]
 #[path = "snap/city_work.rs"]
 mod city_work;
+
+#[cfg(test)]
+#[path = "snap/regions.rs"]
+mod regions;

@@ -390,7 +390,7 @@ mod tests {
     /// overlay, with art for normal (set 10), hover (11) and pressed (12).
     fn scene() -> LookScene {
         let mut s = LookScene::default();
-        s.interactables = vec![Interactable { alt_right_click: false, anchor: None, rect: [10, 10, 20, 20], kind: InteractableKind::Button, id: 7 }];
+        s.interactables = vec![Interactable { region: None, alt_right_click: false, anchor: None, rect: [10, 10, 20, 20], kind: InteractableKind::Button, id: 7 }];
         let states = vec![(NORMAL, vec![sprite(10)]), (HOVER, vec![sprite(11)]), (PRESSED, vec![sprite(12)])];
         s.looks = vec![Looks { id: 7, select: Select::None, shown: NORMAL, views: vec![ViewLooks { view: 5, sprites: (1, 3), states }] }];
         s
@@ -580,9 +580,9 @@ mod tests {
             }],
         };
         s.interactables = vec![
-            Interactable { alt_right_click: false, anchor: None, rect: [0, 0, 100, 10], kind: InteractableKind::ListItem, id: 1 },
-            Interactable { alt_right_click: false, anchor: None, rect: [0, 10, 100, 10], kind: InteractableKind::ListItem, id: 2 },
-            Interactable { alt_right_click: false, anchor: None, rect: [0, 0, 100, 20], kind: InteractableKind::List { scroll: [0, 0, 100, 20], step: 10 }, id: 3 },
+            Interactable { region: None, alt_right_click: false, anchor: None, rect: [0, 0, 100, 10], kind: InteractableKind::ListItem, id: 1 },
+            Interactable { region: None, alt_right_click: false, anchor: None, rect: [0, 10, 100, 10], kind: InteractableKind::ListItem, id: 2 },
+            Interactable { region: None, alt_right_click: false, anchor: None, rect: [0, 0, 100, 20], kind: InteractableKind::List { scroll: [0, 0, 100, 20], step: 10 }, id: 3 },
         ];
         s.looks = vec![entry(1, 0, sel), entry(2, 1, NORMAL)];
         let mut f = Feedback::default();

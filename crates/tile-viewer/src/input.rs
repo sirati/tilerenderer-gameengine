@@ -341,7 +341,7 @@ mod tests {
     fn wheel_fractions_follow_target_and_modal_context_but_not_frame_updates() {
         let mut input = InputState::default();
         let mut scene = scene::Scene::default();
-        scene.interactables.push(scene::Interactable { alt_right_click: false, anchor: None, id: 1,
+        scene.interactables.push(scene::Interactable { region: None, alt_right_click: false, anchor: None, id: 1,
             rect: [0, 0, 100, 100], kind: scene::InteractableKind::List { scroll: [0, 0, 90, 100], step: 20 } });
         input.sync_wheel_context(&scene, Some((10, 10)), false);
         let half = wheel_event(MouseScrollDelta::LineDelta(0.0, 0.5));

@@ -568,6 +568,12 @@ pub struct Interactable {
     /// None places the pointer at the control centre. The hit rectangle
     /// stays intact when an entry has blank space after its icon or text.
     pub anchor: Option<[i32; 2]>,
+    /// What a person sees as the whole control, when that is more than
+    /// `rect` (x, y, width, height, the same driver pixels): a check box
+    /// and its label, for one. Button snapping is drawn to it from
+    /// anywhere in it, and still points at and clicks the control where
+    /// `rect` and `anchor` say. None: `rect` alone.
+    pub region: Option<[i32; 4]>,
     pub kind: InteractableKind,
     /// Chosen by the driver, the same while the element is there (e.g. the
     /// address of a game's control object): a renderer may keep pointing at
