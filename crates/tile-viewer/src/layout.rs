@@ -72,9 +72,9 @@
 //!   height ([`ZOOM_BOX_REACH`]) of where a floating box rests (its sides
 //!   and top; below it, as far as its gap), the box glides ([`Glide`],
 //!   [`ZOOM_GLIDE_OMEGA`]) below that place, `zoom_box_drop` (the gap,
-//!   2.5%) of the region's height further down, whatever the pointer does
-//!   in there, and back once it leaves; or it holds the pointer out with
-//!   `zoom_box_block_pointer`. Boxes do not
+//!   5% to 15%, default 5%) of the region's height further down, whatever
+//!   the pointer does in there, and back once it leaves; or it holds the
+//!   pointer out with `zoom_box_block_pointer`. Boxes do not
 //!   dodge the views' own interface (corner buttons, unit orders): they
 //!   lie under it, and it keeps its clicks. Every zoom magnifies
 //!   `zoom_magnification` (1.5×, 2×, 3×, 4×; default 2×) on top of how
@@ -175,7 +175,7 @@ const MAX_STEP: f64 = 0.1;
 /// How fast the zoom boxes glide (a floating box out of the pointer's way
 /// and back, a box at the pointer flipping above or below it): the spring
 /// of [`Glide`] twice as stiff as the world's, settling in half its time
-/// (135 pixels: 27 frames of 16 ms, not 54). One constant for both boxes.
+/// (150 pixels: 28 frames of 16 ms, not 55). One constant for both boxes.
 pub const ZOOM_GLIDE_OMEGA: f64 = 2.0 * Glide::OMEGA;
 /// How near a floating zoom box the pointer makes it move out of the way:
 /// within this many thousandths of its region's height (as its gap and
@@ -1414,7 +1414,7 @@ impl Layout {
         // (`zoom_strip`: the height of every zoom, strip or box.)
         let thousandths = |v: f32, max: f32| (v.clamp(0.0, max) * 1000.0).round() as u32;
         let strip = thousandths(s.zoom_strip, 0.5).max(50);
-        let floating = ZoomBox { height: strip, top: thousandths(s.zoom_box_top, viewer_settings::controls::ZOOM_BOX_TOP_RANGE.max), gap: thousandths(s.zoom_box_drop, viewer_settings::controls::ZOOM_BOX_DROP_RANGE.max) };
+        let floating = ZoomBox { height: strip, top: thousandths(s.zoom_box_top, viewer_settings::controls::ZOOM_BOX_TOP_RANGE.max), gap: thousandths(s.zoom_box_drop.max(viewer_settings::controls::ZOOM_BOX_DROP_RANGE.min), viewer_settings::controls::ZOOM_BOX_DROP_RANGE.max) };
         let place = match s.zoom {
             Zoom::Off => None,
             Zoom::Floating131 => Some(ZoomPlace::Box(3, floating)),
@@ -6141,7 +6141,7 @@ mod tests {
         let rest = [160, 15, 480, 120];
         assert_eq!(geometry(&l), rest);
         // The pointer comes to it: it does not jump, it glides below where
-        // it rests, 2.5 % (15) further down, its top at 150.
+        // it rests, 5 % (30) further down, its top at 165.
         mv(&mut l, (400, 60));
         assert_eq!(geometry(&l), rest);
         let mut tops = vec![];
@@ -6150,9 +6150,9 @@ mod tests {
             frame(&mut l, vec![]);
             tops.push(geometry(&l)[1]);
         }
-        assert!(tops.windows(2).all(|t| t[0] <= t[1]) && tops[0] > 15 && tops[5] < 150, "{tops:?}");
+        assert!(tops.windows(2).all(|t| t[0] <= t[1]) && tops[0] > 15 && tops[5] < 165, "{tops:?}");
         settle(&mut l);
-        let moved = [160, 150, 480, 120];
+        let moved = [160, 165, 480, 120];
         assert_eq!(geometry(&l), moved);
         assert!(!inside(moved, l.pointer));
         // Wherever the pointer goes where it rests, it stays there: not
@@ -6173,7 +6173,7 @@ mod tests {
         mv(&mut l, (400, 300));
         l.advance(std::time::Duration::from_millis(16));
         frame(&mut l, vec![]);
-        assert!((16..150).contains(&geometry(&l)[1]), "{:?}", geometry(&l));
+        assert!((16..165).contains(&geometry(&l)[1]), "{:?}", geometry(&l));
         settle(&mut l);
         assert_eq!(geometry(&l), rest);
         // Its gap setting: 10 % (60) below where it rests.
@@ -6181,11 +6181,11 @@ mod tests {
         mv(&mut l, (400, 60));
         settle(&mut l);
         assert_eq!(geometry(&l), [160, 195, 480, 120]);
-        // No gap: right below where it rests.
+        // The least gap, 5 % (30), whatever the setting says.
         let mut l = arranged(&settings(|s| (s.zoom, s.zoom_box_drop) = (Zoom::Floating131, 0.0)));
         mv(&mut l, (400, 134));
         settle(&mut l);
-        assert_eq!(geometry(&l), [160, 135, 480, 120]);
+        assert_eq!(geometry(&l), [160, 165, 480, 120]);
         assert!(!inside(geometry(&l), l.pointer));
         // Half the window high, 5 % (30) down, 10 % (60) gap: cut at the
         // window's bottom.
@@ -6232,7 +6232,7 @@ mod tests {
             l.adopt_presented_mapping(prepared);
         }
         assert!(shown.windows(2).all(|t| t[0] <= t[1]), "back and forth: {shown:?}");
-        assert_eq!(*shown.last().unwrap(), 150, "{shown:?}");
+        assert_eq!(*shown.last().unwrap(), 165, "{shown:?}");
         // And back up once the pointer leaves, as steadily.
         mv(&mut l, (400, 300));
         let mut shown = vec![];
@@ -6277,17 +6277,17 @@ mod tests {
         let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
         mv(&mut l, (400, 60));
         let tops = glide_tops(&mut l);
-        assert_smooth(&tops, 150 - 15, ZOOM_GLIDE_OMEGA);
-        let arrived = tops.iter().position(|&t| t == 150).expect("arrives");
+        assert_smooth(&tops, 165 - 15, ZOOM_GLIDE_OMEGA);
+        let arrived = tops.iter().position(|&t| t == 165).expect("arrives");
         // The world's own glide over the same way.
         let mut g = Glide::default();
         g.snap((0, 15));
-        let world = (1..).find(|_| g.step((0, 150), 0.016, (0, 0)).1 == 150).unwrap();
+        let world = (1..).find(|_| g.step((0, 165), 0.016, (0, 0)).1 == 165).unwrap();
         assert!((world * 4 / 10..=world * 6 / 10).contains(&arrived), "{arrived} frames, the world {world}: {tops:?}");
         // And back.
         mv(&mut l, (400, 300));
         let tops = glide_tops(&mut l);
-        assert_smooth(&tops, 15 - 150, ZOOM_GLIDE_OMEGA);
+        assert_smooth(&tops, 15 - 165, ZOOM_GLIDE_OMEGA);
         assert_eq!(*tops.last().unwrap(), 15);
     }
 
@@ -6295,8 +6295,9 @@ mod tests {
     fn a_floating_zoom_box_moves_once_the_pointer_comes_within_five_percent() {
         let geometry = |l: &Layout| l.magnifier_geometry(&l.magnifier.unwrap()).0;
         let moved = |l: &Layout| l.zoom_box_target(&l.magnifier.unwrap()).1;
-        // At rest [160, 15, 480, 120]; 5 % of 600 is 30 (the gap 15 below).
-        for (out, near) in [((129, 75), (130, 75)), ((670, 75), (669, 75)), ((129, 0), (130, 0)), ((400, 150), (400, 149))] {
+        // At rest [160, 15, 480, 120]; 5 % of 600 is 30 (below as well: the
+        // gap is 30 too).
+        for (out, near) in [((129, 75), (130, 75)), ((670, 75), (669, 75)), ((129, 0), (130, 0)), ((400, 165), (400, 164))] {
             let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
             mv(&mut l, out);
             assert!(!moved(&l), "{out:?}");
@@ -7220,9 +7221,9 @@ mod tests {
                     l.take_warp();
                     mv(&mut l, p);
                     settle(&mut l);
-                    // Below where it rests, 2.5 % of the region's height further.
+                    // Below where it rests, 5 % of the region's height further.
                     let moved = l.magnifier_geometry(&m).0;
-                    assert_eq!(moved, [initial[0], initial[1] + initial[3] + part(25), initial[2], initial[3]]);
+                    assert_eq!(moved, [initial[0], initial[1] + initial[3] + part(50), initial[2], initial[3]]);
                     assert_eq!(l.pointer, p);
                     assert!(!inside(moved, p));
                     assert!(l.zoom_pointer_walls().is_empty());

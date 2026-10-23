@@ -54,7 +54,7 @@ pub const ZOOM_STRIP_RANGE: Range = Range { min: 0.05, max: 0.5, step: 0.05 };
 pub const ZOOM_BOX_TOP_RANGE: Range = Range { min: 0.0, max: 0.05, step: 0.005 };
 /// The gap between where a floating box rests and where it moves out of the
 /// pointer's way ([`Layout::zoom_box_drop`]).
-pub const ZOOM_BOX_DROP_RANGE: Range = Range { min: 0.0, max: 0.1, step: 0.005 };
+pub const ZOOM_BOX_DROP_RANGE: Range = Range { min: 0.05, max: 0.15, step: 0.005 };
 /// The zoom's magnification as an index into [`Layout::MAGNIFICATIONS`]
 /// (`"layout.zoom_magnification_step"`).
 pub const ZOOM_MAGNIFICATION_STEP_RANGE: Range = Range { min: 0.0, max: (Layout::MAGNIFICATIONS.len() - 1) as f32, step: 1.0 };
@@ -732,12 +732,12 @@ mod tests {
         assert_eq!(s.layout.zoom_box_top, 0.01);
         assert!(s.set_control("layout.zoom_box_top", &ControlValue::Number(0.9)));
         assert_eq!(s.layout.zoom_box_top, 0.05);
-        assert!(s.set_control("layout.zoom_box_drop", &ControlValue::Number(0.0424)));
-        assert_eq!(s.layout.zoom_box_drop, 0.04);
+        assert!(s.set_control("layout.zoom_box_drop", &ControlValue::Number(0.0624)));
+        assert_eq!(s.layout.zoom_box_drop, 0.06);
         assert!(s.set_control("layout.zoom_box_drop", &ControlValue::Number(0.41)));
-        assert_eq!(s.layout.zoom_box_drop, 0.1);
+        assert_eq!(s.layout.zoom_box_drop, 0.15);
         assert!(s.set_control("layout.zoom_box_drop", &ControlValue::Number(-1.0)));
-        assert_eq!(s.layout.zoom_box_drop, 0.0);
+        assert_eq!(s.layout.zoom_box_drop, 0.05);
         assert!(!s.set_control("layout.zoom_box_drop", &ControlValue::Number(f32::NAN)));
         assert_eq!(s.layout.zoom_strip, 0.2);
     }

@@ -381,7 +381,7 @@ pub struct Layout {
     pub zoom_box_top: f32,
     /// The floating boxes, moved out of the pointer's way (while it is
     /// where they rest): the gap between where they rest and their top, as
-    /// a fraction of the region's height, 0..=0.1, default 0.025. Saved as
+    /// a fraction of the region's height, 0.05..=0.15, default 0.05. Saved as
     /// `zoom_box_gap`: the older `zoom_box_drop` (how far below the
     /// pointer they dropped) meant something else and is not read.
     #[serde(rename = "zoom_box_gap")]
@@ -427,7 +427,7 @@ impl Default for Layout {
             menu_zoom: false,
             zoom_strip: 0.2,
             zoom_box_top: 0.025,
-            zoom_box_drop: 0.025,
+            zoom_box_drop: 0.05,
             zoom_magnification: 2.0,
             zoom_box_height: 0.0,
             zoom_box_block_pointer: false,
@@ -693,15 +693,15 @@ mod tests {
     #[test]
     fn every_zoom_is_a_fifth_high_and_older_floating_box_settings_still_load() {
         let l = Settings::default().layout;
-        assert_eq!((l.zoom_strip, l.zoom_box_top, l.zoom_box_drop), (0.2, 0.025, 0.025));
+        assert_eq!((l.zoom_strip, l.zoom_box_top, l.zoom_box_drop), (0.2, 0.025, 0.05));
         // (An older drop below the pointer is not the gap: not read.)
         let old = "[layout]\nzoom = 'Floating131'\nzoom_strip = 0.35\nzoom_box_height = 0.6\nzoom_box_block_pointer = true\nzoom_box_drop = 0.3\n";
         let s: Settings = toml::from_str(old).unwrap();
         assert_eq!((s.layout.zoom, s.layout.zoom_strip, s.layout.zoom_box_block_pointer), (Zoom::Floating131, 0.35, true));
-        assert_eq!((s.layout.zoom_box_top, s.layout.zoom_box_drop), (0.025, 0.025));
-        let gap: Settings = toml::from_str("[layout]\nzoom_box_gap = 0.05\n").unwrap();
-        assert_eq!(gap.layout.zoom_box_drop, 0.05);
-        assert!(toml::to_string(&gap).unwrap().contains("zoom_box_gap = 0.05"));
+        assert_eq!((s.layout.zoom_box_top, s.layout.zoom_box_drop), (0.025, 0.05));
+        let gap: Settings = toml::from_str("[layout]\nzoom_box_gap = 0.1\n").unwrap();
+        assert_eq!(gap.layout.zoom_box_drop, 0.1);
+        assert!(toml::to_string(&gap).unwrap().contains("zoom_box_gap = 0.1"));
         // The magnification: 2× unless set, the nearest of the choices.
         assert_eq!((s.layout.zoom_magnification, s.layout.zoom_magnification_step()), (2.0, 1));
         for (m, step) in [(1.0, 0), (1.5, 0), (2.4, 1), (2.6, 2), (3.0, 2), (9.0, 3), (f32::NAN, 1)] {
