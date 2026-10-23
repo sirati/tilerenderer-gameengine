@@ -40,8 +40,10 @@
 //! # Moving the map
 //!
 //! While the mouse is free, every view scrolls with the pointer at the
-//! window's edges and corners it reaches. Every view uses the same speed
-//! in window pixels, faster nearer the edge. With
+//! window's edges and corners it reaches (within `pan::EDGE_ZONE`, 48
+//! pixels). Every view moves the map as many tiles a second as the game's
+//! own edge scrolling, fastest at the edge and easing out further in,
+//! smooth world movement or not. With
 //! `viewer_settings::MapMovement::Drag`, a left drag
 //! past a few pixels grabs the map instead (a shorter press is a click), it
 //! following the pointer 1:1 and sliding on with momentum. See `pan`.
@@ -158,7 +160,8 @@ const UNPLACED: (i32, i32) = (i32::MIN, i32::MIN);
 pub const SETTLE_FRAMES: u32 = 180;
 /// How fast the viewer scrolls a view the pointer pushes against the
 /// divider, or rests at the window's outermost pixel by, in screen pixels
-/// per second (slower further in, `pan`).
+/// per second (slower further in, `pan`), for a driver that does not tell
+/// its own speed (`Scene::map_wheel_step`, `pan::game_edge_speed`).
 pub const EDGE_PAN_SPEED: f64 = 600.0;
 /// The longest frame step smooth movement takes (a stalled frame does not
 /// make a view jump).

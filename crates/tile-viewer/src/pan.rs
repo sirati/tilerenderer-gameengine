@@ -5,7 +5,7 @@
 //!
 //! # Edge scrolling
 //!
-//! The pointer within [`scene::EDGE_ZONE`] pixels of a window edge scrolls
+//! The pointer within [`EDGE_ZONE`] pixels of a window edge scrolls
 //! the view it is in, if that view reaches that edge of the window; in a
 //! corner both ways at once. Pushed against the divider's wall
 //! (`Layout::against`) the view scrolls towards the divider as at its
@@ -13,11 +13,18 @@
 //! (the game's own screen edge works the same over its interface). Not
 //! while button snapping holds the pointer.
 //!
-//! Every world view uses the same viewer clock and speed curve, at
-//! [`EDGE_PAN_SPEED`] window pixels a second at the outermost pixel down to
-//! [`EDGE_SLOWEST`] of that at the zone's inner end ([`edge_speed`]). Zoom
-//! converts that speed to world pixels, with fractional steps carried over
-//! between frames. The driver's tile-based edge scrolling stays disabled.
+//! Every world view uses the same viewer clock and speed curve: the full
+//! speed at the outermost pixel, easing (a smoothstep) to nothing at the
+//! zone's inner end ([`edge_share`]). The full speed is the game's own at
+//! its outermost pixel: its wheel step (`Scene::map_wheel_step`, which
+//! follows the game's scroll speed setting and zoom) every
+//! [`GAME_EDGE_TICK`], in world pixels whatever the view's zoom or the
+//! world's scale, so the map passes as many tiles a second as the game's
+//! edge scrolling moves it. A driver without that step scrolls at
+//! [`EDGE_PAN_SPEED`] window pixels a second. Smooth world movement or
+//! not, the same: the viewer moves by continuous pixels each frame, with
+//! fractional steps carried over between frames. The driver's tile-based
+//! edge scrolling stays disabled.
 //!
 //! # Dragging
 //!
@@ -55,14 +62,19 @@
 //! or moves its native camera if it supplies no semantic metadata. Panning
 //! does not recenter the driver's camera or quantize A to a tile on release.
 
-use scene::{Button, EDGE_ZONE, Input};
+use scene::{Button, Input};
 use viewer_settings::MapMovement;
 
 use super::{Axis, EDGE_PAN_SPEED, Follow, Hit, Layout, Side, inside};
 
-/// The edge scrolling speed at the inner end of the edge zone, as a share
-/// of [`EDGE_PAN_SPEED`] (the speed at the outermost pixel).
-pub const EDGE_SLOWEST: f64 = 0.25;
+/// How near (in window pixels) a window edge the pointer scrolls the view
+/// it is in: three times the game's own zone
+/// (`civ3_sys::hooks::EDGE_SCROLL_ZONE`, `scene::EDGE_ZONE`).
+pub const EDGE_ZONE: i32 = 3 * scene::EDGE_ZONE;
+/// The game's edge scrolling timer (`Main_Screen_Form::scroll_at_edge`,
+/// 0x4DE4F0 in PcGames): at its view's outermost pixel it moves the map by
+/// its wheel step (`Scene::map_wheel_step`) every this many seconds.
+pub const GAME_EDGE_TICK: f64 = 0.066;
 /// How far (in window pixels) the pointer moves with the left button down
 /// before it drags the map rather than clicks.
 pub const DRAG_THRESHOLD: i32 = 4;
@@ -71,9 +83,9 @@ pub const DRAG_THRESHOLD: i32 = 4;
 pub const STILL_BEFORE_RELEASE: f64 = 0.06;
 
 /// Per axis, where pointer coordinate `v` of a window `size` long is at its
-/// edge, as in `Input::Edge`: 0 if not within [`EDGE_ZONE`] of an edge the
-/// view reaches (`low`: the left or top one; `high`: the right or bottom
-/// one), else how far in it is plus one, negative at the low edge.
+/// edge: 0 if not within [`EDGE_ZONE`] of an edge the view reaches (`low`:
+/// the left or top one; `high`: the right or bottom one), else how far in
+/// it is plus one, negative at the low edge.
 pub fn edge_axis(v: i32, size: i32, low: bool, high: bool) -> i32 {
     let far = size - 1 - v;
     if v < 0 || far < 0 {
@@ -87,17 +99,30 @@ pub fn edge_axis(v: i32, size: i32, low: bool, high: bool) -> i32 {
     }
 }
 
-/// How fast a view scrolls along an axis for the pointer at edge `e` of it
-/// (as in `Input::Edge`), in screen pixels a second, signed: the full
-/// [`EDGE_PAN_SPEED`] at the outermost pixel, falling linearly to
-/// [`EDGE_SLOWEST`] of it at the zone's inner end.
-pub fn edge_speed(e: i32) -> f64 {
+/// The share of the full edge scrolling speed for the pointer at edge `e`
+/// of a view (as [`edge_axis`] counts), signed: 1 at the outermost pixel,
+/// easing smoothly (a smoothstep, flat at both ends) to nearly nothing at
+/// the zone's inner end, so the map neither jumps on entering the zone nor
+/// slows abruptly near the edge.
+pub fn edge_share(e: i32) -> f64 {
     if e == 0 {
         return 0.0;
     }
-    let from = (e.abs() - 1).min(EDGE_ZONE - 1) as f64;
-    let share = 1.0 - (1.0 - EDGE_SLOWEST) * from / (EDGE_ZONE - 1).max(1) as f64;
-    EDGE_PAN_SPEED * share * e.signum() as f64
+    let t = (e.abs() - 1).min(EDGE_ZONE - 1) as f64 / EDGE_ZONE as f64;
+    (1.0 - t * t * (3.0 - 2.0 * t)) * e.signum() as f64
+}
+
+/// How fast a view scrolls along an axis for the pointer at edge `e` of
+/// it, in window pixels a second, signed, for a driver that does not tell
+/// its own speed ([`EDGE_PAN_SPEED`] at the outermost pixel).
+pub fn edge_speed(e: i32) -> f64 {
+    EDGE_PAN_SPEED * edge_share(e)
+}
+
+/// The game's own edge scrolling speed at its outermost pixel, in world
+/// pixels a second per axis, for its wheel step `step`; `None` without one.
+pub fn game_edge_speed(step: (i32, i32)) -> Option<(f64, f64)> {
+    (step != (0, 0)).then(|| (step.0 as f64 / GAME_EDGE_TICK, step.1 as f64 / GAME_EDGE_TICK))
 }
 
 /// Whether the pointer moved from `from` to `to` far enough to drag.
@@ -834,7 +859,10 @@ impl Layout {
         }
         let (Some(scale), Some(center)) = (self.shown_scale(hit), self.exact_center(hit)) else { return };
         let (center, _) = self.clamp_view_center(hit, center);
-        let by = (edge_speed(e.0) * dt * scale, edge_speed(e.1) * dt * scale);
+        // The game's speed in world pixels (as many tiles a second however
+        // large the view shows them), else window pixels through the zoom.
+        let full = game_edge_speed(self.map_wheel_step).unwrap_or((EDGE_PAN_SPEED * scale, EDGE_PAN_SPEED * scale));
+        let by = (edge_share(e.0) * full.0 * dt, edge_share(e.1) * full.1 * dt);
         let (to, _) = self.clamp_view_center(hit, (center.0 + by.0, center.1 + by.1));
         self.place_exact(hit, to);
     }
@@ -846,13 +874,15 @@ mod tests {
 
     #[test]
     fn the_edge_zone_counts_from_the_edges_the_view_reaches() {
-        // Both edges reached: 1 at the outermost pixel, 16 at the zone's end.
+        // Both edges reached: 1 at the outermost pixel, 48 at the zone's end
+        // (three times the game's 16).
+        assert_eq!(EDGE_ZONE, 48);
         assert_eq!(edge_axis(0, 800, true, true), -1);
-        assert_eq!(edge_axis(15, 800, true, true), -16);
-        assert_eq!(edge_axis(16, 800, true, true), 0);
+        assert_eq!(edge_axis(47, 800, true, true), -48);
+        assert_eq!(edge_axis(48, 800, true, true), 0);
         assert_eq!(edge_axis(799, 800, true, true), 1);
-        assert_eq!(edge_axis(784, 800, true, true), 16);
-        assert_eq!(edge_axis(783, 800, true, true), 0);
+        assert_eq!(edge_axis(752, 800, true, true), 48);
+        assert_eq!(edge_axis(751, 800, true, true), 0);
         // An edge the view does not reach (the divider's side of a pane).
         assert_eq!(edge_axis(799, 800, true, false), 0);
         assert_eq!(edge_axis(0, 800, false, true), 0);
@@ -898,11 +928,24 @@ mod tests {
         assert_eq!(edge_speed(0), 0.0);
         assert_eq!(edge_speed(1), EDGE_PAN_SPEED);
         assert_eq!(edge_speed(-1), -EDGE_PAN_SPEED);
-        assert_eq!(edge_speed(EDGE_ZONE), EDGE_PAN_SPEED * EDGE_SLOWEST);
-        assert_eq!(edge_speed(-EDGE_ZONE), -EDGE_PAN_SPEED * EDGE_SLOWEST);
+        assert_eq!(edge_share(1), 1.0);
+        // Nearly nothing at the zone's inner end, nothing past it.
+        assert!(edge_share(EDGE_ZONE) > 0.0 && edge_share(EDGE_ZONE) < 0.01, "{}", edge_share(EDGE_ZONE));
+        assert_eq!(edge_share(-EDGE_ZONE), -edge_share(EDGE_ZONE));
+        // Monotonic: slower with every pixel further in, and smooth (no
+        // step between neighbouring pixels larger than a 1/16th of full).
         for e in 1..EDGE_ZONE {
             assert!(edge_speed(e) > edge_speed(e + 1), "{e}");
+            assert!(edge_share(-e) < edge_share(-e - 1), "{e}");
+            assert!(edge_share(e) - edge_share(e + 1) < 1.0 / 16.0, "{e}");
         }
+        // Flat at both ends: the first pixels in still scroll at nearly
+        // full speed.
+        assert!(edge_share(4) > 0.97);
+        // The game's speed: its wheel step every 66 ms.
+        assert_eq!(game_edge_speed((0, 0)), None);
+        let (x, y) = game_edge_speed((256, 128)).unwrap();
+        assert!((x - 256.0 / 0.066).abs() < 1e-9 && (y - 128.0 / 0.066).abs() < 1e-9);
     }
 
     #[test]
@@ -1050,17 +1093,18 @@ mod tests {
         mv(&mut l, (799, 0));
         tick(&mut l, 100);
         assert_eq!(b(&l), (start.0 + 120, start.1 - 60));
-        // Slower further in: 15 pixels in, a quarter of that.
+        // Slower further in: 15 pixels in, about three quarters of that
+        // (the zone is 48 pixels wide, easing out to nothing).
         mv(&mut l, (784, 300));
         tick(&mut l, 100);
-        assert_eq!(b(&l), (start.0 + 135, start.1 - 60));
+        assert_eq!(b(&l), (start.0 + 166, start.1 - 60));
         // Its bottom edge (its left one is the divider's, no window edge).
         mv(&mut l, (406, 599));
         tick(&mut l, 100);
-        assert_eq!(b(&l), (start.0 + 135, start.1));
+        assert_eq!(b(&l), (start.0 + 166, start.1));
         mv(&mut l, (600, 300));
         tick(&mut l, 100);
-        assert_eq!(b(&l), (start.0 + 135, start.1));
+        assert_eq!(b(&l), (start.0 + 166, start.1));
         assert_eq!(l.split.unwrap().view.follow, Follow::Free);
         // A uses the same viewer integrator, without starting the native
         // game's independent tile-based edge scrolling.
@@ -1098,7 +1142,7 @@ mod tests {
         mv(&mut l, (100, 590));
         assert_eq!(l.pointer, (404, 590));
         tick(&mut l, 100);
-        assert_eq!(b(&l), (start.0 - 60, start.1 + 33));
+        assert_eq!(b(&l), (start.0 - 60, start.1 + 54));
     }
 
     #[test]
@@ -1112,7 +1156,7 @@ mod tests {
         tick(&mut l, 100);
         // (The continuous position, drawn at its nearest pixel.)
         let world = |e: i32| (edge_speed(e) * 0.1 * l.shown_scale(Hit::Main).unwrap()).round() as i32;
-        assert_eq!((world(10), world(5)), (17, 24));
+        assert_eq!((world(10), world(5)), (27, 29));
         assert_eq!(l.main_view.center, (start.0 + world(10), start.1 + world(5)));
         assert_eq!(l.main_view.follow, Follow::Driver);
     }
@@ -1279,7 +1323,7 @@ mod tests {
             mv(&mut l, (100, 300));
             assert!(edges(&mv(&mut l, (3, 0))).is_empty(), "{scale:?}");
             tick(&mut l, 100);
-            assert_eq!(l.main_view.center, (start.0 - (51.0 * world_per_pixel).trunc() as i32, start.1 - (60.0 * world_per_pixel).trunc() as i32), "{scale:?}");
+            assert_eq!(l.main_view.center, (start.0 - (edge_speed(4) * 0.1 * world_per_pixel).round() as i32, start.1 - (60.0 * world_per_pixel).round() as i32), "{scale:?}");
         }
     }
 
@@ -1322,7 +1366,7 @@ mod tests {
             for smooth in [false, true] {
                 for zoom in [super::super::ONE - 1, super::super::ONE, super::super::ONE + 2] {
                     for scale in [(1, 1), (3, 2), (3, 1)] {
-                        for depth in [1, 8, EDGE_ZONE] {
+                        for depth in [1, 8, EDGE_ZONE / 2, EDGE_ZONE - 8] {
                             for ms in [4, 16, 40] {
                                 let make = || {
                                     let mut l = split(MapMovement::EdgeScroll, Roles::Free);
@@ -1355,6 +1399,76 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn edge_scrolling_moves_as_far_as_the_games_own_smooth_or_not() {
+        // The game's wheel step (its scroll speed setting): at the
+        // outermost pixel the map moves that far every 66 ms, in world
+        // pixels however large the world is shown, smooth movement on or
+        // off alike (only continuous instead of in steps).
+        let wrap = Some(WorldBounds { size: (8000, 4000), wrap: (true, true) });
+        for step in [(64, 32), (128, 64), (256, 128)] {
+            for scale in [(1, 1), (5, 2), (5, 1)] {
+                for zoom in [super::super::ONE, super::super::ONE + 2] {
+                    let mut moved = vec![];
+                    for smooth in [false, true] {
+                        let mut s = scene_at(1000);
+                        s.map_wheel_step = step;
+                        let mut l = Layout::default();
+                        l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, smooth_world_movement: smooth, ..Default::default() });
+                        l.world_scale = scale;
+                        l.split.as_mut().unwrap().view.zoom = zoom;
+                        for _ in 0..2 {
+                            l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], wrap);
+                        }
+                        let start = l.exact_center(Hit::Pane).unwrap();
+                        // B's right edge, then its bottom-right corner.
+                        mv(&mut l, (799, 300));
+                        for _ in 0..60 {
+                            l.advance(Duration::from_millis(16));
+                            l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], wrap);
+                        }
+                        let at = l.exact_center(Hit::Pane).unwrap();
+                        let want = step.0 as f64 / GAME_EDGE_TICK * 0.96;
+                        let what = format!("step {step:?} scale {scale:?} zoom {zoom} smooth {smooth}");
+                        assert!((at.0 - start.0 - want).abs() < 1e-6, "{what}: {} vs {want}", at.0 - start.0);
+                        assert_eq!(at.1, start.1, "{what}");
+                        mv(&mut l, (799, 599));
+                        for _ in 0..60 {
+                            l.advance(Duration::from_millis(16));
+                            l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], wrap);
+                        }
+                        let end = l.exact_center(Hit::Pane).unwrap();
+                        assert!((end.1 - at.1 - step.1 as f64 / GAME_EDGE_TICK * 0.96).abs() < 1e-6, "{what}");
+                        moved.push((end.0 - start.0, end.1 - start.1));
+                    }
+                    assert_eq!(moved[0], moved[1], "step {step:?} scale {scale:?} zoom {zoom}: smooth or not, as far");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edge_scrolling_slows_with_every_pixel_further_in() {
+        let mut s = scene_at(1000);
+        s.map_wheel_step = (128, 64);
+        let mut last = f64::INFINITY;
+        for depth in 1..=EDGE_ZONE + 1 {
+            let mut l = split(MapMovement::EdgeScroll, Roles::Free);
+            l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            let start = l.exact_center(Hit::Pane).unwrap();
+            mv(&mut l, (800 - depth, 300));
+            l.advance(Duration::from_millis(100));
+            l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            let d = l.exact_center(Hit::Pane).unwrap().0 - start.0;
+            if depth > EDGE_ZONE {
+                assert_eq!(d, 0.0, "past the zone");
+            } else {
+                assert!(d > 0.0 && d < last, "{depth}: {d} after {last}");
+            }
+            last = d;
         }
     }
 
