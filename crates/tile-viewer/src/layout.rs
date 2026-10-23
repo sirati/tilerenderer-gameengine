@@ -4145,7 +4145,7 @@ impl Layout {
             Input::MouseButton { button, down, x, y } => {
                 let p = self.held_back((x, y));
                 // (On the minimap: B goes there, `pan`.)
-                if button == Button::Right && self.minimap_right(down, p) {
+                if self.minimap_button(button, down, p) {
                     return vec![];
                 }
                 self.button(button, down, p)
@@ -8743,6 +8743,7 @@ impl Layout {
         self.focus = frame.focus;
         self.world_downscale = frame.world_downscale;
         self.map_wheel_step = frame.map_wheel_step;
+        self.minimap = frame.minimap;
         self.window = frame.window;
         self.main = frame.main;
         self.shown = frame.shown;
@@ -8762,6 +8763,20 @@ impl Layout {
 #[cfg(test)]
 mod presented_mapping_tests {
     use super::*;
+    #[test]
+    fn presenting_a_minimap_installs_and_removes_its_click_area() {
+        let mut active = Layout::default();
+        let mut submitted = active.clone();
+        submitted.minimap = Some(scene::Minimap { at: (30, 960), size: (200, 100), shown: [30, 960, 200, 100], world: (8000, 4000) });
+        let expected = submitted.minimap;
+        active.adopt_presented_mapping(submitted);
+        assert_eq!(active.minimap, expected);
+        let mut closed = active.clone();
+        closed.minimap = None;
+        active.adopt_presented_mapping(closed);
+        assert_eq!(active.minimap, None);
+    }
+
     #[test]
     fn presenting_an_older_packet_keeps_newer_pointer_and_keys_but_installs_its_geometry() {
         let mut active = Layout::default();
