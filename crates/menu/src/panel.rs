@@ -256,6 +256,10 @@ pub struct ItemDesc {
     pub checkbox: Option<String>,
     pub slider: Option<String>,
     pub text: Option<String>,
+    /// Hover text, drawn above the panel and in immediate hover looks.
+    pub tooltip: Option<String>,
+    pub tooltip_art: Option<String>,
+    pub tooltip_style: Option<String>,
     #[serde(default)]
     pub at: [i32; 2],
     pub size: Option<[u32; 2]>,
@@ -531,6 +535,9 @@ struct Item {
     at: (i32, i32),
     size: Option<(u32, u32)>,
     text: Option<String>,
+    tooltip: Option<String>,
+    tooltip_art: Option<String>,
+    tooltip_style: Option<String>,
     style: Option<String>,
     align: Option<Align>,
     valign: Option<VAlign>,
@@ -647,6 +654,9 @@ fn repeated(desc: &ItemDesc, entry: &str) -> ItemDesc {
         checkbox: s(&desc.checkbox),
         slider: s(&desc.slider),
         text: s(&desc.text),
+        tooltip: s(&desc.tooltip),
+        tooltip_art: s(&desc.tooltip_art),
+        tooltip_style: s(&desc.tooltip_style),
         style: s(&desc.style),
         tick_style: s(&desc.tick_style),
         normal: s(&desc.normal),
@@ -793,6 +803,9 @@ impl Panels {
                 if let Some(s) = d.style.as_ref().filter(|s| !desc.styles.contains_key(*s)) {
                     return Err(unknown("style", s));
                 }
+                if let Some(s) = d.tooltip_style.as_ref().filter(|s| !desc.styles.contains_key(*s)) {
+                    return Err(unknown("style", s));
+                }
                 let cond = |c: &Option<String>| c.as_deref().map(Cond::parse).transpose().map_err(|m| invalid(what(), &m));
                 let pair = |p: Option<[i32; 2]>| p.map(|[x, y]| (x, y));
                 items.push(Item {
@@ -800,6 +813,9 @@ impl Panels {
                     at: (d.at[0], d.at[1]),
                     size: d.size.map(|[w, h]| (w, h)),
                     text: d.text.clone(),
+                    tooltip: d.tooltip.clone(),
+                    tooltip_art: art_ref(&d.tooltip_art)?,
+                    tooltip_style: d.tooltip_style.clone(),
                     style: d.style.clone(),
                     align: d.align,
                     valign: d.valign,
@@ -1096,9 +1112,37 @@ impl Panels {
     /// `measure` (see [`estimate`]).
     pub fn draw(&self, panel: &Panel, state: &PanelState, area: [i32; 4], measure: &dyn Fn(&TextStyle, &str) -> TextMetrics) -> Vec<Draw> {
         let mut out = Vec::new();
+        let tooltip = state.hover.filter(|&n| panel.items.get(n).is_some_and(|i| i.tooltip.is_some() && Self::visible(i, state) && Self::enabled(i, state)));
         for (n, item) in panel.items.iter().enumerate().filter(|(_, i)| Self::visible(i, state)) {
+            if tooltip == Some(n) { continue; }
             out.extend(self.draw_item(panel, state, area, measure, n, item));
         }
+        if let Some(n) = tooltip {
+            let item = &panel.items[n];
+            // Keep the hovered control and tooltip together on top. The
+            // viewer replaces one contiguous sprite range for each look.
+            out.extend(self.draw_item(panel, state, area, measure, n, item));
+            out.extend(self.tooltip(panel, state, area, measure, item));
+        }
+        out
+    }
+
+    fn tooltip(&self, panel: &Panel, state: &PanelState, area: [i32; 4], measure: &dyn Fn(&TextStyle, &str) -> TextMetrics, item: &Item) -> Vec<Draw> {
+        let Some(text) = &item.tooltip else { return Vec::new() };
+        let style = item.tooltip_style.as_deref().or(item.style.as_deref());
+        let Some(desc) = self.style(style) else { return Vec::new() };
+        let (ox, oy) = self.origin(panel, area);
+        let clip = [ox, oy, ox + panel.size.0 as i32, oy + panel.size.1 as i32];
+        let mut out = Vec::new();
+        let mut d = Drawer { panels: self, state, clip, measure, out: &mut out };
+        let text = d.values_text(text, item.decimals, item.percent);
+        let metrics = measure(&TextStyle { face: desc.face.clone(), height: desc.height, weight: desc.weight, italic: desc.italic, color: desc.color }, &text);
+        let (w, h) = ((metrics.width + 12).min(clip[2] - ox), (metrics.ascent + metrics.descent + 10).min(clip[3] - oy));
+        let [x, y, _, ih] = self.rect(item, state, (ox, oy)).unwrap_or([ox, oy, 0, 0]);
+        let x = x.clamp(ox, clip[2] - w);
+        let y = if y + ih + 5 + h <= clip[3] { y + ih + 5 } else { (y - h - 5).max(oy) };
+        if let Some(art) = &item.tooltip_art { d.art(art, (x, y), Some((w as u32, h as u32))); }
+        d.text(&text, style, TextLook { enabled: true, selected: false, hover: false }, (x + 6, y + 5), Align::Left, VAlign::Top);
         out
     }
 
@@ -1134,7 +1178,9 @@ impl Panels {
                     }
                     _ => {}
                 }
-                self.draw_item(panel, &s, area, measure, n, item)
+                let mut draws = self.draw_item(panel, &s, area, measure, n, item);
+                if s.hover == Some(n) { draws.extend(self.tooltip(panel, &s, area, measure, item)); }
+                draws
             };
             let shown = LookState { pointer: if state.hover == Some(n) { PointerState::Hover } else { PointerState::Normal }, selected };
             let selections: &[bool] = if select == scene::Select::None { &[false] } else { &[false, true] };
@@ -1144,7 +1190,8 @@ impl Panels {
                 .filter(|&l| l != shown)
                 .map(|l| (l, draws_in(l)))
                 .collect();
-            let draws = self.draw_item(panel, state, area, measure, n, item);
+            let mut draws = self.draw_item(panel, state, area, measure, n, item);
+            if state.hover == Some(n) { draws.extend(self.tooltip(panel, state, area, measure, item)); }
             let kind = match &item.kind {
                 Kind::Slider { control, min, max, knob, .. } => {
                     let kw = knob.as_ref().and_then(|k| self.art_named(k, state)).and_then(|a| a.size).map_or(0, |s| s.0 as i32);
@@ -1974,6 +2021,59 @@ mod tests {
         let item = panel.items.iter().find(|i| i.control() == Some("layout.zoom_magnification_step")).unwrap();
         let Kind::Slider { tick_labels, .. } = &item.kind else { panic!("magnification slider") };
         assert_eq!(tick_labels.as_ref().unwrap(), &["1.5×", "2×", "3×", "4×"]);
+    }
+
+    #[test]
+    fn preferences_undo_controls_fit_beside_values_and_tooltips_stay_in_the_panel() {
+        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
+        let panel = panels.panel("preferences").unwrap();
+        let area = [200, 100, 1024, 768];
+        let mut state = PanelState::default();
+        for item in &panel.items {
+            if let Kind::Slider { control, max, .. } = &item.kind {
+                state.values.insert(control.clone(), Value::Number(*max));
+                state.values.insert(format!("dialog.changed.{control}"), Value::On(true));
+            }
+        }
+        for key in ["resolution.scale_menus", "display.limit_fps", "layout.zoom_controls", "layout.zoom_lens_controls"] {
+            state.values.insert(key.into(), Value::On(true));
+        }
+        state.values.insert("layout.zoom".into(), Value::Text("Floating131".into()));
+        state.values.insert("layout.zoom_magnification_label".into(), Value::Text("4×".into()));
+        state.values.insert("layout.split".into(), Value::Text("Vertical1To1".into()));
+        let mut checked = 0;
+        let overlap = |a: [i32; 4], b: [i32; 4]| a[0] < b[0]+b[2] && b[0] < a[0]+a[2] && a[1] < b[1]+b[3] && b[1] < a[1]+a[3];
+        for tab in ["resolution", "layout", "zoom"] {
+            state.values.insert("tab".into(), Value::Text(tab.into()));
+            let looks = panels.looks(panel, &state, area, &estimate);
+            for (i, look) in looks.iter().enumerate() {
+                assert!(looks[..i].iter().all(|other| !overlap(look.rect, other.rect)), "{tab}: {:?} overlaps a control", look.rect);
+            }
+            let undos: Vec<_> = panel.items.iter().enumerate().filter(|(_, i)| i.control() == Some("dialog.undo") && Panels::visible(i, &state)).collect();
+            for (index, undo) in undos {
+                checked += 1;
+                let Kind::Choice { value: control, .. } = &undo.kind else { unreachable!() };
+                let rect = panels.rect(undo, &state, panels.origin(panel, area)).unwrap();
+                let (n, slider) = panel.items.iter().enumerate().find(|(_, i)| matches!(&i.kind, Kind::Slider { control: c, .. } if c == control)).unwrap();
+                for draw in panels.draw_item(panel, &state, area, &estimate, n, slider) {
+                    if let Draw::Text(t) = draw {
+                        let m = estimate(&t.style, &t.text);
+                        assert!(!overlap(rect, [t.x, t.y-m.ascent, m.width, m.ascent+m.descent]), "{control}: undo overlaps {}", t.text);
+                    }
+                }
+                state.hover = Some(index);
+                let draws = panels.draw(panel, &state, area, &estimate);
+                let look = panels.looks(panel, &state, area, &estimate).into_iter().find(|l| l.id == id_hash(&panel.name, &index.to_string())).unwrap();
+                assert!(draws.windows(look.draws.len()).any(|w| w == look.draws), "{control}: hovered control and tooltip must form one replacement range");
+                let Draw::Text(t) = draws.last().unwrap() else { panic!("tooltip must paint above all items") };
+                assert_eq!(t.text, "Undo to current state");
+                let m = estimate(&t.style, &t.text);
+                assert!(t.x >= area[0] && t.x + m.width <= area[0]+area[2]);
+                assert!(t.y-m.ascent >= area[1] && t.y+m.descent <= area[1]+area[3]);
+            }
+            state.hover = None;
+        }
+        assert_eq!(checked, 13);
     }
 
     #[test]

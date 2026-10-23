@@ -1961,6 +1961,54 @@ mod tests {
     }
 
     #[test]
+    fn changing_frame_scale_updates_every_hud_piece_and_active_orders_without_resizing_preferences() {
+        let (mut scene, rect_of) = game_scene();
+        scene.interface.popup = None;
+        scene.views.retain(|v| v.id != 257);
+        scene.interface.menu_fit = true;
+        scene.interface.reachable = Some([836, 1030, 256, 32]);
+        let hud = [[5, 949, 280, 130], [1621, 942, 294, 137], [21, 12, 107, 30], [836, 1030, 256, 32]];
+        for pixel_scale in [1, 2, 3] {
+            for active in [layout::Side::A, layout::Side::B] {
+                let mut layout = layout::Layout::default();
+                layout.apply_settings(&viewer_settings::Layout {
+                    split: viewer_settings::Split::Vertical1To1,
+                    unit_buttons: viewer_settings::UnitButtons::ActiveView, ..Default::default()
+                });
+                let mut menu_rect = None;
+                // Same live layout for successive drag positions and rollback.
+                for frame_scale in [1.0, 1.5, 0.5, 1.0] {
+                    let p = fixed_plan((1920 * pixel_scale, 1080 * pixel_scale), (1920, 1080), (pixel_scale, 1.0, frame_scale, 1.0));
+                    layout.driver_screen = Some(p.screen);
+                    layout.menu_scale = p.menu.zoom;
+                    layout.hud_scale = p.frame;
+                    layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+                    let area = layout.view_area(active);
+                    layout.route(scene::Input::MouseMove { x: area[0]+area[2]/2, y: area[1]+area[3]/2 });
+                    let mut shown = Vec::new();
+                    for _ in 0..3 {
+                        let mut frame = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+                        shown = arrange(&p, &scene, &mut frame, &rect_of).shown.unwrap();
+                        layout.set_interface_shown(Some(shown.clone()));
+                    }
+                    for driver in hud {
+                        let piece = shown.iter().find(|s| s.driver == driver).unwrap();
+                        assert!((piece.rect[2] as f32 - driver[2] as f32 * frame_scale).abs() <= 1.0, "HUD {driver:?}, frame {frame_scale}, pixels {pixel_scale}: {:?}", piece.rect);
+                        let middle = (piece.rect[0]+piece.rect[2]/2, piece.rect[1]+piece.rect[3]/2);
+                        let back = piece.to_driver(middle);
+                        assert!((back.0-driver[0]-driver[2]/2).abs() <= 1 && (back.1-driver[1]-driver[3]/2).abs() <= 1);
+                        if driver[1] == 1030 {
+                            assert!(piece.rect[0] >= area[0] && piece.rect[0]+piece.rect[2] <= area[0]+area[2], "orders in {active:?}");
+                        }
+                    }
+                    let menu = shown.iter().find(|s| s.driver == [448, 156, 1024, 768]).unwrap().rect;
+                    assert_eq!(*menu_rect.get_or_insert(menu), menu, "Preferences stays fixed during HUD preview");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn clicks_on_the_frame_reach_its_pixels_at_every_pixel_scale() {
         // A vertical split in a 4K window at 200 %: the minimap (bottom-left),
         // a top-left button and the unit panel (bottom-right) take clicks

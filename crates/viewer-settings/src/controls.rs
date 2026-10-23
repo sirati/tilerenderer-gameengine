@@ -282,6 +282,41 @@ impl Settings {
             .collect()
     }
 
+    /// Copy one numeric control exactly, without snapping a previously
+    /// accepted value to today's slider steps. Used by live preview and
+    /// per-slider undo. Other controls, including the FPS enable switch,
+    /// keep their current values.
+    pub fn restore_number_control(&mut self, key: &str, source: &Self) -> bool {
+        let before = self.clone();
+        macro_rules! copy { ($group:ident, $field:ident) => { self.$group.$field = source.$group.$field }; }
+        match key {
+            "resolution.base_ui_scale" => copy!(resolution, base_ui_scale),
+            "resolution.menu_scale_percent" => copy!(resolution, menu_scale_percent),
+            "resolution.frame_scale" => copy!(resolution, frame_scale),
+            "resolution.world_scale" => copy!(resolution, world_scale),
+            "layout.separator_width" => copy!(layout, separator_width),
+            "layout.zoom_strip" => copy!(layout, zoom_strip),
+            "layout.zoom_box_top" => copy!(layout, zoom_box_top),
+            "layout.zoom_box_drop" => copy!(layout, zoom_box_drop),
+            "layout.zoom_magnification_step" => copy!(layout, zoom_magnification),
+            "input.snap_updates_per_second" => copy!(input, snap_updates_per_second),
+            "input.snap_ghost_fps" => copy!(input, snap_ghost_fps),
+            "input.capture_sensitivity" => copy!(input, capture_sensitivity),
+            "animation.combat_speed" => copy!(animation, combat_speed),
+            "display.fps_limit" => {
+                if (self.display.max_fps > 0) == (source.display.max_fps > 0) {
+                    copy!(display, fps_limit);
+                    copy!(display, max_fps);
+                } else if let Some(ControlValue::Number(limit)) = source.control(key) {
+                    self.display.fps_limit = limit as u32;
+                    if self.display.max_fps > 0 { self.display.max_fps = limit as u32; }
+                }
+            }
+            _ => return false,
+        }
+        *self != before
+    }
+
     /// Sets control `key` to `value` (numbers clamped to their range and
     /// snapped to its step); whether the settings changed. The screens'
     /// place is set for the split's orientation, the other kept.
@@ -456,6 +491,39 @@ impl Settings {
 mod tests {
     use super::*;
     use crate::ScreenPlace;
+
+    #[test]
+    fn numeric_restore_preserves_exact_values_and_independent_fps_switch() {
+        let mut accepted = Settings::default();
+        accepted.resolution.frame_scale = 1.234;
+        accepted.layout.zoom_strip = 0.123;
+        let mut draft = accepted.clone();
+        draft.resolution.frame_scale = 2.0;
+        draft.layout.zoom_strip = 0.4;
+        draft.layout.zoom_box_drop = 0.5;
+        assert!(draft.restore_number_control("resolution.frame_scale", &accepted));
+        assert!(draft.restore_number_control("layout.zoom_strip", &accepted));
+        assert_eq!(draft.resolution.frame_scale, 1.234);
+        assert_eq!(draft.layout.zoom_strip, 0.123);
+        assert_eq!(draft.layout.zoom_box_drop, 0.5);
+        assert!(!draft.restore_number_control("resolution.frame_scale", &accepted));
+        assert!(!draft.restore_number_control("resolution.pixel_scale", &accepted));
+        accepted.display.max_fps = 144;
+        draft.display.max_fps = 0;
+        draft.display.fps_limit = 480;
+        assert!(draft.restore_number_control("display.fps_limit", &accepted));
+        assert_eq!((draft.display.max_fps, draft.display.fps_limit), (0, 144));
+        accepted.display.max_fps = 0;
+        accepted.display.fps_limit = 240;
+        draft.display.max_fps = 480;
+        assert!(draft.restore_number_control("display.fps_limit", &accepted));
+        assert_eq!((draft.display.max_fps, draft.display.fps_limit), (240, 240));
+        accepted.display.max_fps = 144;
+        accepted.display.fps_limit = 120;
+        draft.display.max_fps = 480;
+        draft.restore_number_control("display.fps_limit", &accepted);
+        assert_eq!((draft.display.max_fps, draft.display.fps_limit), (144, 120), "undo restores the exact accepted backing fields when enable is unchanged");
+    }
 
     #[test]
     fn pacing_controls_preserve_legacy_config_and_remember_disabled_limit() {
