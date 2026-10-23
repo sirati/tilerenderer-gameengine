@@ -527,6 +527,8 @@ pub struct Frame {
     /// with two views (`scaling::arrange` moves their sprites).
     pub unit_orders: Option<UnitOrdersPlace>,
     pub copies: Vec<ScreenCopy>,
+    /// Plain horizontal separators, in their own unscaled UI camera.
+    pub separators: Vec<(u32, [i32; 4])>,
     pub markers: Vec<Marker>,
     /// The divider's glass (`glass`): per strip one pixel across the gap,
     /// the camera of the half of the gap it lies in (the pane's picture
@@ -647,6 +649,11 @@ pub struct Layout {
     pub magnifier: Option<Magnifier>,
     /// Floating zoom boxes hold the pointer out instead of moving aside.
     pub zoom_box_block_pointer: bool,
+    pub zoom_rounded: bool,
+    pub zoom_glass: bool,
+    pub separator_width: u32,
+    /// Physical window pixels per composition pixel.
+    pub window_pixel_scale: f64,
     /// The zoom box's or strip's zoom the settings last asked for: it stays
     /// as the wheel changed it until they ask for another.
     zoom_box_zoom: Option<usize>,
@@ -898,6 +905,10 @@ impl Default for Layout {
             insets: Vec::new(),
             magnifier: None,
             zoom_box_block_pointer: false,
+            zoom_rounded: true,
+            zoom_glass: true,
+            separator_width: 4,
+            window_pixel_scale: 1.0,
             zoom_box_zoom: None,
             clean_map: Default::default(),
             focus_arrow: false,
@@ -1358,6 +1369,9 @@ impl Layout {
         };
         self.magnifier = place.map(|place| Magnifier { mode: MagnifierMode::World, zoom, place, region: s.zoom_place, ..Self::MAGNIFIER });
         self.zoom_box_block_pointer = s.zoom_box_block_pointer;
+        self.zoom_rounded = s.zoom_rounded;
+        self.zoom_glass = s.zoom_glass;
+        self.separator_width = s.separator_width.clamp(1, 16);
         self.screen_place = s.screen_place;
         self.menu_follows_pointer = s.menu_follows_pointer;
         self.smooth = s.smooth_world_movement;
@@ -1509,7 +1523,7 @@ impl Layout {
         let r = match m.place {
             ZoomPlace::Strip(_) => {
                 let Some((mut r, _)) = self.strip() else { return vec![] };
-                r[3] += GAP;
+                r[3] += self.separator_gap();
                 r
             }
             ZoomPlace::Box(..) if self.zoom_box_block_pointer => {
@@ -1831,7 +1845,7 @@ impl Layout {
     /// zoom strip, if there is one).
     pub(crate) fn panes(&self) -> ([i32; 4], Option<[i32; 4]>) {
         let (w, h) = (self.window.0 as i32, self.window.1 as i32);
-        let below = |r: [i32; 4], s: [i32; 4]| [r[0], s[1] + s[3] + GAP, r[2], (r[3] - s[3] - GAP).max(1)];
+        let below = |r: [i32; 4], s: [i32; 4]| [r[0], s[1] + s[3] + self.separator_gap(), r[2], (r[3] - s[3] - self.separator_gap()).max(1)];
         match self.strip() {
             None => self.panes_in([0, 0, w, h]),
             Some((s, None)) => self.panes_in(below([0, 0, w, h], s)),
@@ -1892,24 +1906,28 @@ impl Layout {
     /// The panes in `area`.
     fn panes_in(&self, [x, y, w, h]: [i32; 4]) -> ([i32; 4], Option<[i32; 4]>) {
         if !self.world_shown { return ([x, y, w, h], None); }
+        let gap = self.separator_gap();
         match self.split {
             None => ([x, y, w, h], None),
             Some(s) => match s.axis {
                 Axis::Vertical => {
-                    let a = ((w as f32 * s.fraction) as i32).clamp(GAP, (w - GAP).max(GAP));
-                    ([x, y, a, h], Some([x + a + GAP, y, w - a - GAP, h]))
+                    let a = ((w as f32 * s.fraction) as i32).clamp(gap, (w - gap).max(gap));
+                    ([x, y, a, h], Some([x + a + gap, y, w - a - gap, h]))
                 }
                 Axis::Horizontal => {
-                    let a = ((h as f32 * s.fraction) as i32).clamp(GAP, (h - GAP).max(GAP));
-                    ([x, y, w, a], Some([x, y + a + GAP, w, h - a - GAP]))
+                    let a = ((h as f32 * s.fraction) as i32).clamp(gap, (h - gap).max(gap));
+                    ([x, y, w, a], Some([x, y + a + gap, w, h - a - gap]))
                 }
             },
         }
     }
 
-    /// The gap between the panes across the split's axis (from, to:
-    /// window x for side by side, y for stacked), and its extent along the
-    /// divider (from, to).
+    /// Round to composition pixels, keeping at least one visible pixel.
+    fn separator_gap(&self) -> i32 {
+        (f64::from(self.separator_width.clamp(1, 16)) / self.window_pixel_scale.max(1.0)).round().max(1.0) as i32
+    }
+
+    /// The gap across the split's axis and its extent along the divider.
     pub(crate) fn gap(&self) -> Option<((i32, i32), (i32, i32))> {
         let split = self.split?;
         let (a, b) = self.panes();
@@ -2173,9 +2191,18 @@ impl Layout {
         (source[0] + (p.0 - rect[0]) * d / n, source[1] + (p.1 - rect[1]) * d / n)
     }
 
-    /// Render a world magnifier from the full-size art, even when the
-    /// game shows the world smaller. Keep its logical camera in `shown`
-    /// for input: the driver still expects its own world pixels.
+    /// Only floating and mouse boxes have a lens; strips keep a plain line.
+    fn zoom_lens(&self, m: &Magnifier, rect: [i32; 4]) -> Option<tile_render::Lens> {
+        if !matches!(m.place, ZoomPlace::Box(..) | ZoomPlace::AboutPointer(..)) { return None; }
+        Some(tile_render::Lens {
+            radius: if self.zoom_rounded { rect[2].min(rect[3]) as f32 * 0.075 } else { 0.0 },
+            rim: (if self.zoom_glass { 7.0 } else { self.separator_width as f32 }) / self.window_pixel_scale.max(1.0) as f32,
+            glass: self.zoom_glass,
+        })
+    }
+
+    /// Render full-size art while keeping the logical camera for input in
+    /// the driver's own world pixels.
     fn magnifier_art_camera(&self, camera: Camera) -> Camera {
         let n = camera.downscale.max(1);
         let zoom = times(camera.zoom, (1, n));
@@ -2672,8 +2699,9 @@ impl Layout {
         }
         self.insets_shown = insets;
         // (World only: no overlay belongs to them.)
+        let gap = self.separator_gap();
         let frame_of = |rect: [i32; 4]| {
-            let r = [rect[0] - GAP / 2, rect[1] - GAP / 2, rect[2] + GAP, rect[3] + GAP];
+            let r = [rect[0] - gap / 2, rect[1] - gap / 2, rect[2] + gap, rect[3] + gap];
             // A zoomed view of nothing: a block of the background colour.
             Camera { zoom: (2, 1), origin: (r[0], r[1]), cells: false, ..Camera::new((r[2].max(1) as u32, r[3].max(1) as u32)) }
         };
@@ -2716,7 +2744,13 @@ impl Layout {
         let zoom_box = magnifier.filter(|m| m.place != ZoomPlace::Beside);
         if let Some(m) = zoom_box {
             let (rect, _) = self.magnifier_geometry(&m);
-            push(&mut frame, frame_of(rect));
+            let lens = self.zoom_lens(&m, rect);
+            if lens.is_none() {
+                let border = Camera { origin: (rect[0], rect[1] + rect[3]), cells: false,
+                    ..Camera::new((rect[2].max(1) as u32, self.separator_gap() as u32)) };
+                let at = push(&mut frame, border);
+                frame.separators.push((at, rect_of(&border)));
+            }
             // The world under the pointer (the world cursor while the mouse
             // is captured; where it looked last while nothing is under it).
             let center = if self.locked { Some(self.cursor) } else { self.world_under(self.pointer) }.or(self.magnifier_center);
@@ -2724,6 +2758,7 @@ impl Layout {
             let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None, (1, 1));
             camera.zoomed_art = self.zoomed_art(camera.zoom);
             camera.downscale = downscale;
+            camera.lens = lens;
             push(&mut frame, self.magnifier_art_camera(camera));
             self.shown.push((Hit::Magnifier, camera));
         }
@@ -3395,7 +3430,9 @@ impl Layout {
             return b;
         }
         if let Some(m) = self.magnifier.filter(|_| self.magnifier_shown) {
-            if inside(self.magnifier_geometry(&m).0, p) {
+            let rect = self.magnifier_geometry(&m).0;
+            let in_lens = self.zoom_lens(&m, rect).is_none_or(|lens| lens.distance((rect[2] as u32, rect[3] as u32), ((p.0 - rect[0]) as f32 + 0.5, (p.1 - rect[1]) as f32 + 0.5)) <= 0.0);
+            if inside(rect, p) && in_lens {
                 // The zoom box or strip lies under the driver's interface.
                 if m.place != ZoomPlace::Beside {
                     if let Some(hit) = self.interface_at(p) {
@@ -4616,6 +4653,54 @@ mod tests {
     }
 
     #[test]
+    fn lens_settings_reach_all_box_cameras_and_leave_the_strip_square() {
+        use viewer_settings::Zoom;
+        for mode in [Zoom::Floating131, Zoom::Floating171, Zoom::Mouse111, Zoom::Mouse131, Zoom::TopStrip] {
+            for rounded in [false, true] { for glass in [false, true] { for scale in [1, 2] {
+                let mut l = Layout::default();
+                l.window_pixel_scale = scale as f64;
+                l.apply_settings(&viewer_settings::Layout { zoom: mode, zoom_rounded: rounded, zoom_glass: glass, ..Default::default() });
+                l.pointer = (400, 400);
+                let f = frame(&mut l, vec![]);
+                let logical = l.shown.iter().find(|(h, _)| *h == Hit::Magnifier).unwrap().1;
+                let camera = f.cameras.iter().find(|c| c.lens.is_some());
+                if mode == Zoom::TopStrip { assert!(camera.is_none()); continue; }
+                let camera = camera.unwrap();
+                let lens = camera.lens.unwrap();
+                assert_eq!(lens.glass, glass);
+                assert_eq!(lens.radius > 0.0, rounded);
+                assert_eq!(lens.rim * scale as f32, if glass { 7.0 } else { 4.0 });
+                let corner = (logical.origin.0, logical.origin.1);
+                assert_eq!(l.hit(corner) == Hit::Magnifier, !rounded);
+                assert_eq!(l.hit((logical.origin.0 + logical.viewport.0 as i32 / 2, logical.origin.1 + logical.viewport.1 as i32 / 2)), Hit::Magnifier);
+            } } }
+        }
+    }
+
+    #[test]
+    fn separator_width_uses_window_pixels_and_drives_gap_and_walls() {
+        for scale in [1, 2] {
+            for width in [4, 8, 16] {
+                for split in [viewer_settings::Split::Vertical1To1, viewer_settings::Split::Horizontal1To1] {
+                    let mut l = Layout::default();
+                    l.window_pixel_scale = scale as f64;
+                    l.apply_settings(&viewer_settings::Layout { split, separator_width: width, ..Default::default() });
+                    frame(&mut l, vec![]);
+                    let ((a, b), _) = l.gap().unwrap();
+                    assert_eq!((b-a) * scale, width as i32);
+                    let walls = l.divider_pointer_walls().unwrap();
+                    assert!(!walls.is_empty());
+                    assert!(walls.iter().all(|r| if split.is_vertical() { r[0] == a && r[2] == b-a } else { r[1] == a && r[3] == b-a }));
+                    l.apply_settings(&viewer_settings::Layout { zoom: viewer_settings::Zoom::TopStrip, separator_width: width, ..Default::default() });
+                    frame(&mut l, vec![]);
+                    let strip = l.strip().unwrap().0;
+                    assert_eq!(l.panes().0[1] - strip[1] - strip[3], width as i32 / scale);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn clean_map_masks_are_independent_for_a_b_and_full_detail_zoom() {
         use viewer_settings::clean_map::{Mode, View as Detail};
         for game_downscale in [1, 2] {
@@ -5458,7 +5543,8 @@ mod tests {
                 assert_eq!((rendered.x, rendered.y), (logical.x * downscale as i32, logical.y * downscale as i32));
                 assert_eq!(rendered.overhang, (16, 24, 8, 12));
                 assert_eq!(rendered.zoomed_art, rendered.zoom != (1, 1));
-                for p in [(r[0], r[1]), (r[0] + r[2] / 2, r[1] + r[3] / 2), (r[0] + r[2] - 1, r[1] + r[3] - 1)] {
+                // The middle of each horizontal edge stays inside rounded lenses.
+                for p in [(r[0] + r[2] / 2, r[1]), (r[0] + r[2] / 2, r[1] + r[3] / 2), (r[0] + r[2] / 2, r[1] + r[3] - 1)] {
                     let w = world_at(&logical, p);
                     let full = world_at(rendered, p);
                     assert_eq!((full.0 / downscale as i32, full.1 / downscale as i32), w, "{place:?} {p:?}");
@@ -8756,6 +8842,7 @@ impl Layout {
         self.driver_screen = frame.driver_screen;
         self.menu_scale = frame.menu_scale;
         self.hud_scale = frame.hud_scale;
+        self.window_pixel_scale = frame.window_pixel_scale;
         self.art_zooms = frame.art_zooms;
     }
 }

@@ -721,6 +721,7 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
                 cull: v.cull,
                 origin: v.origin,
                 target_clip: None,
+                lens: None,
                 cells: !v.interface_only,
                 screen_shift: (0, 0),
                 zoomed_art: false,
@@ -801,6 +802,19 @@ fn glass_sprites(compiled: &Compiled, strips: &[(u32, [i32; 4], bool, layout::Sh
         for k in (0..len).step_by(GLASS_TILE as usize) {
             let (px, py) = if vertical { (x, y + k) } else { (x + k, y) };
             out.push(tile_render::PlacedSprite { screen: true, view: Some(camera), clip, ..tile_render::PlacedSprite::new(set, px, py) });
+        }
+    }
+    out
+}
+
+/// A dark band with a light inner half, sized by Layout in window pixels.
+fn separator_sprites(pieces: &[(u32, [i32; 4])]) -> Vec<tile_render::PlacedSprite> {
+    let mut out = Vec::new();
+    for &(camera, [x, y, w, h]) in pieces {
+        for (top, height, color) in [(y, h, 20), (y + h / 2, (h + 1) / 2, 205)] {
+            out.push(tile_render::PlacedSprite { screen: true, view: Some(camera),
+                solid: Some(tile_render::SolidRect { width: w as u32, height: height as u32, rgba: [color, color, color, 255] }),
+                ..tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, x, top) });
         }
     }
     out
@@ -3391,6 +3405,7 @@ impl App {
             self.layout.driver_screen = Some(plan.screen);
             self.layout.menu_scale = plan.menu.zoom;
             self.layout.hud_scale = plan.frame;
+            self.layout.window_pixel_scale = plan.factor();
             // (What the interface covers changes with the scene only.)
             let key = (scene.seq, self.assets_version);
             if self.interface.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -3517,6 +3532,7 @@ impl App {
         // The viewer's markers on top of the world, for this frame only.
         let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
         markers.extend(glass_sprites(&self.compiled, &arranged.divider));
+        markers.extend(separator_sprites(&arranged.separators));
         // The cursor where the viewer draws it, in a camera of its own on
         // top (only when there is one: the frame is as before otherwise).
         let captured = self.layout.captured();
