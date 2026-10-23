@@ -27,6 +27,15 @@
 //!   captured): in the other pane a copy reads as a second pointer
 //!   ([`Marks::mirror_only_in`]).
 //!
+//! - While the game is busy or stuck ([`BusyEffect`]), the system pointer
+//!   carries the small turning hourglass in its own image (one system
+//!   cursor a step, [`Art::native_image`], made once and kept): never a
+//!   sprite beside it, which would trail it. Only a pointer the viewer
+//!   draws anyway (captured, snapping) gets the badge drawn with it
+//!   ([`compose_busy_badge`]), in the same place. A standard system icon
+//!   (text, resize, ...), whose pixels the viewer does not have, shows
+//!   without one.
+//!
 //! The viewer's drawings are screen sprites in a camera of their own, on
 //! top of every view, clipped to the view they mark; they change without
 //! the world being rebuilt (only the free sprites are uploaded again).
@@ -88,6 +97,8 @@ pub struct Art {
     blank: std::collections::HashSet<u32>,
     arrow: Option<u32>,
     busy: Vec<u32>,
+    /// The busy badge on each pointer-sized image ([`badge_place`]).
+    badges: HashMap<u32, Badge>,
 }
 
 impl Art {
@@ -118,7 +129,8 @@ impl Art {
             images.insert(id, image);
             id
         }).collect();
-        Self { images, capture, blank, arrow, busy }
+        let badges = pointer_badges(&images, &busy);
+        Self { images, capture, blank, arrow, busy, badges }
     }
 
     /// The cursor to show for the driver's `cursor`: a sprite that shows
@@ -149,21 +161,67 @@ impl Art {
         Some(self.busy[scene::loading_cursor::frame_at(elapsed) as usize % self.busy.len()])
     }
 
+    #[cfg(test)]
+    pub fn with_image(set: u32, image: Image) -> Self {
+        Self { images: HashMap::from([(set, image)]), ..Default::default() }
+    }
+
     pub fn get(&self, set: u32) -> Option<&Image> {
         self.images.get(&set)
     }
 
     pub fn badged(&self, set: u32, elapsed: std::time::Duration) -> Option<Shown> {
-        if self.busy.is_empty() { return None; }
+        // (Only a pointer with a place for it: one of pointer size.)
+        if self.busy.is_empty() || !self.badges.contains_key(&set) { return None; }
         let hourglass = self.busy[scene::loading_cursor::frame_at(elapsed) as usize % self.busy.len()];
         Some(Shown::Badged { base: set, hourglass })
     }
 
-    /// The requested native cursor image; badges are composed on demand.
-    pub fn cursor_image(&self, shown: Shown) -> Option<Image> {
+    /// Every picture of the animation `shown` belongs to (itself if none),
+    /// so that the system cursors of a whole turn are made at once.
+    pub fn animation_of(&self, shown: Shown) -> Vec<Shown> {
         match shown {
-            Shown::Custom(set) => self.get(set).cloned(),
-            Shown::Badged { base, hourglass } => Some(with_busy_badge(self.get(base)?, self.get(hourglass)?)),
+            Shown::Badged { base, hourglass } if self.busy.contains(&hourglass) =>
+                self.busy.iter().map(|&hourglass| Shown::Badged { base, hourglass }).collect(),
+            Shown::Custom(set) if self.busy.contains(&set) => self.busy.iter().map(|&set| Shown::Custom(set)).collect(),
+            shown => vec![shown],
+        }
+    }
+
+    /// The upright hourglass's visible pixels (`[x, y, w, h]` in its turned
+    /// frame) and the frame's side; `None` without a system hourglass.
+    fn hourglass(&self) -> Option<([u32; 4], u32)> {
+        let frame = self.get(*self.busy.first()?)?;
+        Some((opaque_bounds(frame)?, frame.size.0 as u32))
+    }
+
+    /// Where the small hourglass goes on the pointer `set` (art `size` and
+    /// `hotspot` as [`SetArt`], used where the pixels of `set` are not
+    /// kept: then its whole cell counts as covered); see [`badge_place`].
+    pub fn badge_for(&self, set: u32, size: (u32, u32), hotspot: (u16, u16)) -> Option<Badge> {
+        if let Some(badge) = self.badges.get(&set) { return Some(*badge); }
+        let (upright, side) = self.hourglass()?;
+        Some(badge_place([0, 0, size.0, size.1], &|_, _| true, hotspot, upright, side))
+    }
+    /// Whether [`Art::native_image`] makes an image of `shown`.
+    pub fn has_image(&self, shown: Shown) -> bool {
+        match shown {
+            Shown::Custom(set) => self.get(set).is_some(),
+            Shown::Badged { base, hourglass } => self.get(hourglass).is_some() && self.get(base).is_some() && self.badges.contains_key(&base),
+            _ => false,
+        }
+    }
+
+    /// The system cursor's pixels for `shown` at `scale` (window pixels,
+    /// as [`Scale::native`]). A badged pointer is one image: the pointer
+    /// and its small hourglass, with the pointer's hot spot.
+    pub fn native_image(&self, shown: Shown, scale: Scale) -> Option<Image> {
+        match shown {
+            Shown::Custom(set) => Some(scale.native(self.get(set)?)),
+            Shown::Badged { base, hourglass } => {
+                let badge = *self.badges.get(&base)?;
+                Some(with_busy_badge(&scale.native(self.get(base)?), self.get(hourglass)?, badge, scale))
+            }
             _ => None,
         }
     }
@@ -196,32 +254,169 @@ pub fn busy_effect(status: crate::host_status::Responsiveness, special: bool) ->
     }
 }
 
-pub const BUSY_BADGE_SIDE: u32 = 16;
+/// The small hourglass's height, upright, as a share of the pointer's
+/// visible height (Windows XP's "Working in Background" pointer: the
+/// hourglass is about 60 % as tall as the arrow beside it).
+pub const BADGE_HEIGHT: f32 = 0.6;
+/// Where the upright hourglass's middle would ideally be, as shares of the
+/// pointer's visible width and height from its top-left: at the arrow's
+/// lower right, beside its tail, as on Windows XP.
+pub const BADGE_MIDDLE: (f32, f32) = (0.85, 0.75);
+/// How many covered pointer pixels moving the hourglass one art pixel
+/// further from [`BADGE_MIDDLE`] is worth: it moves off the pointer's
+/// shape (e.g. the game's long diagonal arrow tail) rather than hide it,
+/// but stays attached.
+const BADGE_PULL: f32 = 2.5;
 
-/// Art pixels from the pointer's hot spot to the badge's top-left.
-pub fn badge_offset(size: (u32, u32), hotspot: (u16, u16)) -> (i32, i32) {
-    ((size.0 as i32 - hotspot.0 as i32 + 2).max(12), (size.1 as i32 - hotspot.1 as i32 + 2).max(12))
+/// The busy badge on one pointer: the turned hourglass frame's top-left
+/// relative to the pointer's hot spot, and its side, in the pointer's art
+/// pixels. The frame is square and the hourglass turns about its middle.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Badge {
+    pub offset: (f32, f32),
+    pub side: f32,
 }
 
-/// A single native cursor image, retaining the original hot spot and pixels.
-fn with_busy_badge(base: &Image, hourglass: &Image) -> Image {
-    let offset = badge_offset((base.size.0.into(), base.size.1.into()), base.hotspot);
-    let (x, y) = (base.hotspot.0 as u32 + offset.0 as u32, base.hotspot.1 as u32 + offset.1 as u32);
-    let (w, h) = ((base.size.0 as u32).max(x + BUSY_BADGE_SIDE), (base.size.1 as u32).max(y + BUSY_BADGE_SIDE));
-    let mut rgba = vec![0; (w * h * 4) as usize];
-    for by in 0..base.size.1 as usize {
-        let start = by * base.size.0 as usize * 4;
-        let dest = by * w as usize * 4;
-        rgba[dest..dest + base.size.0 as usize * 4].copy_from_slice(&base.rgba[start..start + base.size.0 as usize * 4]);
+impl Badge {
+    /// The frame's top-left (relative to the hot spot) and side in whole
+    /// pixels `per_art` times as large as the pointer's art pixels; the
+    /// middle, where the hourglass turns, keeps its place.
+    pub fn at(&self, per_art: f32) -> ((i32, i32), u32) {
+        let side = (self.side * per_art).round().max(1.0);
+        let middle = ((self.offset.0 + self.side / 2.0) * per_art, (self.offset.1 + self.side / 2.0) * per_art);
+        (((middle.0 - side / 2.0).round() as i32, (middle.1 - side / 2.0).round() as i32), side as u32)
     }
-    for dy in 0..BUSY_BADGE_SIDE {
-        for dx in 0..BUSY_BADGE_SIDE {
-            let src = ((dy * hourglass.size.1 as u32 / BUSY_BADGE_SIDE * hourglass.size.0 as u32 + dx * hourglass.size.0 as u32 / BUSY_BADGE_SIDE) * 4) as usize;
-            let dest = (((y + dy) * w + x + dx) * 4) as usize;
-            rgba[dest..dest + 4].copy_from_slice(&hourglass.rgba[src..src + 4]);
+}
+
+/// Where the small hourglass goes on a pointer whose visible pixels are
+/// `opaque` (`[x, y, w, h]`, art pixels; `covered` says which of them
+/// show something) with hot spot `hotspot`, for turned hourglass frames of
+/// side `side` whose upright frame shows the hourglass at `upright`.
+///
+/// Like Windows XP's "Working in Background" pointer: the upright
+/// hourglass [`BADGE_HEIGHT`] of the pointer's height, attached at its
+/// lower right; of the places near [`BADGE_MIDDLE`] the one hiding least of
+/// the pointer, never its hot spot.
+pub fn badge_place(opaque: [u32; 4], covered: &dyn Fn(i32, i32) -> bool, hotspot: (u16, u16), upright: [u32; 4], side: u32) -> Badge {
+    let k = BADGE_HEIGHT * opaque[3].max(1) as f32 / upright[3].max(1) as f32;
+    let (w, h) = ((upright[2] as f32 * k).round().max(1.0) as i32, (upright[3] as f32 * k).round().max(1.0) as i32);
+    let [ox, oy, ow, oh] = opaque.map(|v| v as i32);
+    let ideal = (ox as f32 + BADGE_MIDDLE.0 * ow as f32, oy as f32 + BADGE_MIDDLE.1 * oh as f32);
+    let mut best = (f32::INFINITY, (ideal.0 - w as f32 / 2.0, ideal.1 - h as f32 / 2.0));
+    for y in oy - h / 2..=oy + oh {
+        for x in ox - w / 2..=ox + ow {
+            if (x..x + w).contains(&(hotspot.0 as i32)) && (y..y + h).contains(&(hotspot.1 as i32)) { continue; }
+            let middle = (x as f32 + w as f32 / 2.0, y as f32 + h as f32 / 2.0);
+            let distance = (middle.0 - ideal.0).hypot(middle.1 - ideal.1);
+            let mut cost = BADGE_PULL * distance;
+            if cost >= best.0 { continue; }
+            for py in y.max(oy)..(y + h).min(oy + oh) {
+                for px in x.max(ox)..(x + w).min(ox + ow) {
+                    if covered(px, py) { cost += 1.0; }
+                }
+            }
+            if cost < best.0 { best = (cost, (x as f32, y as f32)); }
         }
     }
-    Image { rgba, size: (w as u16, h as u16), hotspot: base.hotspot }
+    let (left, top) = best.1;
+    Badge {
+        offset: (left - upright[0] as f32 * k - hotspot.0 as f32, top - upright[1] as f32 * k - hotspot.1 as f32),
+        side: side as f32 * k,
+    }
+}
+
+/// The largest image taken for a pointer that may get a busy badge.
+const MAX_POINTER_SIDE: u16 = 64;
+
+/// [`badge_place`] for every pointer-sized image but the hourglass's own.
+fn pointer_badges(images: &HashMap<u32, Image>, busy: &[u32]) -> HashMap<u32, Badge> {
+    let Some((upright, side)) = busy.first().and_then(|id| images.get(id)).and_then(|f| Some((opaque_bounds(f)?, f.size.0 as u32))) else {
+        return HashMap::new();
+    };
+    images.iter()
+        .filter(|(id, i)| !busy.contains(id) && i.size.0 <= MAX_POINTER_SIDE && i.size.1 <= MAX_POINTER_SIDE)
+        .filter_map(|(&id, image)| {
+            let covered = |x: i32, y: i32| image.rgba[((y as usize * image.size.0 as usize) + x as usize) * 4 + 3] != 0;
+            Some((id, badge_place(opaque_bounds(image)?, &covered, image.hotspot, upright, side)))
+        })
+        .collect()
+}
+
+/// The smallest box holding every pixel of `image` that is not clear.
+pub fn opaque_bounds(image: &Image) -> Option<[u32; 4]> {
+    let (w, h) = (image.size.0 as u32, image.size.1 as u32);
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for (i, p) in image.rgba.chunks_exact(4).enumerate().take((w * h) as usize) {
+        if p[3] == 0 { continue; }
+        let (x, y) = (i as u32 % w, i as u32 / w);
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    (x0 <= x1).then(|| [x0, y0, x1 - x0 + 1, y1 - y0 + 1])
+}
+
+/// Window pixels per art pixel at `scale`.
+pub fn per_art(scale: Scale) -> f32 {
+    scale.present as f32 * scale.zoom.0.max(1) as f32 / scale.zoom.1.max(1) as f32
+}
+
+/// The largest system cursor image made (Windows and X11 accept larger,
+/// but cursors beyond this are not useful).
+const MAX_CURSOR_SIDE: i32 = 256;
+
+/// One system cursor image: `base` (already at `scale`, window pixels)
+/// with the turned `hourglass` frame over it at `badge`, smoothly scaled
+/// (4×4 samples a pixel). The image grows to hold the badge and keeps the
+/// pointer's hot spot.
+fn with_busy_badge(base: &Image, hourglass: &Image, badge: Badge, scale: Scale) -> Image {
+    let ((bx, by), side) = badge.at(per_art(scale));
+    let (bx, by) = (bx + base.hotspot.0 as i32, by + base.hotspot.1 as i32);
+    let (left, top) = ((-bx).max(0), (-by).max(0));
+    let w = ((base.size.0 as i32).max(bx + side as i32) + left).min(MAX_CURSOR_SIDE) as u32;
+    let h = ((base.size.1 as i32).max(by + side as i32) + top).min(MAX_CURSOR_SIDE) as u32;
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..(base.size.1 as u32).min(h - top as u32) {
+        for x in 0..(base.size.0 as u32).min(w - left as u32) {
+            let s = ((y * base.size.0 as u32 + x) * 4) as usize;
+            let d = (((y + top as u32) * w + x + left as u32) * 4) as usize;
+            rgba[d..d + 4].copy_from_slice(&base.rgba[s..s + 4]);
+        }
+    }
+    let (hw, hh) = (hourglass.size.0 as u64, hourglass.size.1 as u64);
+    if hw == 0 || hh == 0 || (hourglass.rgba.len() as u64) < hw * hh * 4 {
+        return Image { rgba, size: (w as u16, h as u16), hotspot: (base.hotspot.0 + left as u16, base.hotspot.1 + top as u16) };
+    }
+    const N: u64 = 4;
+    let span = 2 * side as u64 * N;
+    for y in 0..side as i32 {
+        for x in 0..side as i32 {
+            let (dx, dy) = (bx + left + x, by + top + y);
+            if dx < 0 || dy < 0 || dx as u32 >= w || dy as u32 >= h { continue; }
+            // The premultiplied mean of N×N samples.
+            let mut sum = [0u64; 4];
+            for sy in 0..N {
+                let v = (((y as u64 * N + sy) * 2 + 1) * hh / span).min(hh - 1);
+                for sx in 0..N {
+                    let u = (((x as u64 * N + sx) * 2 + 1) * hw / span).min(hw - 1);
+                    let p = &hourglass.rgba[((v * hw + u) * 4) as usize..][..4];
+                    let a = p[3] as u64;
+                    for c in 0..3 { sum[c] += p[c] as u64 * a; }
+                    sum[3] += a;
+                }
+            }
+            if sum[3] == 0 { continue; }
+            // Source over the pointer, straight alpha.
+            let a = sum[3] / (N * N);
+            let d = ((dy as u32 * w + dx as u32) * 4) as usize;
+            let under_a = rgba[d + 3] as u64;
+            let out_a = a * 255 + under_a * (255 - a);
+            for c in 0..3 {
+                let src = sum[c] / sum[3];
+                rgba[d + c] = ((src * a * 255 + rgba[d + c] as u64 * under_a * (255 - a)) / out_a.max(1)).min(255) as u8;
+            }
+            rgba[d + 3] = (out_a / 255).min(255) as u8;
+        }
+    }
+    Image { rgba, size: (w as u16, h as u16), hotspot: (base.hotspot.0 + left as u16, base.hotspot.1 + top as u16) }
 }
 
 /// The first frame of `set` as a cursor image (a colour sprite, or an
@@ -303,17 +498,22 @@ impl SetArt {
     }
 }
 
-/// Add the small hourglass beside a drawn pointer. Its own camera keeps
-/// the badge at half the nominal cursor size, including fractional scales.
-pub fn compose_busy_badge(out: &mut Composed, compiled: &Compiled, at: (i32, i32), offset: (i32, i32), clip: Option<[i32; 4]>, scale: Scale, canvas: (u32, u32), next: u32) {
+/// Add the small hourglass to a pointer the viewer draws itself (its hot
+/// spot at canvas pixel `at`), where [`Badge`] puts it on the system
+/// cursor: the same picture as [`Art::native_image`]. Only for pointers
+/// that are sprites anyway (captured, snapping): a system pointer gets its
+/// badge in its own image, never as a sprite trailing it.
+pub fn compose_busy_badge(out: &mut Composed, compiled: &Compiled, at: (i32, i32), badge: Badge, clip: Option<[i32; 4]>, scale: Scale, canvas: (u32, u32), next: u32) {
     let Some(art) = compiled.set(scene::loading_cursor::SET).and_then(|(set, _)| SetArt::of(compiled, set)) else { return };
     if art.size.0 == 0 || art.size.1 == 0 { return; }
     let view = next + out.top.len() as u32;
     if view as usize >= tile_render::MAX_VIEWS { return; }
-    let origin = (at.0 + scale.span(offset.0.max(0) as u32) as i32, at.1 + scale.span(offset.1.max(0) as u32) as i32);
-    let side = scale.span(BUSY_BADGE_SIDE).max(1);
+    // (Canvas pixels: the system cursor's window pixels without the
+    // pixel scale.)
+    let ((dx, dy), side) = badge.at(scale.zoom.0.max(1) as f32 / scale.zoom.1.max(1) as f32);
+    let origin = (at.0 + dx, at.1 + dy);
     out.top.push(Camera {
-        cells: false, zoom: (scale.zoom.0 * BUSY_BADGE_SIDE, scale.zoom.1 * art.size.0),
+        cells: false, zoom: (side, art.size.0),
         origin, screen_shift: origin, hairline: true, target_clip: clip,
         ..Camera::new((side.min(canvas.0), side.min(canvas.1)))
     });
@@ -855,11 +1055,12 @@ pub fn compose(art: SetArt, marks: &Marks, cameras: &[Camera], slots: &[u32], sc
 
 /// World cursors retain their command/capture meaning even if the host is
 /// stuck. Only the actual pointer gets a badge, not its mirrored marks.
-pub fn compose_with_busy(compiled: &Compiled, art: SetArt, marks: &Marks, cameras: &[Camera], slots: &[u32], scale: Scale, canvas: (u32, u32), overlay: u32, period: (i32, i32), status: crate::host_status::Responsiveness) -> Composed {
+pub fn compose_with_busy(compiled: &Compiled, pixels: &Art, art: SetArt, marks: &Marks, cameras: &[Camera], slots: &[u32], scale: Scale, canvas: (u32, u32), overlay: u32, period: (i32, i32), status: crate::host_status::Responsiveness) -> Composed {
     let mut out = compose(art, marks, cameras, slots, scale, canvas, overlay, period);
-    if busy_effect(status, true) == BusyEffect::Badge {
+    let badge = pixels.badge_for(art.set.raw(), art.size, art.hotspot);
+    if let (BusyEffect::Badge, Some(badge)) = (busy_effect(status, true), badge) {
         for p in placements(marks, cameras, period).into_iter().filter(|p| p.own) {
-            compose_busy_badge(&mut out, compiled, p.at, badge_offset(art.size, art.hotspot), p.clip, scale, canvas, overlay + 1);
+            compose_busy_badge(&mut out, compiled, p.at, badge, p.clip, scale, canvas, overlay + 1);
         }
     }
     out
@@ -1601,7 +1802,7 @@ mod busy_tests {
             }
         }
         // Native cursors without CPU image pixels keep their shape. The
-        // viewer draws just the badge beside them in its overlay camera.
+        // viewer has no pixels to add a badge to and draws none beside them.
         let mut native = crate::system_cursor::SystemCursor::default();
         native.refresh(&scene::Scene { seq: 1, assets: 1, cursor: scene::Cursor::System(scene::SystemCursor::Text), ..Default::default() }, 1, 1, art);
         for status in [R::Answering, R::Busy, R::Stuck] {
@@ -1610,31 +1811,96 @@ mod busy_tests {
     }
 
     #[test]
-    fn a_busy_native_image_keeps_the_hotspot_and_adds_a_small_hourglass_below_right() {
+    fn a_busy_system_cursor_is_one_image_with_the_hourglass_attached_at_its_lower_right() {
         let art = Art::of(&with_hourglass(false));
         for base in [art.arrow.unwrap(), art.capture().unwrap()] {
-            let image = art.get(base).unwrap();
-            let badge = art.cursor_image(art.badged(base, std::time::Duration::ZERO).unwrap()).unwrap();
-            assert_eq!(badge.hotspot, image.hotspot);
-            let offset = badge_offset((image.size.0.into(), image.size.1.into()), image.hotspot);
-            let start = (image.hotspot.0 as u32 + offset.0 as u32, image.hotspot.1 as u32 + offset.1 as u32);
-            assert!(start.0 > image.hotspot.0 as u32 && start.1 > image.hotspot.1 as u32);
-            assert_eq!(badge.size, ((image.size.0 as u32).max(start.0 + BUSY_BADGE_SIDE) as u16, (image.size.1 as u32).max(start.1 + BUSY_BADGE_SIDE) as u16));
-            // Every original pointer pixel survives unchanged.
-            for y in 0..image.size.1 as usize {
-                let source = y * image.size.0 as usize * 4;
-                let dest = y * badge.size.0 as usize * 4;
-                let len = image.size.0 as usize * 4;
-                assert_eq!(&image.rgba[source..source + len], &badge.rgba[dest..dest + len]);
+            for scale in [Scale::default(), Scale::new(48, 1), Scale::new(64, 1), Scale::new(64, 2)] {
+                let plain = art.native_image(Shown::Custom(base), scale).unwrap();
+                let shown = art.badged(base, std::time::Duration::ZERO).unwrap();
+                assert!(art.has_image(shown));
+                let badged = art.native_image(shown, scale).unwrap();
+                // One image, the pointer where it was: the same hot spot,
+                // grown only to the right and down.
+                assert_eq!(badged.hotspot, plain.hotspot, "{scale:?}");
+                assert!(badged.size.0 >= plain.size.0 && badged.size.1 >= plain.size.1);
+                let pointer = opaque_bounds(&plain).unwrap();
+                // The hourglass's pixels: those that differ from the plain
+                // pointer's.
+                let (w, pw) = (badged.size.0 as u32, plain.size.0 as u32);
+                let differs = |x: u32, y: u32| {
+                    let b = &badged.rgba[((y * w + x) * 4) as usize..][..4];
+                    let p = (x < pw && y < plain.size.1 as u32).then(|| &plain.rgba[((y * pw + x) * 4) as usize..][..4]);
+                    p.map_or(b[3] != 0, |p| p != b)
+                };
+                let mut glass = [u32::MAX, u32::MAX, 0, 0];
+                for y in 0..badged.size.1 as u32 {
+                    for x in 0..w {
+                        if differs(x, y) { glass = [glass[0].min(x), glass[1].min(y), glass[2].max(x + 1), glass[3].max(y + 1)]; }
+                    }
+                }
+                assert!(glass[0] < glass[2], "a badge is drawn");
+                let (gh, ph) = ((glass[3] - glass[1]) as f32, pointer[3] as f32);
+                // (The test's hourglass fills its frame: it is the badge's
+                // whole square, BADGE_HEIGHT of the pointer.)
+                assert!((gh / ph - BADGE_HEIGHT).abs() < 0.1, "badge height {gh} for a pointer {ph} high at {scale:?}");
+                // Attached: its middle lower right of the hot spot, and it
+                // touches or overlaps the pointer's box.
+                let middle = ((glass[0] + glass[2]) / 2, (glass[1] + glass[3]) / 2);
+                assert!(middle.0 > badged.hotspot.0 as u32 && middle.1 > badged.hotspot.1 as u32, "{glass:?}");
+                assert!(glass[0] <= pointer[0] + pointer[2] + 1 && glass[1] <= pointer[1] + pointer[3] + 1, "{glass:?} beside {pointer:?}");
+                // The hot spot itself is never covered.
+                let h = badged.hotspot;
+                assert!(!differs(h.0 as u32, h.1 as u32));
             }
             assert_ne!(art.badged(base, std::time::Duration::ZERO), art.badged(base, std::time::Duration::from_millis(83)), "the small hourglass turns too");
+            // The whole turn is made at once and kept.
+            let turn = art.animation_of(art.badged(base, std::time::Duration::ZERO).unwrap());
+            assert_eq!(turn.len(), 12);
+            assert!(turn.iter().all(|s| matches!(s, Shown::Badged { base: b, .. } if *b == base)));
         }
+        assert_eq!(art.animation_of(Shown::Custom(art.arrow.unwrap())), [Shown::Custom(art.arrow.unwrap())]);
+        assert_eq!(art.animation_of(Shown::Custom(art.busy_cursor(std::time::Duration::ZERO).unwrap())).len(), 12, "the stuck hourglass too");
+    }
+
+    /// A diagonal arrow like the game's, its tail running to the lower
+    /// right: the hourglass goes beside the tail, not over it.
+    #[test]
+    fn the_badge_sits_beside_a_diagonal_tail_and_never_on_the_hot_spot() {
+        // 17×28 pointer: the head (rows 0..14) and a tail 5 px wide
+        // running down-right to (16, 27).
+        let covered = |x: i32, y: i32| if y < 14 { x <= y } else { let c = (y - 14) * 10 / 13 + 4; (c - 3..=c + 2).contains(&x) };
+        let badge = badge_place([0, 0, 17, 28], &covered, (0, 0), [0, 0, 46, 46], 46);
+        let side = badge.side;
+        assert!((side - 0.6 * 28.0).abs() < 0.01);
+        let (x0, y0) = (badge.offset.0.round() as i32, badge.offset.1.round() as i32);
+        let s = side.round() as i32;
+        let hidden = (y0..y0 + s).flat_map(|y| (x0..x0 + s).map(move |x| (x, y))).filter(|&(x, y)| (0..17).contains(&x) && (0..28).contains(&y) && covered(x, y)).count();
+        let tail = (14..28).map(|y| (0..17).filter(|&x| covered(x, y)).count()).sum::<usize>();
+        assert!(hidden * 4 < tail, "hides {hidden} of the tail's {tail} pixels at {badge:?}");
+        assert!(x0 + s >= 12 && y0 <= 27 && x0 <= 18, "attached to the arrow: {badge:?}");
+        // A pointer covering its whole cell (no pixels kept): at the lower
+        // right, the hot spot clear.
+        let whole = badge_place([0, 0, 32, 32], &|_, _| true, (16, 16), [0, 0, 46, 46], 46);
+        let at = (whole.offset.0 + 16.0, whole.offset.1 + 16.0);
+        assert!(at.0 + whole.side / 2.0 > 16.0 && at.1 + whole.side / 2.0 > 16.0);
+        assert!(!(at.0 <= 16.0 && 16.0 < at.0 + whole.side && at.1 <= 16.0 && 16.0 < at.1 + whole.side), "{whole:?}");
+    }
+
+    #[test]
+    fn badge_squares_scale_about_their_middle_in_whole_pixels() {
+        let badge = Badge { offset: (3.5, 7.25), side: 16.8 };
+        assert_eq!(badge.at(1.0), ((3, 7), 17));
+        assert_eq!(badge.at(2.0), ((7, 14), 34));
+        let ((x, y), s) = badge.at(1.5);
+        let middle = ((3.5 + 8.4) * 1.5, (7.25 + 8.4) * 1.5);
+        assert!((x as f32 + s as f32 / 2.0 - middle.0).abs() <= 1.0 && (y as f32 + s as f32 / 2.0 - middle.1).abs() <= 1.0);
     }
 
     #[test]
     fn captured_drawn_cursor_keeps_its_shape_with_a_scaled_busy_or_stuck_badge() {
         use crate::host_status::Responsiveness as R;
         let compiled = with_hourglass(false);
+        let pixels = Art::of(&compiled);
         let set = compiled.set("Viewer@command/0").unwrap().0;
         let art = SetArt::of(&compiled, set).unwrap();
         let hourglass = compiled.set(scene::loading_cursor::SET).unwrap().0;
@@ -1643,17 +1909,22 @@ mod busy_tests {
             captured: true, world_cursor: vec![(100, 100)],
             cursor_view: Some(([0, 0, 400, 300], (100, 100), false)), ..Default::default()
         }).marks;
+        let badge = pixels.badge_for(set.raw(), art.size, art.hotspot).unwrap();
         for scale in [Scale::default(), Scale::new(48, 1), Scale::new(64, 2)] {
             for status in [R::Answering, R::Busy, R::Stuck] {
-                let out = compose_with_busy(&compiled, art, &marks, &[camera], &[], scale, (400, 300), 1, (0, 0), status);
+                let out = compose_with_busy(&compiled, &pixels, art, &marks, &[camera], &[], scale, (400, 300), 1, (0, 0), status);
                 assert_eq!(out.sprites.iter().filter(|s| s.set == set).count(), 1, "keep the captured cursor for {status:?}");
                 let badges: Vec<_> = out.sprites.iter().filter(|s| s.set == hourglass).collect();
                 assert_eq!(badges.len(), usize::from(status != R::Answering));
-                if let Some(badge) = badges.first() {
-                    assert_eq!(badge.ticks_per_frame, scene::loading_cursor::TICKS_PER_FRAME);
+                if let Some(sprite) = badges.first() {
+                    assert_eq!(sprite.ticks_per_frame, scene::loading_cursor::TICKS_PER_FRAME);
                     let c = out.top.last().unwrap();
-                    assert_eq!(c.viewport, (scale.span(BUSY_BADGE_SIDE), scale.span(BUSY_BADGE_SIDE)));
-                    assert!(c.origin.0 > 100 && c.origin.1 > 100);
+                    // Where the system cursor's image has it, in canvas
+                    // pixels (the system's are these times the pixel scale).
+                    let ((dx, dy), side) = badge.at(scale.zoom.0 as f32 / scale.zoom.1 as f32);
+                    assert_eq!(c.viewport, (side, side));
+                    assert_eq!(c.origin, (100 + dx, 100 + dy));
+                    assert!(c.origin.0 + side as i32 / 2 > 100 && c.origin.1 + side as i32 / 2 > 100);
                     assert_eq!(c.target_clip, Some([0, 0, 400, 300]));
                 }
             }

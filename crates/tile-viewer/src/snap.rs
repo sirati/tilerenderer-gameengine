@@ -1782,10 +1782,10 @@ impl SnapInput {
     /// as long as the renderer draws that many views. `window`: the
     /// canvas.
     pub fn compose(&self, compiled: &render_desc::Compiled, overlay: u32, next: u32, scale: crate::cursor::Scale, window: (u32, u32)) -> crate::cursor::Composed {
-        self.compose_with_busy(compiled, overlay, next, scale, window, crate::host_status::Responsiveness::Answering)
+        self.compose_with_busy(compiled, &crate::cursor::Art::default(), overlay, next, scale, window, crate::host_status::Responsiveness::Answering)
     }
 
-    pub fn compose_with_busy(&self, compiled: &render_desc::Compiled, overlay: u32, next: u32, scale: crate::cursor::Scale, window: (u32, u32), status: crate::host_status::Responsiveness) -> crate::cursor::Composed {
+    pub fn compose_with_busy(&self, compiled: &render_desc::Compiled, pixels: &crate::cursor::Art, overlay: u32, next: u32, scale: crate::cursor::Scale, window: (u32, u32), status: crate::host_status::Responsiveness) -> crate::cursor::Composed {
         let mut out = crate::cursor::Composed::default();
         let Some(pointer) = self.snapper.pointer() else { return out };
         let set = |names: &[&str]| names.iter().find_map(|n| compiled.set(n).map(|(s, _)| s));
@@ -1817,10 +1817,13 @@ impl SnapInput {
             out.top.extend(c.top);
         }
         if status != crate::host_status::Responsiveness::Answering {
-            let offset = set(&[ARROW_SPRITE, POINTER_SPRITE, crate::CURSOR_SPRITE])
+            // (Placed on the solid pointer as on the system cursor.)
+            let badge = set(&[ARROW_SPRITE, POINTER_SPRITE, crate::CURSOR_SPRITE])
                 .and_then(|set| crate::cursor::SetArt::of(compiled, set))
-                .map_or((16, 22), |art| crate::cursor::badge_offset(art.size, art.hotspot));
-            crate::cursor::compose_busy_badge(&mut out, compiled, (pointer.0.round() as i32, pointer.1.round() as i32), offset, None, scale, window, next);
+                .and_then(|art| pixels.badge_for(art.set.raw(), art.size, art.hotspot));
+            if let Some(badge) = badge {
+                crate::cursor::compose_busy_badge(&mut out, compiled, (pointer.0.round() as i32, pointer.1.round() as i32), badge, None, scale, window, next);
+            }
         }
         out
     }

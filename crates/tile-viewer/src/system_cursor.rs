@@ -115,6 +115,8 @@ impl SystemCursor {
 
     pub fn art(&self) -> &Art { &self.art }
 
+    pub fn art_handle(&self) -> Arc<Art> { self.art.clone() }
+
     pub fn cursor(&self) -> scene::Cursor { self.art.system_shown(self.cursor) }
 }
 

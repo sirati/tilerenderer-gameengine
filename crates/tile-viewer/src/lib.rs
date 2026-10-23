@@ -2832,15 +2832,19 @@ impl App {
                 // pixels are the window's physical ones on every system).
                 match self.custom_cursors.get(&(shown, scale)) {
                     Some(c) => gpu.window.set_cursor(c.clone()),
-                    None => match self.os_cursor.art().cursor_image(shown) {
+                    None if self.os_cursor.art().has_image(shown) => {
                         // Made on a thread of its own; until it is, the
                         // pointer stays as it is (asked again next frame).
-                        Some(image) => {
-                            self.cursor_builds.start((shown, scale), image);
-                            self.pointer_presentation.shown = None;
+                        // An animation's pictures are all made at once and
+                        // kept: each later step only switches handles.
+                        for picture in self.os_cursor.art().animation_of(shown) {
+                            if !self.custom_cursors.contains_key(&(picture, scale)) {
+                                self.cursor_builds.start((picture, scale), self.os_cursor.art_handle());
+                            }
                         }
-                        None => gpu.window.set_cursor(winit::window::CursorIcon::Default),
-                    },
+                        self.pointer_presentation.shown = None;
+                    }
+                    None => gpu.window.set_cursor(winit::window::CursorIcon::Default),
                 }
                 gpu.window.set_cursor_visible(true);
             }
@@ -3732,7 +3736,7 @@ impl App {
             Some(art) if cameras.len() < tile_render::MAX_VIEWS => {
                 let bounds = world_bounds(&self.compiled, scene);
                 let period = (if bounds.wrap.0 { bounds.size.0 } else { 0 }, if bounds.wrap.1 { bounds.size.1 } else { 0 });
-                cursor::compose_with_busy(&self.compiled, art, &marks, &cameras, &arranged.cursor_slots, cursor_scale, window, overlay, period, busy_status)
+                cursor::compose_with_busy(&self.compiled, &self.cursor_art, art, &marks, &cameras, &arranged.cursor_slots, cursor_scale, window, overlay, period, busy_status)
             }
             _ => cursor::Composed::default(),
         };
@@ -3746,17 +3750,16 @@ impl App {
         // shows there (as `pointer_hidden`): never both.
         let system_hidden = (captured && !self.machine.edge()) || facts.snap_mode || self.unlock_pending.is_some() || self.constraints.moving() || snapping;
         let snap = if cameras.len() < tile_render::MAX_VIEWS && system_hidden {
-            self.snap.compose_with_busy(&self.compiled, overlay, overlay + 1 + composed.top.len() as u32, cursor_scale, window, busy_status)
+            self.snap.compose_with_busy(&self.compiled, &self.cursor_art, overlay, overlay + 1 + composed.top.len() as u32, cursor_scale, window, busy_status)
         } else {
             cursor::Composed::default()
         };
         composed.top.extend(snap.top);
-        // Native icons without CPU pixels keep their OS shape; only their
-        // badge is drawn in the overlay. Custom images contain both already.
-        if busy_status != host_status::Responsiveness::Answering && !system_hidden && self.pointer_inside && self.pointer_presentation.active()
-            && matches!(self.os_cursor.shown_busy(false, self.capture_icon, scene.interface.targeting, captured, responsiveness, self.started.elapsed()), cursor::Shown::Icon(_)) {
-            cursor::compose_busy_badge(&mut composed, &self.compiled, self.system_pointer, (16, 22), None, cursor_scale, window, overlay + 1);
-        }
+        // While the system shows the pointer, its busy badge is part of the
+        // system cursor's own image (`update_system_pointer`), never a
+        // sprite here: a sprite would trail the pointer by a frame or more.
+        // (A standard system icon, whose pixels the viewer does not have,
+        // keeps its shape without a badge.)
         let cursor_sprites = composed.sprites;
         let mut snap_sprites = snap.sprites;
         if overlay < tile_render::MAX_VIEWS as u32 {
@@ -4216,8 +4219,10 @@ struct CursorBuilds {
 type CursorBuilt = (u64, (cursor::Shown, cursor::Scale), Option<winit::window::CustomCursorSource>);
 
 impl CursorBuilds {
-    /// Makes `image` at cursor scale `key.1`, unless it is being made.
-    fn start(&mut self, key: (cursor::Shown, cursor::Scale), image: cursor::Image) {
+    /// Makes the system cursor `key.0` of `art` at cursor scale `key.1`
+    /// (`cursor::Art::native_image`: pointer and busy badge in one
+    /// image), unless it is being made.
+    fn start(&mut self, key: (cursor::Shown, cursor::Scale), art: Arc<cursor::Art>) {
         if !self.pending.insert(key) {
             return;
         }
@@ -4226,10 +4231,11 @@ impl CursorBuilds {
         let generation = self.generation;
         let initialize = self.native_thread_init;
         std::thread::spawn(move || thread_start::initialized(initialize, || {
-            let native = key.1.native(&image);
-            let source = winit::window::CustomCursor::from_rgba(native.rgba, native.size.0, native.size.1, native.hotspot.0, native.hotspot.1)
-                .inspect_err(|e| log::warn!("viewer: cursor {:?}: {e}", key.0))
-                .ok();
+            let source = art.native_image(key.0, key.1).and_then(|native| {
+                winit::window::CustomCursor::from_rgba(native.rgba, native.size.0, native.size.1, native.hotspot.0, native.hotspot.1)
+                    .inspect_err(|e| log::warn!("viewer: cursor {:?}: {e}", key.0))
+                    .ok()
+            });
             if tx.send((generation, key, source)).is_ok() {
                 if let Some(wake) = wake { wake(); }
             }
@@ -4307,9 +4313,9 @@ mod cursor_completion_tests {
         let mut builds = CursorBuilds::default();
         builds.native_thread_init = Some(initialize_cursor_thread);
         builds.wake = Some(Arc::new(move || { tx.send(INITIALIZED.get()).unwrap(); }));
-        builds.start((cursor::Shown::Custom(7), cursor::Scale::default()), cursor::Image {
+        builds.start((cursor::Shown::Custom(7), cursor::Scale::default()), Arc::new(cursor::Art::with_image(7, cursor::Image {
             rgba: vec![255, 255, 255, 255], size: (1, 1), hotspot: (0, 0),
-        });
+        })));
         assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
         assert_eq!(builds.take_ready().len(), 1);
         assert!(!INITIALIZED.get(), "caller context must remain untouched");
@@ -4321,9 +4327,9 @@ mod cursor_completion_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut builds = CursorBuilds::default();
         builds.wake = Some(Arc::new(move || { let _ = tx.send(()); }));
-        builds.start((cursor::Shown::Custom(7), cursor::Scale::default()), cursor::Image {
+        builds.start((cursor::Shown::Custom(7), cursor::Scale::default()), Arc::new(cursor::Art::with_image(7, cursor::Image {
             rgba: vec![255, 255, 255, 255], size: (1, 1), hotspot: (0, 0),
-        });
+        })));
         rx.recv_timeout(Duration::from_secs(5)).expect("cursor worker must wake main independently of frame completion");
         assert_eq!(builds.take_ready().len(), 1);
     }

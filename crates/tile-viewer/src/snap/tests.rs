@@ -1043,7 +1043,7 @@ fn in_the_mode_only_the_snapping_pointer_and_its_ghost_are_drawn() {
     assert_eq!((sprites[1].x, sprites[1].y, sprites[1].view, sprites[1].screen), (400, 300, Some(7), true));
     assert!(sprites.iter().all(|p| p.view == Some(7) && p.screen));
     for status in [crate::host_status::Responsiveness::Busy, crate::host_status::Responsiveness::Stuck] {
-        let busy = snap.compose_with_busy(&compiled, 7, 8, crate::cursor::Scale::default(), WINDOW, status);
+        let busy = snap.compose_with_busy(&compiled, &crate::cursor::Art::of(&compiled), 7, 8, crate::cursor::Scale::default(), WINDOW, status);
         assert_eq!(&busy.sprites[..2], sprites.as_slice(), "keep both pointer and ghost for {status:?}");
         assert_eq!(busy.sprites.len(), 3, "one badge on the solid pointer only");
         assert_eq!(busy.sprites[2].set, compiled.set(scene::loading_cursor::SET).unwrap().0);
