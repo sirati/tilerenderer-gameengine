@@ -73,8 +73,10 @@
 //!   holds the pointer out with `zoom_box_block_pointer`. Boxes do not
 //!   dodge the views' own interface (corner buttons, unit orders): they
 //!   lie under it, and it keeps its clicks. Every zoom magnifies
-//!   `zoom_magnification` (1.5×, 2×, 3×, 4×; default 2×); Ctrl+wheel over
-//!   it changes that within those steps until the setting changes.
+//!   `zoom_magnification` (1.5×, 2×, 3×, 4×; default 2×) on top of how
+//!   large the view under it shows the world (world scale, the view's own
+//!   zoom); Ctrl+wheel over it changes that within those steps until the
+//!   setting changes.
 //! - **Screens**: a screen the driver names (`Scene::interface`) goes over
 //!   the window, or its panel is fitted over A or B. Both world panes keep
 //!   their own cameras. Generic menus instead keep their requested size
@@ -1591,10 +1593,11 @@ impl Layout {
         if self.sharp_text && self.world_shown && self.beside.is_none() {
             let views = std::iter::once(self.main_view).chain(self.split.map(|s| s.view)).chain(self.insets.iter().map(|i| i.view));
             let scale = self.world_scale;
-            let magnifier_downscale = self.shown.iter().find(|(h, _)| *h == Hit::Magnifier)
-                .map_or_else(|| self.main.map_or(1, |c| c.downscale.max(1)), |(_, c)| c.downscale.max(1));
+            // (A world magnifier: its magnification on top of the view's.)
+            let shown_magnifier = self.shown.iter().find(|(h, _)| *h == Hit::Magnifier).map(|(_, c)| *c);
+            let magnifier_downscale = shown_magnifier.map_or_else(|| self.main.map_or(1, |c| c.downscale.max(1)), |c| c.downscale.max(1));
             let world = self.magnifier.filter(|m| m.mode == MagnifierMode::World)
-                .map(|m| times(ZOOMS[m.zoom], (1, magnifier_downscale)));
+                .map(|m| times(shown_magnifier.map_or_else(|| times(ZOOMS[m.zoom], self.magnified_view_zoom()), |c| c.zoom), (1, magnifier_downscale)));
             let used = views.map(|v| v.zoom_by(scale)).chain(world).filter(|&z| z != (1, 1));
             // (The fitted screen's zoom, too.)
             let mut used: Vec<(u32, u32)> = used.chain(self.fit.or(self.placed_screen).map(|f| f.zoom)).filter(|z| z.0 <= 255 && z.1 <= 255).collect();
@@ -2206,6 +2209,21 @@ impl Layout {
         (source[0] + (p.0 - rect[0]) * d / n, source[1] + (p.1 - rect[1]) * d / n)
     }
 
+    /// The zoom of the view a world magnifier looks into (the world
+    /// cursor's view while the mouse is captured, else the one under the
+    /// pointer; A's where neither shows the world): the world scale, the
+    /// view's own zoom and all. The magnifier enlarges that, so 2× shows the
+    /// world twice as large as that view does, never smaller.
+    fn magnified_view_zoom(&self) -> (u32, u32) {
+        let view = |hit: Hit| self.shown.iter().find(|(h, _)| *h == hit && matches!(h, Hit::Main | Hit::Pane | Hit::Inset(_))).map(|(_, c)| c.zoom);
+        let under = if self.locked {
+            self.shown.iter().find(|(h, _)| self.follow_of(*h) == Some(Follow::Pointer)).map(|(h, _)| *h)
+        } else {
+            Some(self.hit_below_magnifier(self.pointer))
+        };
+        under.and_then(view).or_else(|| view(Hit::Main)).unwrap_or_else(|| self.main_view.zoom_by(self.world_scale))
+    }
+
     /// Floating, pointer and menu boxes have a lens; strips keep a plain line.
     fn zoom_lens(&self, m: &Magnifier, rect: [i32; 4]) -> Option<tile_render::Lens> {
         if matches!(m.place, ZoomPlace::Strip(..)) || (m.place == ZoomPlace::Beside && m.mode == MagnifierMode::World) { return None; }
@@ -2770,7 +2788,8 @@ impl Layout {
             // is captured; where it looked last while nothing is under it).
             let center = if self.locked { Some(self.cursor) } else { self.world_under(self.pointer) }.or(self.magnifier_center);
             self.magnifier_center = center;
-            let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None, (1, 1));
+            // Its magnification on top of the zoom of the view it looks into.
+            let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None, self.magnified_view_zoom());
             camera.zoomed_art = self.zoomed_art(camera.zoom);
             camera.downscale = downscale;
             camera.lens = lens;
@@ -2834,7 +2853,7 @@ impl Layout {
                     // nothing is under it).
                     let center = if self.locked { Some(self.cursor) } else { self.world_under(self.pointer) }.or(self.magnifier_center);
                     self.magnifier_center = center;
-                    let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None, (1, 1));
+                    let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None, self.magnified_view_zoom());
                     camera.zoomed_art = self.zoomed_art(camera.zoom);
                     camera.downscale = downscale;
                     camera.lens = lens;
@@ -5575,7 +5594,9 @@ mod tests {
         let magnifier = l.magnifier_art_camera(logical);
         assert!(world.contains(&&magnifier));
         assert!(world.iter().all(|&&c| c == magnifier || c.downscale == 2), "{world:?}");
-        assert_eq!((magnifier.downscale, magnifier.zoom), (1, (3, 2)));
+        // (3× on top of the 2× inset under the pointer, of the half-size
+        // world: 3× full size.)
+        assert_eq!((magnifier.downscale, magnifier.zoom), (1, (3, 1)));
         assert_eq!(f.cameras[0].zoom, (2, 1));
         // The interface stays as it is.
         assert_eq!(f.cameras[f.view_cameras[1].unwrap() as usize].downscale, 1);
@@ -5997,6 +6018,39 @@ mod tests {
         // Away from it: back at the top.
         mv(&mut l, (10, 590));
         assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0, [160, 120, 480, 300]);
+    }
+
+    #[test]
+    fn every_zoom_magnifies_the_world_as_large_as_the_view_under_it_shows_it() {
+        let shown_zoom = |l: &Layout| l.shown.iter().find(|(h, _)| *h == Hit::Magnifier).unwrap().1.zoom;
+        for zoom in [Zoom::Floating131, Zoom::Floating171, Zoom::Mouse111, Zoom::Mouse131, Zoom::TopStrip] {
+            // The world shown 2.5 times as large: 2× shows it 5 times.
+            for (scale, magnification, expected) in [((5, 2), 2.0, (5, 1)), ((5, 2), 1.5, (15, 4)), ((5, 2), 4.0, (10, 1)), ((3, 1), 2.0, (6, 1)), ((1, 2), 2.0, (1, 1))] {
+                let mut l = arranged(&settings(|s| (s.zoom, s.zoom_magnification) = (zoom, magnification)));
+                l.world_scale = scale;
+                l.set_walls(Walls::Open);
+                mv(&mut l, (400, 400));
+                frame(&mut l, vec![]);
+                let main = l.shown.iter().find(|(h, _)| *h == Hit::Main).unwrap().1.zoom;
+                assert_eq!(main, scale, "{zoom:?}");
+                assert_eq!(shown_zoom(&l), expected, "{zoom:?} at {scale:?}, {magnification}×");
+            }
+        }
+        // Over B zoomed in by hand (2× of the 5/2 world): 2× of that.
+        let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, Zoom::Mouse111, Place::Floating)));
+        l.world_scale = (5, 2);
+        l.split.as_mut().unwrap().view.zoom = ONE + 2;
+        l.set_walls(Walls::Open);
+        mv(&mut l, (600, 400));
+        frame(&mut l, vec![]);
+        assert_eq!(shown_zoom(&l), (10, 1));
+        // Over A: 2× of A's 5/2.
+        mv(&mut l, (200, 400));
+        frame(&mut l, vec![]);
+        assert_eq!(shown_zoom(&l), (5, 1));
+        // The driver hears of the magnifier's zoom (sharp text).
+        l.sharp_text = true;
+        assert!(l.take_zooms_change().unwrap().contains(&(5, 1)));
     }
 
     #[test]
@@ -6806,8 +6860,8 @@ mod tests {
                     l.advance(std::time::Duration::from_millis(100));
                     frame(&mut l, vec![]);
                     let slow = if hit == Hit::Main { l.main_view.center } else { l.split.unwrap().view.center };
-                    assert_eq!(slow.1, after.1 - 15);
-                    mv(&mut l, (x, boundary + 16));
+                    assert_eq!(slow.1, after.1 - 46);
+                    mv(&mut l, (x, boundary + pan::EDGE_ZONE));
                     l.advance(std::time::Duration::from_millis(100));
                     frame(&mut l, vec![]);
                     let stopped = if hit == Hit::Main { l.main_view.center } else { l.split.unwrap().view.center };

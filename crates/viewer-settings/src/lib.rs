@@ -381,7 +381,8 @@ pub struct Layout {
     /// pointer comes to it, as a fraction of the region's height, 0..=0.5,
     /// default 0.3.
     pub zoom_box_drop: f32,
-    /// How much the zoom box or strip enlarges the world: one of
+    /// How much the zoom box or strip enlarges the world beyond how large
+    /// the view under it shows it (world scale and view zoom): one of
     /// [`Layout::MAGNIFICATIONS`] (another value counts as the nearest),
     /// default 2.
     pub zoom_magnification: f32,
