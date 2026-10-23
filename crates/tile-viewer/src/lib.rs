@@ -1102,6 +1102,39 @@ pub fn render_arranged(
     gpu.render_views(&mut renderer, &frame.cameras, size, scene.tick, config.clear)
 }
 
+/// Renders `scene` as a viewer window of `window` pixels shows it with
+/// the user's `resolution` and `layout` settings: the canvas (the window
+/// divided by the pixel scale), the driver's interface at the menu and
+/// frame scales (`scaling::plan`, `scaling::arrange`). For tools that look
+/// at how the interface is placed and sized.
+pub fn render_planned(
+    gpu: &tile_render::Headless,
+    compiled: &Compiled,
+    scene: &Scene,
+    window: (u32, u32),
+    resolution: &viewer_settings::Resolution,
+    settings: &viewer_settings::Layout,
+    config: &ViewerConfig,
+) -> RgbaImage {
+    let rect_of = |s: &scene::FreeSprite| sprite_rect(compiled, s);
+    let plan = scaling::plan(window, scene.screen_size, resolution).for_scene(scene, rect_of);
+    let mut layout = layout::Layout::default();
+    layout.apply_settings(settings);
+    layout.grid_step = compiled.step;
+    layout.driver_screen = Some(plan.screen);
+    layout.menu_scale = plan.menu.zoom;
+    layout.hud_scale = plan.frame;
+    layout.window_pixel_scale = plan.factor();
+    layout.screen_content = named_screen_content(compiled, scene);
+    let mut frame = layout.frame(scene, plan.canvas(), config.overhang, interface_rects(compiled, scene), Some(world_bounds(compiled, scene)));
+    let arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
+    renderer.set_world(&gpu.device, &scene_world_arranged(compiled, scene, &frame.view_cameras, &arranged.overlay_cameras));
+    apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
+    gpu.render_views(&mut renderer, &frame.cameras, plan.canvas(), scene.tick, config.clear)
+}
+
 /// A device on `adapter` with `surface` configured for a window of `size`
 /// (a non-sRGB format, so atlas colours reach the screen unchanged); or the
 /// adapter and why not.

@@ -1952,6 +1952,91 @@ mod tests {
         (scene, rect_of)
     }
 
+    /// The screens after a game (the summary replay, demographics, the
+    /// histograph, the ranking) as the bridge gives them: a screen part of
+    /// their own (`Interface::screen_view`) over the frame, with no world
+    /// (the game has ended), the replay's play button an Alt target.
+    /// In-game advisors the same, over a world.
+    fn screen_scene(world: bool, name: &str) -> (Scene, impl Fn(&FreeSprite) -> Option<[i32; 4]>) {
+        use scene::{Interactable, InteractableKind, View, ViewState};
+        let sprite = |x, y| FreeSprite { x, y, screen: true, after_pass: u32::MAX, ..Default::default() };
+        let mut views = vec![
+            ViewState { id: 0, view: if world { View { camera_x: 1000, camera_y: 500, zoom: (1, 1), ..Default::default() } } else { View::default() }, overlay: vec![] },
+            ViewState { id: 254, view: View { interface_only: true, ..Default::default() }, overlay: vec![sprite(5, 949), sprite(1621, 942), sprite(21, 12)] },
+            ViewState { id: 258, view: View { interface_only: true, origin: (448, 156), viewport: (1024, 768), ..Default::default() }, overlay: vec![sprite(448, 156), sprite(964, 548)] },
+        ];
+        if !world { views[0].overlay.clear(); }
+        let scene = Scene {
+            views,
+            shape: if world { scene::WorldShape { cols: 60, rows: 62, wrap_x: true, wrap_y: false } } else { scene::WorldShape::default() },
+            interface: scene::Interface { screen: Some(name.into()), screen_view: Some(258), ..Default::default() },
+            interactables: vec![Interactable { region: None, alt_right_click: false, id: 1, rect: [964, 548, 45, 30], anchor: None, kind: InteractableKind::Button }],
+            screen_size: (1920, 1080),
+            ..Default::default()
+        };
+        let rect_of = |s: &FreeSprite| Some(match (s.x, s.y) {
+            (5, 949) => [5, 949, 282, 131],
+            (1621, 942) => [1621, 942, 294, 137],
+            (21, 12) => [21, 12, 107, 30],
+            (448, 156) => [448, 156, 1024, 768],
+            (x, y) => [x, y, 45, 30],
+        });
+        (scene, rect_of)
+    }
+
+    #[test]
+    fn the_screens_after_a_game_are_as_large_as_the_advisors_and_take_alt_input() {
+        use viewer_settings::{Place, ScreenPlace, Split};
+        for window in [(3840, 2160), (2880, 1800), (1920, 1080)] {
+            for pixel_scale in [1, 2] {
+                for base_ui_scale in [1.0, 2.0] {
+                    for (scale_menus, menu_scale_percent) in [(false, 100.0), (true, 100.0), (true, 60.0)] {
+                        for split in [Split::Standard, Split::Vertical1To1] {
+                            let resolution = Resolution { pixel_scale, base_ui_scale, scale_menus, menu_scale_percent, ..Default::default() };
+                            let what = format!("{window:?} ×{pixel_scale} base {base_ui_scale} menus {scale_menus}/{menu_scale_percent} {split:?}");
+                            let shown = |world: bool, name: &str, place: Place| {
+                                let (scene, rect_of) = screen_scene(world, name);
+                                let p = plan(window, scene.screen_size, &resolution).for_scene(&scene, &rect_of);
+                                let mut layout = layout::Layout::default();
+                                layout.apply_settings(&viewer_settings::Layout { split, screen_place: ScreenPlace { vertical: place, horizontal: place }, ..Default::default() });
+                                layout.driver_screen = Some(p.screen);
+                                layout.menu_scale = p.menu.zoom;
+                                let mut frame = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+                                let arranged = arrange_panned(&p, &scene, &mut frame, &mut layout.menu_pan, &rect_of);
+                                let body = arranged.shown.as_ref().and_then(|s| s.iter().find(|s| s.driver == [448, 156, 1024, 768]).map(|s| s.rect));
+                                layout.set_interface_shown(arranged.shown);
+                                let targets = crate::snap::targets_mapped(&scene.interactables, |r| layout.driver_rect_to_window(r), p.canvas());
+                                let hit = targets.first().map(|t| t.center()).and_then(|at| layout.route_window((at.0 as i32, at.1 as i32)));
+                                (body, hit, p.canvas())
+                            };
+                            // The advisor floating over the world; the replay
+                            // after the game: the same size and place.
+                            let (advisor, _, canvas) = shown(true, "F1", Place::Floating);
+                            for name in ["Replay", "F11", "F8", "Ranking"] {
+                                let (after, hit, _) = shown(false, name, Place::Floating);
+                                assert_eq!(after, advisor, "{name} {what}");
+                                // (Larger than the canvas at a large base scale: panned as the menus are.)
+                                let [x, y, w, h] = after.unwrap();
+                                let fits = w <= canvas.0 as i32 && h <= canvas.1 as i32;
+                                assert!(!fits || (x >= 0 && y >= 0 && x + w <= canvas.0 as i32 && y + h <= canvas.1 as i32), "{name} {what}: {after:?}");
+                                // The play button's Alt target sends the
+                                // pointer onto it in the game's window.
+                                let (hx, hy) = hit.unwrap_or_else(|| panic!("{name} {what}: no target"));
+                                assert!((964..1009).contains(&hx) && (548..578).contains(&hy), "{name} {what}: {hx}, {hy}");
+                                // With the screens placed in a pane: there is
+                                // no world beside them to keep a pane for.
+                                if split != Split::Standard {
+                                    let (in_pane, _, _) = shown(false, name, Place::LeftOrBottom);
+                                    assert_eq!(in_pane, after, "{name} {what}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn snapping_highlights_the_row_of_an_anchored_menu_it_points_at() {
         // A context menu opened at a world click in B (parked game camera:
