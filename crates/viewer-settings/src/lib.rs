@@ -110,6 +110,11 @@ pub struct Resolution {
     /// smaller than its art, including background frames and tiles.
     /// Text, controls and world art keep their existing sharp rendering.
     pub background_sampling: BackgroundSampling,
+    /// Transient, never saved: the base UI scale menus keep while
+    /// Preferences previews another base behind its open dialog. `None`:
+    /// menus use `base_ui_scale` like the frame and world.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub menu_base_ui_scale: Option<f32>,
 }
 
 /// [`Resolution::background_sampling`].
@@ -129,7 +134,7 @@ pub enum BackgroundSampling {
 
 impl Default for Resolution {
     fn default() -> Self {
-        Self { pixel_scale: 1, base_ui_scale: 1.0, scale_menus: false, menu_scale_percent: 100.0, frame_scale: 1.0, world_scale: 1.0, background_sampling: BackgroundSampling::Dither }
+        Self { pixel_scale: 1, base_ui_scale: 1.0, scale_menus: false, menu_scale_percent: 100.0, frame_scale: 1.0, world_scale: 1.0, background_sampling: BackgroundSampling::Dither, menu_base_ui_scale: None }
     }
 }
 
@@ -149,12 +154,13 @@ impl<'de> Deserialize<'de> for Resolution {
             frame_scale: f32,
             world_scale: f32,
             background_sampling: BackgroundSampling,
+            menu_base_ui_scale: Option<f32>,
         }
         impl Default for Saved {
             fn default() -> Self {
                 let r = Resolution::default();
                 Self { pixel_scale: r.pixel_scale, base_ui_scale: None, scale_menus: r.scale_menus, menu_scale_percent: r.menu_scale_percent,
-                    menu_scale: None, frame_scale: r.frame_scale, world_scale: r.world_scale, background_sampling: r.background_sampling }
+                    menu_scale: None, frame_scale: r.frame_scale, world_scale: r.world_scale, background_sampling: r.background_sampling, menu_base_ui_scale: None }
             }
         }
         let saved = Saved::deserialize(deserializer)?;
@@ -164,7 +170,7 @@ impl<'de> Deserialize<'de> for Resolution {
         // Old files sized native art with the pixel scale. Keep that size.
         let mut resolution = Self { pixel_scale, base_ui_scale: saved.base_ui_scale.unwrap_or(pixel_scale as f32), scale_menus: saved.scale_menus,
             menu_scale_percent: saved.menu_scale_percent, frame_scale: saved.frame_scale, world_scale: saved.world_scale,
-            background_sampling: saved.background_sampling };
+            background_sampling: saved.background_sampling, menu_base_ui_scale: saved.menu_base_ui_scale };
         resolution.base_ui_scale = resolution.effective_base_ui_scale();
         resolution.menu_scale_percent = resolution.effective_menu_scale_percent();
         Ok(resolution)
@@ -177,6 +183,12 @@ impl Resolution {
         if self.base_ui_scale.is_finite() {
             (self.base_ui_scale.clamp(1.0, Self::MAX_PIXEL_SCALE as f32) * 2.0).round() / 2.0
         } else { 1.0 }
+    }
+
+    /// The base UI scale menus use: [`Self::menu_base_ui_scale`] while a
+    /// preview holds them, else the base itself, in finite half steps.
+    pub fn effective_menu_base_ui_scale(&self) -> f32 {
+        Self { base_ui_scale: self.menu_base_ui_scale.unwrap_or(self.base_ui_scale), ..Self::default() }.effective_base_ui_scale()
     }
 
     /// A finite screen-relative menu percentage, including settings made

@@ -282,7 +282,7 @@ pub fn plan(window: (u32, u32), screen: (u32, u32), settings: &Resolution) -> Pl
     // at 100 %).
     let zoom = if settings.scale_menus {
         reduced(canvas.1 as u64 * (settings.effective_menu_scale_percent() * 1000.0).round() as u64, reference * 100_000)
-    } else { times(ratio(settings.effective_base_ui_scale()), (1, n)) };
+    } else { times(ratio(settings.effective_menu_base_ui_scale()), (1, n)) };
     // Percentage menus already follow the window, so their size does not
     // need resolution compensation. Native art uses the base in window pixels.
     let base = times(ratio(settings.effective_base_ui_scale()), (1, n));
@@ -1165,6 +1165,18 @@ mod tests {
         // Compensation uses the actual scale when a small window lowers it.
         let p = plan((800, 600), (1024, 768), &Resolution { pixel_scale: 6, base_ui_scale: 2.0, ..Default::default() });
         assert_eq!(times(p.frame, p.present.zoom), (2, 1));
+    }
+
+    #[test]
+    fn a_previewed_base_scales_frame_and_world_while_menus_keep_theirs() {
+        let accepted = Resolution { base_ui_scale: 1.5, frame_scale: 1.25, ..Default::default() };
+        let previewed = Resolution { base_ui_scale: 4.0, menu_base_ui_scale: Some(1.5), ..accepted.clone() };
+        let (a, p) = (plan((3840, 2160), (1920, 1080), &accepted), plan((3840, 2160), (1920, 1080), &previewed));
+        assert_eq!(p.menu, a.menu, "Preferences, a menu, keeps its size");
+        assert_eq!(p.frame, times(ratio(1.25), (4, 1)));
+        assert_eq!(p.world, (4, 1));
+        assert!(!toml::to_string(&accepted).unwrap().contains("menu_base_ui_scale"), "never saved");
+        assert_eq!(toml::from_str::<Resolution>(&toml::to_string(&previewed).unwrap()).unwrap(), previewed, "sent to the viewer");
     }
 
     // Mechanism tests can exercise arbitrary affine ratios independently

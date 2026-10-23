@@ -2059,7 +2059,7 @@ mod tests {
         state.values.insert("layout.split".into(), Value::Text("Vertical1To1".into()));
         let mut checked = 0;
         let overlap = |a: [i32; 4], b: [i32; 4]| a[0] < b[0]+b[2] && b[0] < a[0]+a[2] && a[1] < b[1]+b[3] && b[1] < a[1]+a[3];
-        for tab in ["resolution", "layout", "zoom"] {
+        for tab in ["resolution", "layout", "zoom", "accessibility"] {
             state.values.insert("tab".into(), Value::Text(tab.into()));
             let looks = panels.looks(panel, &state, area, &estimate);
             for (i, look) in looks.iter().enumerate() {
@@ -2089,7 +2089,7 @@ mod tests {
             }
             state.hover = None;
         }
-        assert_eq!(checked, 13);
+        assert_eq!(checked, 15);
     }
 
     #[test]
@@ -2148,6 +2148,106 @@ mod tests {
             assert_eq!(centre(k), button.at.0 + button.size.unwrap().0 as i32 / 2);
             if k < *max { assert_eq!(centre(k + 0.5), (centre(k) + centre(k + 1.0)) / 2); }
         }
+    }
+
+    /// Every renderer tab of the Preferences, with its conditional
+    /// controls, undo buttons and either Base UI scale button shown: each
+    /// item (a control with its label and value, or a text) lies inside
+    /// the tab's parchment and overlaps no other item. On Accessibility
+    /// every item sits in a card with a heading, each control in the card of
+    /// the feature it belongs to, its undo button beside it.
+    #[test]
+    fn preferences_tabs_fit_without_overlaps_and_accessibility_controls_sit_in_their_cards() {
+        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
+        let panel = panels.panel("preferences").unwrap();
+        let area = [0, 0, 1024, 768];
+        let origin = panels.origin(panel, area);
+        let mut state = PanelState::default();
+        for item in &panel.items {
+            if let Kind::Slider { control, max, .. } = &item.kind {
+                state.values.insert(control.clone(), Value::Number(*max));
+                state.values.insert(format!("dialog.changed.{control}"), Value::On(true));
+            }
+        }
+        for key in ["resolution.scale_menus", "display.limit_fps", "layout.zoom_controls", "layout.zoom_lens_controls",
+            "accessibility.unit_rings", "accessibility.active_unit_arrow", "layout.menu_follows_pointer"] {
+            state.values.insert(key.into(), Value::On(true));
+        }
+        for (key, value) in [("layout.zoom", "Floating131"), ("layout.zoom_magnification_label", "4×"), ("layout.split", "Vertical1To1"),
+            ("layout.orientation", "vertical"), ("layout.screen_place", "Floating"), ("accessibility.hud_percent", "300")] {
+            state.values.insert(key.into(), Value::Text(value.into()));
+        }
+        let overlap = |a: [i32; 4], b: [i32; 4]| a[0] < b[0]+b[2] && b[0] < a[0]+a[2] && a[1] < b[1]+b[3] && b[1] < a[1]+a[3];
+        let inside = |a: [i32; 4], b: [i32; 4]| a[0] >= b[0] && a[1] >= b[1] && a[0]+a[2] <= b[0]+b[2] && a[1]+a[3] <= b[1]+b[3];
+        let union = |a: [i32; 4], b: [i32; 4]| {
+            let (l, t) = (a[0].min(b[0]), a[1].min(b[1]));
+            [l, t, (a[0]+a[2]).max(b[0]+b[2]) - l, (a[1]+a[3]).max(b[1]+b[3]) - t]
+        };
+        let background = |item: &Item| matches!(&item.kind, Kind::Image(art) if art == "cover" || art == "section");
+        for previewing in [false, true] {
+            state.values.insert("dialog.previewing_base".into(), Value::On(previewing));
+            for tab in ["resolution", "layout", "zoom", "clean_map", "accessibility"] {
+                state.values.insert("tab".into(), Value::Text(tab.into()));
+                let visible: Vec<(usize, &Item)> = panel.items.iter().enumerate().filter(|(_, i)| Panels::visible(i, &state)).collect();
+                let rect_of = |n: usize, item: &Item| {
+                    let mut rect = panels.rect(item, &state, origin);
+                    for draw in panels.draw_item(panel, &state, area, &estimate, n, item) {
+                        if let Draw::Text(t) = draw {
+                            let m = estimate(&t.style, &t.text);
+                            let text = [t.x, t.y - m.ascent, m.width, m.ascent + m.descent];
+                            rect = Some(rect.map_or(text, |r| union(r, text)));
+                        }
+                    }
+                    rect.unwrap()
+                };
+                let parchment = visible.iter().find(|(_, i)| matches!(&i.kind, Kind::Image(a) if a == "cover")).map(|&(n, i)| rect_of(n, i)).unwrap();
+                let cards: Vec<[i32; 4]> = visible.iter().filter(|(_, i)| matches!(&i.kind, Kind::Image(a) if a == "section")).map(|&(n, i)| rect_of(n, i)).collect();
+                // (The tab buttons lie above the parchment.)
+                let items: Vec<(&Item, [i32; 4])> = visible.iter().filter(|(_, i)| !background(i) && !matches!(&i.kind, Kind::Choice { control, .. } if control == "tab"))
+                    .map(|&(n, i)| (i, rect_of(n, i))).collect();
+                let name = |item: &Item| item.control().map(str::to_owned).or(item.text.clone()).unwrap_or_default();
+                for (i, (item, rect)) in items.iter().enumerate() {
+                    assert!(inside(*rect, parchment), "{tab}: {} at {rect:?} leaves the panel {parchment:?}", name(item));
+                    for (other, other_rect) in &items[..i] {
+                        assert!(!overlap(*rect, *other_rect), "{tab}: {} at {rect:?} overlaps {} at {other_rect:?}", name(item), name(other));
+                    }
+                }
+                if tab != "accessibility" { continue; }
+                let card_of = |rect: [i32; 4]| {
+                    let holding: Vec<_> = cards.iter().copied().filter(|card| inside(rect, *card)).collect();
+                    assert_eq!(holding.len(), 1, "accessibility: {rect:?} in exactly one card");
+                    holding[0]
+                };
+                let heading = |card: [i32; 4]| items.iter().find(|(i, r)| i.style.as_deref() == Some("heading") && inside(*r, card)).and_then(|(i, _)| i.text.clone());
+                for (item, rect) in &items {
+                    assert!(heading(card_of(*rect)).is_some(), "accessibility: {} in a card without a heading", name(item));
+                }
+                for card in &cards {
+                    assert!(heading(*card).is_some(), "accessibility: card {card:?} without a heading");
+                }
+                let card_named = |control: &str| {
+                    let (_, rect) = items.iter().find(|(i, _)| i.control() == Some(control)).unwrap();
+                    heading(card_of(*rect)).unwrap()
+                };
+                for (control, card) in [("accessibility.active_unit_arrow", "Active unit"), ("accessibility.arrow_bobbing", "Active unit"),
+                    ("accessibility.hud_size", "Unit markers"), ("accessibility.stack_count", "Unit markers"),
+                    ("accessibility.unit_rings", "Diplomacy rings"), ("accessibility.war.color", "Diplomacy rings"),
+                    ("accessibility.peace.invert", "Diplomacy rings"), ("accessibility.ring_width", "Diplomacy rings"),
+                    ("input.alt_in_menus", "Mouse (Alt mode)"), ("input.snap_updates_per_second", "Mouse (Alt mode)")] {
+                    assert_eq!(card_named(control), card, "{control}");
+                }
+                // Each undo button in its slider's card, on its row.
+                for (undo, rect) in items.iter().filter(|(i, _)| i.control() == Some("dialog.undo")) {
+                    let Kind::Choice { value: control, .. } = &undo.kind else { unreachable!() };
+                    let slider = items.iter().find(|(i, _)| i.control() == Some(control.as_str())).unwrap();
+                    assert_eq!(card_of(*rect), card_of(slider.1), "{control}: undo in its card");
+                    assert_eq!(rect[1], origin.1 + slider.0.at.1, "{control}: undo on the slider's row");
+                }
+            }
+        }
+        // The Alt mode settings left the Layout tab for Accessibility.
+        state.values.insert("tab".into(), Value::Text("layout".into()));
+        assert!(!panel.items.iter().any(|i| Panels::visible(i, &state) && matches!(i.control(), Some("input.alt_in_menus" | "input.snap_updates_per_second"))));
     }
 
     #[test]
