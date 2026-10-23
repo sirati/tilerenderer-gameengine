@@ -637,7 +637,16 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let region = if popup { popup_region.or(menu_region) } else { menu_region };
         let zoom = if fits { fit_at_most(plan.menu.zoom, Some([o.0, o.1, w, h]), region_size(region)) } else { plan.menu.zoom };
         let from = (o.0 - d.0 + w / 2, o.1 - d.1 + h / 2);
-        let placed = menu_region.map_or_else(|| middle.apply(from), |[x, y, w, h]| (x + w / 2 - d.0, y + h / 2 - d.1));
+        // A screen part goes in the middle of the canvas, where the game
+        // drew it or not (the hall of fame: at its window's top left, as a
+        // 1024×768 screen in a larger window); a popup keeps its place
+        // about the middle.
+        let middle_of = |[x, y, w, h]: [i32; 4]| (x + w / 2 - d.0, y + h / 2 - d.1);
+        let placed = match menu_region {
+            Some(region) => middle_of(region),
+            None if !popup => middle_of(canvas_rect),
+            None => middle.apply(from),
+        };
         let (hw, hh) = (scaled(w as i64 / 2, zoom) as i32, scaled(h as i64 / 2, zoom) as i32);
         let [rx, ry, rw, rh] = if popup { popup_region.or(menu_region) } else { menu_region }.unwrap_or(canvas_rect);
         let keep = |v: i32, half: i32, origin: i32, span: i32| if 2 * half <= span { v.clamp(origin + half, origin + span - half) } else { origin + span / 2 };
@@ -1979,6 +1988,7 @@ mod tests {
             (1621, 942) => [1621, 942, 294, 137],
             (21, 12) => [21, 12, 107, 30],
             (448, 156) => [448, 156, 1024, 768],
+            (0, 0) => [0, 0, 1024, 768],
             (x, y) => [x, y, 45, 30],
         });
         (scene, rect_of)
@@ -1995,7 +2005,14 @@ mod tests {
                             let resolution = Resolution { pixel_scale, base_ui_scale, scale_menus, menu_scale_percent, ..Default::default() };
                             let what = format!("{window:?} ×{pixel_scale} base {base_ui_scale} menus {scale_menus}/{menu_scale_percent} {split:?}");
                             let shown = |world: bool, name: &str, place: Place| {
-                                let (scene, rect_of) = screen_scene(world, name);
+                                let (mut scene, rect_of) = screen_scene(world, name);
+                                // The hall of fame: drawn at the game's top left.
+                                let at = if name == "Hall of Fame" { (0, 0) } else { (448, 156) };
+                                scene.views[2].view.origin = at;
+                                scene.views[2].overlay[0].x = at.0;
+                                scene.views[2].overlay[0].y = at.1;
+                                for s in &mut scene.views[2].overlay[1..] { s.x += at.0 - 448; s.y += at.1 - 156; }
+                                for i in &mut scene.interactables { i.rect[0] += at.0 - 448; i.rect[1] += at.1 - 156; }
                                 let p = plan(window, scene.screen_size, &resolution).for_scene(&scene, &rect_of);
                                 let mut layout = layout::Layout::default();
                                 layout.apply_settings(&viewer_settings::Layout { split, screen_place: ScreenPlace { vertical: place, horizontal: place }, ..Default::default() });
@@ -2003,16 +2020,17 @@ mod tests {
                                 layout.menu_scale = p.menu.zoom;
                                 let mut frame = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
                                 let arranged = arrange_panned(&p, &scene, &mut frame, &mut layout.menu_pan, &rect_of);
-                                let body = arranged.shown.as_ref().and_then(|s| s.iter().find(|s| s.driver == [448, 156, 1024, 768]).map(|s| s.rect));
+                                let body = arranged.shown.as_ref().and_then(|s| s.iter().find(|s| s.driver == [at.0, at.1, 1024, 768]).map(|s| s.rect));
                                 layout.set_interface_shown(arranged.shown);
                                 let targets = crate::snap::targets_mapped(&scene.interactables, |r| layout.driver_rect_to_window(r), p.canvas());
-                                let hit = targets.first().map(|t| t.center()).and_then(|at| layout.route_window((at.0 as i32, at.1 as i32)));
+                                let hit = targets.first().map(|t| t.center()).and_then(|at| layout.route_window((at.0 as i32, at.1 as i32)))
+                                    .map(|(x, y)| (x + 448 - at.0, y + 156 - at.1));
                                 (body, hit, p.canvas())
                             };
                             // The advisor floating over the world; the replay
                             // after the game: the same size and place.
                             let (advisor, _, canvas) = shown(true, "F1", Place::Floating);
-                            for name in ["Replay", "F11", "F8", "Ranking"] {
+                            for name in ["Replay", "F11", "F8", "Ranking", "Hall of Fame"] {
                                 let (after, hit, _) = shown(false, name, Place::Floating);
                                 assert_eq!(after, advisor, "{name} {what}");
                                 // (Larger than the canvas at a large base scale: panned as the menus are.)
