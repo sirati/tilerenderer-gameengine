@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, Button, DetachedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 53;
+pub const VERSION: u32 = 54;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -503,7 +503,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 for attached in i.modal_attached {
                     w.bool(attached);
                 }
-                for rect in [i.reachable, i.focus_control] {
+                for rect in [i.reachable, i.focus_control, i.tooltip] {
                     w.bool(rect.is_some());
                     for v in rect.unwrap_or_default() {
                         w.i32(v);
@@ -759,7 +759,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
                     Ok(some.then_some(rect))
                 };
-                let (reachable, focus_control) = (rect()?, rect()?);
+                let (reachable, focus_control, tooltip) = (rect()?, rect()?, rect()?);
                 let beside = r.bool()?;
                 let screen_rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
                 let edge = match r.u8()? {
@@ -801,6 +801,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     screen_view,
                     reachable,
                     focus_control,
+                    tooltip,
                     beside: beside.then_some(Beside { screen: screen_rect, edge, world }),
                     popup_anchor,
                     popup_on_screen,
@@ -1309,6 +1310,7 @@ mod tests {
             screen_view: Some(258),
             reachable: Some([-1, 2, 300, 40]),
             focus_control: Some([5, 6, 7, 8]),
+            tooltip: Some([800, 990, 120, 18]),
             beside: Some(Beside { screen: [448, 156, 1024, 768], edge: Edge::Bottom, world: Some([-64, 32, 1280, 640]) }),
             popup_anchor: Some(PopupAnchor { world: (-3, 70_000), offset: (-128, 1), world_scaled: true }),
             popup_on_screen: true,

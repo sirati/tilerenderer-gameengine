@@ -443,6 +443,12 @@ pub struct Interface {
     /// every view of the renderer's (e.g. the active unit's orders), while
     /// they are shown.
     pub reachable: Option<[i32; 4]>,
+    /// The tooltip the driver shows (x, y, w, h), if any: drawn over
+    /// everything for a moment while the pointer rests on a control. A
+    /// renderer that arranges the interface draws it with the control it
+    /// belongs to, but arranges nothing around it (it is no panel of its
+    /// own and takes no room).
+    pub tooltip: Option<[i32; 4]>,
     /// The driver asks for its screen and its world side by side (e.g. a
     /// menu with a preview of the world it picks).
     pub beside: Option<Beside>,

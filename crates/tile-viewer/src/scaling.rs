@@ -543,7 +543,9 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     // sprite its panel.
     let mut pieces: Vec<Option<Affine>> = vec![None; frame.cameras.len()];
     let mut clips: Vec<Option<[i32; 4]>> = vec![None; frame.cameras.len()];
-    let mut panelled: Vec<(usize, usize, Vec<(Affine, [i32; 4])>, Vec<usize>, usize)> = Vec::new();
+    let mut panelled: Vec<(usize, usize, Vec<(Affine, [i32; 4])>, Vec<usize>, usize, Option<(usize, usize)>)> = Vec::new();
+    // (A sprite of the driver's tooltip: inside its rectangle.)
+    let in_tip = |r: [i32; 4]| parts.tooltip.is_some_and(|t| r[0] >= t[0] && r[1] >= t[1] && r[0] + r[2] <= t[0] + t[2] && r[1] + r[3] <= t[1] + t[3]);
     // What takes the pointer: per rectangle (the driver's pixels) its map
     // and how far the layout moved it.
     let mut shown: Vec<(Affine, [i32; 4], (i32, i32), Option<[i32; 4]>)> = Vec::new();
@@ -708,19 +710,31 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         } else if v.view.menu {
             menu
         } else {
-            // The frame's panels, each anchored at its side or corner.
-            let (anchors, of_sprite) = panels(plan.screen, &v.overlay, &rect_of);
+            // The frame's panels, each anchored at its side or corner; the
+            // tooltip none of them (`scene::Interface::tooltip`): it comes
+            // and goes with the pointer, and a panel's place and scale (its
+            // camera's origin, where its pixels round) must not.
+            let tip_sprites: Vec<usize> = v.overlay.iter().enumerate().filter(|(_, s)| rect_of(s).is_some_and(in_tip)).map(|(k, _)| k).collect();
+            let (anchors, mut of_sprite) = panels(plan.screen, &v.overlay, &rect_of, &|k| tip_sprites.contains(&k));
             // (Each no larger than the canvas.)
-            let anchors: Vec<(Affine, [i32; 4])> = anchors.into_iter().map(|(a, r)| {
+            let mut anchors: Vec<(Affine, [i32; 4])> = anchors.into_iter().map(|(a, r)| {
                 let piece = plan.frame_piece(a);
                 (kept(Affine { zoom: fitting(piece.zoom, Some(r)), ..piece }, r).at((r[0], r[1])), r)
             }).collect();
             if frame.unit_orders.is_some() && !anchors.is_empty() || anchors.len() > 1 || anchors.first().is_some_and(|a| a.0.zoom != (1, 1) || a.0.from != a.0.to) {
+                // The tooltip: a camera of its own, mapped as the sprite
+                // nearest to it (the control it is for) is.
+                let tip = tip_host(&v.overlay, &rect_of, &of_sprite, parts.tooltip).and_then(|host| {
+                    let r = bounding(&tip_sprites.iter().filter_map(|&k| rect_of(&v.overlay[k])).collect::<Vec<_>>())?;
+                    anchors.push((anchors[of_sprite[host]].0.at((r[0], r[1])), r));
+                    for &k in &tip_sprites { of_sprite[k] = anchors.len() - 1; }
+                    Some((anchors.len() - 1, host))
+                });
                 let start = shown.len();
                 for (s, &k) in v.overlay.iter().zip(&of_sprite) {
                     shown.extend(rect_of(s).map(|r| (anchors[k].0, r, (0, 0), None)));
                 }
-                panelled.push((c, i, anchors, of_sprite, start));
+                panelled.push((c, i, anchors, of_sprite, start, tip));
                 continue;
             }
             Affine::IDENTITY
@@ -759,10 +773,16 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             shown.iter().map(|(piece, r, d, clip)| {
                 let rect = piece.drawn(*r);
                 ([r[0] - d.0, r[1] - d.1, r[2], r[3]], clip.map_or(rect, |clip| intersection(rect, clip)))
-            }).filter(|(_, r)| r[2] > 0 && r[3] > 0).collect()
+            // (Nothing makes room for the tooltip: the buttons would move
+            // away from their own.)
+            }).filter(|(d, r)| r[2] > 0 && r[3] > 0 && !in_tip(*d)).collect()
         } else { Vec::new() };
-        for (_, i, anchors, of_sprite, start) in &mut panelled {
+        for (_, i, anchors, of_sprite, start, tip) in &mut panelled {
             place_unit_orders(place, orders, &scene.views[*i].overlay, &rect_of, &occupied, anchors, of_sprite);
+            // (The tooltip goes with its control, wherever that went.)
+            if let Some((t, host)) = *tip {
+                anchors[t].0 = anchors[of_sprite[host]].0.at((anchors[t].1[0], anchors[t].1[1]));
+            }
             let maps = scene.views[*i].overlay.iter().zip(of_sprite.iter()).filter_map(|(s, &k)| rect_of(s).map(|_| anchors[k].0));
             for (entry, piece) in shown[*start..].iter_mut().zip(maps) {
                 entry.0 = piece;
@@ -778,7 +798,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         // renderer's fallback once, rather than on every rendered frame.
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| log::warn!("viewer: the frame and panels need {required} views, limit {}: panels drawn as one (not repeated)", tile_render::MAX_VIEWS));
-        for (c, i, anchors, _, _) in panelled.drain(..) {
+        for (c, i, anchors, _, _, _) in panelled.drain(..) {
             shown.retain(|(p, _, _, _)| !anchors.iter().any(|a| a.0 == *p));
             shown.extend(scene.views[i].overlay.iter().filter_map(&rect_of).map(|r| (Affine::IDENTITY, r, (0, 0), None)));
             pieces[c] = Some(Affine::IDENTITY);
@@ -803,7 +823,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         }
         index[k] = cameras.len() as u32;
         match (panelled.iter().find(|p| p.0 == k), pieces[k]) {
-            (Some((_, i, anchors, of_sprite, _)), _) => {
+            (Some((_, i, anchors, of_sprite, _, _)), _) => {
                 // Each panel's part of the driver's screen, at its place.
                 let first = cameras.len() as u32;
                 for (piece, [x, y, w, h]) in anchors {
@@ -1035,9 +1055,13 @@ fn bounding(rects: &[[i32; 4]]) -> Option<[i32; 4]> {
 /// The frame's panels: sprites close to each other belong together, and a
 /// panel keeps to the side or corner of `screen` its middle is nearest
 /// (thirds each way). Per side or corner in use: its anchor and the
-/// rectangle of its panels; per sprite: its index among those.
-fn panels(screen: (u32, u32), sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>) -> (Vec<((u8, u8), [i32; 4])>, Vec<usize>) {
+/// rectangle of its panels; per sprite: its index among those. The
+/// sprites `apart` picks (a tooltip's) belong to no panel (index
+/// `usize::MAX`), unless there is nothing else.
+fn panels(screen: (u32, u32), sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, apart: &dyn Fn(usize) -> bool) -> (Vec<((u8, u8), [i32; 4])>, Vec<usize>) {
     let rects: Vec<[i32; 4]> = sprites.iter().map(|s| rect_of(s).unwrap_or([s.x, s.y, 1, 1])).collect();
+    let mut apart: Vec<bool> = (0..rects.len()).map(apart).collect();
+    if apart.iter().all(|&a| a) { apart.fill(false); }
     // Union-find over sprites whose rectangles (grown by the gap) touch.
     let mut parent: Vec<usize> = (0..rects.len()).collect();
     fn root(parent: &mut [usize], mut i: usize) -> usize {
@@ -1052,14 +1076,14 @@ fn panels(screen: (u32, u32), sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSpr
     };
     for i in 0..rects.len() {
         for j in 0..i {
-            if near(&rects[i], &rects[j]) {
+            if !apart[i] && !apart[j] && near(&rects[i], &rects[j]) {
                 let (a, b) = (root(&mut parent, i), root(&mut parent, j));
                 parent[a] = b;
             }
         }
     }
     let mut panel_rects: std::collections::BTreeMap<usize, Vec<[i32; 4]>> = Default::default();
-    for (i, r) in rects.iter().enumerate() {
+    for (i, r) in rects.iter().enumerate().filter(|&(i, _)| !apart[i]) {
         let k = root(&mut parent, i);
         panel_rects.entry(k).or_default().push(*r);
     }
@@ -1079,6 +1103,10 @@ fn panels(screen: (u32, u32), sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSpr
     let mut anchors: Vec<((u8, u8), Vec<[i32; 4]>)> = Vec::new();
     let mut of_sprite = Vec::with_capacity(rects.len());
     for (i, r) in rects.iter().enumerate() {
+        if apart[i] {
+            of_sprite.push(usize::MAX);
+            continue;
+        }
         let a = anchor_of[&root(&mut parent, i)];
         let k = match anchors.iter().position(|(x, _)| *x == a) {
             Some(k) => k,
@@ -1092,6 +1120,20 @@ fn panels(screen: (u32, u32), sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSpr
     }
     let anchors = anchors.into_iter().map(|(a, rs)| (a, bounding(&rs).unwrap_or_default())).collect();
     (anchors, of_sprite)
+}
+
+/// Of `sprites` in panels (`of_sprite`, as [`panels`] gave them), the one
+/// nearest to `tooltip` (driver pixels): the control it is for.
+fn tip_host(sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, of_sprite: &[usize], tooltip: Option<[i32; 4]>) -> Option<usize> {
+    let t = tooltip?;
+    let gap = |a: i32, a1: i32, b: i32, b1: i32| (b - a1).max(a - b1).max(0) as i64;
+    sprites.iter().zip(of_sprite).enumerate().filter(|(_, (_, k))| **k != usize::MAX)
+        .filter_map(|(i, (s, _))| rect_of(s).map(|r| (i, r)))
+        .min_by_key(|(_, r)| {
+            let (dx, dy) = (gap(r[0], r[0] + r[2], t[0], t[0] + t[2]), gap(r[1], r[1] + r[3], t[1], t[1] + t[3]));
+            dx * dx + dy * dy
+        })
+        .map(|(i, _)| i)
 }
 
 #[cfg(test)]
@@ -1854,7 +1896,7 @@ mod tests {
                 (x, y) => [x, y, 64, 32],
             })
         };
-        let (anchors, of) = panels((1920, 1080), &sprites, &rect_of);
+        let (anchors, of) = panels((1920, 1080), &sprites, &rect_of, &|_| false);
         let anchor = |i: usize| anchors[of[i]].0;
         assert_eq!([anchor(0), anchor(1), anchor(2), anchor(3), anchor(4), anchor(5)], [(0, 2), (0, 2), (0, 0), (2, 2), (1, 2), (1, 2)]);
         assert_eq!(anchors[of[0]].1, [5, 949, 280, 130]);
@@ -2190,6 +2232,126 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The scene of the frame's panels: the unit panel (bottom right) with
+    /// its small buttons above it, the minimap (bottom left), the unit's
+    /// eight order buttons (`reachable`), and, if `tip`, the game's tooltip
+    /// there (box and text sprites, inside `Interface::tooltip` as the
+    /// bridge reports it, or not reported: as the game draws it only).
+    fn hud_with_tooltip(tip: Option<([i32; 4], bool)>) -> (Scene, impl Fn(&FreeSprite) -> Option<[i32; 4]> + Clone) {
+        use scene::{View, ViewState};
+        let sprite = |x, y| FreeSprite { x, y, screen: true, after_pass: u32::MAX, ..Default::default() };
+        let mut overlay = vec![sprite(5, 949), sprite(1621, 942), sprite(1650, 908), sprite(1690, 908)];
+        overlay.extend((0..8).map(|k| sprite(832 + 32 * k, 1030)));
+        let mut rects: Vec<[i32; 4]> = vec![[5, 949, 280, 130], [1621, 942, 294, 137], [1650, 908, 30, 28], [1690, 908, 30, 28]];
+        rects.extend((0..8).map(|k| [832 + 32 * k, 1030, 32, 32]));
+        if let Some((t, _)) = tip {
+            // Its box, and a line of text in it.
+            overlay.extend([sprite(t[0], t[1]), sprite(t[0] + 3, t[1] + 2)]);
+            rects.extend([t, [t[0] + 3, t[1] + 2, t[2] - 6, t[3] - 4]]);
+        }
+        let world = View { camera_x: 1000, camera_y: 500, zoom: (1, 1), ..Default::default() };
+        let scene = Scene {
+            views: vec![
+                ViewState { id: 0, view: world, overlay: vec![] },
+                ViewState { id: 254, view: View { interface_only: true, ..Default::default() }, overlay: overlay.clone() },
+            ],
+            shape: scene::WorldShape { cols: 60, rows: 62, wrap_x: true, wrap_y: false },
+            interface: scene::Interface { reachable: Some([832, 1030, 256, 32]), tooltip: tip.filter(|t| t.1).map(|t| t.0), ..Default::default() },
+            screen_size: (1920, 1080),
+            ..Default::default()
+        };
+        let rect_of = move |s: &FreeSprite| overlay.iter().position(|o| (o.x, o.y) == (s.x, s.y)).map(|k| rects[k]);
+        (scene, rect_of)
+    }
+
+    /// The tooltip of a button the unit's orders were moved into the
+    /// active view with (here one beside them, on their row, between them
+    /// and the minimap): they do not make room for it (it would move with
+    /// them, away from the pointer and back); it goes with its button.
+    #[test]
+    fn active_unit_buttons_stay_put_under_their_own_tooltip() {
+        use viewer_settings::{Split, UnitButtons};
+        let buttons: Vec<[i32; 4]> = (0..8).map(|k| [832 + 32 * k, 1030, 32, 32]).collect();
+        for side in [layout::Side::A, layout::Side::B] {
+            for frame_scale in [1.0, 1.25, 1.5] {
+                for pixel_scale in [1, 2] {
+                    // Left of the first button, right of the last, above one.
+                    for tip in [[700, 1036, 128, 20], [1092, 1036, 128, 20], [900, 1006, 140, 20]] {
+                        let what = format!("{side:?}, frame ×{frame_scale}, ×{pixel_scale}, tooltip {tip:?}");
+                        let shown = |tip: Option<([i32; 4], bool)>| {
+                            let (scene, rect_of) = hud_with_tooltip(tip);
+                            let p = fixed_plan((1920 * pixel_scale, 1080 * pixel_scale), (1920, 1080), (pixel_scale, 1.0, frame_scale, 1.0));
+                            let mut l = layout::Layout::default();
+                            l.apply_settings(&viewer_settings::Layout { split: Split::Vertical1To1, unit_buttons: UnitButtons::ActiveView, ..Default::default() });
+                            l.driver_screen = Some(p.screen);
+                            l.frame(&scene, (1920, 1080), (0, 0, 0, 0), vec![], None);
+                            let area = l.view_area(side);
+                            l.route(scene::Input::MouseMove { x: area[0] + area[2] / 2, y: area[1] + area[3] / 2 });
+                            let mut shown = Vec::new();
+                            // (Several frames: each arranged from the last one shown.)
+                            for _ in 0..3 {
+                                let mut f = l.frame(&scene, (1920, 1080), (0, 0, 0, 0), vec![], None);
+                                shown = arrange(&p, &scene, &mut f, &rect_of).shown.unwrap();
+                                l.set_interface_shown(Some(shown.clone()));
+                            }
+                            shown
+                        };
+                        let before = shown(None);
+                        let hovered = shown(Some((tip, true)));
+                        let at = |shown: &[ShownPiece], d: [i32; 4]| shown.iter().find(|s| s.driver == d).unwrap_or_else(|| panic!("{what}: {d:?} shown")).rect;
+                        for b in &buttons {
+                            assert_eq!(at(&hovered, *b), at(&before, *b), "{what}: button {b:?} moved for its tooltip");
+                        }
+                        // The tooltip shows by the button nearest it, as the game put it there.
+                        let near = *buttons.iter().min_by_key(|b| (b[0] + 16 - (tip[0] + tip[2] / 2)).abs()).unwrap();
+                        let (b, t) = (at(&hovered, near), at(&hovered, tip));
+                        let s = b[2] as f64 / 32.0;
+                        for (got, want) in [(t[0] - b[0], (tip[0] - near[0]) as f64 * s), (t[1] - b[1], (tip[1] - near[1]) as f64 * s)] {
+                            assert!((got as f64 - want).abs() <= 1.0, "{what}: tooltip at {t:?}, its button at {b:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The tooltip of the unit panel's small buttons (shown while one is
+    /// hovered or pressed, above them, reaching past the panel) changes
+    /// nothing of the panel: the same place and scale, to the pixel, at
+    /// every scale (its camera's origin, where its pixels round, stays).
+    #[test]
+    fn the_unit_panel_does_not_move_for_its_buttons_tooltip() {
+        let panel = [[1621, 942, 294, 137], [1650, 908, 30, 28], [1690, 908, 30, 28]];
+        let mut moved_unreported = 0;
+        for frame_scale in [1.0, 1.1, 1.25, 1.33, 1.5, 0.75] {
+            for pixel_scale in [1, 2, 3] {
+                for tip in [[1600, 884, 110, 20], [1640, 938, 96, 18], [1560, 890, 90, 16]] {
+                    let what = format!("frame ×{frame_scale}, ×{pixel_scale}, tooltip {tip:?}");
+                    let arranged = |tip: Option<([i32; 4], bool)>| {
+                        let (scene, rect_of) = hud_with_tooltip(tip);
+                        let p = fixed_plan((1920 * pixel_scale, 1080 * pixel_scale), (1920, 1080), (pixel_scale, 1.0, frame_scale, 1.0));
+                        let mut l = layout::Layout::default();
+                        l.driver_screen = Some(p.screen);
+                        let mut f = l.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+                        let shown = arrange(&p, &scene, &mut f, &rect_of).shown.unwrap();
+                        panel.iter().map(|d| {
+                            let s = shown.iter().find(|s| s.driver == *d).unwrap();
+                            // Where its pixels go: its corners and a few between.
+                            let points: Vec<(i32, i32)> = (0..=6).map(|k| s.piece.apply((d[0] + d[2] * k / 6, d[1] + d[3] * k / 6))).collect();
+                            (s.rect, points)
+                        }).collect::<Vec<_>>()
+                    };
+                    let before = arranged(None);
+                    assert_eq!(arranged(Some((tip, true))), before, "{what}: the panel moved");
+                    // (As the game draws it alone, it was a part of the panel.)
+                    moved_unreported += usize::from(arranged(Some((tip, false))) != before);
+                }
+            }
+        }
+        // (So this exercises what moved it.)
+        assert!(moved_unreported > 0);
     }
 
     #[test]
