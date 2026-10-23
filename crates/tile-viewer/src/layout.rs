@@ -2207,8 +2207,8 @@ impl Layout {
     fn zoom_lens(&self, m: &Magnifier, rect: [i32; 4]) -> Option<tile_render::Lens> {
         if matches!(m.place, ZoomPlace::Strip(..)) || (m.place == ZoomPlace::Beside && m.mode == MagnifierMode::World) { return None; }
         Some(tile_render::Lens {
-            radius: if self.zoom_rounded { (rect[2].min(rect[3]) as f32 * 0.18).min(30.0 / self.window_pixel_scale.max(1.0) as f32) } else { 0.0 },
-            rim: (if self.zoom_glass { 14.0 } else { self.separator_width as f32 }) / self.window_pixel_scale.max(1.0) as f32,
+            radius: if self.zoom_rounded { (rect[2].min(rect[3]) as f32 * 0.32).min(56.0 / self.window_pixel_scale.max(1.0) as f32) } else { 0.0 },
+            rim: (if self.zoom_glass { 24.0 } else { self.separator_width as f32 }) / self.window_pixel_scale.max(1.0) as f32,
             glass: self.zoom_glass,
         })
     }
@@ -4683,7 +4683,7 @@ mod tests {
                 let lens = camera.lens.unwrap();
                 assert_eq!(lens.glass, glass);
                 assert_eq!(lens.radius > 0.0, rounded);
-                assert_eq!(lens.rim * scale as f32, if glass { 14.0 } else { 4.0 });
+                assert_eq!(lens.rim * scale as f32, if glass { 24.0 } else { 4.0 });
                 let corner = (logical.origin.0, logical.origin.1);
                 assert_eq!(l.hit(corner) == Hit::Magnifier, !rounded);
                 assert_eq!(l.hit((logical.origin.0 + logical.viewport.0 as i32 / 2, logical.origin.1 + logical.viewport.1 as i32 / 2)), Hit::Magnifier);
@@ -4711,8 +4711,8 @@ mod tests {
             let lens = copy.lens.unwrap();
             assert_eq!(lens.glass, glass);
             assert_eq!(lens.radius > 0.0, rounded);
-            assert_eq!(lens.rim * scale as f32, if glass { 14.0 } else { 4.0 });
-            assert!((lens.radius * scale as f32 - if rounded { 30.0 } else { 0.0 }).abs() < 0.01);
+            assert_eq!(lens.rim * scale as f32, if glass { 24.0 } else { 4.0 });
+            assert!((lens.radius * scale as f32 - if rounded { 56.0 } else { 0.0 }).abs() < 0.01);
             assert_eq!(l.hit((rect[0], rect[1])) == Hit::Magnifier, !rounded);
             let source = copy.source;
             assert!(!overlap(rect, source));
