@@ -28,11 +28,12 @@
 //!   ([`Marks::mirror_only_in`]).
 //!
 //! - While the game is busy or stuck ([`BusyEffect`]), the system pointer
-//!   carries the small turning hourglass in its own image (one system
-//!   cursor a step, [`Art::native_image`], made once and kept): never a
-//!   sprite beside it, which would trail it. Only a pointer the viewer
-//!   draws anyway (captured, snapping) gets the badge drawn with it
-//!   ([`compose_busy_badge`]), in the same place. A standard system icon
+//!   carries the small upright hourglass ([`BADGE_SPRITES`]) in its own
+//!   image (one system cursor a step, [`Art::native_image`], made once
+//!   and kept): never a sprite beside it, which would trail it. Only a
+//!   pointer the viewer draws anyway (captured, snapping) gets the badge
+//!   drawn with it ([`compose_busy_badge`]): the same pixels, the same
+//!   place. A standard system icon
 //!   (text, resize, ...), whose pixels the viewer does not have, shows
 //!   without one.
 //!
@@ -97,6 +98,8 @@ pub struct Art {
     blank: std::collections::HashSet<u32>,
     arrow: Option<u32>,
     busy: Vec<u32>,
+    /// The busy badge's frames ([`BADGE_SPRITES`]), as images.
+    badge_frames: Vec<u32>,
     /// The busy badge on each pointer-sized image ([`badge_place`]).
     badges: HashMap<u32, Badge>,
 }
@@ -123,14 +126,19 @@ impl Art {
         }
         let capture = compiled.sets_with_prefix(CAPTURE_SPRITES).map(|(_, s)| s.raw()).next();
         let arrow = compiled.set(crate::snap::ARROW_SPRITE).map(|(s, _)| s.raw()).filter(|s| images.contains_key(s));
-        let busy: Vec<_> = busy_frames(compiled).into_iter().map(|image| {
+        let mut add = |image: Image| {
             let mut id = u32::MAX;
             while images.contains_key(&id) { id -= 1; }
             images.insert(id, image);
             id
-        }).collect();
-        let badges = pointer_badges(&images, &busy);
-        Self { images, capture, blank, arrow, busy, badges }
+        };
+        let busy: Vec<_> = busy_frames(compiled).into_iter().map(&mut add).collect();
+        let badge_frames: Vec<_> = compiled.set(BADGE_SPRITES)
+            .map(|(set, _)| (0..scene::loading_cursor::FRAME_COUNT).map_while(|k| image_frame(compiled, set, k)).collect::<Vec<_>>())
+            .unwrap_or_default().into_iter().map(&mut add).collect();
+        let badge_set = compiled.set(BADGE_SPRITES).map(|(s, _)| s.raw());
+        let badges = pointer_badges(&images, &badge_frames, badge_set);
+        Self { images, capture, blank, arrow, busy, badge_frames, badges }
     }
 
     /// The cursor to show for the driver's `cursor`: a sprite that shows
@@ -172,8 +180,8 @@ impl Art {
 
     pub fn badged(&self, set: u32, elapsed: std::time::Duration) -> Option<Shown> {
         // (Only a pointer with a place for it: one of pointer size.)
-        if self.busy.is_empty() || !self.badges.contains_key(&set) { return None; }
-        let hourglass = self.busy[scene::loading_cursor::frame_at(elapsed) as usize % self.busy.len()];
+        if self.badge_frames.is_empty() || !self.badges.contains_key(&set) { return None; }
+        let hourglass = self.badge_frames[scene::loading_cursor::frame_at(elapsed) as usize % self.badge_frames.len()];
         Some(Shown::Badged { base: set, hourglass })
     }
 
@@ -181,18 +189,11 @@ impl Art {
     /// so that the system cursors of a whole turn are made at once.
     pub fn animation_of(&self, shown: Shown) -> Vec<Shown> {
         match shown {
-            Shown::Badged { base, hourglass } if self.busy.contains(&hourglass) =>
-                self.busy.iter().map(|&hourglass| Shown::Badged { base, hourglass }).collect(),
+            Shown::Badged { base, hourglass } if self.badge_frames.contains(&hourglass) =>
+                self.badge_frames.iter().map(|&hourglass| Shown::Badged { base, hourglass }).collect(),
             Shown::Custom(set) if self.busy.contains(&set) => self.busy.iter().map(|&set| Shown::Custom(set)).collect(),
             shown => vec![shown],
         }
-    }
-
-    /// The upright hourglass's visible pixels (`[x, y, w, h]` in its turned
-    /// frame) and the frame's side; `None` without a system hourglass.
-    fn hourglass(&self) -> Option<([u32; 4], u32)> {
-        let frame = self.get(*self.busy.first()?)?;
-        Some((opaque_bounds(frame)?, frame.size.0 as u32))
     }
 
     /// Where the small hourglass goes on the pointer `set` (art `size` and
@@ -200,14 +201,15 @@ impl Art {
     /// kept: then its whole cell counts as covered); see [`badge_place`].
     pub fn badge_for(&self, set: u32, size: (u32, u32), hotspot: (u16, u16)) -> Option<Badge> {
         if let Some(badge) = self.badges.get(&set) { return Some(*badge); }
-        let (upright, side) = self.hourglass()?;
-        Some(badge_place([0, 0, size.0, size.1], &|_, _| true, hotspot, side as f32 / upright[3].max(1) as f32))
+        let frame = self.get(*self.badge_frames.first()?)?;
+        Some(badge_place([0, 0, size.0, size.1], &|_, _| true, hotspot, (frame.size.0.into(), frame.size.1.into())))
     }
+
     /// Whether [`Art::native_image`] makes an image of `shown`.
     pub fn has_image(&self, shown: Shown) -> bool {
         match shown {
             Shown::Custom(set) => self.get(set).is_some(),
-            Shown::Badged { base, hourglass } => self.busy.contains(&hourglass) && self.get(base).is_some() && self.badges.contains_key(&base),
+            Shown::Badged { base, hourglass } => self.badge_frames.contains(&hourglass) && self.get(base).is_some() && self.badges.contains_key(&base),
             _ => false,
         }
     }
@@ -220,10 +222,7 @@ impl Art {
             Shown::Custom(set) => Some(scale.native(self.get(set)?)),
             Shown::Badged { base, hourglass } => {
                 let badge = *self.badges.get(&base)?;
-                // (The step of the turn: the system hourglass's frame.)
-                let step = self.busy.iter().position(|&h| h == hourglass)? as u32;
-                let art = self.get(base)?;
-                Some(with_busy_badge(&scale.native(art), art, badge, scene::loading_cursor::angle_of(step) as f32, scale))
+                Some(with_busy_badge(self.get(base)?, self.get(hourglass)?, badge, scale))
             }
             _ => None,
         }
@@ -257,108 +256,83 @@ pub fn busy_effect(status: crate::host_status::Responsiveness, special: bool) ->
     }
 }
 
-/// The small hourglass's height, upright, as a share of the pointer's
-/// visible height (Windows XP's "Working in Background" pointer: the
-/// hourglass is about 60 % as tall as the arrow beside it).
-pub const BADGE_HEIGHT: f32 = 0.6;
-/// The hourglass's width as a share of its height.
-pub const BADGE_ASPECT: f32 = 0.62;
-/// Where the hourglass would ideally turn, as shares of the pointer's
-/// visible width and height from its top-left: at its lower right.
-pub const BADGE_IDEAL: (f32, f32) = (0.8, 0.8);
-/// Art pixels kept clear between the turning hourglass and the pointer.
-pub const BADGE_MARGIN: f32 = 1.5;
+/// The busy badge's frames: the small upright hourglass whose sand drains
+/// and which flips over once a cycle (`assets/civ3/loading-cursor.toml`,
+/// render-desc's `hourglass:` art; frame `k` shows at step `k` of
+/// `scene::loading_cursor`). Pixel art at the cursor art's scale: the
+/// system cursor's image and the viewer's drawing scale it as the pointer.
+pub const BADGE_SPRITES: &str = "Viewer@busy_badge/0";
 
-/// The busy badge on one pointer, in the pointer's art pixels: the point
-/// the hourglass turns about, relative to the pointer's hot spot (fixed:
-/// it spins in place), its upright height, and the side of the system
-/// hourglass's turned frame drawn at that height (the viewer's own
-/// drawing, [`compose_busy_badge`]).
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// Where the badge's middle would ideally be, as shares of the pointer's
+/// visible width and height from its top-left: beside the lower half of
+/// the arrow, as on Windows XP's "Working in Background" pointer.
+pub const BADGE_IDEAL: (f32, f32) = (0.9, 0.7);
+/// The most clear pixels between the badge and the pointer: it is
+/// attached.
+pub const BADGE_GAP: i32 = 1;
+
+/// The busy badge on one pointer: its frames' top-left relative to the
+/// pointer's hot spot (`hotspot`, in the pointer's art), and their size,
+/// in the pointer's art pixels. Upright in every frame, the same box: it
+/// never moves.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Badge {
-    pub centre: (f32, f32),
-    pub height: f32,
-    pub frame: f32,
+    pub offset: (i32, i32),
+    pub hotspot: (u16, u16),
+    pub size: (u32, u32),
 }
 
-impl Badge {
-    /// The radius the turning hourglass sweeps, its outline included.
-    pub fn reach(&self) -> f32 {
-        (self.height * BADGE_ASPECT / 2.0).hypot(self.height / 2.0)
-    }
-
-    /// The turning point (relative to the hot spot, on a pixel corner)
-    /// and the upright height, in whole pixels `per_art` times as large as
-    /// the pointer's art pixels.
-    pub fn at(&self, per_art: f32) -> ((i32, i32), u32) {
-        ((((self.centre.0) * per_art).round() as i32, (self.centre.1 * per_art).round() as i32), (self.height * per_art).round().max(5.0) as u32)
-    }
-
-    /// The system hourglass's frame for the viewer's drawing: its top-left
-    /// relative to the hot spot and its side, in pixels `per_art` times
-    /// as large as art pixels, its middle on the turning point.
-    pub fn frame_at(&self, per_art: f32) -> ((i32, i32), u32) {
-        let side = (self.frame * per_art).round().max(1.0) as i32;
-        let ((x, y), _) = self.at(per_art);
-        ((x - side / 2, y - side / 2), side as u32)
-    }
-}
-
-/// Where the small hourglass goes on a pointer whose visible pixels are
-/// `opaque` (`[x, y, w, h]`, art pixels; `covered` says which of them
-/// show something) with hot spot `hotspot`; `frame` is the system
-/// hourglass's turned frame side per upright hourglass height.
-///
-/// Like Windows XP's "Working in Background" pointer: the hourglass
-/// [`BADGE_HEIGHT`] of the pointer's height, at its lower right, as near
-/// [`BADGE_IDEAL`] as it can turn without ever touching the pointer's
-/// pixels (every angle: the circle it sweeps, [`BADGE_MARGIN`] clear).
-pub fn badge_place(opaque: [u32; 4], covered: &dyn Fn(i32, i32) -> bool, hotspot: (u16, u16), frame: f32) -> Badge {
-    let height = (BADGE_HEIGHT * opaque[3].max(1) as f32).round();
-    let probe = Badge { centre: (0.0, 0.0), height, frame: frame * height };
-    let clear = probe.reach() + BADGE_MARGIN;
+/// Where the busy badge (frames `size` art pixels) goes on a pointer whose
+/// visible pixels are `opaque` (`[x, y, w, h]`, art pixels; `covered`
+/// says which of them show something) with hot spot `hotspot`: touching
+/// the pointer (at most [`BADGE_GAP`] clear pixels between) without
+/// covering any of its pixels or its hot spot, as near [`BADGE_IDEAL`] as
+/// that allows.
+pub fn badge_place(opaque: [u32; 4], covered: &dyn Fn(i32, i32) -> bool, hotspot: (u16, u16), size: (u32, u32)) -> Badge {
     let [ox, oy, ow, oh] = opaque.map(|v| v as i32);
-    let mut pixels: Vec<(f32, f32)> = Vec::new();
+    let (w, h) = (size.0 as i32, size.1 as i32);
+    let mut pixels: Vec<(i32, i32)> = Vec::new();
     for y in oy..oy + oh {
         for x in ox..ox + ow {
-            if covered(x, y) { pixels.push((x as f32 + 0.5, y as f32 + 0.5)); }
+            if covered(x, y) { pixels.push((x, y)); }
         }
     }
-    pixels.push((hotspot.0 as f32 + 0.5, hotspot.1 as f32 + 0.5));
     let ideal = (ox as f32 + BADGE_IDEAL.0 * ow as f32, oy as f32 + BADGE_IDEAL.1 * oh as f32);
-    // Turning points on pixel corners, nearest the ideal first.
-    let reach = clear.ceil() as i32 + 1;
-    let mut candidates: Vec<(f32, (f32, f32))> = Vec::new();
-    for y in oy - reach..=oy + oh + reach {
-        for x in ox - reach..=ox + ow + reach {
-            let c = (x as f32, y as f32);
-            candidates.push(((c.0 - ideal.0).hypot(c.1 - ideal.1), c));
+    let hot = (hotspot.0 as i32, hotspot.1 as i32);
+    let mut best: Option<(f32, (i32, i32))> = None;
+    for y in oy - h - BADGE_GAP..=oy + oh + BADGE_GAP {
+        for x in ox - w - BADGE_GAP..=ox + ow + BADGE_GAP {
+            if (x..x + w).contains(&hot.0) && (y..y + h).contains(&hot.1) { continue; }
+            // Clear pixels between the box and the nearest pointer pixel
+            // (-1: one under the box).
+            let gap = pixels.iter().map(|&(px, py)| {
+                let dx = if px < x { x - px } else if px >= x + w { px - (x + w - 1) } else { 0 };
+                let dy = if py < y { y - py } else if py >= y + h { py - (y + h - 1) } else { 0 };
+                dx.max(dy) - 1
+            }).min().unwrap_or(0);
+            if !(0..=BADGE_GAP).contains(&gap) { continue; }
+            let middle = (x as f32 + w as f32 / 2.0, y as f32 + h as f32 / 2.0);
+            let cost = (middle.0 - ideal.0).hypot(middle.1 - ideal.1) + gap as f32 * 2.0;
+            if best.is_none_or(|(c, _)| cost < c) { best = Some((cost, (x, y))); }
         }
     }
-    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
-    // A pixel is clear when its nearest point is outside the circle.
-    let free = |c: (f32, f32)| pixels.iter().all(|p| {
-        let (dx, dy) = (((p.0 - c.0).abs() - 0.5).max(0.0), ((p.1 - c.1).abs() - 0.5).max(0.0));
-        dx.hypot(dy) >= clear
-    });
-    let centre = candidates.iter().map(|c| c.1).find(|&c| free(c))
-        .unwrap_or((ox as f32 + ow as f32 + clear, oy as f32 + oh as f32 + clear));
-    Badge { centre: (centre.0 - hotspot.0 as f32, centre.1 - hotspot.1 as f32), ..probe }
+    let at = best.map_or((ox + ow + BADGE_GAP, oy + oh - h), |b| b.1);
+    Badge { offset: (at.0 - hot.0, at.1 - hot.1), hotspot, size }
 }
 
 /// The largest image taken for a pointer that may get a busy badge.
 const MAX_POINTER_SIDE: u16 = 64;
 
-/// [`badge_place`] for every pointer-sized image but the hourglass's own.
-fn pointer_badges(images: &HashMap<u32, Image>, busy: &[u32]) -> HashMap<u32, Badge> {
-    let Some(frame) = busy.first().and_then(|id| images.get(id)).and_then(|f| Some(f.size.0 as f32 / opaque_bounds(f)?[3].max(1) as f32)) else {
-        return HashMap::new();
-    };
+/// [`badge_place`] for every pointer-sized image but the badge's own
+/// (frames `frames`, set `own`).
+fn pointer_badges(images: &HashMap<u32, Image>, frames: &[u32], own: Option<u32>) -> HashMap<u32, Badge> {
+    let Some(frame) = frames.first().and_then(|id| images.get(id)) else { return HashMap::new() };
+    let size = (frame.size.0 as u32, frame.size.1 as u32);
     images.iter()
-        .filter(|(id, i)| !busy.contains(id) && i.size.0 <= MAX_POINTER_SIDE && i.size.1 <= MAX_POINTER_SIDE)
+        .filter(|(id, i)| !frames.contains(id) && Some(**id) != own && i.size.0 <= MAX_POINTER_SIDE && i.size.1 <= MAX_POINTER_SIDE)
         .filter_map(|(&id, image)| {
             let covered = |x: i32, y: i32| image.rgba[((y as usize * image.size.0 as usize) + x as usize) * 4 + 3] != 0;
-            Some((id, badge_place(opaque_bounds(image)?, &covered, image.hotspot, frame)))
+            Some((id, badge_place(opaque_bounds(image)?, &covered, image.hotspot, size)))
         })
         .collect()
 }
@@ -375,96 +349,35 @@ pub fn opaque_bounds(image: &Image) -> Option<[u32; 4]> {
     (x0 <= x1).then(|| [x0, y0, x1 - x0 + 1, y1 - y0 + 1])
 }
 
-/// Window pixels per art pixel at `scale`.
-pub fn per_art(scale: Scale) -> f32 {
-    scale.present as f32 * scale.zoom.0.max(1) as f32 / scale.zoom.1.max(1) as f32
-}
-
 /// The largest system cursor image made (Windows and X11 accept larger,
 /// but cursors beyond this are not useful).
 const MAX_CURSOR_SIDE: i32 = 256;
 
-/// The hourglass's parts, as [`hourglass_part`] finds them.
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum Part { None, Bar, Glass, Sand }
-
-/// The colours of the badge's parts: the game's sand and parchment, as
-/// its gold arrow, with a dark outline one pixel wide.
-const OUTLINE: [u8; 4] = [28, 20, 10, 255];
-const BAR: [u8; 4] = [204, 160, 82, 255];
-const GLASS: [u8; 4] = [252, 248, 236, 255];
-const SAND: [u8; 4] = [232, 182, 58, 255];
-
-/// The part of an upright hourglass `height` pixels high (outline
-/// included) at `(u, v)` from its middle.
-fn hourglass_part((u, v): (f32, f32), height: f32) -> Part {
-    let hh = height / 2.0 - 1.0;
-    let hw = height * BADGE_ASPECT / 2.0 - 1.0;
-    let bar = (height * 0.13).max(1.5);
-    if v.abs() > hh || u.abs() > hw { return Part::None; }
-    if v.abs() >= hh - bar { return Part::Bar; }
-    let inner = hh - bar;
-    let neck = (hw * 0.14).max(0.7);
-    let bulb = hw - (hw * 0.18).max(1.0);
-    let t = (v.abs() / inner).clamp(0.0, 1.0);
-    // Bulbs widening from the neck, a little rounded.
-    let half = neck + (bulb - neck) * t.powf(0.75);
-    if u.abs() > half { return Part::None; }
-    // Sand draining from the upper bulb's lower part through the neck
-    // onto a pile in the lower one.
-    let sand = (v > inner * 0.55) || (v < -inner * 0.1 && v > -inner * 0.5) || (v.abs() <= inner * 0.1 + 0.5) || (v > 0.0 && u.abs() < 0.5);
-    if sand { Part::Sand } else { Part::Glass }
-}
-
-/// One system cursor image: `base` (already at `scale`, window pixels,
-/// made from `art` whose hot spot it keeps) with the small hourglass
-/// turned `degrees` clockwise about `badge`'s fixed point, drawn at the
-/// window's pixel size: crisp pixels, as the pointer's. The image grows
-/// to hold the badge.
-fn with_busy_badge(base: &Image, art: &Image, badge: Badge, degrees: f32, scale: Scale) -> Image {
-    let per = per_art(scale);
-    let ((cx, cy), height) = badge.at(per);
-    // (The art hot spot's top-left corner in the scaled image.)
-    let hot = ((art.hotspot.0 as f32 * per).round() as i32, (art.hotspot.1 as f32 * per).round() as i32);
-    let (cx, cy) = (cx + hot.0, cy + hot.1);
-    let height = height as f32;
-    let reach = (height * BADGE_ASPECT / 2.0).hypot(height / 2.0).ceil() as i32 + 1;
-    let (left, top) = ((reach - cx).max(0), (reach - cy).max(0));
-    let w = ((base.size.0 as i32).max(cx + reach) + left).min(MAX_CURSOR_SIDE) as u32;
-    let h = ((base.size.1 as i32).max(cy + reach) + top).min(MAX_CURSOR_SIDE) as u32;
+/// One system cursor image: the pointer `art` with the badge `frame` at
+/// `badge`, both at `scale` as [`Scale::native`] makes them (the pixels
+/// the viewer draws, [`compose_busy_badge`]). The image grows to hold the
+/// badge and keeps the pointer's hot spot.
+fn with_busy_badge(art: &Image, frame: &Image, badge: Badge, scale: Scale) -> Image {
+    let base = scale.native(art);
+    let glass = scale.native(frame);
+    let p = scale.present as i32;
+    let at = (p * scale.signed_span(badge.hotspot.0 as i32 + badge.offset.0), p * scale.signed_span(badge.hotspot.1 as i32 + badge.offset.1));
+    let (left, top) = ((-at.0).max(0), (-at.1).max(0));
+    let w = ((base.size.0 as i32).max(at.0 + glass.size.0 as i32) + left).min(MAX_CURSOR_SIDE) as u32;
+    let h = ((base.size.1 as i32).max(at.1 + glass.size.1 as i32) + top).min(MAX_CURSOR_SIDE) as u32;
     let mut rgba = vec![0u8; (w * h * 4) as usize];
-    for y in 0..(base.size.1 as u32).min(h - top as u32) {
-        for x in 0..(base.size.0 as u32).min(w - left as u32) {
-            let s = ((y * base.size.0 as u32 + x) * 4) as usize;
-            let d = (((y + top as u32) * w + x + left as u32) * 4) as usize;
-            rgba[d..d + 4].copy_from_slice(&base.rgba[s..s + 4]);
+    let mut paste = |image: &Image, (x0, y0): (i32, i32)| {
+        for y in 0..image.size.1 as i32 {
+            for x in 0..image.size.0 as i32 {
+                let (dx, dy) = (x0 + left + x, y0 + top + y);
+                let s = &image.rgba[((y * image.size.0 as i32 + x) * 4) as usize..][..4];
+                if s[3] == 0 || dx < 0 || dy < 0 || dx as u32 >= w || dy as u32 >= h { continue; }
+                rgba[((dy as u32 * w + dx as u32) * 4) as usize..][..4].copy_from_slice(s);
+            }
         }
-    }
-    // Each pixel's part, from its middle turned back to upright.
-    let (sin, cos) = degrees.to_radians().sin_cos();
-    let side = (2 * reach + 1) as usize;
-    let part_at = |x: i32, y: i32| {
-        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-        hourglass_part((px * cos + py * sin, -px * sin + py * cos), height)
     };
-    let parts: Vec<Part> = (0..side * side).map(|i| part_at(i as i32 % side as i32 - reach, i as i32 / side as i32 - reach)).collect();
-    let part = |x: i32, y: i32| if x.abs() <= reach && y.abs() <= reach && x >= -reach && y >= -reach && ((x + reach) as usize) < side && ((y + reach) as usize) < side { parts[(y + reach) as usize * side + (x + reach) as usize] } else { Part::None };
-    for y in -reach..=reach {
-        for x in -reach..=reach {
-            let colour = match part(x, y) {
-                Part::Bar => BAR,
-                Part::Glass => GLASS,
-                Part::Sand => SAND,
-                // One pixel of outline round the shape.
-                Part::None if (-1..=1).any(|dy| (-1..=1).any(|dx| part(x + dx, y + dy) != Part::None)) => OUTLINE,
-                Part::None => continue,
-            };
-            let (dx, dy) = (cx + left + x, cy + top + y);
-            if dx < 0 || dy < 0 || dx as u32 >= w || dy as u32 >= h { continue; }
-            let d = ((dy as u32 * w + dx as u32) * 4) as usize;
-            rgba[d..d + 4].copy_from_slice(&colour);
-        }
-    }
+    paste(&base, (0, 0));
+    paste(&glass, at);
     Image { rgba, size: (w as u16, h as u16), hotspot: (base.hotspot.0 + left as u16, base.hotspot.1 + top as u16) }
 }
 
@@ -547,24 +460,27 @@ impl SetArt {
     }
 }
 
-/// Add the small hourglass to a pointer the viewer draws itself (its hot
-/// spot at canvas pixel `at`), where [`Badge`] puts it on the system
-/// cursor: the same picture as [`Art::native_image`]. Only for pointers
-/// that are sprites anyway (captured, snapping): a system pointer gets its
-/// badge in its own image, never as a sprite trailing it.
+/// Add the busy badge to a pointer the viewer draws itself (its hot spot
+/// at canvas pixel `at`): the same frames at the same place as in the
+/// system cursor's image ([`Art::native_image`]), pixel for pixel. Only
+/// for pointers that are sprites anyway (captured, snapping): a system
+/// pointer gets its badge in its own image, never as a sprite trailing it.
 pub fn compose_busy_badge(out: &mut Composed, compiled: &Compiled, at: (i32, i32), badge: Badge, clip: Option<[i32; 4]>, scale: Scale, canvas: (u32, u32), next: u32) {
-    let Some(art) = compiled.set(scene::loading_cursor::SET).and_then(|(set, _)| SetArt::of(compiled, set)) else { return };
+    let Some(art) = compiled.set(BADGE_SPRITES).and_then(|(set, _)| SetArt::of(compiled, set)) else { return };
     if art.size.0 == 0 || art.size.1 == 0 { return; }
     let view = next + out.top.len() as u32;
     if view as usize >= tile_render::MAX_VIEWS { return; }
-    // (Canvas pixels: the system cursor's window pixels without the
-    // pixel scale.)
-    let ((dx, dy), side) = badge.frame_at(scale.zoom.0.max(1) as f32 / scale.zoom.1.max(1) as f32);
-    let origin = (at.0 + dx, at.1 + dy);
+    // (As the pointer's camera in `compose`: its art's origin at the hot
+    // spot minus the hot spot's span.)
+    let origin = (
+        at.0 - scale.span(badge.hotspot.0 as u32) as i32 + scale.signed_span(badge.hotspot.0 as i32 + badge.offset.0),
+        at.1 - scale.span(badge.hotspot.1 as u32) as i32 + scale.signed_span(badge.hotspot.1 as i32 + badge.offset.1),
+    );
+    let viewport = (scale.span(art.size.0).max(1), scale.span(art.size.1).max(1));
     out.top.push(Camera {
-        cells: false, zoom: (side, art.size.0),
+        cells: false, zoom: scale.zoom,
         origin, screen_shift: origin, hairline: true, target_clip: clip,
-        ..Camera::new((side.min(canvas.0), side.min(canvas.1)))
+        ..Camera::new((viewport.0.min(canvas.0), viewport.1.min(canvas.1)))
     });
     out.sprites.push(PlacedSprite {
         screen: true, view: Some(view), ticks_per_frame: scene::loading_cursor::TICKS_PER_FRAME,
@@ -620,6 +536,11 @@ impl Scale {
     /// pixel ⌊c·zoom.1/zoom.0⌋, as the renderer scales a view).
     pub fn span(&self, art: u32) -> u32 {
         (art as u64 * self.zoom.0.max(1) as u64).div_ceil(self.zoom.1.max(1) as u64) as u32
+    }
+
+    /// [`Scale::span`] of a signed art distance from the art's origin.
+    pub fn signed_span(&self, art: i32) -> i32 {
+        if art >= 0 { self.span(art as u32) as i32 } else { -(self.span(art.unsigned_abs()) as i32) }
     }
 
     fn art_of(&self, canvas: u32) -> u32 {
@@ -1859,115 +1780,130 @@ mod busy_tests {
         }
     }
 
-    /// The badge's pixels in `badged` (those not in `plain`, the same
-    /// pointer without it): their box.
-    fn badge_box(plain: &Image, badged: &Image) -> [i32; 4] {
-        let (w, pw) = (badged.size.0 as i32, plain.size.0 as i32);
-        let shift = (badged.hotspot.0 as i32 - plain.hotspot.0 as i32, badged.hotspot.1 as i32 - plain.hotspot.1 as i32);
-        let mut b = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
-        for y in 0..badged.size.1 as i32 {
-            for x in 0..w {
-                let p = &badged.rgba[((y * w + x) * 4) as usize..][..4];
-                let (px, py) = (x - shift.0, y - shift.1);
-                let under = (px >= 0 && py >= 0 && px < pw && py < plain.size.1 as i32).then(|| &plain.rgba[((py * pw + px) * 4) as usize..][..4]);
-                if under.map_or(p[3] != 0, |u| u != p) {
-                    b = [b[0].min(x), b[1].min(y), b[2].max(x + 1), b[3].max(y + 1)];
-                }
+    /// Clear pixels between `badge`'s box and the nearest visible pixel of
+    /// `image` (-1: one under the box).
+    fn gap(image: &Image, badge: Badge) -> i32 {
+        let (x, y) = (badge.hotspot.0 as i32 + badge.offset.0, badge.hotspot.1 as i32 + badge.offset.1);
+        let (w, h) = (badge.size.0 as i32, badge.size.1 as i32);
+        let mut gap = i32::MAX;
+        for py in 0..image.size.1 as i32 {
+            for px in 0..image.size.0 as i32 {
+                if image.rgba[((py * image.size.0 as i32 + px) * 4 + 3) as usize] == 0 { continue; }
+                let dx = if px < x { x - px } else if px >= x + w { px - (x + w - 1) } else { 0 };
+                let dy = if py < y { y - py } else if py >= y + h { py - (y + h - 1) } else { 0 };
+                gap = gap.min(dx.max(dy) - 1);
             }
         }
-        b
+        gap
     }
 
     #[test]
-    fn a_busy_system_cursor_is_one_crisp_image_its_hourglass_spinning_in_place_clear_of_the_pointer() {
+    fn a_busy_system_cursor_is_one_image_with_an_upright_hourglass_attached_and_still() {
         let art = Art::of(&with_hourglass(false));
+        assert_eq!(art.badge_frames.len(), 12);
         for base in [art.arrow.unwrap(), art.capture().unwrap()] {
+            let pointer = art.get(base).unwrap();
+            let badge = art.badge_for(base, (0, 0), (0, 0)).unwrap();
+            assert_eq!(badge.size, (11, 17));
+            // Attached: touching, or one clear pixel between; covering
+            // none of the pointer's pixels nor its hot spot.
+            assert!((0..=BADGE_GAP).contains(&gap(pointer, badge)), "{badge:?}");
+            let (bx, by) = (badge.hotspot.0 as i32 + badge.offset.0, badge.hotspot.1 as i32 + badge.offset.1);
+            assert!(!((bx..bx + 11).contains(&(pointer.hotspot.0 as i32)) && (by..by + 17).contains(&(pointer.hotspot.1 as i32))));
+            assert!(badge.offset.0 + 5 > 0 && badge.offset.1 + 8 > 0, "lower right of the hot spot: {badge:?}");
             for scale in [Scale::default(), Scale::new(48, 1), Scale::new(64, 1), Scale::new(64, 2)] {
                 let plain = art.native_image(Shown::Custom(base), scale).unwrap();
-                let pointer = opaque_bounds(&plain).unwrap();
                 let turn = art.animation_of(art.badged(base, std::time::Duration::ZERO).unwrap());
-                assert_eq!(turn.len(), 12, "the whole turn is made at once and kept");
-                let mut middle = None;
-                for shown in turn {
+                assert_eq!(turn.len(), 12, "the whole cycle is made at once and kept");
+                let p = scale.present as i32;
+                let rect = [p * scale.signed_span(bx), p * scale.signed_span(by), p * (scale.signed_span(bx) + scale.span(11) as i32), p * (scale.signed_span(by) + scale.span(17) as i32)];
+                for (k, &shown) in turn.iter().enumerate() {
                     assert!(art.has_image(shown));
                     let badged = art.native_image(shown, scale).unwrap();
                     // One image, the pointer where it was: the same hot
-                    // spot, every pointer pixel as it was (the hourglass
-                    // never covers any, at any angle).
-                    let shift = (badged.hotspot.0 - plain.hotspot.0, badged.hotspot.1 - plain.hotspot.1);
-                    for y in 0..plain.size.1 as usize {
-                        for x in 0..plain.size.0 as usize {
-                            let p = &plain.rgba[(y * plain.size.0 as usize + x) * 4..][..4];
-                            let b = &badged.rgba[((y + shift.1 as usize) * badged.size.0 as usize + x + shift.0 as usize) * 4..][..4];
-                            if p[3] != 0 { assert_eq!(p, b, "{shown:?} {scale:?} covers the pointer at {x},{y}"); }
+                    // spot and every pointer pixel as it was.
+                    assert_eq!(badged.hotspot, plain.hotspot, "{scale:?}");
+                    let (bw, pw) = (badged.size.0 as i32, plain.size.0 as i32);
+                    for y in 0..badged.size.1 as i32 {
+                        for x in 0..bw {
+                            let b = &badged.rgba[((y * bw + x) * 4) as usize..][..4];
+                            let under = (x < pw && y < plain.size.1 as i32).then(|| &plain.rgba[((y * pw + x) * 4) as usize..][..4]);
+                            if under.is_some_and(|u| u[3] != 0) {
+                                assert_eq!(under.unwrap(), b, "frame {k} covers the pointer at {x},{y} ({scale:?})");
+                            } else if b[3] != 0 {
+                                // The badge, only in its box, which every
+                                // frame keeps: upright and still.
+                                assert!(x >= rect[0] && y >= rect[1] && x < rect[2] && y < rect[3], "frame {k} at {x},{y} outside {rect:?}");
+                                assert_eq!(b[3], 255, "crisp");
+                            }
                         }
                     }
-                    let b = badge_box(&plain, &badged);
-                    assert!(b[0] < b[2], "a badge is drawn");
-                    // Crisp: whole pixels of its own colours.
-                    for y in b[1]..b[3] {
-                        for x in b[0]..b[2] {
-                            let p = &badged.rgba[((y * badged.size.0 as i32 + x) * 4) as usize..][..4];
-                            assert!(p[3] == 0 || [OUTLINE, BAR, GLASS, SAND].iter().any(|c| c == p) || (x - shift.0 as i32) < plain.size.0 as i32 && (y - shift.1 as i32) < plain.size.1 as i32, "{p:?}");
-                        }
-                    }
-                    // It spins in place: the same middle at every step.
-                    let m = (b[0] + b[2], b[1] + b[3]);
-                    assert_eq!(*middle.get_or_insert(m), m, "{shown:?} at {scale:?}");
-                    if matches!(shown, Shown::Badged { hourglass, .. } if hourglass == art.busy[0]) {
-                        // Upright: BADGE_HEIGHT of the pointer.
-                        let (gh, ph) = ((b[3] - b[1]) as f32, pointer[3] as f32);
-                        assert!((gh / ph - BADGE_HEIGHT).abs() < 0.08, "badge height {gh} for a pointer {ph} high at {scale:?}");
-                    }
-                    // Attached at the pointer's lower right: upright, no
-                    // further from it than turning clear of it needs.
-                    let bd = art.badge_for(base, (0, 0), (0, 0)).unwrap();
-                    let slack = ((bd.reach() - bd.height * BADGE_ASPECT / 2.0 + BADGE_MARGIN + 2.0) * per_art(scale)).ceil() as i32;
-                    let (mx, my) = (m.0 / 2 - shift.0 as i32, m.1 / 2 - shift.1 as i32);
-                    assert!(mx > plain.hotspot.0 as i32 && my > plain.hotspot.1 as i32);
-                    assert!(b[0] - shift.0 as i32 <= (pointer[0] + pointer[2]) as i32 + slack, "{b:?} beside {pointer:?}");
                 }
             }
-            assert_ne!(art.badged(base, std::time::Duration::ZERO), art.badged(base, std::time::Duration::from_millis(83)), "the small hourglass turns");
         }
         assert_eq!(art.animation_of(Shown::Custom(art.arrow.unwrap())), [Shown::Custom(art.arrow.unwrap())]);
         assert_eq!(art.animation_of(Shown::Custom(art.busy_cursor(std::time::Duration::ZERO).unwrap())).len(), 12, "the stuck hourglass too");
+        assert_ne!(art.badged(art.arrow.unwrap(), std::time::Duration::ZERO), art.badged(art.arrow.unwrap(), std::time::Duration::from_millis(83)), "the sand runs");
     }
 
     /// A diagonal arrow like the game's, its tail running to the lower
-    /// right, and a ring like its "not here" pointer: the circle the
-    /// hourglass sweeps stays clear of them, close beside them.
+    /// right, a ring like its "not here" pointer and a whole cell: the
+    /// badge touches each, covering nothing.
     #[test]
-    fn the_turning_badge_never_touches_the_pointer_or_its_hot_spot() {
-        // 17×28: the head (rows 0..14) and a tail 5 px wide running
-        // down-right to (16, 27).
+    fn the_badge_touches_the_pointer_without_covering_it_or_its_hot_spot() {
         let arrow = |x: i32, y: i32| if y < 14 { x <= y } else { let c = (y - 14) * 10 / 13 + 4; (c - 3..=c + 2).contains(&x) };
         let ring = |x: i32, y: i32| { let d = ((x - 12) as f32 + 0.5).hypot((y - 12) as f32 + 0.5); (9.0..12.0).contains(&d) };
         for (covered, opaque, hot) in [(&arrow as &dyn Fn(i32, i32) -> bool, [0, 0, 17, 28], (0u16, 0u16)), (&ring, [0, 0, 24, 24], (12, 12)), (&|_, _| true, [0, 0, 32, 32], (16, 16))] {
-            let badge = badge_place(opaque, covered, hot, 1.4);
-            assert!((badge.height - (0.6 * opaque[3] as f32).round()).abs() < 0.01);
-            let c = (badge.centre.0 + hot.0 as f32, badge.centre.1 + hot.1 as f32);
-            let mut nearest = f32::INFINITY;
-            for y in opaque[1] as i32..(opaque[1] + opaque[3]) as i32 {
-                for x in opaque[0] as i32..(opaque[0] + opaque[2]) as i32 {
-                    if !covered(x, y) { continue; }
-                    let (dx, dy) = (((x as f32 + 0.5 - c.0).abs() - 0.5).max(0.0), ((y as f32 + 0.5 - c.1).abs() - 0.5).max(0.0));
-                    nearest = nearest.min(dx.hypot(dy));
+            let badge = badge_place(opaque, covered, hot, (11, 17));
+            let (x, y) = (hot.0 as i32 + badge.offset.0, hot.1 as i32 + badge.offset.1);
+            let mut nearest = i32::MAX;
+            for py in 0..opaque[3] as i32 {
+                for px in 0..opaque[2] as i32 {
+                    if !covered(px, py) { continue; }
+                    let dx = if px < x { x - px } else if px >= x + 11 { px - (x + 10) } else { 0 };
+                    let dy = if py < y { y - py } else if py >= y + 17 { py - (y + 16) } else { 0 };
+                    nearest = nearest.min(dx.max(dy) - 1);
                 }
             }
-            assert!(nearest >= badge.reach() + BADGE_MARGIN - 1e-3, "{badge:?} {nearest}");
-            assert!(nearest <= badge.reach() + BADGE_MARGIN + 1.5, "attached: {badge:?} {nearest}");
-            assert!(badge.centre.0 > 0.0 && badge.centre.1 > 0.0, "lower right of the hot spot: {badge:?}");
+            assert!((0..=BADGE_GAP).contains(&nearest), "{badge:?}: {nearest} clear pixels");
+            assert!(!((x..x + 11).contains(&(hot.0 as i32)) && (y..y + 17).contains(&(hot.1 as i32))));
+            // At the lower right: its middle right of and below the hot
+            // spot, beside the pointer's lower half.
+            assert!(x * 2 + 11 > hot.0 as i32 * 2 && y * 2 + 17 > (opaque[3] as i32), "{badge:?}");
         }
     }
 
+    /// The viewer's drawing of a captured pointer with its badge is the
+    /// system cursor's image pixel for pixel.
     #[test]
-    fn the_turning_point_and_frame_scale_in_whole_pixels() {
-        let badge = Badge { centre: (20.5, 14.25), height: 17.0, frame: 24.0 };
-        assert_eq!(badge.at(1.0), ((21, 14), 17));
-        assert_eq!(badge.at(2.0), ((41, 29), 34));
-        assert_eq!(badge.frame_at(1.0), ((9, 2), 24));
-        assert_eq!(badge.frame_at(2.0), ((17, 5), 48), "the frame's middle on the turning point");
+    fn the_drawn_badge_is_the_system_cursors_pixel_for_pixel() {
+        use crate::host_status::Responsiveness as R;
+        let compiled = with_hourglass(false);
+        let pixels = Art::of(&compiled);
+        let arrow = pixels.arrow.unwrap();
+        let set = SpriteSetId::from_raw(arrow);
+        let art = SetArt::of(&compiled, set).unwrap();
+        let canvas = (160, 120);
+        let mut world = tile_render::TileWorld::new(tile_render::Grid { cols: 1, rows: 1, layout: tile_render::Layout::Orthogonal, wrap_x: false, wrap_y: false, step: (8, 8) }, compiled.sets.clone());
+        for scale in [Scale::default(), Scale::new(48, 1), Scale::new(64, 1)] {
+            let q = (40, 30);
+            let marks = Marks { window: vec![q], ..Default::default() };
+            let out = compose_with_busy(&compiled, &pixels, art, &marks, &[], &[], scale, canvas, 0, (0, 0), R::Busy);
+            world.free = out.sprites;
+            let mut cameras = vec![overlay_camera(canvas)];
+            cameras.extend(out.top);
+            let picture = tile_render::reference::render_views(&world, &compiled.atlas, &cameras, canvas, 0, [1, 2, 3, 255]);
+            let native = pixels.native_image(pixels.badged(arrow, std::time::Duration::ZERO).unwrap(), scale).unwrap();
+            let origin = (q.0 - native.hotspot.0 as i32, q.1 - native.hotspot.1 as i32);
+            for y in 0..native.size.1 as i32 {
+                for x in 0..native.size.0 as i32 {
+                    let n = &native.rgba[((y * native.size.0 as i32 + x) * 4) as usize..][..4];
+                    let drawn = picture.get((origin.0 + x) as u32, (origin.1 + y) as u32);
+                    let expected = if n[3] == 0 { [1, 2, 3, 255] } else { [n[0], n[1], n[2], n[3]] };
+                    assert_eq!(drawn, expected, "{scale:?} at {x},{y}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1977,7 +1913,7 @@ mod busy_tests {
         let pixels = Art::of(&compiled);
         let set = compiled.set("Viewer@command/0").unwrap().0;
         let art = SetArt::of(&compiled, set).unwrap();
-        let hourglass = compiled.set(scene::loading_cursor::SET).unwrap().0;
+        let hourglass = compiled.set(BADGE_SPRITES).unwrap().0;
         let camera = Camera { cells: true, ..Camera::new((400, 300)) };
         let marks = Machine::default().step(&Facts {
             captured: true, world_cursor: vec![(100, 100)],
@@ -1993,13 +1929,10 @@ mod busy_tests {
                 if let Some(sprite) = badges.first() {
                     assert_eq!(sprite.ticks_per_frame, scene::loading_cursor::TICKS_PER_FRAME);
                     let c = out.top.last().unwrap();
-                    // Turning about the system cursor's turning point, in
-                    // canvas pixels (the system's are these times the pixel
-                    // scale).
-                    let ((dx, dy), side) = badge.frame_at(scale.zoom.0 as f32 / scale.zoom.1 as f32);
-                    assert_eq!(c.viewport, (side, side));
-                    assert_eq!(c.origin, (100 + dx, 100 + dy));
-                    assert!(c.origin.0 + side as i32 / 2 > 100 && c.origin.1 + side as i32 / 2 > 100);
+                    assert_eq!(c.viewport, (scale.span(11), scale.span(17)));
+                    let x = 100 - scale.span(16) as i32 + scale.signed_span(16 + badge.offset.0);
+                    let y = 100 - scale.span(16) as i32 + scale.signed_span(16 + badge.offset.1);
+                    assert_eq!(c.origin, (x, y));
                     assert_eq!(c.target_clip, Some([0, 0, 400, 300]));
                 }
             }

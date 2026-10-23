@@ -793,7 +793,7 @@ pub enum BlendDesc {
 }
 
 /// Sources made without the loader (full colour).
-const GENERATED: [&str; 10] = ["solid:", "line:", "arrow:", "gilded_arrow:", "marker_shadow:", "crosshair:", "panes:", "pointer:", "rects:", "glyphs:"];
+const GENERATED: [&str; 11] = ["solid:", "line:", "arrow:", "gilded_arrow:", "marker_shadow:", "crosshair:", "panes:", "pointer:", "rects:", "glyphs:", "hourglass:"];
 
 /// The characters of a [`glyphs`] image, one cell each, in this order.
 pub const GLYPHS: &str = " 0123456789.%fpsmkingartCPUGbuld/~";
@@ -1236,6 +1236,66 @@ fn outline(sprite: &RgbaImage, width: u32, color: [u8; 4], smooth: bool) -> Rgba
     })
 }
 
+/// `source = "hourglass:WxH:N"`: the busy badge's hourglass (the viewer's
+/// "working in background" pointer), `N` frames of `W`×`H` side by side,
+/// pixel art: a one-pixel dark outline, sand-coloured bars, white glass,
+/// gold sand. Upright in every frame: over frames `0..N-1` the sand drains
+/// from the upper bulb into the lower one; frame `N-1` is the hourglass
+/// flipping over, seen edge on (its box unchanged), after which frame 0
+/// is full again.
+fn hourglass(spec: &str) -> Result<RgbaImage, String> {
+    let err = || format!("hourglass image {spec:?}: expected WxH:N (at least 5x7, 2 frames)");
+    let (size, n) = spec.split_once(':').ok_or_else(err)?;
+    let (w, h) = size.split_once('x').ok_or_else(err)?;
+    let (w, h, n): (u32, u32, u32) = (w.parse().map_err(|_| err())?, h.parse().map_err(|_| err())?, n.parse().map_err(|_| err())?);
+    if w < 5 || h < 7 || n < 2 || w * n > 4096 {
+        return Err(err());
+    }
+    const OUTLINE: [u8; 4] = [28, 20, 10, 255];
+    const BAR: [u8; 4] = [204, 160, 82, 255];
+    const GLASS: [u8; 4] = [252, 248, 236, 255];
+    const SAND: [u8; 4] = [232, 182, 58, 255];
+    // (Half sizes inside the outline, in pixels from the middle.)
+    let (hw, hh) = (w as f64 / 2.0 - 1.0, h as f64 / 2.0 - 1.0);
+    let bar = (h as f64 * 0.12).max(1.0).round();
+    let inner = hh - bar;
+    let neck = (hw * 0.18).max(0.5);
+    let bulb = hw - 1.0;
+    // The part at (u, v) from the middle of frame `k`: 0 nothing, 1 bar,
+    // 2 glass, 3 sand.
+    let part = |u: f64, v: f64, k: u32| -> u8 {
+        // Flipping: the hourglass squashed to an edge-on sliver.
+        let v = if k == n - 1 { v / 0.3 } else { v };
+        if v.abs() > hh || u.abs() > hw { return 0; }
+        if v.abs() > inner { return 1; }
+        let t = (v.abs() / inner).clamp(0.0, 1.0);
+        if u.abs() > neck + (bulb - neck) * t.powf(0.8) { return 0; }
+        if k == n - 1 { return 2; }
+        let drained = k as f64 / (n - 2).max(1) as f64;
+        // The upper bulb's sand sinks towards the neck; the lower bulb's
+        // pile grows from the bottom; a stream runs between while it drains.
+        let top = v < 0.0 && v > -inner * 0.9 * (1.0 - drained);
+        let pile = v > inner * (1.0 - 0.9 * drained) - 0.01;
+        let stream = drained > 0.0 && drained < 1.0 && u.abs() < 0.5 && v >= 0.0;
+        if top || pile || stream { 3 } else { 2 }
+    };
+    Ok(RgbaImage::from_fn(w * n, h, |x, y| {
+        let k = x / w;
+        let at = |x: i32, y: i32| -> u8 {
+            if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 { return 0; }
+            part(x as f64 + 0.5 - w as f64 / 2.0, y as f64 + 0.5 - h as f64 / 2.0, k)
+        };
+        let (x, y) = ((x % w) as i32, y as i32);
+        match at(x, y) {
+            1 => BAR,
+            2 => GLASS,
+            3 => SAND,
+            _ if (-1..=1).any(|dy| (-1..=1).any(|dx| at(x + dx, y + dy) != 0)) => OUTLINE,
+            _ => [0; 4],
+        }
+    }))
+}
+
 /// `source = "rects:WxH;R,G,B,A:X,Y,W,H;..."`: a clear `W × H` image with
 /// rectangles filled in order (later ones over earlier ones), each given as
 /// its colour and its top-left and size; `R,G,B,A:X,Y,W,H*N,DX,DY` fills it
@@ -1445,7 +1505,7 @@ impl Description {
     /// boxes makes them (`blank_loader`, then the image's own `blank`).
     fn load_frames(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc, blank: bool) -> Result<Vec<RgbaImage>, DescError> {
         let options = self.image_options(img, blank);
-        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 10] = [
+        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 11] = [
             ("solid:", solid),
             ("line:", line),
             ("arrow:", arrow),
@@ -1456,6 +1516,7 @@ impl Description {
             ("pointer:", pointer),
             ("rects:", rects),
             ("glyphs:", glyphs),
+            ("hourglass:", hourglass),
         ];
         let generated = generators.iter().find_map(|(prefix, make)| img.source.strip_prefix(prefix).map(make));
         let image_error = |message: String| DescError::Image { name: name.to_owned(), message };
@@ -2722,6 +2783,36 @@ pub enum SheetScaling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The busy badge's hourglass: upright pixel art in every frame, the
+    /// same box, its sand moving from the upper bulb to the lower one, and
+    /// a last frame flipping over.
+    #[test]
+    fn hourglass_frames_drain_upright_and_flip() {
+        let strip = hourglass("11x17:12").unwrap();
+        assert_eq!((strip.width, strip.height), (132, 17));
+        let gold = [232, 182, 58, 255];
+        let outline = [28, 20, 10, 255];
+        let sand = |k: u32, upper: bool| (0..11).flat_map(|x| (0..17).map(move |y| (x, y)))
+            .filter(|&(_, y)| if upper { y < 8 } else { y > 8 })
+            .filter(|&(x, y)| strip.get(k * 11 + x, y) == gold).count();
+        assert!(sand(0, true) > 3 * sand(0, false).max(1), "full above at first");
+        assert!(sand(10, false) > 3 * sand(10, true).max(1), "drained below at last");
+        for k in 1..11 {
+            assert!(sand(k, true) <= sand(k - 1, true) && sand(k, false) >= sand(k - 1, false), "frame {k} drains");
+        }
+        let rows = |k: u32| (0..17).filter(|&y| (0..11).any(|x| strip.get(k * 11 + x, y)[3] != 0)).count();
+        for k in 0..11 {
+            assert_eq!(rows(k), 17, "upright and the full box: frame {k}");
+            // Every pixel is opaque or clear (crisp), and the shape's edge
+            // is the outline.
+            for y in 0..17 { for x in 0..11 { let p = strip.get(k * 11 + x, y); assert!(p[3] == 0 || p[3] == 255); } }
+            assert_eq!(strip.get(k * 11 + 5, 0), outline);
+            assert_eq!(strip.get(k * 11 + 5, 16), outline);
+        }
+        assert!(rows(11) < 9, "flipping over: seen edge on");
+        assert!(hourglass("3x3:2").is_err());
+    }
 
     #[test]
     fn outlines_go_around_the_outside() {

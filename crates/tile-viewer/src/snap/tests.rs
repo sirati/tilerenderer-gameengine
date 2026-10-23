@@ -1007,13 +1007,13 @@ fn in_the_mode_only_the_snapping_pointer_and_its_ghost_are_drawn() {
         image = "p"
         cell = [14, 22]
         group = "Viewer@pointer"
-        [images.hourglass]
-        source = "solid:200,180,100,255:46x46"
-        [sheets.hourglass]
-        image = "hourglass"
-        cell = [46, 46]
-        anchor = [-23, -23]
-        group = "Viewer@loading_cursor"
+        [images.badge]
+        source = "hourglass:11x17:12"
+        [sheets.badge]
+        image = "badge"
+        cell = [11, 17]
+        grid = [12, 1]
+        group = "Viewer@busy_badge"
         "#,
     )
     .unwrap()
@@ -1046,7 +1046,7 @@ fn in_the_mode_only_the_snapping_pointer_and_its_ghost_are_drawn() {
         let busy = snap.compose_with_busy(&compiled, &crate::cursor::Art::of(&compiled), 7, 8, crate::cursor::Scale::default(), WINDOW, status);
         assert_eq!(&busy.sprites[..2], sprites.as_slice(), "keep both pointer and ghost for {status:?}");
         assert_eq!(busy.sprites.len(), 3, "one badge on the solid pointer only");
-        assert_eq!(busy.sprites[2].set, compiled.set(scene::loading_cursor::SET).unwrap().0);
+        assert_eq!(busy.sprites[2].set, compiled.set(crate::cursor::BADGE_SPRITES).unwrap().0);
         assert_eq!(busy.sprites[2].ticks_per_frame, scene::loading_cursor::TICKS_PER_FRAME);
         assert_eq!(busy.top.len(), 1);
         assert!(busy.top[0].origin.0 > 400 && busy.top[0].origin.1 > 300);
