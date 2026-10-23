@@ -69,7 +69,8 @@
 //!   room to. All of them are `zoom_strip` of the region's height (one
 //!   slider, default 20%). The pointer stops below a strip and scrolls
 //!   upwards there. While the pointer is where a floating box rests, the
-//!   box glides ([`Glide`]) below that place, `zoom_box_drop` (the gap,
+//!   box glides ([`Glide`], [`ZOOM_GLIDE_OMEGA`]) below that place,
+//!   `zoom_box_drop` (the gap,
 //!   2.5%) of the region's height further down, whatever the pointer does
 //!   in there, and back once it leaves; or it holds the pointer out with
 //!   `zoom_box_block_pointer`. Boxes do not
@@ -170,6 +171,11 @@ pub const EDGE_PAN_SPEED: f64 = 600.0;
 /// The longest frame step smooth movement takes (a stalled frame does not
 /// make a view jump).
 const MAX_STEP: f64 = 0.1;
+/// How fast the zoom boxes glide (a floating box out of the pointer's way
+/// and back, a box at the pointer flipping above or below it): the spring
+/// of [`Glide`] twice as stiff as the world's, settling in half its time
+/// (135 pixels: 27 frames of 16 ms, not 54). One constant for both boxes.
+pub const ZOOM_GLIDE_OMEGA: f64 = 2.0 * Glide::OMEGA;
 
 /// Smooth movement of a view's centre: a critically damped spring pulling
 /// it towards its target, with momentum (retargeting keeps the velocity),
@@ -204,6 +210,11 @@ impl Glide {
     /// the centre now. In a world wrapping along an axis (`period` > 0) it
     /// goes the short way round.
     pub fn step(&mut self, target: (i32, i32), dt: f64, period: (i32, i32)) -> (i32, i32) {
+        self.step_at(Self::OMEGA, target, dt, period)
+    }
+
+    /// As [`Glide::step`], the spring's angular frequency `omega` (1/s).
+    pub fn step_at(&mut self, omega: f64, target: (i32, i32), dt: f64, period: (i32, i32)) -> (i32, i32) {
         if !self.placed {
             self.snap(target);
             return target;
@@ -218,7 +229,7 @@ impl Glide {
             }
             // x(t) = t + (e0 + (v0 + ω e0) t) e^{-ω t} (exact).
             let (e0, v0) = (*pos - t, *vel);
-            let w = Self::OMEGA;
+            let w = omega;
             let decay = (-w * dt).exp();
             let c = v0 + w * e0;
             let e = (e0 + c * dt) * decay;
@@ -480,8 +491,8 @@ pub struct ZoomBox {
 }
 
 /// A floating zoom box on its way between where it rests and where it
-/// moves out of the pointer's way ([`Glide`], as the world's smooth
-/// movement): its top and height now.
+/// moves out of the pointer's way ([`Glide`] at [`ZOOM_GLIDE_OMEGA`], twice as
+/// fast as the world's smooth movement): its top and height now.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 struct ZoomBoxMotion {
     /// Where it rests (its region, sizes, margin): another one (the
@@ -2275,7 +2286,7 @@ impl Layout {
     }
 
     /// A floating zoom box `dt` seconds on its way to where it goes
-    /// ([`Layout::zoom_box_target`]), gliding as the world does (a new
+    /// ([`Layout::zoom_box_target`]), gliding at [`ZOOM_GLIDE_OMEGA`] (a new
     /// resting place, from settings or the window, is taken at once).
     fn move_zoom_box(&mut self, dt: f64) {
         let Some(m) = self.magnifier.filter(|m| matches!(m.place, ZoomPlace::Box(..)) && self.world_shown) else {
@@ -2288,7 +2299,7 @@ impl Layout {
             log::debug!("viewer: the zoom box {}", if moved { "moves out of the pointer's way" } else { "goes back" });
         }
         z.moved = moved;
-        z.now = z.glide.step((target[1], target[3]), dt, (0, 0));
+        z.now = z.glide.step_at(ZOOM_GLIDE_OMEGA, (target[1], target[3]), dt, (0, 0));
         self.zoom_box_motion = Some(z);
     }
 
@@ -6228,6 +6239,47 @@ mod tests {
         }
         assert!(shown.windows(2).all(|t| t[0] >= t[1]), "back and forth: {shown:?}");
         assert_eq!(*shown.last().unwrap(), 15, "{shown:?}");
+    }
+
+    /// The frames' tops of a floating box until it rests (at most 2 s),
+    /// frames 16 ms apart.
+    fn glide_tops(l: &mut Layout) -> Vec<i32> {
+        let geometry = |l: &Layout| l.magnifier_geometry(&l.magnifier.unwrap()).0;
+        let mut tops = vec![geometry(l)[1]];
+        for _ in 0..125 {
+            l.advance(std::time::Duration::from_millis(16));
+            frame(l, vec![]);
+            tops.push(geometry(l)[1]);
+        }
+        tops
+    }
+
+    /// No frame moves a box further than the spring can at its fastest
+    /// (from rest, `distance` · ω / e a second), and it never turns back.
+    fn assert_smooth(tops: &[i32], distance: i32, omega: f64) {
+        let most = (distance.abs() as f64 * omega / std::f64::consts::E * 0.016).ceil() as i32 + 1;
+        assert!(tops.windows(2).all(|t| (t[1] - t[0]).abs() <= most), "a jump over {most}: {tops:?}");
+        let sign = distance.signum();
+        assert!(tops.windows(2).all(|t| (t[1] - t[0]) * sign >= 0), "back and forth: {tops:?}");
+    }
+
+    #[test]
+    fn a_floating_zoom_box_glides_twice_as_fast_as_the_world_without_jumps() {
+        let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
+        mv(&mut l, (400, 60));
+        let tops = glide_tops(&mut l);
+        assert_smooth(&tops, 150 - 15, ZOOM_GLIDE_OMEGA);
+        let arrived = tops.iter().position(|&t| t == 150).expect("arrives");
+        // The world's own glide over the same way.
+        let mut g = Glide::default();
+        g.snap((0, 15));
+        let world = (1..).find(|_| g.step((0, 150), 0.016, (0, 0)).1 == 150).unwrap();
+        assert!((world * 4 / 10..=world * 6 / 10).contains(&arrived), "{arrived} frames, the world {world}: {tops:?}");
+        // And back.
+        mv(&mut l, (400, 300));
+        let tops = glide_tops(&mut l);
+        assert_smooth(&tops, 15 - 150, ZOOM_GLIDE_OMEGA);
+        assert_eq!(*tops.last().unwrap(), 15);
     }
 
     #[test]
