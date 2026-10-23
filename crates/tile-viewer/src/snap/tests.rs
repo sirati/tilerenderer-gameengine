@@ -1123,7 +1123,7 @@ fn alt_targets_on_title_and_setup_keep_their_full_window_positions_with_saved_ga
 fn alt_targets_keep_the_preview_menu_mapping_while_the_optional_world_loads_or_fails() {
     let source = [1125, 640, 1024, 768];
     let control = [2025, 660, 16, 12];
-    let plan = crate::scaling::plan((2946, 1844), (3274, 2048), &viewer_settings::Resolution { pixel_scale: 2, ..Default::default() });
+    let plan = crate::scaling::plan((2946, 1844), (3274, 2048), &viewer_settings::Resolution { pixel_scale: 2, base_ui_scale: 2.0, ..Default::default() });
     let mut l = Layout::default();
     l.configure("split=vertical,pane=pointer,magnifier=world,ui=pane").unwrap();
     l.driver_screen = Some(plan.screen);

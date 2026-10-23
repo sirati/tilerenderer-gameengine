@@ -342,6 +342,24 @@ mod tests {
         }
     }
     #[test]
+    fn resolution_confirmation_keeps_the_base_and_fine_sizes() {
+        let mut settings = viewer_settings::Settings::default();
+        settings.resolution.base_ui_scale = 2.5;
+        settings.resolution.frame_scale = 1.5;
+        settings.resolution.world_scale = 0.75;
+        let original = settings.resolution.clone();
+        let mut preview = Preview::default();
+        for keep in [false, true] {
+            let lease = lease(if keep { 2 } else { 1 });
+            preview.observe(Some(lease), Instant::now());
+            settings.resolution.pixel_scale = lease.pixel_scale;
+            let (_, scale) = preview.resolve(keep).unwrap();
+            preview.project(Some(lease), &mut settings);
+            assert_eq!(settings.resolution, viewer_settings::Resolution { pixel_scale: scale, ..original.clone() });
+        }
+    }
+
+    #[test]
     fn stalled_publisher_expires_and_repeated_metadata_cannot_restart_or_reapply() {
         let now = Instant::now();
         let mut p = Preview::default();

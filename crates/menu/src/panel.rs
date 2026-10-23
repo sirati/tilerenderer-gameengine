@@ -89,6 +89,9 @@
 //! size = [240, 25]                # the track
 //! normal = "bar"                  # the track; `knob`, `knob_hover`
 //! knob = "knob"
+//! tick_step = 0.5                # ruler marks at multiples inside the track
+//! tick_label_step = 1.0          # unitless labels at whole numbers
+//! tick_style = "caption"        # small text, clipped to the slider
 //! min = 0.5
 //! max = 3.0
 //! step = 0.05
@@ -270,6 +273,11 @@ pub struct ItemDesc {
     pub min: Option<f32>,
     pub max: Option<f32>,
     pub step: Option<f32>,
+    /// Ruler marks at multiples of this value, within the slider's range.
+    pub tick_step: Option<f32>,
+    /// Label only multiples of this value (defaults to `tick_step`). No units.
+    pub tick_label_step: Option<f32>,
+    pub tick_style: Option<String>,
     pub decimals: Option<u32>,
     #[serde(default)]
     pub percent: bool,
@@ -511,7 +519,7 @@ enum Kind {
     Text,
     Choice { control: String, value: String },
     Checkbox { control: String },
-    Slider { control: String, min: f32, max: f32, step: f32, knob: Option<String>, knob_hover: Option<String> },
+    Slider { control: String, min: f32, max: f32, step: f32, knob: Option<String>, knob_hover: Option<String>, ticks: Vec<(f32, bool)>, tick_style: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -637,6 +645,7 @@ fn repeated(desc: &ItemDesc, entry: &str) -> ItemDesc {
         slider: s(&desc.slider),
         text: s(&desc.text),
         style: s(&desc.style),
+        tick_style: s(&desc.tick_style),
         normal: s(&desc.normal),
         hover: s(&desc.hover),
         selected: s(&desc.selected),
@@ -753,7 +762,23 @@ impl Panels {
                     if !(min < max) || step < 0.0 || d.size.is_none() {
                         return Err(invalid(what(), "a slider needs its size and min < max (step >= 0)"));
                     }
-                    Kind::Slider { control: control.clone(), min, max, step, knob: art_ref(&d.knob)?, knob_hover: art_ref(&d.knob_hover)? }
+                    let mut ticks = Vec::new();
+                    if let Some(tick_step) = d.tick_step {
+                        let label_step = d.tick_label_step.unwrap_or(tick_step);
+                        if !tick_step.is_finite() || tick_step <= 0.0 || !label_step.is_finite() || label_step <= 0.0
+                            || !min.is_finite() || !max.is_finite() || (max - min) / tick_step > 1000.0 {
+                            return Err(invalid(what(), "finite positive tick steps with at most 1001 marks"));
+                        }
+                        for k in (min / tick_step).ceil() as i32..=(max / tick_step).floor() as i32 {
+                            let v = k as f32 * tick_step;
+                            let label = (v / label_step - (v / label_step).round()).abs() < 0.0001;
+                            ticks.push((v, label));
+                        }
+                    }
+                    if let Some(style) = d.tick_style.as_ref().filter(|s| !desc.styles.contains_key(*s)) {
+                        return Err(unknown("style", style));
+                    }
+                    Kind::Slider { control: control.clone(), min, max, step, knob: art_ref(&d.knob)?, knob_hover: art_ref(&d.knob_hover)?, ticks, tick_style: d.tick_style.clone() }
                 } else if d.text.is_some() {
                     Kind::Text
                 } else {
@@ -1238,7 +1263,7 @@ impl Panels {
                         }
                     }
                 }
-                Kind::Slider { control, min, max, knob, knob_hover, .. } => {
+                Kind::Slider { control, min, max, knob, knob_hover, ticks, tick_style, .. } => {
                     let (w, h) = size.unwrap_or_default();
                     if let Some(a) = look(false) {
                         d.art(a, (x, y), Some((w, h)));
@@ -1247,11 +1272,26 @@ impl Panels {
                         Some(Value::Number(n)) => n.clamp(*min, *max),
                         _ => *min,
                     };
+                    let kw = knob.as_ref().and_then(|k| self.art_named(k, state)).and_then(|a| a.size).map_or(0, |s| s.0 as i32);
+                    let ruler_style = tick_style.as_deref().or(item.style.as_deref());
+                    let clip = d.clip;
+                    // The ruler stays inside the item, including labels at either end.
+                    d.clip = [clip[0].max(x), clip[1].max(y), clip[2].min(x + w as i32), clip[3].min(y + h as i32)];
+                    for &(value, label) in ticks {
+                        let cx = x + slider_center(w as i32, kw, (value - min) / (max - min));
+                        let rgb = self.style(ruler_style).map_or([72, 60, 36], |s| if enabled { s.color } else { s.disabled_color.unwrap_or(s.color) });
+                        d.element(Element::Fill { rect: [cx, y + h as i32 - 14, 1, 3], rgb, alpha: 255, clip: d.clip });
+                        if label {
+                            d.text(&format_number(value, item.decimals, item.percent), ruler_style, text_look,
+                                (cx, y + h as i32 - 10), Align::Center, VAlign::Top);
+                        }
+                    }
+                    d.clip = clip;
                     let knob = if hover || state.dragging == Some(n) { knob_hover.as_ref().or(knob.as_ref()) } else { knob.as_ref() };
                     if let Some(k) = knob {
                         let (kw, kh) = self.art_named(k, state).and_then(|a| a.size).unwrap_or_default();
                         let t = (v - min) / (max - min);
-                        let kx = x + ((w as i32 - kw as i32) as f32 * t).round() as i32;
+                        let kx = x + slider_center(w as i32, kw as i32, t) - kw as i32 / 2;
                         d.art(k, (kx, y + (h as i32 - kh as i32) / 2), None);
                     }
                     if let Some(t) = &item.text {
@@ -1438,6 +1478,11 @@ fn value_text(v: &Value, decimals: u32, percent: bool) -> String {
 
 fn inside([x, y, w, h]: [i32; 4], px: i32, py: i32) -> bool {
     px >= x && py >= y && px < x + w && py < y + h
+}
+
+/// Handle centre along the track. Ends are inset by half its width.
+fn slider_center(width: i32, knob: i32, t: f32) -> i32 {
+    knob / 2 + ((width - knob).max(0) as f32 * t.clamp(0.0, 1.0)).round() as i32
 }
 
 /// `v` on the nearest step from `min` (any value with no step), within
@@ -1840,6 +1885,69 @@ mod tests {
         let compiled = render_desc::Description::parse(&text).unwrap().compile(&NoFiles, 256).unwrap();
         assert!(compiled.set(&generated_sprite("icon_a")).is_some());
         assert_eq!(generated_sprite("icon_a"), "Panel@icon_a/0");
+    }
+
+    #[test]
+    fn preference_rulers_follow_handle_centres_and_stay_inside_each_slider() {
+        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
+        let panel = panels.panel("preferences").unwrap();
+        let mut state = PanelState::default();
+        let area = [0, 0, 1024, 768];
+        let mut count = 0;
+        for (index, item) in panel.items.iter().enumerate() {
+            let Kind::Slider { control, min, max, knob, ticks, .. } = &item.kind else { continue };
+            count += 1;
+            assert!(!ticks.is_empty(), "{control} needs a ruler");
+            let (w, h) = item.size.unwrap();
+            let (x, y) = item.at;
+            let kw = panels.art_named(knob.as_ref().unwrap(), &state).unwrap().size.unwrap().0 as i32;
+            for &(value, _) in ticks {
+                let cx = x + slider_center(w as i32, kw, (value - min) / (max - min));
+                assert!(cx >= x + kw / 2 && cx <= x + w as i32 - kw / 2, "{control}: {value}");
+                state.values.insert(control.clone(), Value::Number(value));
+                let draws = panels.draw_item(panel, &state, area, &estimate, index, item);
+                assert!(draws.iter().any(|d| matches!(d, Draw::Element(Element::Fill { rect, .. })
+                    if *rect == [cx, y + h as i32 - 14, 1, 3])), "{control}: tick at {value}");
+                assert!(draws.iter().any(|d| matches!(d, Draw::Element(Element::Image { at, region, .. })
+                    if region.source == "Art/SCROLL.PCX" && at.0 + kw / 2 == cx)), "{control}: handle at {value}");
+                for draw in &draws {
+                    if let Draw::Text(t) = draw {
+                        if t.style.height != 9 { continue; }
+                        let m = estimate(&t.style, &t.text);
+                        assert_eq!(t.clip, [x, y, x + w as i32, y + h as i32]);
+                        assert!(t.x >= x && t.x + m.width <= x + w as i32, "{control}: {}", t.text);
+                        assert!(t.y - m.ascent >= y && t.y + m.descent <= y + h as i32);
+                        assert!(t.text.chars().all(|c| c.is_ascii_digit() || c == '.'));
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn ruler_steps_must_be_finite_positive_and_bounded() {
+        for step in ["0", "-1", "inf", "nan", "0.00001"] {
+            let text = PANELS.replace("slider = \"scale\"", &format!("slider = \"scale\"\ntick_step = {step}"));
+            assert!(Panels::parse(&text).is_err(), "tick step {step}");
+        }
+    }
+
+    #[test]
+    fn base_ui_slider_centres_line_up_with_pixel_scale_buttons() {
+        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
+        let panel = panels.panel("preferences").unwrap();
+        let item = panel.items.iter().find(|i| i.control() == Some("resolution.base_ui_scale")).unwrap();
+        let Kind::Slider { min, max, knob, .. } = &item.kind else { panic!("base scale slider") };
+        let kw = panels.art_named(knob.as_ref().unwrap(), &PanelState::default()).unwrap().size.unwrap().0 as i32;
+        let centre = |v| item.at.0 + slider_center(item.size.unwrap().0 as i32, kw, (v - min) / (max - min));
+        for button in &panel.items {
+            let Kind::Choice { control, value } = &button.kind else { continue };
+            if control != "resolution.pixel_scale" { continue; }
+            let k = value.parse::<f32>().unwrap();
+            assert_eq!(centre(k), button.at.0 + button.size.unwrap().0 as i32 / 2);
+            if k < *max { assert_eq!(centre(k + 0.5), (centre(k) + centre(k + 1.0)) / 2); }
+        }
     }
 
     #[test]

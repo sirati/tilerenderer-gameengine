@@ -45,7 +45,7 @@ impl Range {
 
 /// The fractional scales of the game's frame and world map.
 pub const SCALE_RANGE: Range = Range { min: 0.5, max: 3.0, step: 0.05 };
-/// Standard menu height relative to the visible canvas.
+/// Standard menu height relative to the window.
 pub const MENU_SCALE_PERCENT_RANGE: Range = Range { min: 25.0, max: 100.0, step: 1.0 };
 /// The height of every zoom: the strip, the floating boxes and the boxes
 /// at the mouse ([`Layout::zoom_strip`]).
@@ -73,8 +73,9 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 32] = [
+pub const KEYS: [&str; 33] = [
     "resolution.pixel_scale",
+    "resolution.base_ui_scale",
     "resolution.scale_menus",
     "resolution.menu_scale_percent",
     "resolution.frame_scale",
@@ -111,6 +112,7 @@ pub const KEYS: [&str; 32] = [
 /// The range of number control `key`, if it is one.
 pub fn range(key: &str) -> Option<Range> {
     match key {
+        "resolution.base_ui_scale" => Some(Range { min: 1.0, max: Resolution::MAX_PIXEL_SCALE as f32, step: 0.5 }),
         "resolution.menu_scale_percent" => Some(MENU_SCALE_PERCENT_RANGE),
         "resolution.frame_scale" | "resolution.world_scale" => Some(SCALE_RANGE),
         "layout.zoom_strip" => Some(ZOOM_STRIP_RANGE),
@@ -221,6 +223,7 @@ impl Settings {
         if key.starts_with("clean_map.") { return self.clean_map.control(key); }
         match key {
             "resolution.pixel_scale" => Some(ControlValue::Choice(r.effective_pixel_scale().to_string())),
+            "resolution.base_ui_scale" => Some(ControlValue::Number(r.effective_base_ui_scale())),
             "resolution.scale_menus" => Some(ControlValue::On(r.scale_menus)),
             "resolution.menu_scale_percent" => Some(ControlValue::Number(r.effective_menu_scale_percent())),
             "resolution.frame_scale" => Some(ControlValue::Number(r.frame_scale)),
@@ -293,6 +296,7 @@ impl Settings {
                     ControlValue::On(on) => { r.scale_menus = *on; true }
                     _ => false,
                 },
+                "resolution.base_ui_scale" => set_number(&mut r.base_ui_scale, key, value),
                 "resolution.menu_scale_percent" => set_number(&mut r.menu_scale_percent, key, value),
                 "resolution.frame_scale" => set_number(&mut r.frame_scale, key, value),
                 "resolution.world_scale" => set_number(&mut r.world_scale, key, value),
@@ -586,6 +590,18 @@ mod tests {
         let saved: Settings = toml::from_str("[display]\ncursor_size = 64\n").unwrap();
         assert_eq!(saved.display.cursor_size, 64);
         assert_eq!(toml::from_str::<Settings>(&toml::to_string(&saved).unwrap()).unwrap(), saved);
+    }
+
+    #[test]
+    fn base_ui_scale_snaps_without_changing_resolution_or_fine_scales() {
+        let mut settings = Settings::default();
+        settings.resolution.pixel_scale = 3;
+        let before = settings.resolution.clone();
+        assert!(settings.set_control("resolution.base_ui_scale", &ControlValue::Number(2.3)));
+        assert_eq!(settings.control("resolution.base_ui_scale"), Some(ControlValue::Number(2.5)));
+        assert_eq!(settings.resolution, Resolution { base_ui_scale: 2.5, ..before });
+        assert!(settings.set_control("resolution.base_ui_scale", &ControlValue::Number(100.0)));
+        assert_eq!(settings.resolution.base_ui_scale, Resolution::MAX_PIXEL_SCALE as f32);
     }
 
     #[test]

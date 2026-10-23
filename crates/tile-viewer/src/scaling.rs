@@ -282,9 +282,12 @@ pub fn plan(window: (u32, u32), screen: (u32, u32), settings: &Resolution) -> Pl
     // at 100 %).
     let zoom = if settings.scale_menus {
         reduced(canvas.1 as u64 * (settings.effective_menu_scale_percent() * 1000.0).round() as u64, reference * 100_000)
-    } else { (1, 1) };
+    } else { times(ratio(settings.effective_base_ui_scale()), (1, n)) };
+    // Percentage menus already follow the window, so their size does not
+    // need resolution compensation. Native art uses the base in window pixels.
+    let base = times(ratio(settings.effective_base_ui_scale()), (1, n));
     let menu = Affine { from: center(screen), to: center(canvas), zoom };
-    Plan { present, screen, menu, fit_menus: settings.scale_menus, frame: ratio(settings.frame_scale), world: ratio(settings.world_scale), menu_bounds: None }
+    Plan { present, screen, menu, fit_menus: settings.scale_menus, frame: times(ratio(settings.frame_scale), base), world: times(ratio(settings.world_scale), base), menu_bounds: None }
 }
 
 /// Actual menu bounds in driver pixels. A dedicated screen camera or
@@ -1095,11 +1098,38 @@ fn panels(screen: (u32, u32), sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSpr
 mod tests {
     use super::*;
 
+    #[test]
+    fn base_ui_size_is_independent_of_render_resolution() {
+        let window = (3840, 2880);
+        for base_ui_scale in [1.0, 2.0, 2.5, 6.0] {
+            for scale_menus in [false, true] {
+                let settings = Resolution { base_ui_scale, scale_menus, menu_scale_percent: 50.0,
+                    frame_scale: 1.5, world_scale: 0.75, ..Default::default() };
+                let reference = plan(window, (1920, 1080), &settings);
+                for pixel_scale in 1..=Resolution::MAX_PIXEL_SCALE {
+                    let p = plan(window, (1920, 1080), &Resolution { pixel_scale, ..settings.clone() });
+                    for (canvas, screen) in [(p.menu.zoom, reference.menu.zoom), (p.frame, reference.frame), (p.world, reference.world)] {
+                        assert_eq!(times(canvas, p.present.zoom), screen, "base {base_ui_scale}, pixels {pixel_scale}, menus {scale_menus}");
+                    }
+                    // Drawing and clicks use the same fractional map.
+                    let driver = (1032, 612);
+                    let canvas = p.menu.apply(driver);
+                    let back = p.menu.invert(p.to_screen({ let w = p.to_window(canvas); (w.0 as f64, w.1 as f64) }));
+                    let tolerance = p.menu.zoom.1.div_ceil(p.menu.zoom.0) as i32;
+                    assert!((back.0 - driver.0).abs() <= tolerance && (back.1 - driver.1).abs() <= tolerance);
+                }
+            }
+        }
+        // Compensation uses the actual scale when a small window lowers it.
+        let p = plan((800, 600), (1024, 768), &Resolution { pixel_scale: 6, base_ui_scale: 2.0, ..Default::default() });
+        assert_eq!(times(p.frame, p.present.zoom), (2, 1));
+    }
+
     // Mechanism tests can exercise arbitrary affine ratios independently
     // of the screen-percentage policy exposed in the settings.
     fn fixed_plan(window: (u32, u32), screen: (u32, u32), scales: (u32, f32, f32, f32)) -> Plan {
         let (pixel_scale, menu, frame_scale, world_scale) = scales;
-        let mut p = plan(window, screen, &Resolution { pixel_scale, frame_scale, world_scale, ..Default::default() });
+        let mut p = plan(window, screen, &Resolution { pixel_scale, base_ui_scale: pixel_scale as f32, frame_scale, world_scale, ..Default::default() });
         p.menu.zoom = ratio(menu);
         p
     }
@@ -1141,7 +1171,7 @@ mod tests {
                             let p = plan(window, scene.screen_size, &settings).for_scene(&scene, rect_of);
                             assert_eq!(p.present.zoom, (pixel_scale, 1));
                             let canvas = p.canvas();
-                            let expected = if scale_menus { canvas.1 as f64 / 768.0 * menu_scale_percent as f64 / 100.0 } else { 1.0 }
+                            let expected = if scale_menus { canvas.1 as f64 / 768.0 * menu_scale_percent as f64 / 100.0 } else { 1.0 / pixel_scale as f64 }
                                 .min(canvas.0 as f64 / 1024.0).min(canvas.1 as f64 / 768.0);
                             assert!((p.menu.zoom.0 as f64 / p.menu.zoom.1 as f64 - expected).abs() < 0.000001);
                             let mut layout = layout::Layout::default();
@@ -1306,7 +1336,7 @@ mod tests {
                             let canvas = p.canvas();
                             let (cw, ch) = (canvas.0 as f64, canvas.1 as f64);
                             let most = (cw / 1024.0).min(ch / vh);
-                            let expected = if scale_menus { ch / vh * menu_scale_percent as f64 / 100.0 } else { 1.0 }.min(most);
+                            let expected = if scale_menus { ch / vh * menu_scale_percent as f64 / 100.0 } else { 1.0 / p.present.zoom.0 as f64 }.min(most);
                             let what = format!("screen {screen:?}, window {window:?}, {settings:?}, canvas {canvas:?}");
                             assert!((p.menu.zoom.0 as f64 / p.menu.zoom.1 as f64 - expected).abs() < 1e-9, "{what}: {:?}", p.menu.zoom);
                             for configured in [false, true] {
@@ -1560,7 +1590,7 @@ mod tests {
         scene.interface = scene::Interface::default();
         for menu_scale_percent in [25.0, 100.0] {
             let p = plan((1920, 1080), scene.screen_size,
-                &Resolution { pixel_scale: 3, scale_menus: false, menu_scale_percent, ..Default::default() }).for_scene(&scene, &rect_of);
+                &Resolution { pixel_scale: 3, base_ui_scale: 3.0, scale_menus: false, menu_scale_percent, ..Default::default() }).for_scene(&scene, &rect_of);
             assert_eq!(p.menu.zoom, (1, 1));
             let mut layout = layout::Layout::default();
             layout.driver_screen = Some(p.screen);

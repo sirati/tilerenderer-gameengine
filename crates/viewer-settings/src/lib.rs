@@ -90,16 +90,19 @@ pub struct Resolution {
     /// the menu, frame and world scales size things there. (0, "Auto" in
     /// older files, loads as 1.)
     pub pixel_scale: u32,
-    /// Size menus relative to the visible canvas. When false menus use
-    /// their native size; the title and Preferences still fit the canvas.
+    /// Size in window pixels, independent of render resolution (half steps, 1..=6).
+    /// Native menus, frame and world use base / pixel scale on the canvas.
+    pub base_ui_scale: f32,
+    /// Size menus relative to the window. When false menus use their
+    /// native size times the base; title and Preferences still fit.
     pub scale_menus: bool,
-    /// Standard menu height as a percentage of the canvas height, 25..=100.
+    /// Standard menu height as a percentage of the window height, 25..=100.
     /// Only used when `scale_menus` is true.
     pub menu_scale_percent: f32,
-    /// Fractional scale of the game's frame (the interface around the world:
-    /// buttons, unit box, minimap).
+    /// Fractional scale relative to the base for the game's frame
+    /// (buttons, unit box, minimap).
     pub frame_scale: f32,
-    /// Fractional scale of the world map.
+    /// Fractional scale of the world map relative to the base.
     pub world_scale: f32,
     /// How menu background art is sampled when a menu is drawn larger or
     /// smaller than its art, including background frames and tiles.
@@ -124,7 +127,7 @@ pub enum BackgroundSampling {
 
 impl Default for Resolution {
     fn default() -> Self {
-        Self { pixel_scale: 1, scale_menus: false, menu_scale_percent: 100.0, frame_scale: 1.0, world_scale: 1.0, background_sampling: BackgroundSampling::Dither }
+        Self { pixel_scale: 1, base_ui_scale: 1.0, scale_menus: false, menu_scale_percent: 100.0, frame_scale: 1.0, world_scale: 1.0, background_sampling: BackgroundSampling::Dither }
     }
 }
 
@@ -137,6 +140,7 @@ impl<'de> Deserialize<'de> for Resolution {
         #[serde(default)]
         struct Saved {
             pixel_scale: u32,
+            base_ui_scale: Option<f32>,
             scale_menus: bool,
             menu_scale_percent: f32,
             menu_scale: Option<f32>,
@@ -147,22 +151,32 @@ impl<'de> Deserialize<'de> for Resolution {
         impl Default for Saved {
             fn default() -> Self {
                 let r = Resolution::default();
-                Self { pixel_scale: r.pixel_scale, scale_menus: r.scale_menus, menu_scale_percent: r.menu_scale_percent,
+                Self { pixel_scale: r.pixel_scale, base_ui_scale: None, scale_menus: r.scale_menus, menu_scale_percent: r.menu_scale_percent,
                     menu_scale: None, frame_scale: r.frame_scale, world_scale: r.world_scale, background_sampling: r.background_sampling }
             }
         }
         let saved = Saved::deserialize(deserializer)?;
         let _legacy_multiplier = saved.menu_scale;
         // (0 was "Auto", the desktop's scale: now ×1 everywhere.)
-        let mut resolution = Self { pixel_scale: saved.pixel_scale.clamp(1, Self::MAX_PIXEL_SCALE), scale_menus: saved.scale_menus,
+        let pixel_scale = saved.pixel_scale.clamp(1, Self::MAX_PIXEL_SCALE);
+        // Old files sized native art with the pixel scale. Keep that size.
+        let mut resolution = Self { pixel_scale, base_ui_scale: saved.base_ui_scale.unwrap_or(pixel_scale as f32), scale_menus: saved.scale_menus,
             menu_scale_percent: saved.menu_scale_percent, frame_scale: saved.frame_scale, world_scale: saved.world_scale,
             background_sampling: saved.background_sampling };
+        resolution.base_ui_scale = resolution.effective_base_ui_scale();
         resolution.menu_scale_percent = resolution.effective_menu_scale_percent();
         Ok(resolution)
     }
 }
 
 impl Resolution {
+    /// Finite half steps, also for settings made outside Preferences.
+    pub fn effective_base_ui_scale(&self) -> f32 {
+        if self.base_ui_scale.is_finite() {
+            (self.base_ui_scale.clamp(1.0, Self::MAX_PIXEL_SCALE as f32) * 2.0).round() / 2.0
+        } else { 1.0 }
+    }
+
     /// A finite screen-relative menu percentage, including settings made
     /// programmatically rather than through a preferences control. Whole
     /// percents, as the control's steps: a hand-edited 60.758 is 61.
@@ -612,6 +626,21 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_ui_scale_defaults_and_migrates_saved_pixel_size() {
+        assert_eq!(Settings::default().resolution.base_ui_scale, 1.0);
+        for (pixel, base) in [(0, 1.0), (1, 1.0), (3, 3.0), (6, 6.0), (9, 6.0)] {
+            let saved: Settings = toml::from_str(&format!("[resolution]\npixel_scale = {pixel}\n")).unwrap();
+            assert_eq!(saved.resolution.base_ui_scale, base);
+            let back: Settings = toml::from_str(&toml::to_string(&saved).unwrap()).unwrap();
+            assert_eq!(back, saved);
+        }
+        for (value, expected) in [("2.5", 2.5), ("2.3", 2.5), ("0.0", 1.0), ("99.0", 6.0), ("nan", 1.0)] {
+            let saved: Settings = toml::from_str(&format!("[resolution]\npixel_scale = 4\nbase_ui_scale = {value}\n")).unwrap();
+            assert_eq!(saved.resolution.base_ui_scale, expected);
+        }
+    }
 
     #[test]
     fn round_trips_and_fills_defaults() {

@@ -28,7 +28,7 @@ fn status_orb_and_select_unit_targets_follow_the_drawn_panel_across_splits_and_s
                 let mut layout = Layout::default();
                 layout.apply_settings(&viewer_settings::Layout { split, ..Default::default() });
                 let plan = crate::scaling::plan((3840, 2160), scene.screen_size,
-                    &viewer_settings::Resolution { pixel_scale, frame_scale, ..Default::default() });
+                    &viewer_settings::Resolution { pixel_scale, base_ui_scale: pixel_scale as f32, frame_scale, ..Default::default() });
                 layout.driver_screen = Some(plan.screen);
                 for _ in 0..2 {
                     let mut frame = layout.frame(&scene, plan.present.canvas, (0, 0, 0, 0), vec![[1621, 940, 295, 140]], None);
