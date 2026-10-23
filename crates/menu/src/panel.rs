@@ -1333,11 +1333,15 @@ impl Panels {
                     for (tick, &(value, label)) in ticks.iter().enumerate() {
                         let cx = x + slider_center(w as i32, kw, (value - min) / (max - min));
                         let rgb = self.style(ruler_style).map_or([72, 60, 36], |s| if enabled { s.color } else { s.disabled_color.unwrap_or(s.color) });
-                        d.element(Element::Fill { rect: [cx, y + h as i32 - 14, 1, 3], rgb, alpha: 255, clip: d.clip });
+                        // As on a ruler: a mark down from the top edge and one up
+                        // from the bottom edge, the label between them.
+                        let (top, bottom, len) = ruler_marks(y, h as i32, label);
+                        d.element(Element::Fill { rect: [cx, top, 1, len], rgb, alpha: 255, clip: d.clip });
+                        d.element(Element::Fill { rect: [cx, bottom, 1, len], rgb, alpha: 255, clip: d.clip });
                         if label {
                             let text = tick_labels.as_ref().map(|labels| labels[tick].clone()).unwrap_or_else(|| format_number(value, item.decimals, item.percent));
                             d.text(&text, ruler_style, text_look,
-                                (cx, y + h as i32 - 10), Align::Center, VAlign::Top);
+                                (cx, y + h as i32 / 2), Align::Center, VAlign::Middle);
                         }
                     }
                     d.clip = clip;
@@ -1537,6 +1541,15 @@ fn inside([x, y, w, h]: [i32; 4], px: i32, py: i32) -> bool {
 /// Handle centre along the track. Ends are inset by half its width.
 fn slider_center(width: i32, knob: i32, t: f32) -> i32 {
     knob / 2 + ((width - knob).max(0) as f32 * t.clamp(0.0, 1.0)).round() as i32
+}
+
+/// A ruler tick's marks on a track at `y`, `h` high: (top mark's y, bottom
+/// mark's y, their length). Both touch the inside of the track's 2-pixel
+/// frame; labelled ticks get longer marks, as whole numbers on a ruler.
+fn ruler_marks(y: i32, h: i32, labelled: bool) -> (i32, i32, i32) {
+    const FRAME: i32 = 2;
+    let len = if labelled { 4 } else { 3 };
+    (y + FRAME, y + h - FRAME - len, len)
 }
 
 /// `v` on the nearest step from `min` (any value with no step), within
@@ -1955,13 +1968,16 @@ mod tests {
             let (w, h) = item.size.unwrap();
             let (x, y) = item.at;
             let kw = panels.art_named(knob.as_ref().unwrap(), &state).unwrap().size.unwrap().0 as i32;
-            for &(value, _) in ticks {
+            for &(value, label) in ticks {
                 let cx = x + slider_center(w as i32, kw, (value - min) / (max - min));
                 assert!(cx >= x + kw / 2 && cx <= x + w as i32 - kw / 2, "{control}: {value}");
                 state.values.insert(control.clone(), Value::Number(value));
                 let draws = panels.draw_item(panel, &state, area, &estimate, index, item);
-                assert!(draws.iter().any(|d| matches!(d, Draw::Element(Element::Fill { rect, .. })
-                    if *rect == [cx, y + h as i32 - 14, 1, 3])), "{control}: tick at {value}");
+                let (top, bottom, len) = ruler_marks(y, h as i32, label);
+                for mark in [top, bottom] {
+                    assert!(draws.iter().any(|d| matches!(d, Draw::Element(Element::Fill { rect, .. })
+                        if *rect == [cx, mark, 1, len])), "{control}: tick at {value}");
+                }
                 assert!(draws.iter().any(|d| matches!(d, Draw::Element(Element::Image { at, region, .. })
                     if region.source == "Art/SCROLL.PCX" && at.0 + kw / 2 == cx)), "{control}: handle at {value}");
                 for draw in &draws {
