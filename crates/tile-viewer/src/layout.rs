@@ -68,11 +68,13 @@
 //!   room); or a strip across the top of that region that the views give
 //!   room to. All of them are `zoom_strip` of the region's height (one
 //!   slider, default 20%). The pointer stops below a strip and scrolls
-//!   upwards there. While the pointer is where a floating box rests, the
-//!   box glides ([`Glide`]) below that place, `zoom_box_drop` (the gap,
-//!   2.5%) of the region's height further down, whatever the pointer does
-//!   in there, and back once it leaves; or it holds the pointer out with
-//!   `zoom_box_block_pointer`. Boxes do not
+//!   upwards there. Once the pointer comes within 5% of the region's
+//!   height ([`ZOOM_BOX_REACH`]) of where a floating box rests (its sides
+//!   and top; below it, as far as its gap), the box glides ([`Glide`],
+//!   [`ZOOM_GLIDE_OMEGA`]) below that place, `zoom_box_drop` (the gap,
+//!   5% to 15%, default 5%) of the region's height further down, whatever
+//!   the pointer does in there, and back once it leaves; or it holds the
+//!   pointer out with `zoom_box_block_pointer`. Boxes do not
 //!   dodge the views' own interface (corner buttons, unit orders): they
 //!   lie under it, and it keeps its clicks. Every zoom magnifies
 //!   `zoom_magnification` (1.5×, 2×, 3×, 4×; default 2×) on top of how
@@ -170,6 +172,20 @@ pub const EDGE_PAN_SPEED: f64 = 600.0;
 /// The longest frame step smooth movement takes (a stalled frame does not
 /// make a view jump).
 const MAX_STEP: f64 = 0.1;
+/// How fast the zoom boxes glide (a floating box out of the pointer's way
+/// and back, a box at the pointer flipping above or below it): the spring
+/// of [`Glide`] twice as stiff as the world's, settling in half its time
+/// (150 pixels: 28 frames of 16 ms, not 55). One constant for both boxes.
+pub const ZOOM_GLIDE_OMEGA: f64 = 2.0 * Glide::OMEGA;
+/// How near a floating zoom box the pointer makes it move out of the way:
+/// within this many thousandths of its region's height (as its gap and
+/// margin) of its sides or top (5%).
+pub const ZOOM_BOX_REACH: u32 = 50;
+/// How much further down than where it has room above it the pointer has
+/// to be before a box at the mouse below it goes back above it, in
+/// thousandths of its region's height (2.5%): no flipping back and forth
+/// about that height.
+pub const ZOOM_FLIP_HYSTERESIS: u32 = 25;
 
 /// Smooth movement of a view's centre: a critically damped spring pulling
 /// it towards its target, with momentum (retargeting keeps the velocity),
@@ -204,6 +220,11 @@ impl Glide {
     /// the centre now. In a world wrapping along an axis (`period` > 0) it
     /// goes the short way round.
     pub fn step(&mut self, target: (i32, i32), dt: f64, period: (i32, i32)) -> (i32, i32) {
+        self.step_at(Self::OMEGA, target, dt, period)
+    }
+
+    /// As [`Glide::step`], the spring's angular frequency `omega` (1/s).
+    pub fn step_at(&mut self, omega: f64, target: (i32, i32), dt: f64, period: (i32, i32)) -> (i32, i32) {
         if !self.placed {
             self.snap(target);
             return target;
@@ -218,7 +239,7 @@ impl Glide {
             }
             // x(t) = t + (e0 + (v0 + ω e0) t) e^{-ω t} (exact).
             let (e0, v0) = (*pos - t, *vel);
-            let w = Self::OMEGA;
+            let w = omega;
             let decay = (-w * dt).exp();
             let c = v0 + w * e0;
             let e = (e0 + c * dt) * decay;
@@ -454,11 +475,13 @@ pub enum ZoomPlace {
     Beside,
     /// A box at the top of its region, centred across, `1 : n : 1` of its
     /// width (margin : box : margin), [`ZoomBox::height`] of its height,
-    /// [`ZoomBox::top`] below its top; while the pointer is where it rests
-    /// it moves below that place, [`ZoomBox::gap`] below it, gliding.
+    /// [`ZoomBox::top`] below its top; once the pointer comes near where it
+    /// rests ([`ZOOM_BOX_REACH`]) it moves below that place, [`ZoomBox::gap`]
+    /// below it, gliding.
     Box(u32, ZoomBox),
     /// A box at the pointer (the world cursor while the mouse is captured):
-    /// above it, else below it, centred on it across, kept inside its
+    /// above it, else below it (`zoom_mouse_above`, `zoom_mouse_below`,
+    /// gliding between the two), centred on it across, kept inside its
     /// region; `1 : n : 1` of the region's width, and this many
     /// thousandths of its height (`zoom_strip`).
     AboutPointer(u32, u32),
@@ -480,8 +503,8 @@ pub struct ZoomBox {
 }
 
 /// A floating zoom box on its way between where it rests and where it
-/// moves out of the pointer's way ([`Glide`], as the world's smooth
-/// movement): its top and height now.
+/// moves out of the pointer's way ([`Glide`] at [`ZOOM_GLIDE_OMEGA`], twice as
+/// fast as the world's smooth movement): its top and height now.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 struct ZoomBoxMotion {
     /// Where it rests (its region, sizes, margin): another one (the
@@ -492,6 +515,19 @@ struct ZoomBoxMotion {
     /// Its top and height.
     glide: Glide,
     now: (i32, i32),
+}
+
+/// A box at the mouse ([`ZoomPlace::AboutPointer`]) on its way between
+/// above and below the pointer ([`Glide`] at [`ZOOM_GLIDE_OMEGA`]): where its
+/// top is from the pointer's height now. It follows the pointer at once;
+/// only that distance glides.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+struct ZoomMouseMotion {
+    /// Whether it goes below the pointer (no room above).
+    below: bool,
+    /// Its top from the pointer's height (in `.1`).
+    glide: Glide,
+    now: i32,
 }
 
 /// A sprite the viewer adds to the world.
@@ -671,6 +707,11 @@ pub struct Layout {
     pub magnifier: Option<Magnifier>,
     /// Floating zoom boxes hold the pointer out instead of moving aside.
     pub zoom_box_block_pointer: bool,
+    /// A box at the mouse: the space between the pointer and its bottom
+    /// above it, and its top below it, in thousandths of its region's
+    /// height (`zoom_mouse_above`, `zoom_mouse_below`).
+    pub zoom_mouse_above: u32,
+    pub zoom_mouse_below: u32,
     pub zoom_rounded: bool,
     pub zoom_glass: bool,
     pub separator_width: u32,
@@ -808,6 +849,8 @@ pub struct Layout {
     magnifier_center: Option<(i32, i32)>,
     /// A floating zoom box moving out of the pointer's way and back.
     zoom_box_motion: Option<ZoomBoxMotion>,
+    /// A box at the mouse flipping between above and below the pointer.
+    zoom_mouse_motion: Option<ZoomMouseMotion>,
     /// From the last frame: the driver's screen and its world side by side
     /// (`scene::Interface::beside`): the world's rectangle.
     beside: Option<[i32; 4]>,
@@ -939,6 +982,8 @@ impl Default for Layout {
             insets: Vec::new(),
             magnifier: None,
             zoom_box_block_pointer: false,
+            zoom_mouse_above: 100,
+            zoom_mouse_below: 200,
             zoom_rounded: true,
             zoom_glass: true,
             separator_width: 4,
@@ -1014,6 +1059,7 @@ impl Default for Layout {
             world_shown: true,
             magnifier_center: None,
             zoom_box_motion: None,
+            zoom_mouse_motion: None,
             beside: None,
             beside_mapping: None,
             focus: None,
@@ -1397,7 +1443,7 @@ impl Layout {
         // (`zoom_strip`: the height of every zoom, strip or box.)
         let thousandths = |v: f32, max: f32| (v.clamp(0.0, max) * 1000.0).round() as u32;
         let strip = thousandths(s.zoom_strip, 0.5).max(50);
-        let floating = ZoomBox { height: strip, top: thousandths(s.zoom_box_top, viewer_settings::controls::ZOOM_BOX_TOP_RANGE.max), gap: thousandths(s.zoom_box_drop, viewer_settings::controls::ZOOM_BOX_DROP_RANGE.max) };
+        let floating = ZoomBox { height: strip, top: thousandths(s.zoom_box_top, viewer_settings::controls::ZOOM_BOX_TOP_RANGE.max), gap: thousandths(s.zoom_box_drop.max(viewer_settings::controls::ZOOM_BOX_DROP_RANGE.min), viewer_settings::controls::ZOOM_BOX_DROP_RANGE.max) };
         let place = match s.zoom {
             Zoom::Off => None,
             Zoom::Floating131 => Some(ZoomPlace::Box(3, floating)),
@@ -1412,6 +1458,8 @@ impl Layout {
         self.magnifier = if s.menu_zoom { Some(Magnifier { zoom, ..Self::MAGNIFIER }) }
             else { place.map(|place| Magnifier { mode: MagnifierMode::World, zoom, place, region: s.zoom_place, ..Self::MAGNIFIER }) };
         self.zoom_box_block_pointer = s.zoom_box_block_pointer;
+        self.zoom_mouse_above = thousandths(s.zoom_mouse_above, viewer_settings::controls::ZOOM_MOUSE_ABOVE_RANGE.max);
+        self.zoom_mouse_below = thousandths(s.zoom_mouse_below, viewer_settings::controls::ZOOM_MOUSE_BELOW_RANGE.max);
         self.zoom_rounded = s.zoom_rounded;
         self.zoom_glass = s.zoom_glass;
         self.separator_width = s.separator_width.clamp(1, 16);
@@ -2202,16 +2250,19 @@ impl Layout {
             ZoomPlace::AboutPointer(n, thousandths) => {
                 // Its height `zoom_strip` of its region's. Above the pointer
                 // (the world cursor while the mouse is captured), else below
-                // it, clear of its arrow; centred on it across; inside its
-                // region; under the views' interface rather than dodging it.
+                // it (`zoom_mouse_motion`, gliding between the two); centred
+                // on it across; inside its region; under the views'
+                // interface rather than dodging it.
                 let r = self.zoom_region(m);
                 let w = width(r, n);
                 let h = ((r[3] as i64 * thousandths as i64 / 1000) as i32).clamp(0, r[3]);
-                let (px, py) = if self.locked { self.cursor_on_window().unwrap_or(self.pointer) } else { self.pointer };
+                let (px, py) = self.zoom_mouse_pointer();
                 let x = (px - w / 2).clamp(r[0], (r[0] + r[2] - w).max(r[0]));
-                let above = py - GAP - h;
-                let y = if above >= r[1] { above } else { py + POINTER_CLEARANCE };
-                let y = y.clamp(r[1], (r[1] + r[3] - h).max(r[1]));
+                let offset = match self.zoom_mouse_motion {
+                    Some(z) if z.glide.placed => z.now,
+                    _ => self.zoom_mouse_offset(m, None).1,
+                };
+                let y = (py + offset).clamp(r[1], (r[1] + r[3] - h).max(r[1]));
                 return ([x, y, w, h], None);
             }
             ZoomPlace::Strip(_) => return (self.strip().map_or([0, 0, 0, 0], |(s, _)| s), None),
@@ -2248,12 +2299,13 @@ impl Layout {
     /// pointer (the world cursor while the mouse is captured) is there, and
     /// then where it goes, else where it rests. It rests at the top of its
     /// region, `top` below it, centred across, `1 : n : 1` of its width.
-    /// While the pointer is where it rests (over the map, not the driver's
-    /// interface, unless it holds the pointer out instead) it goes below
-    /// that place, `gap` further down: away from the pointer however the
-    /// pointer moves in there, back once the pointer leaves it. Where the
-    /// region is too short for all of it there, it is cut at the region's
-    /// bottom.
+    /// While the pointer is near where it rests (within [`ZOOM_BOX_REACH`] of
+    /// its sides or top, or of its bottom as far as `gap`; over the map, not
+    /// the driver's interface, unless it holds the pointer out instead) it
+    /// goes below that place, `gap` further down: away from the pointer
+    /// however the pointer moves in there, back once the pointer leaves.
+    /// Where the region is too short for all of it there, it is cut at the
+    /// region's bottom.
     fn zoom_box_target(&self, m: &Magnifier) -> ([i32; 4], bool, [i32; 4]) {
         let ZoomPlace::Box(n, zb) = m.place else { return ([0; 4], false, [0; 4]) };
         let r = self.zoom_region(m);
@@ -2263,10 +2315,12 @@ impl Layout {
         let top = (r[1] + part(zb.top)).min(r[1] + r[3] - h);
         let rest = [r[0] + (r[2] - w) / 2, top, w, h];
         let p = if self.locked { self.cursor_on_window().unwrap_or(self.pointer) } else { self.pointer };
-        // (Its sides and top a frame's width wider: the pointer at its rim
-        // counts; not below, where it goes.)
+        // The pointer within `ZOOM_BOX_REACH` of its sides or top counts:
+        // it goes before the pointer gets to it. Below it only as far as
+        // the gap, where it goes: further down it would go onto the pointer.
         let [x, y, w, h] = rest;
-        let there = inside([x - GAP, y - GAP, w + 2 * GAP, h + GAP], p);
+        let (reach, under) = (part(ZOOM_BOX_REACH), part(ZOOM_BOX_REACH.min(zb.gap)));
+        let there = inside([x - reach, y - reach, w + 2 * reach, h + reach + under], p);
         let below = y + h + part(zb.gap);
         if (self.zoom_box_block_pointer && !self.locked) || self.interface_at(p).is_some() || !there || below >= r[1] + r[3] {
             return (rest, false, rest);
@@ -2274,8 +2328,50 @@ impl Layout {
         (rest, true, [x, below, w, h.min(r[1] + r[3] - below)])
     }
 
+    /// Where a box at the mouse goes about: the pointer, the world cursor
+    /// while the mouse is captured.
+    fn zoom_mouse_pointer(&self) -> (i32, i32) {
+        if self.locked { self.cursor_on_window().unwrap_or(self.pointer) } else { self.pointer }
+    }
+
+    /// A box at the mouse ([`ZoomPlace::AboutPointer`]): whether it goes
+    /// below the pointer, and its top from the pointer's height there.
+    /// Above it, `zoom_mouse_above` of its region's height between them
+    /// (at least a frame's width), where it has room; else below it,
+    /// `zoom_mouse_below` (at least clear of its arrow). Below it already
+    /// (`was_below`), it goes back above only once it has room there with
+    /// [`ZOOM_FLIP_HYSTERESIS`] to spare.
+    fn zoom_mouse_offset(&self, m: &Magnifier, was_below: Option<bool>) -> (bool, i32) {
+        let ZoomPlace::AboutPointer(_, thousandths) = m.place else { return (false, 0) };
+        let r = self.zoom_region(m);
+        let part = |t: u32| ((r[3] as i64 * t as i64 / 1000) as i32).clamp(0, r[3]);
+        let h = part(thousandths);
+        let (above, below) = (part(self.zoom_mouse_above).max(GAP) + h, part(self.zoom_mouse_below).max(POINTER_CLEARANCE));
+        let spare = if was_below == Some(true) { part(ZOOM_FLIP_HYSTERESIS) } else { 0 };
+        let goes_below = self.zoom_mouse_pointer().1 - above < r[1] + spare;
+        (goes_below, if goes_below { below } else { -above })
+    }
+
+    /// A box at the mouse `dt` seconds on its way between above and below
+    /// the pointer, gliding at [`ZOOM_GLIDE_OMEGA`] (as a floating box);
+    /// where it first shows, at once.
+    fn move_zoom_mouse(&mut self, dt: f64) {
+        let Some(m) = self.magnifier.filter(|m| matches!(m.place, ZoomPlace::AboutPointer(..)) && self.world_shown) else {
+            self.zoom_mouse_motion = None;
+            return;
+        };
+        let mut z = self.zoom_mouse_motion.unwrap_or_default();
+        let (below, offset) = self.zoom_mouse_offset(&m, z.glide.placed.then_some(z.below));
+        if z.glide.placed && below != z.below {
+            log::debug!("viewer: the zoom box at the mouse goes {}", if below { "below it" } else { "above it" });
+        }
+        z.below = below;
+        z.now = z.glide.step_at(ZOOM_GLIDE_OMEGA, (0, offset), dt, (0, 0)).1;
+        self.zoom_mouse_motion = Some(z);
+    }
+
     /// A floating zoom box `dt` seconds on its way to where it goes
-    /// ([`Layout::zoom_box_target`]), gliding as the world does (a new
+    /// ([`Layout::zoom_box_target`]), gliding at [`ZOOM_GLIDE_OMEGA`] (a new
     /// resting place, from settings or the window, is taken at once).
     fn move_zoom_box(&mut self, dt: f64) {
         let Some(m) = self.magnifier.filter(|m| matches!(m.place, ZoomPlace::Box(..)) && self.world_shown) else {
@@ -2288,7 +2384,7 @@ impl Layout {
             log::debug!("viewer: the zoom box {}", if moved { "moves out of the pointer's way" } else { "goes back" });
         }
         z.moved = moved;
-        z.now = z.glide.step((target[1], target[3]), dt, (0, 0));
+        z.now = z.glide.step_at(ZOOM_GLIDE_OMEGA, (target[1], target[3]), dt, (0, 0));
         self.zoom_box_motion = Some(z);
     }
 
@@ -2855,6 +2951,7 @@ impl Layout {
         // pointer is on top.
         let fit_rect = fit.map(|f| if f.hit == Hit::Main { main_rect } else { pane_rect.unwrap_or(main_rect) });
         self.move_zoom_box(dt);
+        self.move_zoom_mouse(dt);
         let magnifier = magnifier.filter(|m| m.place == ZoomPlace::Beside || (self.world_shown && !fit_rect.is_some_and(|f| overlap(f, self.magnifier_geometry(m).0))));
         self.magnifier_shown = magnifier.is_some();
         let zoom_box = magnifier.filter(|m| m.place != ZoomPlace::Beside);
@@ -5950,6 +6047,7 @@ mod tests {
         let geometry = |s: &Settings, pointer: (i32, i32)| {
             let mut l = arranged(s);
             mv(&mut l, pointer);
+            settle(&mut l);
             let f = frame(&mut l, vec![]);
             let m = l.magnifier.unwrap();
             assert_eq!(m.mode, MagnifierMode::World);
@@ -5983,13 +6081,15 @@ mod tests {
         let stacked = Settings { split: S::Horizontal1To1, ..right.clone() };
         assert_eq!(geometry(&stacked, (10, 10)), [160, 15, 480, 120]);
         // At the pointer: 1:1:1, 1:3:1 across, `zoom_strip` (a fifth) of
-        // the height, above the pointer, centred on it across.
-        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse111), (400, 300)), [267, 176, 266, 120]);
-        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse131), (400, 300)), [160, 176, 480, 120]);
-        // No room above: below it, clear of its arrow; inside the window.
-        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse111), (790, 5)), [534, 29, 266, 120]);
+        // the height, above the pointer (10 %, 60, between them), centred on
+        // it across.
+        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse111), (400, 300)), [267, 120, 266, 120]);
+        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse131), (400, 300)), [160, 120, 480, 120]);
+        // No room above: below it (20 %, 120, between them); inside the
+        // window.
+        assert_eq!(geometry(&settings(|s| s.zoom = Zoom::Mouse111), (790, 5)), [534, 125, 266, 120]);
         let mouse_right = Settings { zoom: Zoom::Mouse111, ..right };
-        assert_eq!(geometry(&mouse_right, (420, 590)), [404, 466, 132, 120]);
+        assert_eq!(geometry(&mouse_right, (420, 590)), [404, 410, 132, 120]);
     }
 
     #[test]
@@ -6028,7 +6128,7 @@ mod tests {
         let geometry = |s: &Settings, pointer: (i32, i32)| {
             let mut l = arranged(s);
             mv(&mut l, pointer);
-            frame(&mut l, vec![]);
+            settle(&mut l);
             l.magnifier_geometry(&l.magnifier.unwrap()).0
         };
         let (a, b) = ([0, 0, 400, 600], [404, 0, 396, 600]);
@@ -6047,7 +6147,7 @@ mod tests {
                     assert!(within(r, b), "{zoom:?} {roles:?} right at {x}: {r:?}");
                     assert!(within(o, [0, 0, 800, 600]), "{zoom:?} {roles:?} floating at {x}: {o:?}");
                     for g in [l, r, o] {
-                        assert_eq!((g[1], g[3]), (176, 120), "{zoom:?} {roles:?} at {x}: above the pointer");
+                        assert_eq!((g[1], g[3]), (120, 120), "{zoom:?} {roles:?} at {x}: above the pointer");
                     }
                     if let Some((pl, pr, po)) = last {
                         assert!(l[0] >= pl && r[0] >= pr && o[0] >= po, "{zoom:?} at {x}: it follows the mouse");
@@ -6059,14 +6159,14 @@ mod tests {
         let mouse = settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, Zoom::Mouse111, Place::LeftOrBottom));
         // Centred on the pointer in its view; at its side with the pointer in
         // the other view.
-        assert_eq!(geometry(&mouse, (200, 300)), [134, 176, 133, 120]);
-        assert_eq!(geometry(&mouse, (600, 300)), [267, 176, 133, 120]);
+        assert_eq!(geometry(&mouse, (200, 300)), [134, 120, 133, 120]);
+        assert_eq!(geometry(&mouse, (600, 300)), [267, 120, 133, 120]);
         let mouse_right = Settings { zoom_place: Place::RightOrTop, ..mouse.clone() };
-        assert_eq!(geometry(&mouse_right, (100, 300)), [404, 176, 132, 120]);
-        assert_eq!(geometry(&mouse_right, (600, 300)), [534, 176, 132, 120]);
+        assert_eq!(geometry(&mouse_right, (100, 300)), [404, 120, 132, 120]);
+        assert_eq!(geometry(&mouse_right, (600, 300)), [534, 120, 132, 120]);
         // Floating: over the divider.
         let floating = Settings { zoom_place: Place::Floating, ..mouse };
-        assert_eq!(geometry(&floating, (420, 300)), [287, 176, 266, 120]);
+        assert_eq!(geometry(&floating, (420, 300)), [287, 120, 266, 120]);
     }
 
     #[test]
@@ -6074,7 +6174,7 @@ mod tests {
         let geometry = |s: &Settings, pointer: (i32, i32)| {
             let mut l = arranged(s);
             mv(&mut l, pointer);
-            frame(&mut l, vec![]);
+            settle(&mut l);
             l.magnifier_geometry(&l.magnifier.unwrap()).0
         };
         for split in [S::Standard, S::Vertical1To1] {
@@ -6091,14 +6191,14 @@ mod tests {
             }
         }
         let mouse = |h: f32| geometry(&settings(|s| (s.zoom, s.zoom_strip) = (Zoom::Mouse111, h)), (400, 400));
-        assert_eq!(mouse(0.05), [267, 366, 266, 30]);
-        assert_eq!(mouse(0.5), [267, 96, 266, 300]);
+        assert_eq!(mouse(0.05), [267, 310, 266, 30]);
+        assert_eq!(mouse(0.5), [267, 40, 266, 300]);
         // Below 5 %: 5 %; above 50 %: 50 %.
         assert_eq!(mouse(0.01), mouse(0.05));
         assert_eq!(mouse(0.9), mouse(0.5));
         // In a view: that fraction of its height (the whole window's here).
         let right = |h: f32| geometry(&settings(|s| (s.split, s.zoom, s.zoom_place, s.zoom_strip) = (S::Vertical1To1, Zoom::Mouse131, Place::RightOrTop, h)), (600, 400));
-        assert_eq!(right(0.05), [482, 366, 237, 30]);
+        assert_eq!(right(0.05), [482, 310, 237, 30]);
         // The strip too, from 5 %.
         let strip = |h: f32| geometry(&settings(|s| (s.zoom, s.zoom_strip) = (Zoom::TopStrip, h)), (400, 400));
         assert_eq!(strip(0.05), [0, 0, 800, 30]);
@@ -6121,7 +6221,7 @@ mod tests {
         let rest = [160, 15, 480, 120];
         assert_eq!(geometry(&l), rest);
         // The pointer comes to it: it does not jump, it glides below where
-        // it rests, 2.5 % (15) further down, its top at 150.
+        // it rests, 5 % (30) further down, its top at 165.
         mv(&mut l, (400, 60));
         assert_eq!(geometry(&l), rest);
         let mut tops = vec![];
@@ -6130,9 +6230,9 @@ mod tests {
             frame(&mut l, vec![]);
             tops.push(geometry(&l)[1]);
         }
-        assert!(tops.windows(2).all(|t| t[0] <= t[1]) && tops[0] > 15 && tops[5] < 150, "{tops:?}");
+        assert!(tops.windows(2).all(|t| t[0] <= t[1]) && tops[0] > 15 && tops[5] < 165, "{tops:?}");
         settle(&mut l);
-        let moved = [160, 150, 480, 120];
+        let moved = [160, 165, 480, 120];
         assert_eq!(geometry(&l), moved);
         assert!(!inside(moved, l.pointer));
         // Wherever the pointer goes where it rests, it stays there: not
@@ -6153,7 +6253,7 @@ mod tests {
         mv(&mut l, (400, 300));
         l.advance(std::time::Duration::from_millis(16));
         frame(&mut l, vec![]);
-        assert!((16..150).contains(&geometry(&l)[1]), "{:?}", geometry(&l));
+        assert!((16..165).contains(&geometry(&l)[1]), "{:?}", geometry(&l));
         settle(&mut l);
         assert_eq!(geometry(&l), rest);
         // Its gap setting: 10 % (60) below where it rests.
@@ -6161,11 +6261,11 @@ mod tests {
         mv(&mut l, (400, 60));
         settle(&mut l);
         assert_eq!(geometry(&l), [160, 195, 480, 120]);
-        // No gap: right below where it rests.
+        // The least gap, 5 % (30), whatever the setting says.
         let mut l = arranged(&settings(|s| (s.zoom, s.zoom_box_drop) = (Zoom::Floating131, 0.0)));
         mv(&mut l, (400, 134));
         settle(&mut l);
-        assert_eq!(geometry(&l), [160, 135, 480, 120]);
+        assert_eq!(geometry(&l), [160, 165, 480, 120]);
         assert!(!inside(geometry(&l), l.pointer));
         // Half the window high, 5 % (30) down, 10 % (60) gap: cut at the
         // window's bottom.
@@ -6185,6 +6285,208 @@ mod tests {
         mv(&mut l, (10, 590));
         frame(&mut l, vec![]);
         assert_eq!(geometry(&l), [160, 0, 480, 120]);
+    }
+
+    /// As the window does it: each frame prepared on the live layout, which
+    /// is then put back as it was; once presented, the frame's layout is
+    /// taken whole if no input came meanwhile, else only what it mapped
+    /// (`adopt_presented_mapping`). The pointer moving in the box's resting
+    /// place every frame, frames of uneven length: the box shown glides
+    /// down steadily, never back, and arrives.
+    #[test]
+    fn a_floating_zoom_box_glides_steadily_while_the_pointer_moves_and_frames_are_adopted() {
+        let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
+        let geometry = |l: &Layout| l.magnifier_geometry(&l.magnifier.unwrap()).0;
+        assert_eq!(geometry(&l), [160, 15, 480, 120]);
+        mv(&mut l, (400, 60));
+        let mut shown = vec![];
+        for k in 0..120 {
+            let before = l.clone();
+            l.advance(std::time::Duration::from_millis([16, 7, 25, 11][k % 4]));
+            frame(&mut l, vec![]);
+            shown.push(geometry(&l)[1]);
+            let prepared = l.clone();
+            l = before;
+            // Input while the frame was in flight: the pointer moves on.
+            mv(&mut l, (300 + (k as i32 * 7) % 200, 30 + (k as i32 * 5) % 90));
+            l.adopt_presented_mapping(prepared);
+        }
+        assert!(shown.windows(2).all(|t| t[0] <= t[1]), "back and forth: {shown:?}");
+        assert_eq!(*shown.last().unwrap(), 165, "{shown:?}");
+        // And back up once the pointer leaves, as steadily.
+        mv(&mut l, (400, 300));
+        let mut shown = vec![];
+        for k in 0..120 {
+            let before = l.clone();
+            l.advance(std::time::Duration::from_millis([16, 7, 25, 11][k % 4]));
+            frame(&mut l, vec![]);
+            shown.push(geometry(&l)[1]);
+            let prepared = l.clone();
+            l = before;
+            mv(&mut l, (300 + (k as i32 * 7) % 200, 300 + (k as i32 * 5) % 90));
+            l.adopt_presented_mapping(prepared);
+        }
+        assert!(shown.windows(2).all(|t| t[0] >= t[1]), "back and forth: {shown:?}");
+        assert_eq!(*shown.last().unwrap(), 15, "{shown:?}");
+    }
+
+    /// The frames' tops of a floating box until it rests (at most 2 s),
+    /// frames 16 ms apart.
+    fn glide_tops(l: &mut Layout) -> Vec<i32> {
+        let geometry = |l: &Layout| l.magnifier_geometry(&l.magnifier.unwrap()).0;
+        let mut tops = vec![geometry(l)[1]];
+        for _ in 0..125 {
+            l.advance(std::time::Duration::from_millis(16));
+            frame(l, vec![]);
+            tops.push(geometry(l)[1]);
+        }
+        tops
+    }
+
+    /// No frame moves a box further than the spring can at its fastest
+    /// (from rest, `distance` · ω / e a second), and it never turns back.
+    fn assert_smooth(tops: &[i32], distance: i32, omega: f64) {
+        let most = (distance.abs() as f64 * omega / std::f64::consts::E * 0.016).ceil() as i32 + 1;
+        assert!(tops.windows(2).all(|t| (t[1] - t[0]).abs() <= most), "a jump over {most}: {tops:?}");
+        let sign = distance.signum();
+        assert!(tops.windows(2).all(|t| (t[1] - t[0]) * sign >= 0), "back and forth: {tops:?}");
+    }
+
+    #[test]
+    fn a_floating_zoom_box_glides_twice_as_fast_as_the_world_without_jumps() {
+        let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
+        mv(&mut l, (400, 60));
+        let tops = glide_tops(&mut l);
+        assert_smooth(&tops, 165 - 15, ZOOM_GLIDE_OMEGA);
+        let arrived = tops.iter().position(|&t| t == 165).expect("arrives");
+        // The world's own glide over the same way.
+        let mut g = Glide::default();
+        g.snap((0, 15));
+        let world = (1..).find(|_| g.step((0, 165), 0.016, (0, 0)).1 == 165).unwrap();
+        assert!((world * 4 / 10..=world * 6 / 10).contains(&arrived), "{arrived} frames, the world {world}: {tops:?}");
+        // And back.
+        mv(&mut l, (400, 300));
+        let tops = glide_tops(&mut l);
+        assert_smooth(&tops, 15 - 165, ZOOM_GLIDE_OMEGA);
+        assert_eq!(*tops.last().unwrap(), 15);
+    }
+
+    #[test]
+    fn a_floating_zoom_box_moves_once_the_pointer_comes_within_five_percent() {
+        let geometry = |l: &Layout| l.magnifier_geometry(&l.magnifier.unwrap()).0;
+        let moved = |l: &Layout| l.zoom_box_target(&l.magnifier.unwrap()).1;
+        // At rest [160, 15, 480, 120]; 5 % of 600 is 30 (below as well: the
+        // gap is 30 too).
+        for (out, near) in [((129, 75), (130, 75)), ((670, 75), (669, 75)), ((129, 0), (130, 0)), ((400, 165), (400, 164))] {
+            let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
+            mv(&mut l, out);
+            assert!(!moved(&l), "{out:?}");
+            mv(&mut l, near);
+            assert!(moved(&l), "{near:?}");
+        }
+        // The pointer coming at it from the sides and the top, a frame
+        // every 16 ms, finds it gone. (From the top the pointer is within
+        // reach at once. From a side, the lower its height the further the
+        // box has to go before its top is past the pointer: at 125 pixels a
+        // second anywhere, faster only in its upper part, where the box is
+        // past the pointer before the pointer covers the 30 pixels. From
+        // below the box cannot go out of the way: it goes down, through the
+        // pointer.)
+        let approaches = [2, 4, 8, 20].into_iter().flat_map(|v| [(400, 0), (200, 0), (620, 0)].map(|p| (p, (0, 1), v)))
+            .chain([20, 45, 75, 105, 130].into_iter().flat_map(|y| [((10, y), (1, 0), 2), ((790, y), (-1, 0), 2)]))
+            .chain([4, 8].into_iter().flat_map(|v| [20, 45].map(|y| [((10, y), (1, 0), v), ((790, y), (-1, 0), v)])).flatten());
+        for (start, (dx, dy), v) in approaches {
+            let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
+            let mut p = start;
+            mv(&mut l, p);
+            settle(&mut l);
+            // Up to the box's middle.
+            while (dx != 0 && (p.0 - 400) * dx < 0) || (dy != 0 && p.1 < 75) {
+                p = (p.0 + dx * v, p.1 + dy * v);
+                mv(&mut l, p);
+                l.advance(std::time::Duration::from_millis(16));
+                frame(&mut l, vec![]);
+                assert!(!inside(geometry(&l), p), "from {start:?} at {v} pixels a frame: at {p:?} in {:?}", geometry(&l));
+            }
+            assert!(moved(&l));
+        }
+    }
+
+    /// A box at the mouse's top from the pointer, frame by frame (16 ms)
+    /// while `pointer` gives where the pointer goes at each frame.
+    fn mouse_box_offsets(l: &mut Layout, frames: usize, pointer: impl Fn(usize) -> (i32, i32)) -> (Vec<i32>, usize) {
+        let mut offsets = vec![];
+        let mut flips = 0;
+        let mut below = l.zoom_mouse_motion.unwrap().below;
+        for k in 0..frames {
+            let p = pointer(k);
+            mv(l, p);
+            l.advance(std::time::Duration::from_millis(16));
+            frame(l, vec![]);
+            offsets.push(l.magnifier_geometry(&l.magnifier.unwrap()).0[1] - p.1);
+            if l.zoom_mouse_motion.unwrap().below != below {
+                below = !below;
+                flips += 1;
+            }
+        }
+        (offsets, flips)
+    }
+
+    #[test]
+    fn a_zoom_box_at_the_mouse_flips_once_about_the_top_gliding_without_turning_back() {
+        // A fifth (120) high, 10 % (60) above the pointer: room above while
+        // the pointer is 180 down; below it, 20 % (120) between them; back
+        // above only from 195 (2.5 %, 15, to spare).
+        let mut l = arranged(&settings(|s| s.zoom = Zoom::Mouse111));
+        mv(&mut l, (400, 300));
+        settle(&mut l);
+        assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0[1], 120);
+        // Up to 170, then about the flip, 172 to 192 and back, for 2 s.
+        let up = |k: usize| (400, (300 - 3 * k as i32).max(170));
+        let wobble = |k: usize| (400, 182 + [-10, -5, 0, 5, 10, 5, 0, -5][k % 8]);
+        let (mut offsets, flips) = mouse_box_offsets(&mut l, 50, up);
+        let (more, more_flips) = mouse_box_offsets(&mut l, 125, wobble);
+        offsets.extend(more);
+        assert_eq!((flips, more_flips), (1, 0), "{offsets:?}");
+        assert!(offsets.windows(2).all(|o| o[0] <= o[1]), "back and forth: {offsets:?}");
+        assert_eq!(*offsets.last().unwrap(), 120);
+        assert_smooth(&offsets, 300, ZOOM_GLIDE_OMEGA);
+        // Down past 195: above again, once, as smoothly.
+        let down = |k: usize| (400, (190 + k as i32).min(260));
+        let (offsets, flips) = mouse_box_offsets(&mut l, 125, down);
+        assert_eq!(flips, 1, "{offsets:?}");
+        assert!(offsets.windows(2).all(|o| o[0] >= o[1]), "back and forth: {offsets:?}");
+        assert_eq!(*offsets.last().unwrap(), -180);
+        assert_smooth(&offsets, -300, ZOOM_GLIDE_OMEGA);
+    }
+
+    #[test]
+    fn a_zoom_box_at_the_mouse_glides_as_fast_as_a_floating_box_and_never_jumps() {
+        // Where it first shows: at once where it goes (above the pointer).
+        let mut l = Layout::default();
+        l.apply_settings(&settings(|s| s.zoom = Zoom::Mouse111));
+        mv(&mut l, (400, 300));
+        frame(&mut l, vec![]);
+        assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0[1], 120);
+        settle(&mut l);
+        assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0[1], 120);
+        // The pointer jumps up to where there is no room above: the box
+        // follows it, and glides below it (300 pixels) as fast as a floating
+        // box glides (`ZOOM_GLIDE_OMEGA`), no frame further than that allows.
+        let (offsets, flips) = mouse_box_offsets(&mut l, 125, |_| (400, 100));
+        assert_eq!(flips, 1);
+        assert_smooth(&offsets, 300, ZOOM_GLIDE_OMEGA);
+        let arrived = offsets.iter().position(|&o| o == 120).expect("arrives");
+        let mut g = Glide::default();
+        g.snap((0, -180));
+        let same = (1..).find(|_| g.step_at(ZOOM_GLIDE_OMEGA, (0, 120), 0.016, (0, 0)).1 == 120).unwrap();
+        // (Within a frame: at first it is held at the window's top.)
+        assert!((arrived + 1).abs_diff(same) <= 1, "{} frames, {same} for the spring: {offsets:?}", arrived + 1);
+        // Another distance below it (the settings): it glides there too.
+        l.apply_settings(&settings(|s| (s.zoom, s.zoom_mouse_below) = (Zoom::Mouse111, 0.4)));
+        let (offsets, _) = mouse_box_offsets(&mut l, 125, |_| (400, 100));
+        assert_smooth(&offsets, 120, ZOOM_GLIDE_OMEGA);
+        assert_eq!(*offsets.last().unwrap(), 240);
     }
 
     #[test]
@@ -6269,10 +6571,14 @@ mod tests {
         // moved below them.
         for zoom in [Zoom::Mouse111, Zoom::Mouse131] {
             let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, zoom, Place::LeftOrBottom)));
-            mv(&mut l, (100, 140));
+            mv(&mut l, (100, 200));
+            for _ in 0..90 {
+                l.advance(std::time::Duration::from_millis(16));
+                l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            }
             let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
             let r = l.magnifier_geometry(&l.magnifier.unwrap()).0;
-            assert_eq!((r[0], r[1], r[3]), (if zoom == Zoom::Mouse111 { 34 } else { 0 }, 16, 120), "{zoom:?}");
+            assert_eq!((r[0], r[1], r[3]), (if zoom == Zoom::Mouse111 { 34 } else { 0 }, 20, 120), "{zoom:?}");
             assert!(f.view_cameras[2].unwrap() as usize > boxed(&f, r), "{zoom:?}: the buttons are drawn over the box");
             assert_ne!(l.hit((30, 20)), Hit::Magnifier, "{zoom:?}");
             assert_eq!(l.hit((60, 100)), Hit::Magnifier, "{zoom:?}");
@@ -7076,9 +7382,9 @@ mod tests {
                     l.take_warp();
                     mv(&mut l, p);
                     settle(&mut l);
-                    // Below where it rests, 2.5 % of the region's height further.
+                    // Below where it rests, 5 % of the region's height further.
                     let moved = l.magnifier_geometry(&m).0;
-                    assert_eq!(moved, [initial[0], initial[1] + initial[3] + part(25), initial[2], initial[3]]);
+                    assert_eq!(moved, [initial[0], initial[1] + initial[3] + part(50), initial[2], initial[3]]);
                     assert_eq!(l.pointer, p);
                     assert!(!inside(moved, p));
                     assert!(l.zoom_pointer_walls().is_empty());
@@ -8226,15 +8532,15 @@ mod tests {
     fn a_zoom_box_at_the_mouse_goes_above_the_world_cursor_while_captured() {
         let mut l = arranged(&settings(|s| (s.split, s.roles, s.zoom, s.zoom_place) = (S::Vertical1To1, Roles::UnitMouse, Zoom::Mouse111, Place::RightOrTop)));
         mv(&mut l, (600, 400));
-        frame(&mut l, vec![]);
+        settle(&mut l);
         // (Above the pointer: never under it.)
         assert_eq!(l.hit((600, 400)), Hit::Pane);
         click(&mut l, (600, 400));
         assert!(l.locked);
-        frame(&mut l, vec![]);
+        settle(&mut l);
         let at = l.cursor_on_window().unwrap();
         let r = l.magnifier_geometry(&l.magnifier.unwrap()).0;
-        assert_eq!((r[0] + r[2] / 2, r[1] + r[3]), (at.0.clamp(404 + 66, 800 - 66), at.1 - GAP), "{r:?} {at:?}");
+        assert_eq!((r[0] + r[2] / 2, r[1] + r[3]), (at.0.clamp(404 + 66, 800 - 66), at.1 - 60), "{r:?} {at:?}");
     }
 
     // ---- Smooth world movement --------------------------------------------
@@ -9187,6 +9493,11 @@ impl Layout {
         self.hud_scale = frame.hud_scale;
         self.window_pixel_scale = frame.window_pixel_scale;
         self.art_zooms = frame.art_zooms;
+        // Where a floating zoom box is on its way: the next frame glides on
+        // from where this one showed it (and clicks go where it is shown),
+        // not again from where it was before this frame.
+        self.zoom_box_motion = frame.zoom_box_motion;
+        self.zoom_mouse_motion = frame.zoom_mouse_motion;
     }
 }
 

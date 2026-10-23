@@ -290,16 +290,18 @@ pub enum Zoom {
     Off,
     /// A box at the top of its region, centred across, `1:3:1` of the
     /// width, [`Layout::zoom_strip`] of the height, its top
-    /// [`Layout::zoom_box_top`] below the region's top. While the pointer
-    /// is where it rests, it moves (gliding) below that place, its top
-    /// [`Layout::zoom_box_drop`] below that place's bottom (or holds the
-    /// pointer out, [`Layout::zoom_box_block_pointer`]).
+    /// [`Layout::zoom_box_top`] below the region's top. Once the pointer
+    /// comes within 5% of the height of where it rests, it moves (gliding)
+    /// below that place, its top [`Layout::zoom_box_drop`] below that
+    /// place's bottom (or holds the pointer out,
+    /// [`Layout::zoom_box_block_pointer`]).
     Floating131,
     /// As `Floating131`, `1:7:1`.
     Floating171,
-    /// A box at the mouse: above it (below where there is no room), centred
-    /// on it across; `1:1:1` of the width, [`Layout::zoom_strip`] of the
-    /// height.
+    /// A box at the mouse: [`Layout::zoom_mouse_above`] above it (else
+    /// [`Layout::zoom_mouse_below`] below it, where there is no room above),
+    /// centred on it across; `1:1:1` of the width, [`Layout::zoom_strip`]
+    /// of the height.
     Mouse111,
     /// As `Mouse111`, `1:3:1` of the width.
     Mouse131,
@@ -380,11 +382,19 @@ pub struct Layout {
     pub zoom_box_top: f32,
     /// The floating boxes, moved out of the pointer's way (while it is
     /// where they rest): the gap between where they rest and their top, as
-    /// a fraction of the region's height, 0..=0.1, default 0.025. Saved as
+    /// a fraction of the region's height, 0.05..=0.15, default 0.05. Saved as
     /// `zoom_box_gap`: the older `zoom_box_drop` (how far below the
     /// pointer they dropped) meant something else and is not read.
     #[serde(rename = "zoom_box_gap")]
     pub zoom_box_drop: f32,
+    /// The boxes at the mouse ([`Zoom::Mouse111`], [`Zoom::Mouse131`]): the
+    /// space between the pointer and the bottom of the box above it, as a
+    /// fraction of its region's height, 0..=0.3, default 0.1.
+    pub zoom_mouse_above: f32,
+    /// The boxes at the mouse, below the pointer where there is no room
+    /// above it: the space between the pointer and the box's top, as a
+    /// fraction of its region's height, 0..=0.4, default 0.2.
+    pub zoom_mouse_below: f32,
     /// How much the zoom box or strip enlarges the world beyond how large
     /// the view under it shows it (world scale and view zoom): one of
     /// [`Layout::MAGNIFICATIONS`] (another value counts as the nearest),
@@ -426,7 +436,9 @@ impl Default for Layout {
             menu_zoom: false,
             zoom_strip: 0.2,
             zoom_box_top: 0.025,
-            zoom_box_drop: 0.025,
+            zoom_box_drop: 0.05,
+            zoom_mouse_above: 0.1,
+            zoom_mouse_below: 0.2,
             zoom_magnification: 2.0,
             zoom_box_height: 0.0,
             zoom_box_block_pointer: false,
@@ -692,15 +704,15 @@ mod tests {
     #[test]
     fn every_zoom_is_a_fifth_high_and_older_floating_box_settings_still_load() {
         let l = Settings::default().layout;
-        assert_eq!((l.zoom_strip, l.zoom_box_top, l.zoom_box_drop), (0.2, 0.025, 0.025));
+        assert_eq!((l.zoom_strip, l.zoom_box_top, l.zoom_box_drop), (0.2, 0.025, 0.05));
         // (An older drop below the pointer is not the gap: not read.)
         let old = "[layout]\nzoom = 'Floating131'\nzoom_strip = 0.35\nzoom_box_height = 0.6\nzoom_box_block_pointer = true\nzoom_box_drop = 0.3\n";
         let s: Settings = toml::from_str(old).unwrap();
         assert_eq!((s.layout.zoom, s.layout.zoom_strip, s.layout.zoom_box_block_pointer), (Zoom::Floating131, 0.35, true));
-        assert_eq!((s.layout.zoom_box_top, s.layout.zoom_box_drop), (0.025, 0.025));
-        let gap: Settings = toml::from_str("[layout]\nzoom_box_gap = 0.05\n").unwrap();
-        assert_eq!(gap.layout.zoom_box_drop, 0.05);
-        assert!(toml::to_string(&gap).unwrap().contains("zoom_box_gap = 0.05"));
+        assert_eq!((s.layout.zoom_box_top, s.layout.zoom_box_drop), (0.025, 0.05));
+        let gap: Settings = toml::from_str("[layout]\nzoom_box_gap = 0.1\n").unwrap();
+        assert_eq!(gap.layout.zoom_box_drop, 0.1);
+        assert!(toml::to_string(&gap).unwrap().contains("zoom_box_gap = 0.1"));
         // The magnification: 2× unless set, the nearest of the choices.
         assert_eq!((s.layout.zoom_magnification, s.layout.zoom_magnification_step()), (2.0, 1));
         for (m, step) in [(1.0, 0), (1.5, 0), (2.4, 1), (2.6, 2), (3.0, 2), (9.0, 3), (f32::NAN, 1)] {
