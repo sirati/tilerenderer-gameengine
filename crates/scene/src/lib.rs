@@ -210,8 +210,8 @@ pub struct SpriteLifetime {
 /// A range of world sprites on its way: they move by `way` (world pixels,
 /// full size), evenly over `duration_ms`, then stay there. Its clock runs on
 /// the viewer's monotonic clock from when the batch first telling `serial`
-/// arrived, less `elapsed_ms`: how much of it had passed as the driver sent
-/// that batch. A nonzero serial identifies one telling; resending it must
+/// arrived: the sprites start at the start of the way, however late the
+/// driver could send it. A nonzero serial identifies one telling; resending it must
 /// not restart its clock. Drivers allocate serials in increasing order
 /// across the session. `sprites` is a half-open range in
 /// [`Scene::sprites`], drawn where the way begins.
@@ -221,7 +221,6 @@ pub struct Motion {
     pub sprites: (u32, u32),
     pub way: (i32, i32),
     pub duration_ms: u32,
-    pub elapsed_ms: u32,
 }
 
 /// What the renderer knows: the whole world and the views of it. Drivers
@@ -1574,7 +1573,7 @@ mod tests {
     #[test]
     fn motions_keep_their_first_arrival() {
         let (driver, mut display) = connect();
-        let motion = |serial| Motion { serial, sprites: (0, 1), way: (64, 32), duration_ms: 100, elapsed_ms: 0 };
+        let motion = |serial| Motion { serial, sprites: (0, 1), way: (64, 32), duration_ms: 100 };
         let before = std::time::Instant::now();
         driver.send(vec![Update::Motions(vec![motion(1)])]);
         assert!(display.receive(Duration::ZERO));

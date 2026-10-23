@@ -3687,7 +3687,9 @@ impl App {
                 // (A frame-timing trace of the slides: `TILE_VIEWER_MOTION_TRACE=1`.)
                 static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| profile::env_on("TILE_VIEWER_MOTION_TRACE"));
                 if *TRACE {
-                    log::info!("viewer: motion at {:.1} ms: {offsets:?}", started.duration_since(self.started).as_secs_f64() * 1000.0);
+                    let free = &self.world.as_ref().expect("built above").free;
+                    let at: Vec<_> = offsets.iter().flat_map(|&((a, b), _)| (a..b).filter_map(|i| free.get(i as usize).map(|s| (s.x, s.y)))).collect();
+                    log::info!("viewer: motion at {:.1} ms (scene {}): {offsets:?} sprites at {at:?}", started.duration_since(self.started).as_secs_f64() * 1000.0, scene.seq);
                 }
             }
         }

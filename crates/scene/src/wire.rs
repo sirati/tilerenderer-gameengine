@@ -396,7 +396,6 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     w.i32(m.way.0);
                     w.i32(m.way.1);
                     w.u32(m.duration_ms);
-                    w.u32(m.elapsed_ms);
                 }
             }
             Update::View { id, view } => {
@@ -702,11 +701,11 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
             }
             2 => Update::Sprites(r.sprites()?),
             29 => {
-                let n = r.len(32)?;
+                let n = r.len(28)?;
                 let mut motions = Vec::with_capacity(n);
                 for _ in 0..n {
                     let serial = u64::from(r.u32()?) | (u64::from(r.u32()?) << 32);
-                    motions.push(crate::Motion { serial, sprites: (r.u32()?, r.u32()?), way: (r.i32()?, r.i32()?), duration_ms: r.u32()?, elapsed_ms: r.u32()? });
+                    motions.push(crate::Motion { serial, sprites: (r.u32()?, r.u32()?), way: (r.i32()?, r.i32()?), duration_ms: r.u32()? });
                 }
                 Update::Motions(motions)
             }
@@ -1290,7 +1289,7 @@ mod tests {
     #[test]
     fn motions_round_trip_diff_and_apply() {
         let mut after = crate::Scene::default();
-        after.motions = vec![crate::Motion { serial: 0x0123_4567_89AB_CDEF, sprites: (3, 9), way: (-64, 32), duration_ms: 75, elapsed_ms: 12 }];
+        after.motions = vec![crate::Motion { serial: 0x0123_4567_89AB_CDEF, sprites: (3, 9), way: (-64, 32), duration_ms: 75 }];
         let updates = after.updates_since(&crate::Scene::default());
         assert_eq!(updates, vec![Update::Motions(after.motions.clone())]);
         assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);

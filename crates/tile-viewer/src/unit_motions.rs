@@ -1,9 +1,8 @@
 //! World sprites on their way (`scene::Motion`: units sliding to the next
 //! tile), moved on the viewer's own clock at its frame rate, not at the rate
 //! the driver publishes. Each telling's clock starts when its batch arrived
-//! (`scene::Display::motion_arrival`; else when a frame first shows it),
-//! less what had passed of it as the driver sent it; resending it changes
-//! nothing.
+//! (`scene::Display::motion_arrival`; else when a frame first shows it), so
+//! its first frame starts the whole way; resending it changes nothing.
 use std::{collections::HashMap, time::{Duration, Instant}};
 
 #[derive(Default)]
@@ -35,10 +34,7 @@ impl UnitMotions {
         self.started.retain(|serial, _| scene.motions.iter().any(|m| m.serial == *serial));
         let n = scene.sprites.len() as u32;
         let offsets: Vec<_> = scene.motions.iter().map(|m| {
-            let started = *self.started.entry(m.serial).or_insert_with(|| {
-                let arrived = arrival(m.serial).unwrap_or(now);
-                arrived.checked_sub(Duration::from_millis(m.elapsed_ms.into())).unwrap_or(arrived)
-            });
+            let started = *self.started.entry(m.serial).or_insert_with(|| arrival(m.serial).unwrap_or(now));
             ((m.sprites.0.min(n), m.sprites.1.min(n)), offset_at(m.way, m.duration_ms, now.saturating_duration_since(started)))
         }).collect();
         if !rebuilt && offsets == self.applied {
@@ -77,7 +73,7 @@ mod tests {
     use super::*;
 
     fn motion(serial: u64) -> scene::Motion {
-        scene::Motion { serial, sprites: (1, 3), way: (64, 32), duration_ms: 100, elapsed_ms: 0 }
+        scene::Motion { serial, sprites: (1, 3), way: (64, 32), duration_ms: 100 }
     }
 
     fn scene_with(motions: Vec<scene::Motion>) -> scene::Scene {
@@ -119,14 +115,14 @@ mod tests {
     }
 
     #[test]
-    fn the_clock_starts_at_the_batch_s_arrival_less_what_had_passed_when_sent() {
+    fn the_clock_starts_when_the_batch_arrived_not_when_first_drawn() {
         let arrived = Instant::now();
         let mut m = UnitMotions::default();
-        // Sent 40 ms into the slide; first drawn 10 ms after it arrived.
-        let scene = scene_with(vec![scene::Motion { elapsed_ms: 40, ..motion(8) }]);
+        let scene = scene_with(vec![motion(8)]);
         let at = |ms| arrived + Duration::from_millis(ms);
-        assert_eq!(m.offsets(&scene, at(10), false, |s| (s == 8).then_some(arrived)).unwrap(), [((1, 3), (32, 16))]);
-        assert_eq!(m.offsets(&scene, at(60), false, |_| None).unwrap(), [((1, 3), (64, 32))]);
+        // First drawn 10 ms after its batch arrived (a frame later).
+        assert_eq!(m.offsets(&scene, at(10), false, |s| (s == 8).then_some(arrived)).unwrap(), [((1, 3), (6, 3))]);
+        assert_eq!(m.offsets(&scene, at(100), false, |_| None).unwrap(), [((1, 3), (64, 32))]);
     }
 
     /// What a frame of a slide costs the viewer (`--ignored --nocapture`):
