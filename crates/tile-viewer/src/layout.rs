@@ -6187,6 +6187,49 @@ mod tests {
         assert_eq!(geometry(&l), [160, 0, 480, 120]);
     }
 
+    /// As the window does it: each frame prepared on the live layout, which
+    /// is then put back as it was; once presented, the frame's layout is
+    /// taken whole if no input came meanwhile, else only what it mapped
+    /// (`adopt_presented_mapping`). The pointer moving in the box's resting
+    /// place every frame, frames of uneven length: the box shown glides
+    /// down steadily, never back, and arrives.
+    #[test]
+    fn a_floating_zoom_box_glides_steadily_while_the_pointer_moves_and_frames_are_adopted() {
+        let mut l = arranged(&settings(|s| s.zoom = Zoom::Floating131));
+        let geometry = |l: &Layout| l.magnifier_geometry(&l.magnifier.unwrap()).0;
+        assert_eq!(geometry(&l), [160, 15, 480, 120]);
+        mv(&mut l, (400, 60));
+        let mut shown = vec![];
+        for k in 0..120 {
+            let before = l.clone();
+            l.advance(std::time::Duration::from_millis([16, 7, 25, 11][k % 4]));
+            frame(&mut l, vec![]);
+            shown.push(geometry(&l)[1]);
+            let prepared = l.clone();
+            l = before;
+            // Input while the frame was in flight: the pointer moves on.
+            mv(&mut l, (300 + (k as i32 * 7) % 200, 30 + (k as i32 * 5) % 90));
+            l.adopt_presented_mapping(prepared);
+        }
+        assert!(shown.windows(2).all(|t| t[0] <= t[1]), "back and forth: {shown:?}");
+        assert_eq!(*shown.last().unwrap(), 150, "{shown:?}");
+        // And back up once the pointer leaves, as steadily.
+        mv(&mut l, (400, 300));
+        let mut shown = vec![];
+        for k in 0..120 {
+            let before = l.clone();
+            l.advance(std::time::Duration::from_millis([16, 7, 25, 11][k % 4]));
+            frame(&mut l, vec![]);
+            shown.push(geometry(&l)[1]);
+            let prepared = l.clone();
+            l = before;
+            mv(&mut l, (300 + (k as i32 * 7) % 200, 300 + (k as i32 * 5) % 90));
+            l.adopt_presented_mapping(prepared);
+        }
+        assert!(shown.windows(2).all(|t| t[0] >= t[1]), "back and forth: {shown:?}");
+        assert_eq!(*shown.last().unwrap(), 15, "{shown:?}");
+    }
+
     #[test]
     fn every_zoom_magnifies_the_world_as_large_as_the_view_under_it_shows_it() {
         let shown_zoom = |l: &Layout| l.shown.iter().find(|(h, _)| *h == Hit::Magnifier).unwrap().1.zoom;
@@ -9187,6 +9230,10 @@ impl Layout {
         self.hud_scale = frame.hud_scale;
         self.window_pixel_scale = frame.window_pixel_scale;
         self.art_zooms = frame.art_zooms;
+        // Where a floating zoom box is on its way: the next frame glides on
+        // from where this one showed it (and clicks go where it is shown),
+        // not again from where it was before this frame.
+        self.zoom_box_motion = frame.zoom_box_motion;
     }
 }
 
