@@ -21,7 +21,7 @@ use tile_render::{Camera, GlyphShape, OutlineGlyph, PlacedSprite, SolidRect};
 /// Unanswered for longer than this: busy.
 pub const BUSY_AFTER: Duration = Duration::from_millis(500);
 /// Unanswered for longer than this: stuck.
-pub const STUCK_AFTER: Duration = Duration::from_secs(3);
+pub const STUCK_AFTER: Duration = Duration::from_secs(5);
 
 /// The panel's art: the parchment, its edges (a row, a column), the busy
 /// cursor (the loading cursor's turning hourglass, as the busy pointer),
@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn answering_then_busy_after_half_a_second_then_stuck_after_three_then_hidden_again() {
+    fn answering_then_busy_after_half_a_second_then_stuck_after_five_then_hidden_again() {
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         // The game's thread stops answering at t0; statuses keep coming.
@@ -362,7 +362,10 @@ mod tests {
         assert_eq!(judge(host(500), at(500)), Responsiveness::Answering, "500 ms is not yet more than 500 ms");
         assert_eq!(judge(host(500), at(501)), Responsiveness::Busy);
         assert_eq!(judge(host(2_900), at(3_000)), Responsiveness::Busy);
-        assert_eq!(judge(host(3_000), at(3_001)), Responsiveness::Stuck);
+        assert_eq!(judge(host(3_000), at(3_001)), Responsiveness::Busy);
+        assert_eq!(STUCK_AFTER, Duration::from_secs(5));
+        assert_eq!(judge(host(4_900), at(5_000)), Responsiveness::Busy);
+        assert_eq!(judge(host(5_000), at(5_001)), Responsiveness::Stuck);
         assert_eq!(judge(host(9_000), at(9_050)), Responsiveness::Stuck);
         // It answers again: hidden at once.
         assert_eq!(judge(Some((status(0), at(9_100))), at(9_100)), Responsiveness::Answering);
@@ -388,9 +391,10 @@ mod tests {
         let last = Some((status(0), t0));
         assert_eq!(judge(last, t0 + Duration::from_millis(400)), Responsiveness::Answering);
         assert_eq!(judge(last, t0 + Duration::from_millis(600)), Responsiveness::Busy);
-        assert_eq!(judge(last, t0 + Duration::from_millis(3_100)), Responsiveness::Stuck);
+        assert_eq!(judge(last, t0 + Duration::from_millis(3_100)), Responsiveness::Busy);
+        assert_eq!(judge(last, t0 + Duration::from_millis(5_100)), Responsiveness::Stuck);
         // Silence on top of what was said.
-        assert_eq!(judge(Some((status(2_800), t0)), t0 + Duration::from_millis(300)), Responsiveness::Stuck);
+        assert_eq!(judge(Some((status(4_800), t0)), t0 + Duration::from_millis(300)), Responsiveness::Stuck);
         // A driver that sends no status: nothing shows.
         assert_eq!(judge(None, t0 + Duration::from_secs(60)), Responsiveness::Answering);
     }

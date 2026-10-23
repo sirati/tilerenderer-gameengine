@@ -1007,6 +1007,13 @@ fn in_the_mode_only_the_snapping_pointer_and_its_ghost_are_drawn() {
         image = "p"
         cell = [14, 22]
         group = "Viewer@pointer"
+        [images.hourglass]
+        source = "solid:200,180,100,255:46x46"
+        [sheets.hourglass]
+        image = "hourglass"
+        cell = [46, 46]
+        anchor = [-23, -23]
+        group = "Viewer@loading_cursor"
         "#,
     )
     .unwrap()
@@ -1035,6 +1042,15 @@ fn in_the_mode_only_the_snapping_pointer_and_its_ghost_are_drawn() {
     assert_eq!(sprites[1].set, compiled.set(ARROW_SPRITE).unwrap().0);
     assert_eq!((sprites[1].x, sprites[1].y, sprites[1].view, sprites[1].screen), (400, 300, Some(7), true));
     assert!(sprites.iter().all(|p| p.view == Some(7) && p.screen));
+    for status in [crate::host_status::Responsiveness::Busy, crate::host_status::Responsiveness::Stuck] {
+        let busy = snap.compose_with_busy(&compiled, 7, 8, crate::cursor::Scale::default(), WINDOW, status);
+        assert_eq!(&busy.sprites[..2], sprites.as_slice(), "keep both pointer and ghost for {status:?}");
+        assert_eq!(busy.sprites.len(), 3, "one badge on the solid pointer only");
+        assert_eq!(busy.sprites[2].set, compiled.set(scene::loading_cursor::SET).unwrap().0);
+        assert_eq!(busy.sprites[2].ticks_per_frame, scene::loading_cursor::TICKS_PER_FRAME);
+        assert_eq!(busy.top.len(), 1);
+        assert!(busy.top[0].origin.0 > 400 && busy.top[0].origin.1 > 300);
+    }
     // Landed: the ghost under the pointer is not drawn.
     ticks(&mut snap, &mut l, &s, 0.0, 1.0);
     let sprites = snap.sprites(&compiled, 7);

@@ -1126,9 +1126,8 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         pending_cursor_art: None,
         custom_cursors: std::collections::HashMap::new(),
         system_cursor_size: cursor::NOMINAL,
-        shown_cursor_scale: cursor::Scale::default(),
         cursor_builds: CursorBuilds { native_thread_init, ..Default::default() },
-        shown_pointer: None,
+        pointer_presentation: system_cursor::Presentation::default(),
         capture_icon: false,
         pointer_inside: true,
         pointer_since: None,
@@ -1420,16 +1419,14 @@ struct App {
     /// A committed whole atlas's cursor pixels, activated only when its
     /// scene becomes drawable. Old custom cursors remain usable meanwhile.
     pending_cursor_art: Option<(u64, cursor::Art)>,
-    custom_cursors: std::collections::HashMap<(u32, cursor::Scale), winit::window::CustomCursor>,
+    custom_cursors: std::collections::HashMap<(cursor::Shown, cursor::Scale), winit::window::CustomCursor>,
     /// The operating system's cursor size (window pixels; the cursor size
-    /// setting's default), the scale the system pointer was last shown
-    /// at. Normal uncaptured pointers are always drawn by the OS.
+    /// setting's default). Normal uncaptured pointers are drawn by the OS.
     system_cursor_size: u32,
-    shown_cursor_scale: cursor::Scale,
     /// System cursors being made (off the event loop: the picture never
     /// waits for one).
     cursor_builds: CursorBuilds,
-    shown_pointer: Option<cursor::Shown>,
+    pointer_presentation: system_cursor::Presentation,
     capture_icon: bool,
     /// Whether the system pointer is in the window.
     pointer_inside: bool,
@@ -2668,7 +2665,7 @@ impl App {
         if self.os_cursor.refresh(self.display.scene(), whole.generation, through, whole.cursor_art.clone()) {
             self.custom_cursors.clear();
             self.cursor_builds.forget();
-            self.shown_pointer = None;
+            self.pointer_presentation.shown = None;
         }
     }
 
@@ -2683,16 +2680,25 @@ impl App {
         // System cursors made since (each asked for again).
         for (key, source) in self.cursor_builds.take_ready() {
             self.custom_cursors.insert(key, event_loop.create_custom_cursor(source));
-            self.shown_pointer = None;
+            self.pointer_presentation.shown = None;
         }
-        let shown = self.os_cursor.shown_at(self.pointer_hidden(), self.capture_icon, self.display.scene().interface.targeting, std::time::Duration::from_secs_f64(self.now().max(0.0)));
+        let status = host_status::judge(self.display.host(), Instant::now());
+        let hidden = self.pointer_presentation.active() && self.pointer_hidden();
+        let shown = self.os_cursor.shown_busy(hidden, self.capture_icon, self.display.scene().interface.targeting, self.layout.captured(), status, std::time::Duration::from_secs_f64(self.now().max(0.0)));
         let scale = self.cursor_scale();
-        let Some(gpu) = &self.gpu else { return };
-        if self.shown_pointer == Some(shown) && self.shown_cursor_scale == scale {
-            return;
+        if self.gpu.is_none() { return; }
+        let Some(restore) = self.pointer_presentation.apply(shown, scale) else { return };
+        if restore {
+            // Repeat the real grab request, including release. AppKit and
+            // compositors may have revoked it while the window was away.
+            self.grab((self.layout.captured() && !self.machine.edge()) || self.snap.snap_mode_active());
         }
-        self.shown_pointer = Some(shown);
-        self.shown_cursor_scale = scale;
+        let Some(gpu) = &self.gpu else { return };
+        if restore {
+            // A same-value call also hits winit's macOS visibility cache.
+            // Reproduce Alt's visibility transition before the final state.
+            gpu.window.set_cursor_visible(shown == cursor::Shown::Hidden);
+        }
         log::debug!("viewer: system pointer {shown:?}");
         match shown {
             cursor::Shown::Hidden => gpu.window.set_cursor_visible(false),
@@ -2700,18 +2706,18 @@ impl App {
                 gpu.window.set_cursor(icon);
                 gpu.window.set_cursor_visible(true);
             }
-            cursor::Shown::Custom(set) => {
+            cursor::Shown::Custom(_) | cursor::Shown::Badged { .. } => {
                 // At the cursor size, pixel for pixel what the viewer draws
                 // of it on the canvas at the pixel scale (a custom cursor's
                 // pixels are the window's physical ones on every system).
-                match self.custom_cursors.get(&(set, scale)) {
+                match self.custom_cursors.get(&(shown, scale)) {
                     Some(c) => gpu.window.set_cursor(c.clone()),
-                    None => match self.os_cursor.art().get(set) {
+                    None => match self.os_cursor.art().cursor_image(shown) {
                         // Made on a thread of its own; until it is, the
                         // pointer stays as it is (asked again next frame).
                         Some(image) => {
-                            self.cursor_builds.start((set, scale), image.clone());
-                            self.shown_pointer = None;
+                            self.cursor_builds.start((shown, scale), image);
+                            self.pointer_presentation.shown = None;
                         }
                         None => gpu.window.set_cursor(winit::window::CursorIcon::Default),
                     },
@@ -3027,7 +3033,7 @@ impl App {
             );
             // (The system pointer's art at the new pixel scale.)
             if self.plan.map(|p| p.present.zoom) != Some(plan.present.zoom) {
-                self.shown_pointer = None;
+                self.pointer_presentation.shown = None;
             }
             self.plan = Some(plan);
             self.layout.world_scale = plan.world;
@@ -3593,18 +3599,20 @@ impl App {
         let overlay = cameras.len() as u32;
         // (As `cursor_scale`, with the GPU borrowed.)
         let cursor_scale = cursor::Scale::new(self.settings.display.effective_cursor_size(self.system_cursor_size), (plan.present.zoom.0.max(1) / plan.present.zoom.1.max(1)).max(1));
-        let composed = match cursor::sprite_set(&self.compiled, self.cursor_art.shown(self.cursor)).and_then(|set| cursor::SetArt::of(&self.compiled, set)) {
+        let responsiveness = host_status::judge(self.display.host(), Instant::now());
+        let busy_status = self.os_cursor.status(responsiveness);
+        let cursor_art = cursor::sprite_set(&self.compiled, self.cursor_art.shown(self.cursor)).and_then(|set| cursor::SetArt::of(&self.compiled, set));
+        let mut composed = match cursor_art {
             Some(art) if cameras.len() < tile_render::MAX_VIEWS => {
                 let bounds = world_bounds(&self.compiled, scene);
                 let period = (if bounds.wrap.0 { bounds.size.0 } else { 0 }, if bounds.wrap.1 { bounds.size.1 } else { 0 });
-                cursor::compose(art, &marks, &cameras, &arranged.cursor_slots, cursor_scale, window, overlay, period)
+                cursor::compose_with_busy(&self.compiled, art, &marks, &cameras, &arranged.cursor_slots, cursor_scale, window, overlay, period, busy_status)
             }
             _ => cursor::Composed::default(),
         };
         for (slot, camera) in &composed.slots {
             cameras[*slot as usize] = *camera;
         }
-        let cursor_sprites = composed.sprites;
         // The snapping pointer and its ghost (while snapping, the only
         // cursor), in the same camera on top, in window pixels.
         // (At the cursor's size, as the cursor: its cameras after the
@@ -3612,10 +3620,18 @@ impl App {
         // shows there (as `pointer_hidden`): never both.
         let system_hidden = (captured && !self.machine.edge()) || facts.snap_mode || self.unlock_pending.is_some() || self.constraints.moving() || snapping;
         let snap = if cameras.len() < tile_render::MAX_VIEWS && system_hidden {
-            self.snap.compose(&self.compiled, overlay, overlay + 1 + composed.top.len() as u32, cursor_scale, window)
+            self.snap.compose_with_busy(&self.compiled, overlay, overlay + 1 + composed.top.len() as u32, cursor_scale, window, busy_status)
         } else {
             cursor::Composed::default()
         };
+        composed.top.extend(snap.top);
+        // Native icons without CPU pixels keep their OS shape; only their
+        // badge is drawn in the overlay. Custom images contain both already.
+        if busy_status != host_status::Responsiveness::Answering && !system_hidden && self.pointer_inside && self.pointer_presentation.active()
+            && matches!(self.os_cursor.shown_busy(false, self.capture_icon, scene.interface.targeting, captured, responsiveness, self.started.elapsed()), cursor::Shown::Icon(_)) {
+            cursor::compose_busy_badge(&mut composed, &self.compiled, self.system_pointer, (16, 22), None, cursor_scale, window, overlay + 1);
+        }
+        let cursor_sprites = composed.sprites;
         let mut snap_sprites = snap.sprites;
         if overlay < tile_render::MAX_VIEWS as u32 {
             if let Some([x, y, w, h]) = self.snap.keyboard_focus_rect(scene, &self.layout) {
@@ -3630,7 +3646,6 @@ impl App {
         if cursor_sprites.iter().any(|s| s.view == Some(overlay)) || !snap_sprites.is_empty() || !composed.top.is_empty() {
             cameras.push(cursor::overlay_camera(window));
             cameras.extend(composed.top);
-            cameras.extend(snap.top);
         }
         // The frame counter over everything (the cursor too), by a camera of
         // its own showing the whole window 1:1 (whatever the split and
@@ -3646,7 +3661,6 @@ impl App {
         // next to the driver's top-left buttons (`host_status`).
         let host = self.display.host();
         let stale = host_status::stale(host, Instant::now());
-        let responsiveness = host_status::judge(host, Instant::now());
         self.host_status.note(responsiveness, stale);
         if responsiveness != host_status::Responsiveness::Answering && cameras.len() < tile_render::MAX_VIEWS {
             let anchor = host_status::anchor(&self.compiled, scene, &arranged.cameras, &arranged.view_cameras);
@@ -3781,17 +3795,21 @@ impl ApplicationHandler for App {
             WindowEvent::CursorLeft { .. } => self.pointer_inside = false,
             _ => {}
         }
-        if let WindowEvent::Focused(false) = event {
+        self.pointer_presentation.observe(&event);
+        if matches!(event, WindowEvent::Focused(false) | WindowEvent::Occluded(true)) {
             self.menu_scroll.focus_lost();
             for input in self.snap.focus_lost(&mut self.layout) {
                 self.send(input);
             }
             self.layout.released();
+            self.unlock_pending = None;
+            self.machine.cancel_edge();
+            self.snap_grabbed = false;
             self.grab(false);
         }
         // The pointer is at no edge of the window once it left (or the
         // window is no longer the one the user works in).
-        if matches!(event, WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. }) {
+        if matches!(event, WindowEvent::Focused(false) | WindowEvent::Occluded(true) | WindowEvent::CursorLeft { .. }) {
             for input in self.layout.pointer_gone() {
                 self.send(input);
             }
@@ -3907,7 +3925,7 @@ impl ApplicationHandler for App {
         self.resolve_settings_preview(expired);
         let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
         // The Alt mode by itself in menus, only for the window in front.
-        let focused = self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus());
+        let focused = self.pointer_presentation.active() && self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus());
         self.snap.set_alt_in_menus(self.settings.input.alt_in_menus && focused);
         let snapped_inputs = if self.settings_preview.active() { Vec::new() } else {
             self.snap.tick(&mut self.layout, &self.shown_scene, now, rates)
@@ -3951,7 +3969,7 @@ impl ApplicationHandler for App {
                 None => ControlFlow::Poll,
             }
         };
-        let cursor_wake = self.os_cursor.next_animation_wake(self.pointer_hidden(), Duration::from_secs_f64(self.now().max(0.0)));
+        let cursor_wake = self.os_cursor.next_animation_wake(self.pointer_hidden(), host_status::judge(self.display.host(), Instant::now()), Duration::from_secs_f64(self.now().max(0.0)));
         let flow = match (flow, cursor_wake) {
             (ControlFlow::WaitUntil(at), Some(delay)) => ControlFlow::WaitUntil(at.min(Instant::now() + delay)),
             (ControlFlow::Wait, Some(delay)) => ControlFlow::WaitUntil(Instant::now() + delay),
@@ -4058,22 +4076,22 @@ mod window_work_area_tests {
 }
 
 /// System cursors made from cursor art at a pixel scale, each on a thread
-/// of its own; by (sprite set, pixel scale).
+/// of its own; by (cursor picture, pixel scale), including busy badges.
 #[derive(Default)]
 struct CursorBuilds {
     native_thread_init: Option<fn()>,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
     /// What is being made, and of which art (see `forget`).
-    pending: std::collections::HashSet<(u32, cursor::Scale)>,
+    pending: std::collections::HashSet<(cursor::Shown, cursor::Scale)>,
     generation: u64,
     ready: Option<(std::sync::mpsc::Sender<CursorBuilt>, std::sync::mpsc::Receiver<CursorBuilt>)>,
 }
 
-type CursorBuilt = (u64, (u32, cursor::Scale), Option<winit::window::CustomCursorSource>);
+type CursorBuilt = (u64, (cursor::Shown, cursor::Scale), Option<winit::window::CustomCursorSource>);
 
 impl CursorBuilds {
     /// Makes `image` at cursor scale `key.1`, unless it is being made.
-    fn start(&mut self, key: (u32, cursor::Scale), image: cursor::Image) {
+    fn start(&mut self, key: (cursor::Shown, cursor::Scale), image: cursor::Image) {
         if !self.pending.insert(key) {
             return;
         }
@@ -4084,7 +4102,7 @@ impl CursorBuilds {
         std::thread::spawn(move || thread_start::initialized(initialize, || {
             let native = key.1.native(&image);
             let source = winit::window::CustomCursor::from_rgba(native.rgba, native.size.0, native.size.1, native.hotspot.0, native.hotspot.1)
-                .inspect_err(|e| log::warn!("viewer: cursor of set {}: {e}", key.0))
+                .inspect_err(|e| log::warn!("viewer: cursor {:?}: {e}", key.0))
                 .ok();
             if tx.send((generation, key, source)).is_ok() {
                 if let Some(wake) = wake { wake(); }
@@ -4093,7 +4111,7 @@ impl CursorBuilds {
     }
 
     /// The cursors made since last asked (of the current art).
-    fn take_ready(&mut self) -> Vec<((u32, cursor::Scale), winit::window::CustomCursorSource)> {
+    fn take_ready(&mut self) -> Vec<((cursor::Shown, cursor::Scale), winit::window::CustomCursorSource)> {
         let Some((_, rx)) = &self.ready else { return Vec::new() };
         let mut out = Vec::new();
         while let Ok((generation, key, source)) = rx.try_recv() {
@@ -4163,7 +4181,7 @@ mod cursor_completion_tests {
         let mut builds = CursorBuilds::default();
         builds.native_thread_init = Some(initialize_cursor_thread);
         builds.wake = Some(Arc::new(move || { tx.send(INITIALIZED.get()).unwrap(); }));
-        builds.start((7, cursor::Scale::default()), cursor::Image {
+        builds.start((cursor::Shown::Custom(7), cursor::Scale::default()), cursor::Image {
             rgba: vec![255, 255, 255, 255], size: (1, 1), hotspot: (0, 0),
         });
         assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
@@ -4177,7 +4195,7 @@ mod cursor_completion_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut builds = CursorBuilds::default();
         builds.wake = Some(Arc::new(move || { let _ = tx.send(()); }));
-        builds.start((7, cursor::Scale::default()), cursor::Image {
+        builds.start((cursor::Shown::Custom(7), cursor::Scale::default()), cursor::Image {
             rgba: vec![255, 255, 255, 255], size: (1, 1), hotspot: (0, 0),
         });
         rx.recv_timeout(Duration::from_secs(5)).expect("cursor worker must wake main independently of frame completion");

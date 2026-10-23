@@ -112,7 +112,7 @@ impl Art {
         }
         let capture = compiled.sets_with_prefix(CAPTURE_SPRITES).map(|(_, s)| s.raw()).next();
         let arrow = compiled.set(crate::snap::ARROW_SPRITE).map(|(s, _)| s.raw()).filter(|s| images.contains_key(s));
-        let busy = busy_frames(compiled).into_iter().map(|image| {
+        let busy: Vec<_> = busy_frames(compiled).into_iter().map(|image| {
             let mut id = u32::MAX;
             while images.contains_key(&id) { id -= 1; }
             images.insert(id, image);
@@ -153,10 +153,75 @@ impl Art {
         self.images.get(&set)
     }
 
+    pub fn badged(&self, set: u32, elapsed: std::time::Duration) -> Option<Shown> {
+        if self.busy.is_empty() { return None; }
+        let hourglass = self.busy[scene::loading_cursor::frame_at(elapsed) as usize % self.busy.len()];
+        Some(Shown::Badged { base: set, hourglass })
+    }
+
+    /// The requested native cursor image; badges are composed on demand.
+    pub fn cursor_image(&self, shown: Shown) -> Option<Image> {
+        match shown {
+            Shown::Custom(set) => self.get(set).cloned(),
+            Shown::Badged { base, hourglass } => Some(with_busy_badge(self.get(base)?, self.get(hourglass)?)),
+            _ => None,
+        }
+    }
+
+    /// Only the ordinary arrow may give way to the full stuck hourglass.
+    pub fn special(&self, cursor: scene::Cursor) -> bool {
+        match self.shown(cursor) {
+            scene::Cursor::Default | scene::Cursor::System(scene::SystemCursor::Arrow | scene::SystemCursor::Wait | scene::SystemCursor::Progress) => false,
+            scene::Cursor::Sprite(set) => Some(set) != self.arrow,
+            _ => true,
+        }
+    }
+
     /// The capture pointer's set, if the description has one.
     pub fn capture(&self) -> Option<u32> {
         self.capture.filter(|s| self.images.contains_key(s))
     }
+}
+
+/// Busy keeps the pointer's meaning; only a stuck ordinary arrow is replaced.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BusyEffect { None, Badge, Hourglass }
+
+pub fn busy_effect(status: crate::host_status::Responsiveness, special: bool) -> BusyEffect {
+    use crate::host_status::Responsiveness as R;
+    match (status, special) {
+        (R::Answering, _) => BusyEffect::None,
+        (R::Stuck, false) => BusyEffect::Hourglass,
+        _ => BusyEffect::Badge,
+    }
+}
+
+pub const BUSY_BADGE_SIDE: u32 = 16;
+
+/// Art pixels from the pointer's hot spot to the badge's top-left.
+pub fn badge_offset(size: (u32, u32), hotspot: (u16, u16)) -> (i32, i32) {
+    ((size.0 as i32 - hotspot.0 as i32 + 2).max(12), (size.1 as i32 - hotspot.1 as i32 + 2).max(12))
+}
+
+/// A single native cursor image, retaining the original hot spot and pixels.
+fn with_busy_badge(base: &Image, hourglass: &Image) -> Image {
+    let offset = badge_offset((base.size.0.into(), base.size.1.into()), base.hotspot);
+    let (x, y) = (base.hotspot.0 as u32 + offset.0 as u32, base.hotspot.1 as u32 + offset.1 as u32);
+    let (w, h) = ((base.size.0 as u32).max(x + BUSY_BADGE_SIDE), (base.size.1 as u32).max(y + BUSY_BADGE_SIDE));
+    let mut rgba = vec![0; (w * h * 4) as usize];
+    for by in 0..base.size.1 as usize {
+        let start = by * base.size.0 as usize * 4;
+        let dest = by * w as usize * 4;
+        rgba[dest..dest + base.size.0 as usize * 4].copy_from_slice(&base.rgba[start..start + base.size.0 as usize * 4]);
+    }
+    for dy in 0..BUSY_BADGE_SIDE {
+        for dx in 0..BUSY_BADGE_SIDE {
+            let src = ((dy * hourglass.size.1 as u32 / BUSY_BADGE_SIDE * hourglass.size.0 as u32 + dx * hourglass.size.0 as u32 / BUSY_BADGE_SIDE) * 4) as usize;
+            let dest = (((y + dy) * w + x + dx) * 4) as usize;
+            rgba[dest..dest + 4].copy_from_slice(&hourglass.rgba[src..src + 4]);
+        }
+    }
+    Image { rgba, size: (w as u16, h as u16), hotspot: base.hotspot }
 }
 
 /// The first frame of `set` as a cursor image (a colour sprite, or an
@@ -236,6 +301,26 @@ impl SetArt {
         let s = compiled.atlas.sprites.get(id.0 as usize)?;
         Some(SetArt { set, size: (s.width, s.height), hotspot: hotspot((s.anchor_x, s.anchor_y), (s.width, s.height)), anchor: (s.anchor_x, s.anchor_y) })
     }
+}
+
+/// Add the small hourglass beside a drawn pointer. Its own camera keeps
+/// the badge at half the nominal cursor size, including fractional scales.
+pub fn compose_busy_badge(out: &mut Composed, compiled: &Compiled, at: (i32, i32), offset: (i32, i32), clip: Option<[i32; 4]>, scale: Scale, canvas: (u32, u32), next: u32) {
+    let Some(art) = compiled.set(scene::loading_cursor::SET).and_then(|(set, _)| SetArt::of(compiled, set)) else { return };
+    if art.size.0 == 0 || art.size.1 == 0 { return; }
+    let view = next + out.top.len() as u32;
+    if view as usize >= tile_render::MAX_VIEWS { return; }
+    let origin = (at.0 + scale.span(offset.0.max(0) as u32) as i32, at.1 + scale.span(offset.1.max(0) as u32) as i32);
+    let side = scale.span(BUSY_BADGE_SIDE).max(1);
+    out.top.push(Camera {
+        cells: false, zoom: (scale.zoom.0 * BUSY_BADGE_SIDE, scale.zoom.1 * art.size.0),
+        origin, screen_shift: origin, hairline: true, target_clip: clip,
+        ..Camera::new((side.min(canvas.0), side.min(canvas.1)))
+    });
+    out.sprites.push(PlacedSprite {
+        screen: true, view: Some(view), ticks_per_frame: scene::loading_cursor::TICKS_PER_FRAME,
+        ..PlacedSprite::new(art.set, -art.anchor.0, -art.anchor.1)
+    });
 }
 
 /// The art cell every cursor size is measured against: the game's cursor
@@ -391,12 +476,14 @@ pub fn empty_camera() -> Camera {
 }
 
 /// What the system pointer shows.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Shown {
     Hidden,
     Icon(winit::window::CursorIcon),
     /// A cursor made from this set's image ([`Art`]).
     Custom(u32),
+    /// The base pointer and a small hourglass in one native cursor image.
+    Badged { base: u32, hourglass: u32 },
 }
 
 /// The system pointer for the driver's `cursor`: hidden while the viewer
@@ -762,6 +849,18 @@ pub fn compose(art: SetArt, marks: &Marks, cameras: &[Camera], slots: &[u32], sc
             None => continue,
         };
         out.sprites.push(PlacedSprite { screen: true, view: Some(view), ..PlacedSprite::new(art.set, -art.anchor.0, -art.anchor.1) });
+    }
+    out
+}
+
+/// World cursors retain their command/capture meaning even if the host is
+/// stuck. Only the actual pointer gets a badge, not its mirrored marks.
+pub fn compose_with_busy(compiled: &Compiled, art: SetArt, marks: &Marks, cameras: &[Camera], slots: &[u32], scale: Scale, canvas: (u32, u32), overlay: u32, period: (i32, i32), status: crate::host_status::Responsiveness) -> Composed {
+    let mut out = compose(art, marks, cameras, slots, scale, canvas, overlay, period);
+    if busy_effect(status, true) == BusyEffect::Badge {
+        for p in placements(marks, cameras, period).into_iter().filter(|p| p.own) {
+            compose_busy_badge(&mut out, compiled, p.at, badge_offset(art.size, art.hotspot), p.clip, scale, canvas, overlay + 1);
+        }
     }
     out
 }
@@ -1409,6 +1508,20 @@ mod busy_tests {
             image = "arrow"
             cell = [14, 22]
             group = "Viewer@cursors"
+            [images.capture]
+            source = "solid:100,200,80,255:24x24"
+            [sheets.capture]
+            image = "capture"
+            cell = [24, 24]
+            anchor = [-12, -12]
+            group = "Viewer@capture"
+            [images.command]
+            source = "solid:220,40,50,255:32x32"
+            [sheets.command]
+            image = "command"
+            cell = [32, 32]
+            anchor = [-16, -16]
+            group = "Viewer@command"
             {}"#, include_str!("../../../assets/civ3/loading-cursor.toml"));
         assert!(!text.contains("Cursor.flc"), "never the unit-selection ring");
         let desc = render_desc::Description::parse(&text).unwrap();
@@ -1417,7 +1530,7 @@ mod busy_tests {
     }
 
     #[test]
-    fn the_busy_pointer_is_the_turning_hourglass_with_its_hot_spot_in_the_middle() {
+    fn the_full_stuck_pointer_is_the_turning_hourglass_with_its_hot_spot_in_the_middle() {
         let compiled = with_hourglass(false);
         let art = Art::of(&compiled);
         assert_eq!(art.busy_frames(), 12);
@@ -1453,5 +1566,97 @@ mod busy_tests {
             assert_eq!(art.busy_cursor(std::time::Duration::from_millis(ms)),Some(id));
         }
         assert_eq!(Art { arrow: Some(5), ..Default::default() }.busy_cursor(std::time::Duration::ZERO),Some(5));
+    }
+
+    #[test]
+    fn busy_and_stuck_preserve_capture_command_and_native_special_pointers() {
+        use crate::host_status::Responsiveness as R;
+        let compiled = with_hourglass(false);
+        let art = std::sync::Arc::new(Art::of(&compiled));
+        let command = compiled.set("Viewer@command/0").unwrap().0.raw();
+        let elapsed = std::time::Duration::from_millis(83);
+        for (cursor, capture, targeting, preserve, base, special) in [
+            (scene::Cursor::Default, false, false, false, art.arrow.unwrap(), false),
+            (scene::Cursor::System(scene::SystemCursor::Progress), false, false, false, art.arrow.unwrap(), false),
+            (scene::Cursor::Default, true, false, false, art.capture().unwrap(), true),
+            (scene::Cursor::Sprite(command), false, false, false, command, true),
+            (scene::Cursor::Sprite(command), true, true, false, command, true),
+            // At a captured map edge the OS draws the world cursor, even
+            // if its shape happens to be the ordinary arrow.
+            (scene::Cursor::Default, false, false, true, art.arrow.unwrap(), true),
+        ] {
+            let mut system = crate::system_cursor::SystemCursor::default();
+            system.refresh(&scene::Scene { seq: 1, assets: 1, cursor, ..Default::default() }, 1, 1, art.clone());
+            for status in [R::Answering, R::Busy, R::Stuck] {
+                let effective = system.status(status);
+                assert_eq!(system.next_animation_wake(false, status, elapsed).is_some(), effective != R::Answering);
+                assert_eq!(system.next_animation_wake(true, status, elapsed), None);
+                let expected = match busy_effect(effective, special) {
+                    BusyEffect::None => Shown::Custom(base),
+                    BusyEffect::Badge => art.badged(base, elapsed).unwrap(),
+                    BusyEffect::Hourglass => Shown::Custom(art.busy_cursor(elapsed).unwrap()),
+                };
+                assert_eq!(system.shown_busy(false, capture, targeting, preserve, status, elapsed), expected, "{cursor:?} capture={capture} {status:?}");
+                assert_eq!(system.shown_busy(true, capture, targeting, preserve, status, elapsed), Shown::Hidden);
+            }
+        }
+        // Native cursors without CPU image pixels keep their shape. The
+        // viewer draws just the badge beside them in its overlay camera.
+        let mut native = crate::system_cursor::SystemCursor::default();
+        native.refresh(&scene::Scene { seq: 1, assets: 1, cursor: scene::Cursor::System(scene::SystemCursor::Text), ..Default::default() }, 1, 1, art);
+        for status in [R::Answering, R::Busy, R::Stuck] {
+            assert_eq!(native.shown_busy(false, false, false, false, status, elapsed), Shown::Icon(winit::window::CursorIcon::Text));
+        }
+    }
+
+    #[test]
+    fn a_busy_native_image_keeps_the_hotspot_and_adds_a_small_hourglass_below_right() {
+        let art = Art::of(&with_hourglass(false));
+        for base in [art.arrow.unwrap(), art.capture().unwrap()] {
+            let image = art.get(base).unwrap();
+            let badge = art.cursor_image(art.badged(base, std::time::Duration::ZERO).unwrap()).unwrap();
+            assert_eq!(badge.hotspot, image.hotspot);
+            let offset = badge_offset((image.size.0.into(), image.size.1.into()), image.hotspot);
+            let start = (image.hotspot.0 as u32 + offset.0 as u32, image.hotspot.1 as u32 + offset.1 as u32);
+            assert!(start.0 > image.hotspot.0 as u32 && start.1 > image.hotspot.1 as u32);
+            assert_eq!(badge.size, ((image.size.0 as u32).max(start.0 + BUSY_BADGE_SIDE) as u16, (image.size.1 as u32).max(start.1 + BUSY_BADGE_SIDE) as u16));
+            // Every original pointer pixel survives unchanged.
+            for y in 0..image.size.1 as usize {
+                let source = y * image.size.0 as usize * 4;
+                let dest = y * badge.size.0 as usize * 4;
+                let len = image.size.0 as usize * 4;
+                assert_eq!(&image.rgba[source..source + len], &badge.rgba[dest..dest + len]);
+            }
+            assert_ne!(art.badged(base, std::time::Duration::ZERO), art.badged(base, std::time::Duration::from_millis(83)), "the small hourglass turns too");
+        }
+    }
+
+    #[test]
+    fn captured_drawn_cursor_keeps_its_shape_with_a_scaled_busy_or_stuck_badge() {
+        use crate::host_status::Responsiveness as R;
+        let compiled = with_hourglass(false);
+        let set = compiled.set("Viewer@command/0").unwrap().0;
+        let art = SetArt::of(&compiled, set).unwrap();
+        let hourglass = compiled.set(scene::loading_cursor::SET).unwrap().0;
+        let camera = Camera { cells: true, ..Camera::new((400, 300)) };
+        let marks = Machine::default().step(&Facts {
+            captured: true, world_cursor: vec![(100, 100)],
+            cursor_view: Some(([0, 0, 400, 300], (100, 100), false)), ..Default::default()
+        }).marks;
+        for scale in [Scale::default(), Scale::new(48, 1), Scale::new(64, 2)] {
+            for status in [R::Answering, R::Busy, R::Stuck] {
+                let out = compose_with_busy(&compiled, art, &marks, &[camera], &[], scale, (400, 300), 1, (0, 0), status);
+                assert_eq!(out.sprites.iter().filter(|s| s.set == set).count(), 1, "keep the captured cursor for {status:?}");
+                let badges: Vec<_> = out.sprites.iter().filter(|s| s.set == hourglass).collect();
+                assert_eq!(badges.len(), usize::from(status != R::Answering));
+                if let Some(badge) = badges.first() {
+                    assert_eq!(badge.ticks_per_frame, scene::loading_cursor::TICKS_PER_FRAME);
+                    let c = out.top.last().unwrap();
+                    assert_eq!(c.viewport, (scale.span(BUSY_BADGE_SIDE), scale.span(BUSY_BADGE_SIDE)));
+                    assert!(c.origin.0 > 100 && c.origin.1 > 100);
+                    assert_eq!(c.target_clip, Some([0, 0, 400, 300]));
+                }
+            }
+        }
     }
 }
