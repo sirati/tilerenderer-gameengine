@@ -73,7 +73,7 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 33] = [
+pub const KEYS: [&str; 36] = [
     "resolution.pixel_scale",
     "resolution.base_ui_scale",
     "resolution.scale_menus",
@@ -82,6 +82,9 @@ pub const KEYS: [&str; 33] = [
     "resolution.world_scale",
     "resolution.background_sampling",
     "layout.split",
+    "layout.separator_width",
+    "layout.zoom_rounded",
+    "layout.zoom_glass",
     "layout.zoom_place",
     "layout.zoom",
     "layout.zoom_strip",
@@ -115,6 +118,7 @@ pub fn range(key: &str) -> Option<Range> {
         "resolution.base_ui_scale" => Some(Range { min: 1.0, max: Resolution::MAX_PIXEL_SCALE as f32, step: 0.5 }),
         "resolution.menu_scale_percent" => Some(MENU_SCALE_PERCENT_RANGE),
         "resolution.frame_scale" | "resolution.world_scale" => Some(SCALE_RANGE),
+        "layout.separator_width" => Some(Range { min: 1.0, max: 16.0, step: 1.0 }),
         "layout.zoom_strip" => Some(ZOOM_STRIP_RANGE),
         "layout.zoom_box_top" => Some(ZOOM_BOX_TOP_RANGE),
         "layout.zoom_box_drop" => Some(ZOOM_BOX_DROP_RANGE),
@@ -232,6 +236,9 @@ impl Settings {
             "layout.split" => choice(l.split),
             "layout.zoom_place" => choice(l.zoom_place),
             "layout.zoom" => choice(l.zoom),
+            "layout.separator_width" => Some(ControlValue::Number(l.separator_width.clamp(1, 16) as f32)),
+            "layout.zoom_rounded" => Some(ControlValue::On(l.zoom_rounded)),
+            "layout.zoom_glass" => Some(ControlValue::On(l.zoom_glass)),
             "layout.zoom_strip" => Some(ControlValue::Number(l.zoom_strip)),
             "layout.zoom_box_top" => Some(ControlValue::Number(l.zoom_box_top)),
             "layout.zoom_box_drop" => Some(ControlValue::Number(l.zoom_box_drop)),
@@ -304,6 +311,19 @@ impl Settings {
                 "layout.split" => set_choice(&mut l.split, value),
                 "layout.zoom_place" => set_choice(&mut l.zoom_place, value),
                 "layout.zoom" => set_choice(&mut l.zoom, value),
+                "layout.separator_width" => {
+                    let mut width = l.separator_width as f32;
+                    let ok = set_number(&mut width, key, value);
+                    if ok { l.separator_width = width as u32; }
+                    ok
+                }
+                "layout.zoom_rounded" | "layout.zoom_glass" => match value {
+                    ControlValue::On(on) => {
+                        if key == "layout.zoom_rounded" { l.zoom_rounded = *on; } else { l.zoom_glass = *on; }
+                        true
+                    }
+                    _ => false,
+                },
                 "layout.zoom_strip" => set_number(&mut l.zoom_strip, key, value),
                 "layout.zoom_box_top" => set_number(&mut l.zoom_box_top, key, value),
                 "layout.zoom_box_drop" => set_number(&mut l.zoom_box_drop, key, value),

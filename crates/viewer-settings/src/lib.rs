@@ -1,6 +1,6 @@
 //! The viewer's own settings: how its picture is scaled, how its views are
 //! arranged and what they follow, and how the pointer moves between them.
-//! The preferences screen edits them (its "Resolution" and "Layout" tabs);
+//! The preferences screen edits them (its "Resolution", "Layout" and "Zoom" tabs);
 //! the viewer and the driver read them. Saved as TOML.
 //!
 //! Game-agnostic: screens are named by the driver (`ScreenKind` holds
@@ -338,11 +338,17 @@ impl ScreenPlace {
     }
 }
 
-/// The "Layout" tab.
+/// Arrangement and zoom settings, edited on the Layout and Zoom tabs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Layout {
     pub split: Split,
+    /// Divider width in physical window pixels, clamped to 1..=16.
+    pub separator_width: u32,
+    /// Round floating and mouse zoom lenses. The top strip stays square.
+    pub zoom_rounded: bool,
+    /// Shade the zoom lens rim as polished glass.
+    pub zoom_glass: bool,
     /// Where the zoom box goes in a vertical split (else unused).
     pub zoom_place: Place,
     pub zoom: Zoom,
@@ -390,6 +396,9 @@ impl Default for Layout {
     fn default() -> Self {
         Self {
             split: Split::Standard,
+            separator_width: 4,
+            zoom_rounded: true,
+            zoom_glass: true,
             zoom_place: Place::Floating,
             zoom: Zoom::Off,
             zoom_strip: 0.2,
@@ -925,5 +934,25 @@ mod combat_speed_settings_tests {
         assert!(settings.set_control("animation.combat_speed", &controls::ControlValue::Number(f32::NAN)));
         assert_eq!(settings.animation.combat_speed, 1.0);
         settings.animation = original.animation.clone(); assert_eq!(settings, original);
+    }
+}
+
+#[cfg(test)]
+mod zoom_glass_tests {
+    use super::*;
+    use controls::ControlValue;
+
+    #[test]
+    fn old_layouts_default_to_glass_and_new_controls_round_trip() {
+        let mut settings: Settings = toml::from_str("[layout]\nzoom = 'Floating131'\nzoom_strip = 0.35").unwrap();
+        assert!(settings.layout.zoom_rounded && settings.layout.zoom_glass);
+        assert_eq!(settings.layout.separator_width, 4);
+        assert_eq!(settings.layout.zoom_strip, 0.35);
+        for key in ["layout.zoom_rounded", "layout.zoom_glass"] {
+            assert!(settings.set_control(key, &ControlValue::On(false)));
+        }
+        assert!(settings.set_control("layout.separator_width", &ControlValue::Number(99.0)));
+        assert_eq!(settings.layout.separator_width, 16);
+        assert_eq!(toml::from_str::<Settings>(&toml::to_string(&settings).unwrap()).unwrap(), settings);
     }
 }

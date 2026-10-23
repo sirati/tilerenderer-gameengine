@@ -91,6 +91,7 @@
 //! knob = "knob"
 //! tick_step = 0.5                # ruler marks at multiples inside the track
 //! tick_label_step = 1.0          # unitless labels at whole numbers
+//! # tick_labels = ["1.5×", "2×", "3×", "4×"]  # optional, one per tick
 //! tick_style = "caption"        # small text, clipped to the slider
 //! min = 0.5
 //! max = 3.0
@@ -277,6 +278,8 @@ pub struct ItemDesc {
     pub tick_step: Option<f32>,
     /// Label only multiples of this value (defaults to `tick_step`). No units.
     pub tick_label_step: Option<f32>,
+    /// Optional labels in tick order, e.g. magnifications for an index slider.
+    pub tick_labels: Option<Vec<String>>,
     pub tick_style: Option<String>,
     pub decimals: Option<u32>,
     #[serde(default)]
@@ -519,7 +522,7 @@ enum Kind {
     Text,
     Choice { control: String, value: String },
     Checkbox { control: String },
-    Slider { control: String, min: f32, max: f32, step: f32, knob: Option<String>, knob_hover: Option<String>, ticks: Vec<(f32, bool)>, tick_style: Option<String> },
+    Slider { control: String, min: f32, max: f32, step: f32, knob: Option<String>, knob_hover: Option<String>, ticks: Vec<(f32, bool)>, tick_labels: Option<Vec<String>>, tick_style: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -775,10 +778,13 @@ impl Panels {
                             ticks.push((v, label));
                         }
                     }
+                    if d.tick_labels.as_ref().is_some_and(|labels| labels.len() != ticks.len()) {
+                        return Err(invalid(what(), "one custom label per ruler tick"));
+                    }
                     if let Some(style) = d.tick_style.as_ref().filter(|s| !desc.styles.contains_key(*s)) {
                         return Err(unknown("style", style));
                     }
-                    Kind::Slider { control: control.clone(), min, max, step, knob: art_ref(&d.knob)?, knob_hover: art_ref(&d.knob_hover)?, ticks, tick_style: d.tick_style.clone() }
+                    Kind::Slider { control: control.clone(), min, max, step, knob: art_ref(&d.knob)?, knob_hover: art_ref(&d.knob_hover)?, ticks, tick_labels: d.tick_labels.clone(), tick_style: d.tick_style.clone() }
                 } else if d.text.is_some() {
                     Kind::Text
                 } else {
@@ -1263,7 +1269,7 @@ impl Panels {
                         }
                     }
                 }
-                Kind::Slider { control, min, max, knob, knob_hover, ticks, tick_style, .. } => {
+                Kind::Slider { control, min, max, knob, knob_hover, ticks, tick_labels, tick_style, .. } => {
                     let (w, h) = size.unwrap_or_default();
                     if let Some(a) = look(false) {
                         d.art(a, (x, y), Some((w, h)));
@@ -1277,12 +1283,13 @@ impl Panels {
                     let clip = d.clip;
                     // The ruler stays inside the item, including labels at either end.
                     d.clip = [clip[0].max(x), clip[1].max(y), clip[2].min(x + w as i32), clip[3].min(y + h as i32)];
-                    for &(value, label) in ticks {
+                    for (tick, &(value, label)) in ticks.iter().enumerate() {
                         let cx = x + slider_center(w as i32, kw, (value - min) / (max - min));
                         let rgb = self.style(ruler_style).map_or([72, 60, 36], |s| if enabled { s.color } else { s.disabled_color.unwrap_or(s.color) });
                         d.element(Element::Fill { rect: [cx, y + h as i32 - 14, 1, 3], rgb, alpha: 255, clip: d.clip });
                         if label {
-                            d.text(&format_number(value, item.decimals, item.percent), ruler_style, text_look,
+                            let text = tick_labels.as_ref().map(|labels| labels[tick].clone()).unwrap_or_else(|| format_number(value, item.decimals, item.percent));
+                            d.text(&text, ruler_style, text_look,
                                 (cx, y + h as i32 - 10), Align::Center, VAlign::Top);
                         }
                     }
@@ -1917,12 +1924,46 @@ mod tests {
                         assert_eq!(t.clip, [x, y, x + w as i32, y + h as i32]);
                         assert!(t.x >= x && t.x + m.width <= x + w as i32, "{control}: {}", t.text);
                         assert!(t.y - m.ascent >= y && t.y + m.descent <= y + h as i32);
-                        assert!(t.text.chars().all(|c| c.is_ascii_digit() || c == '.'));
+                        assert!(t.text.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '×'));
                     }
                 }
             }
         }
-        assert_eq!(count, 10);
+        assert_eq!(count, 13);
+    }
+
+    #[test]
+    fn zoom_preferences_are_separate_and_controls_fit_without_overlap() {
+        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
+        let panel = panels.panel("preferences").unwrap();
+        for tab in ["layout", "zoom"] {
+            for mode in ["Off", "Floating131", "Floating171", "Mouse111", "Mouse131", "TopStrip"] {
+                let mut state = PanelState::default();
+                state.values.insert("tab".into(), Value::Text(tab.into()));
+                state.values.insert("layout.zoom".into(), Value::Text(mode.into()));
+                state.values.insert("layout.split".into(), Value::Text("Vertical1To1".into()));
+                let looks = panels.looks(panel, &state, [0, 0, 1024, 768], &estimate);
+                for (i, look) in looks.iter().enumerate() {
+                    let [x, y, w, h] = look.rect;
+                    assert!(x >= 49 && x+w <= 973 && y >= 40 && y+h <= 690, "{tab} {mode}: {:?}", look.rect);
+                    for other in &looks[..i] {
+                        let [a, b, c, d] = other.rect;
+                        assert!(x+w <= a || a+c <= x || y+h <= b || b+d <= y, "{tab} {mode}: {:?} overlaps {:?}", look.rect, other.rect);
+                    }
+                }
+                for item in &panel.items {
+                    if item.control().is_some_and(|k| k.starts_with("layout.zoom")) {
+                        let cond = item.show_if.as_ref().unwrap();
+                        let mut layout = state.clone();
+                        layout.values.insert("tab".into(), Value::Text("layout".into()));
+                        assert!(!cond.holds(&layout.values), "zoom control on Layout");
+                    }
+                }
+            }
+        }
+        let item = panel.items.iter().find(|i| i.control() == Some("layout.zoom_magnification_step")).unwrap();
+        let Kind::Slider { tick_labels, .. } = &item.kind else { panic!("magnification slider") };
+        assert_eq!(tick_labels.as_ref().unwrap(), &["1.5×", "2×", "3×", "4×"]);
     }
 
     #[test]
