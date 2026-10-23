@@ -118,10 +118,10 @@ pub const DEAD_ZONE: f64 = 12.0;
 pub const IDLE_RESET: f64 = 0.25;
 
 /// How much an element off the motion's direction is held back: its
-/// distance term times `1 + ANGLE_WEIGHT · (angle / CONE)²` (17 at the
-/// cone's edge, 4.2 at 20°, 1.8 at 10°): one straight ahead wins over one
-/// 20° off unless that is several times nearer.
-pub const ANGLE_WEIGHT: f64 = 16.0;
+/// distance term times `1 + ANGLE_WEIGHT · (angle / CONE)²` (9 at the
+/// cone's edge, 2.6 at 20°, 1.4 at 10°): one straight ahead wins over one
+/// 20° off unless that is more than twice as near.
+pub const ANGLE_WEIGHT: f64 = 8.0;
 
 /// The distance term: how far an element is from the distance the mouse
 /// moved, plus this much of its distance (nearer ones first when equally
@@ -135,8 +135,14 @@ pub const DISTANCE_WEIGHT: f64 = 0.25;
 /// towards the middle of the view reaches it past the elements on the way.
 pub const ATTRACTION: f64 = 0.25;
 
-/// Window pixels per raw mouse count (as an unaccelerated system pointer).
-pub const MOTION_GAIN: f64 = 1.0;
+/// Window pixels per raw mouse count: slower than an unaccelerated system
+/// pointer, so a flick a little too fast or off-angle does not carry across
+/// the screen to a far element.
+pub const MOTION_GAIN: f64 = 0.7;
+
+/// Track pixels per raw mouse count while an Alt-mode slider is edited (as
+/// an unaccelerated system pointer).
+pub const SLIDER_GAIN: f64 = 1.0;
 
 /// Wheel notches for a list's scroll are spread out with this time
 /// constant (seconds): what an update asks for is 95 % sent by the next
@@ -1639,7 +1645,7 @@ impl SnapInput {
             let vertical = edit.track[3] > edit.track[2];
             let (motion, span) = if vertical { (d.1, edit.track[3]) } else { (d.0, edit.track[2]) };
             if motion.is_finite() && span.is_finite() && span > 0.0 {
-                let value = (edit.value + motion * MOTION_GAIN * 1_000_000.0 / span).clamp(0.0, 1_000_000.0);
+                let value = (edit.value + motion * SLIDER_GAIN * 1_000_000.0 / span).clamp(0.0, 1_000_000.0);
                 edit.dirty |= edit.value.round() != value.round();
                 edit.value = value;
             }

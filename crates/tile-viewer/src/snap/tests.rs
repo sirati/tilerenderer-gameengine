@@ -46,7 +46,7 @@ fn run(s: &mut Snapper, targets: &[Target], from: f64, to: f64, motion: Point, m
     while t < to - 1e-9 {
         t += TICK;
         if moving(t) {
-            s.motion(motion);
+            s.motion(px(motion));
         }
         out.extend(s.tick(t, targets, Rates::default()).into_iter().map(|a| (t, a)));
     }
@@ -154,9 +154,9 @@ fn only_elements_within_45_degrees_of_the_motion_are_picked() {
 
 #[test]
 fn the_direction_counts_far_more_than_the_distance() {
-    // Right of (500, 400): one straight ahead 150 px away, one 18° off at
+    // Right of (500, 400): one straight ahead 110 px away, one 18° off at
     // 63 px, one 30° off at 58 px.
-    let t = targets(&[at(1, 650, 400), at(2, 560, 420), at(3, 550, 371)], IDENTITY, WINDOW);
+    let t = targets(&[at(1, 610, 400), at(2, 560, 420), at(3, 550, 371)], IDENTITY, WINDOW);
     assert_eq!(t[pick(&t, (500.0, 400.0), None, (15.0, 0.0)).unwrap()].id, 1);
     // Along a row: the one about as far as the mouse went.
     let r = targets(&[at(1, 200, 100), at(2, 300, 100), at(3, 400, 100)], IDENTITY, WINDOW);
@@ -583,7 +583,7 @@ fn from_the_first_entry_shown_moving_up_scrolls_and_a_long_move_leaves() {
     assert!(actions.iter().any(|(_, a)| matches!(a, Action::Wheel { delta: 120, .. })), "{actions:?}");
     assert_eq!(s.target(), Some((600.0, 110.0)));
     // A long move up in one go: the header.
-    s.motion((0.0, -60.0));
+    s.motion(px((0.0, -60.0)));
     run(&mut s, &t, 1.0, 1.1, (0.0, 0.0), |_| false);
     assert_eq!(s.target(), Some((600.0, 80.0)));
 }
@@ -1255,4 +1255,9 @@ fn alt_wheel_after_menu_replacement_uses_the_current_target_before_tick() {
     scene.interactables = vec![button(7, [500, 520, 80, 30])];
     assert_eq!(snap.route(Input::Wheel { delta: -120, x: 0, y: 0 }, &mut layout, &scene, 1.1, Rates::default()),
         vec![Input::Wheel { delta: -120, x: 540, y: 535 }]);
+}
+
+/// Mouse counts that move the pointer by `p` window pixels.
+fn px(p: Point) -> Point {
+    (p.0 / MOTION_GAIN, p.1 / MOTION_GAIN)
 }
