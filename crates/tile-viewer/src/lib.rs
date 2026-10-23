@@ -766,6 +766,7 @@ pub const CURSOR_SPRITE: &str = "Viewer@cursor/0";
 pub const DIVIDER_SPRITE: &str = "Viewer@divider_v/0";
 pub const DIVIDER_ROW_SPRITE: &str = "Viewer@divider_h/0";
 pub const ARROW_SPRITE: &str = "Viewer@arrow/0";
+pub const ARROW_SHADOW: &str = "Viewer@arrow_shadow";
 
 /// The markers as world sprites on top of everything (but the world
 /// cursor, which `cursor` draws). The arrow gently bobs when enabled
@@ -775,16 +776,29 @@ pub const ARROW_SPRITE: &str = "Viewer@arrow/0";
 pub fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u32, time: Duration, bobbing: bool) -> Vec<tile_render::PlacedSprite> {
     markers
         .iter()
-        .filter_map(|m| {
+        .flat_map(|m| {
             let (name, (x, y)) = match *m {
-                layout::Marker::Cursor(_) => return None,
+                layout::Marker::Cursor(_) => return Vec::new(),
                 layout::Marker::Focus(p) => (ARROW_SPRITE, p),
             };
-            let (set, _) = compiled.set(name)?;
+            let Some((set, _)) = compiled.set(name) else { return Vec::new() };
             let n = downscale.max(1) as i32;
-            let offset = if bobbing { arrow_bob_offset(time).round() as i32 } else { 0 };
-            Some(tile_render::PlacedSprite { category: viewer_settings::clean_map::UNITS,
-                ..tile_render::PlacedSprite::new(set, x * n, y * n + offset) })
+            let bob = if bobbing { arrow_bob_offset(time) } else { 0.0 };
+            let offset = bob.round() as i32;
+            let phase = (bob*4.0).round() as i32;
+            let (set, offset) = if bobbing {
+                compiled.set(&format!("Viewer@arrow_bob/{phase}/0")).map(|(set, _)| (set, 0)).unwrap_or((set, offset))
+            } else { (set, 0) };
+            let mut sprites = Vec::with_capacity(2);
+            if let Some((shadow, _)) = compiled.set(&format!("{ARROW_SHADOW}/{}/0", bob.round() as i32)) {
+                // The shadow stays on the ground. Higher arrows cast a
+                // smaller, fainter patch; only the arrow's origin bobs.
+                sprites.push(tile_render::PlacedSprite { category: viewer_settings::clean_map::UNITS,
+                    ..tile_render::PlacedSprite::new(shadow, x*n, y*n) });
+            }
+            sprites.push(tile_render::PlacedSprite { category: viewer_settings::clean_map::UNITS,
+                ..tile_render::PlacedSprite::new(set, x * n, y * n + offset) });
+            sprites
         })
         .collect()
 }
@@ -830,7 +844,9 @@ mod accessibility_arrow_tests {
             fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> { unreachable!() }
         }
         let desc = "grid = { layout = \"orthogonal\", step = [32,32] }\n[images.arrow]\nsource = \"gilded_arrow:248,194,56,255:33x48\"\n[sheets.arrow]\nimage = \"arrow\"\ncell = [33,48]\ngrid = [1,1]\nanchor = [-16,-112]\ngroup = \"Viewer@arrow\"\n";
-        let compiled = render_desc::Description::parse(desc).unwrap().compile(&NoFiles, 128).unwrap();
+        let shadows: String = (-3..=3).map(|offset| format!("\n[images.shadow{}]\nsource = \"marker_shadow:32,23,14,70:40x14\"\n[sheets.shadow{}]\nimage = \"shadow{}\"\ncell = [40,14]\ngrid = [1,1]\nanchor = [-12,-3]\ngroup = \"Viewer@arrow_shadow/{offset}\"\n", offset+3, offset+3, offset+3)).collect();
+        let phases: String = (-12..=12).map(|phase| format!("\n[images.phase{}]\nsource = \"gilded_arrow:232,183,87,255:33x56@{phase}\"\n[sheets.phase{}]\nimage = \"phase{}\"\ncell = [33,56]\ngrid = [1,1]\nanchor = [-16,-116]\ngroup = \"Viewer@arrow_bob/{phase}\"\n", phase+12, phase+12, phase+12)).collect();
+        let compiled = render_desc::Description::parse(&format!("{desc}{shadows}{phases}")).unwrap().compile(&NoFiles, 128).unwrap();
         let m = [layout::Marker::Focus((100, 160))];
         let cameras = [Camera::new((320, 240))];
         assert!(arrow_bobbing_visible(true, &m, &cameras, 1));
@@ -844,8 +860,15 @@ mod accessibility_arrow_tests {
         assert_ne!(marker_sprites(&compiled, &m, 1, a, true), marker_sprites(&compiled, &m, 1, b, true));
         // No blinking at any phase; native reduced positions return to full
         // world coordinates before the camera applies its own downscale.
-        for ms in (0..3000).step_by(50) { assert_eq!(marker_sprites(&compiled, &m, 2, Duration::from_millis(ms), true).len(), 1); }
-        assert_eq!(marker_sprites(&compiled, &m, 2, a, true)[0].y, 323);
+        for ms in (0..3000).step_by(50) { assert_eq!(marker_sprites(&compiled, &m, 2, Duration::from_millis(ms), true).len(), 2); }
+        let low = marker_sprites(&compiled, &m, 2, a, true);
+        let high = marker_sprites(&compiled, &m, 2, b, true);
+        assert_eq!((low[0].x, low[0].y), (high[0].x, high[0].y), "the shadow stays on the ground");
+        assert_ne!(low[0].set, high[0].set, "shadow coverage changes with height");
+        assert_eq!(low[1].y, 320, "motion is in the supersampled phase art");
+        assert_ne!(marker_sprites(&compiled, &m, 1, Duration::ZERO, true)[1].set,
+            marker_sprites(&compiled, &m, 1, Duration::from_millis(10), true)[1].set,
+            "subpixel phases move before the integer origin advances");
         // The actual GPU retained-picture decision, not just marker math:
         // moving the arrow invalidates its world, a static/absent one does
         // not create further full redraws as the animation clock advances.

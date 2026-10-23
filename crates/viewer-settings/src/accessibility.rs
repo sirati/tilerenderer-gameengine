@@ -30,14 +30,14 @@ impl Default for Accessibility {
     fn default() -> Self {
         Self { active_unit_arrow: false, arrow_bobbing: true, unit_rings: false,
             war: RingColor::default(), allied: RingColor { color: [0, 64, 255], invert: false },
-            peace: RingColor { color: [0, 200, 0], invert: false }, ring_width: 2, hud_size: 0, stack_count: false }
+            peace: RingColor { color: [64, 240, 96], invert: false }, ring_width: 2, hud_size: 0, stack_count: false }
     }
 }
 
 pub const HUD_SCALES: [f32; 4] = [1.0, 1.5, 2.0, 3.0];
 /// The compact palette shown beside each diplomatic relation.
 pub const PALETTE: [[u8; 3]; 16] = [
-    [255, 0, 0], [240, 112, 24], [248, 208, 32], [0, 200, 0],
+    [255, 0, 0], [240, 112, 24], [248, 208, 32], [64, 240, 96],
     [0, 152, 112], [32, 208, 216], [0, 64, 255], [104, 64, 192],
     [200, 48, 160], [248, 144, 176], [144, 80, 40], [192, 168, 104],
     [255, 255, 255], [176, 176, 176], [80, 80, 80], [0, 0, 0],

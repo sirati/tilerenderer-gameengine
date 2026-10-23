@@ -719,6 +719,9 @@ impl SheetDesc {
 pub struct OutlineDesc {
     pub width: u32,
     pub color: [u8; 4],
+    /// Smooth coverage mask in all four channels, for a tinted band.
+    #[serde(default)]
+    pub smooth: bool,
 }
 
 /// One frame of a set: a sprite name, or `{ sheet, index }`-style shorthand
@@ -790,7 +793,7 @@ pub enum BlendDesc {
 }
 
 /// Sources made without the loader (full colour).
-const GENERATED: [&str; 9] = ["solid:", "line:", "arrow:", "gilded_arrow:", "crosshair:", "panes:", "pointer:", "rects:", "glyphs:"];
+const GENERATED: [&str; 10] = ["solid:", "line:", "arrow:", "gilded_arrow:", "marker_shadow:", "crosshair:", "panes:", "pointer:", "rects:", "glyphs:"];
 
 /// The characters of a [`glyphs`] image, one cell each, in this order.
 pub const GLYPHS: &str = " 0123456789.%fpsmkingartCPUGbuld/~";
@@ -902,37 +905,80 @@ fn arrow(spec: &str) -> Result<RgbaImage, String> {
 /// soft shadow, matching the palette of Civ III's parchment and brass UI.
 /// The supplied RGB sets the metal's midtone; alpha applies to the art.
 fn gilded_arrow(spec: &str) -> Result<RgbaImage, String> {
+    // Optional @N shifts the art by N quarter pixels within an eight-pixel
+    // vertical margin. Prepaint these phases so the integer-positioned
+    // sprite renderer can bob smoothly, even under magnification.
+    let (spec, shift) = match spec.split_once('@') {
+        Some((spec, phase)) => (spec, Some(phase.parse::<i32>().map_err(|_| "gilded_arrow: expected a quarter-pixel phase")? as f32/4.0)),
+        None => (spec, None),
+    };
     let (color, (w, h)) = shape_spec(spec, "gilded_arrow")?;
-    let inside = |x: i32, y: i32| {
-        let (x, y) = (x as f32 / w as f32, y as f32 / h as f32);
-        let d = (x - 0.46).abs();
-        (0.07..0.50).contains(&y) && d < 0.14 && (y > 0.10 || d < 0.11)
-            || (0.47..0.88).contains(&y) && d < (0.89 - y) * 0.94
+    if shift.is_some() && h <= 8 { return Err("gilded_arrow: phase art needs an eight-pixel margin".into()); }
+    // Slightly unequal shoulders and a tapered, chamfered shaft. Coordinates
+    // are painted at the native 33x48 size, then supersampled for soft edges.
+    let points = [(13.0, 3.0), (21.0, 3.6), (23.0, 5.5), (22.0, 23.0),
+        (29.5, 23.8), (29.0, 27.0), (16.0, 44.0), (3.5, 26.0),
+        (4.0, 23.0), (11.5, 23.4), (11.0, 5.0)];
+    let surface = |x: f32, y: f32| {
+        let mut inside = false;
+        let (mut distance, mut light) = (f32::MAX, 0.0);
+        for (a, b) in points.iter().zip(points.iter().cycle().skip(1)).take(points.len()) {
+            if (a.1 > y) != (b.1 > y) && x < (b.0-a.0)*(y-a.1)/(b.1-a.1)+a.0 { inside = !inside; }
+            let (dx, dy) = (b.0-a.0, b.1-a.1);
+            let t = ((x-a.0)*dx+(y-a.1)*dy)/(dx*dx+dy*dy);
+            let t = t.clamp(0.0, 1.0);
+            let d = ((x-a.0-t*dx).powi(2)+(y-a.1-t*dy).powi(2)).sqrt();
+            if d < distance {
+                distance = d;
+                light = (dx-dy)/(dx*dx+dy*dy).sqrt() * 0.707;
+            }
+        }
+        (inside, distance, light)
     };
     Ok(RgbaImage::from_fn(w, h, |x, y| {
-        let (x, y) = (x as i32, y as i32);
-        let near = |x, y| (-1..=1).any(|dy| (-1..=1).any(|dx| inside(x+dx, y+dy)));
-        if inside(x, y) {
-            let light_edge = !inside(x-2, y-1);
-            let dark_edge = !inside(x+2, y+1);
-            let grain = ((x * 37 + y * 61 + x * y * 7) % 11 - 5) as f32;
-            let shade = 1.08 - 0.28 * x as f32 / w as f32 - 0.10 * y as f32 / h as f32;
-            let mut rgb = [0; 4];
+        let mut sum = [0.0; 4];
+        for sy in 0..4 { for sx in 0..4 {
+            let px = (x as f32+(sx as f32+0.5)/4.0)*33.0/w as f32;
+            let py = match shift {
+                Some(shift) => (y as f32+(sy as f32+0.5)/4.0-4.0-shift)*48.0/(h-8) as f32,
+                None => (y as f32+(sy as f32+0.5)/4.0)*48.0/h as f32,
+            };
+            let (inside, edge, light) = surface(px, py);
+            if !inside { continue; }
+            let (gx, gy) = (px.floor() as i32, py.floor() as i32);
+            let grain = (gx*37+gy*61+gx*gy*7).rem_euclid(17) as f32/16.0-0.5;
+            let mottle = (px*0.77+py*0.32).sin()*(py*0.63-px*0.21).sin();
+            let worn_edge = 0.95+grain*0.30+(py*1.7).sin()*0.12;
+            // Broad directional bevel, brown crevices and a rounded central
+            // ridge. The metal has patches of tarnish rather than a flat fill.
+            let bevel = ((3.8-edge)/2.8).clamp(0.0, 1.0);
+            let ridge = (-((px-16.0)/3.7).powi(2)).exp()*0.17;
+            let shade = 0.76+ridge+0.08*(py*0.16).cos()+mottle*0.055+grain*0.045;
             for c in 0..3 {
-                let mid = color[c] as f32 * shade + grain;
-                let value = if light_edge { mid * 0.60 + [255.0, 244.0, 176.0][c] * 0.40 }
-                    else if dark_edge { mid * 0.55 + [102.0, 49.0, 12.0][c] * 0.45 } else { mid };
-                rgb[c] = value.clamp(0.0, 255.0) as u8;
+                let body = color[c] as f32*shade;
+                let rim = if light > 0.0 { [255.0, 239.0, 167.0][c] } else { [96.0, 53.0, 22.0][c] };
+                let metal = body+(rim-body)*bevel*light.abs().sqrt();
+                let ink = [55.0, 34.0, 19.0][c]+mottle*7.0;
+                let t = ((edge-worn_edge)*2.2).clamp(0.0, 1.0);
+                sum[c] += ink+(metal-ink)*t;
             }
-            rgb[3] = color[3];
-            rgb
-        } else if near(x, y) {
-            [57, 35, 12, color[3]]
-        } else {
-            let shadow = (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dx, dy)))
-                .filter(|&(dx, dy)| near(x-2+dx, y-3+dy)).count();
-            [22, 15, 8, (shadow as u32 * 9 * color[3] as u32 / 255) as u8]
-        }
+            sum[3] += 1.0;
+        }}
+        if sum[3] == 0.0 { return [0; 4]; }
+        [(sum[0]/sum[3]).clamp(0.0,255.0) as u8,
+            (sum[1]/sum[3]).clamp(0.0,255.0) as u8,
+            (sum[2]/sum[3]).clamp(0.0,255.0) as u8, (sum[3]*color[3] as f32/16.0).round() as u8]
+    }))
+}
+
+/// Soft elliptical ground shadow, separate from the airborne marker.
+fn marker_shadow(spec: &str) -> Result<RgbaImage, String> {
+    let (color, (w, h)) = shape_spec(spec, "marker_shadow")?;
+    Ok(RgbaImage::from_fn(w, h, |x, y| {
+        let r = ((x as f32+0.5-w as f32/2.0)/(w as f32/2.0)).powi(2)
+            + ((y as f32+0.5-h as f32/2.0)/(h as f32/2.0)).powi(2);
+        let alpha = ((-3.5*r).exp()-(-3.5f32).exp()).max(0.0);
+        [color[0], color[1], color[2], (alpha*color[3] as f32).round() as u8]
     }))
 }
 
@@ -1151,7 +1197,7 @@ fn resize_fixed(image: &RgbaImage, (w, h): (u32, u32), [sx, sy]: [u32; 2]) -> Rg
 /// The band `width` pixels wide outside `sprite`'s art (its opaque pixels
 /// and what they enclose), in `color`, on an image grown by `width` on
 /// every side.
-fn outline(sprite: &RgbaImage, width: u32, color: [u8; 4]) -> RgbaImage {
+fn outline(sprite: &RgbaImage, width: u32, color: [u8; 4], smooth: bool) -> RgbaImage {
     let t = width as i32;
     let (w, h) = (sprite.width as i32 + 2 * t, sprite.height as i32 + 2 * t);
     let opaque = |x: i32, y: i32| {
@@ -1171,6 +1217,21 @@ fn outline(sprite: &RgbaImage, width: u32, color: [u8; 4]) -> RgbaImage {
     let near_art = |x: i32, y: i32| (-t..=t).any(|dy| (-t..=t).any(|dx| dx * dx + dy * dy <= t * t + t && opaque(x + dx, y + dy)));
     RgbaImage::from_fn(w as u32, h as u32, |x, y| {
         let (x, y) = (x as i32, y as i32);
+        if smooth && outside[(y*w+x) as usize] {
+            // Distance to the native ink's pixel squares. A one-pixel
+            // coverage ramp softens the dilated contour without blurring
+            // the team ring or filling its transparent centre.
+            let mut nearest = f32::MAX;
+            for dy in -t..=t { for dx in -t..=t {
+                if opaque(x+dx, y+dy) {
+                    let d = (dx.abs() as f32-0.5).max(0.0).powi(2)
+                        + (dy.abs() as f32-0.5).max(0.0).powi(2);
+                    nearest = nearest.min(d);
+                }
+            }}
+            let coverage = (t as f32+0.5-nearest.sqrt()).clamp(0.0,1.0);
+            return color.map(|c| (c as f32*coverage).round() as u8);
+        }
         if outside[(y * w + x) as usize] && near_art(x, y) { color } else { [0; 4] }
     })
 }
@@ -1384,11 +1445,12 @@ impl Description {
     /// boxes makes them (`blank_loader`, then the image's own `blank`).
     fn load_frames(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc, blank: bool) -> Result<Vec<RgbaImage>, DescError> {
         let options = self.image_options(img, blank);
-        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 9] = [
+        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 10] = [
             ("solid:", solid),
             ("line:", line),
             ("arrow:", arrow),
             ("gilded_arrow:", gilded_arrow),
+            ("marker_shadow:", marker_shadow),
             ("crosshair:", crosshair),
             ("panes:", panes),
             ("pointer:", pointer),
@@ -1567,7 +1629,7 @@ impl Description {
                 None => cell,
             };
             let cell = match &sheet.outline {
-                Some(o) => outline(&cell, o.width, o.color),
+                Some(o) => outline(&cell, o.width, o.color, o.smooth),
                 None => cell,
             };
             match sheet.resize {
@@ -2666,13 +2728,39 @@ mod tests {
         // A 2-pixel ring (a hollow square) gets a 1-pixel band outside it,
         // none inside.
         let ring = RgbaImage::from_fn(8, 8, |x, y| if x < 2 || y < 2 || x > 5 || y > 5 { [9, 9, 9, 255] } else { [0; 4] });
-        let o = outline(&ring, 1, [1, 2, 3, 255]);
+        let o = outline(&ring, 1, [1, 2, 3, 255], false);
         assert_eq!((o.width, o.height), (10, 10));
         assert_eq!(o.get(0, 5), [1, 2, 3, 255]);
         assert_eq!(o.get(1, 5), [0; 4]);
         assert_eq!(o.get(5, 5), [0; 4]);
         // (Width 1 still rounds the corners: the diagonal neighbour is in.)
         assert_eq!(o.get(0, 0), [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn smooth_ring_outline_keeps_the_centre_clear_and_has_fractional_coverage() {
+        let ring = RgbaImage::from_fn(8, 8, |x, y| if x == 0 || y == 0 || x == 7 || y == 7 { [255; 4] } else { [0; 4] });
+        let image = outline(&ring, 2, [255;4], true);
+        assert_eq!(image.get(6,6)[3], 0);
+        assert!(image.pixels.iter().any(|c| c[3] > 0 && c[3] < 255));
+        assert!(image.pixels.iter().all(|c| c.iter().all(|channel| *channel == c[3])), "tint blending reads RGB coverage");
+        assert_eq!(image.get(6,0)[3], 255);
+    }
+
+    #[test]
+    fn painted_arrow_phases_preserve_art_and_move_between_whole_pixels() {
+        let native = gilded_arrow("232,183,87,255:33x48").unwrap();
+        let base = gilded_arrow("232,183,87,255:33x56@0").unwrap();
+        let shifted = gilded_arrow("232,183,87,255:33x56@4").unwrap();
+        let quarter = gilded_arrow("232,183,87,255:33x56@1").unwrap();
+        for y in 0..48 { for x in 0..33 {
+            assert_eq!(native.get(x,y), base.get(x,y+4));
+            assert_eq!(native.get(x,y), shifted.get(x,y+5));
+        }}
+        assert_ne!(base.pixels, quarter.pixels);
+        assert!(quarter.pixels.iter().any(|c| c[3] > 0 && c[3] < 255));
+        assert!(native.pixels.iter().filter(|c| c[3] == 255).map(|c| c[0]).max().unwrap()
+            - native.pixels.iter().filter(|c| c[3] == 255).map(|c| c[0]).min().unwrap() > 150);
     }
 
     #[test]
@@ -3114,7 +3202,7 @@ mod tests {
         assert_eq!(sprite_pixels(&resized, "masked/0"), vec![[7, 8, 9, 91], [7, 8, 9, 0], [7, 8, 9, 0], [7, 8, 9, 0]]);
         let outlined = Description::parse(&format!("{source}outline = {{ width = 1, color = [1,2,3,255] }}\n")).unwrap().compile(&Checker, 64).unwrap();
         let image = RgbaImage::from_fn(4, 4, |x, y| [7, 8, 9, if (1..3).contains(&x) && (1..3).contains(&y) { 91 } else { 0 }]);
-        assert_eq!(sprite_pixels(&outlined, "masked/0"), outline(&image, 1, [1, 2, 3, 255]).pixels);
+        assert_eq!(sprite_pixels(&outlined, "masked/0"), outline(&image, 1, [1, 2, 3, 255], false).pixels);
     }
 
     #[test]
