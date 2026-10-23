@@ -51,9 +51,10 @@ pub const MENU_SCALE_PERCENT_RANGE: Range = Range { min: 25.0, max: 100.0, step:
 /// at the mouse ([`Layout::zoom_strip`]).
 pub const ZOOM_STRIP_RANGE: Range = Range { min: 0.05, max: 0.5, step: 0.05 };
 /// A floating box's space below its region's top ([`Layout::zoom_box_top`]).
-pub const ZOOM_BOX_TOP_RANGE: Range = Range { min: 0.0, max: 0.2, step: 0.005 };
-/// How far below the pointer a floating box drops ([`Layout::zoom_box_drop`]).
-pub const ZOOM_BOX_DROP_RANGE: Range = Range { min: 0.0, max: 0.5, step: 0.025 };
+pub const ZOOM_BOX_TOP_RANGE: Range = Range { min: 0.0, max: 0.05, step: 0.005 };
+/// The gap between where a floating box rests and where it moves out of the
+/// pointer's way ([`Layout::zoom_box_drop`]).
+pub const ZOOM_BOX_DROP_RANGE: Range = Range { min: 0.0, max: 0.1, step: 0.005 };
 /// The zoom's magnification as an index into [`Layout::MAGNIFICATIONS`]
 /// (`"layout.zoom_magnification_step"`).
 pub const ZOOM_MAGNIFICATION_STEP_RANGE: Range = Range { min: 0.0, max: (Layout::MAGNIFICATIONS.len() - 1) as f32, step: 1.0 };
@@ -602,8 +603,8 @@ mod tests {
             ("layout.zoom_place", ControlValue::Choice("RightOrTop".into())),
             ("layout.zoom", ControlValue::Choice("TopStrip".into())),
             ("layout.zoom_strip", ControlValue::Number(0.35)),
-            ("layout.zoom_box_top", ControlValue::Number(0.05)),
-            ("layout.zoom_box_drop", ControlValue::Number(0.425)),
+            ("layout.zoom_box_top", ControlValue::Number(0.04)),
+            ("layout.zoom_box_drop", ControlValue::Number(0.075)),
             ("layout.zoom_magnification_step", ControlValue::Number(3.0)),
             ("layout.zoom_box_block_pointer", ControlValue::On(true)),
             ("layout.menu_follows_pointer", ControlValue::On(false)),
@@ -721,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn floating_boxes_have_no_own_height_but_a_top_margin_and_a_drop() {
+    fn floating_boxes_have_no_own_height_but_a_top_margin_and_a_gap() {
         let mut s = Settings::default();
         assert!(!KEYS.contains(&"layout.zoom_box_height"));
         assert_eq!(s.control("layout.zoom_box_height"), None);
@@ -730,9 +731,11 @@ mod tests {
         assert!(s.set_control("layout.zoom_box_top", &ControlValue::Number(0.0124)));
         assert_eq!(s.layout.zoom_box_top, 0.01);
         assert!(s.set_control("layout.zoom_box_top", &ControlValue::Number(0.9)));
-        assert_eq!(s.layout.zoom_box_top, 0.2);
+        assert_eq!(s.layout.zoom_box_top, 0.05);
+        assert!(s.set_control("layout.zoom_box_drop", &ControlValue::Number(0.0424)));
+        assert_eq!(s.layout.zoom_box_drop, 0.04);
         assert!(s.set_control("layout.zoom_box_drop", &ControlValue::Number(0.41)));
-        assert_eq!(s.layout.zoom_box_drop, 0.4);
+        assert_eq!(s.layout.zoom_box_drop, 0.1);
         assert!(s.set_control("layout.zoom_box_drop", &ControlValue::Number(-1.0)));
         assert_eq!(s.layout.zoom_box_drop, 0.0);
         assert!(!s.set_control("layout.zoom_box_drop", &ControlValue::Number(f32::NAN)));
