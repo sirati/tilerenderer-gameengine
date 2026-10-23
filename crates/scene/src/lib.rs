@@ -207,6 +207,22 @@ pub struct SpriteLifetime {
     pub duration_ms: u32,
 }
 
+/// A range of world sprites on its way: they move by `way` (world pixels,
+/// full size), evenly over `duration_ms`, then stay there. Its clock runs on
+/// the viewer's monotonic clock from when the batch first telling `serial`
+/// arrived: the sprites start at the start of the way, however late the
+/// driver could send it. A nonzero serial identifies one telling; resending it must
+/// not restart its clock. Drivers allocate serials in increasing order
+/// across the session. `sprites` is a half-open range in
+/// [`Scene::sprites`], drawn where the way begins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Motion {
+    pub serial: u64,
+    pub sprites: (u32, u32),
+    pub way: (i32, i32),
+    pub duration_ms: u32,
+}
+
 /// What the renderer knows: the whole world and the views of it. Drivers
 /// send [`Update`]s; the renderer applies them ([`Scene::apply`]) and draws
 /// every view.
@@ -229,6 +245,8 @@ pub struct Scene {
     /// drawing order (within the pass each follows).
     pub sprites: Vec<FreeSprite>,
     pub sprite_lifetimes: Vec<SpriteLifetime>,
+    /// World sprites on their way (units sliding to the next tile).
+    pub motions: Vec<Motion>,
     /// By id.
     pub views: Vec<ViewState>,
     /// The zooms the scene has zoomed art for (see `FreeSprite::zoom_art`);
@@ -725,6 +743,8 @@ pub enum Update {
     Sprites(Vec<FreeSprite>),
     /// Replaces the lifetimes of world sprite ranges.
     SpriteLifetimes(Vec<SpriteLifetime>),
+    /// See [`Scene::motions`] (replaced).
+    Motions(Vec<Motion>),
     /// View `id` added or changed (its overlay kept), or removed (`None`).
     View { id: u32, view: Option<View> },
     /// The screen-space sprites over view `id` (replaced).
@@ -875,6 +895,7 @@ impl Scene {
             Update::Bindings(b) => self.bindings = b,
             Update::Sprites(sprites) => self.sprites = sprites,
             Update::SpriteLifetimes(lifetimes) => self.sprite_lifetimes = lifetimes,
+            Update::Motions(motions) => self.motions = motions,
             Update::View { id, view: Some(view) } => self.view_mut(id).view = view,
             Update::View { id, view: None } => self.views.retain(|v| v.id != id),
             Update::Overlay { view, sprites } => self.view_mut(view).overlay = sprites,
@@ -971,6 +992,9 @@ impl Scene {
         }
         if self.sprite_lifetimes != old.sprite_lifetimes {
             out.push(Update::SpriteLifetimes(self.sprite_lifetimes.clone()));
+        }
+        if self.motions != old.motions {
+            out.push(Update::Motions(self.motions.clone()));
         }
         for v in &old.views {
             if self.view(v.id).is_none() {
@@ -1194,7 +1218,7 @@ pub fn connect() -> (Driver, Display) {
     let wake = Waker::default();
     (
         Driver { updates: updates_tx, input: input_rx, in_flight: in_flight.clone(), wake: wake.clone() },
-        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() }, changes_from_seq: 0, host: None },
+        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() }, changes_from_seq: 0, host: None, motion_arrivals: Default::default() },
     )
 }
 
@@ -1296,6 +1320,9 @@ pub struct Display {
     changes_from_seq: u64,
     /// The host's status last received, and when (see [`Display::host`]).
     host: Option<(HostStatus, std::time::Instant)>,
+    /// When each motion of the scene first arrived (see
+    /// [`Display::motion_arrival`]).
+    motion_arrivals: std::collections::HashMap<u64, std::time::Instant>,
 }
 
 /// What of a [`Scene`] changed (see [`Display::take_changes`]), for a
@@ -1415,6 +1442,13 @@ impl Display {
             if let Update::Settings(s) = &u {
                 self.new_settings = Some(s.clone());
             }
+            if let Update::Motions(motions) = &u {
+                let now = std::time::Instant::now();
+                self.motion_arrivals.retain(|serial, _| motions.iter().any(|m| m.serial == *serial));
+                for m in motions {
+                    self.motion_arrivals.entry(m.serial).or_insert(now);
+                }
+            }
             self.changes.note(&u);
             self.scene.apply(u);
         }
@@ -1428,6 +1462,13 @@ impl Display {
     /// driver or the connection gone silent).
     pub fn host(&self) -> Option<(HostStatus, std::time::Instant)> {
         self.host
+    }
+
+    /// When the batch first telling motion `serial` (of the latest scene)
+    /// arrived, on the renderer's clock: the driver sent it then, however
+    /// long the renderer takes to show that scene.
+    pub fn motion_arrival(&self, serial: u64) -> Option<std::time::Instant> {
+        self.motion_arrivals.get(&serial).copied()
     }
 
     pub fn scene(&self) -> &Scene {
@@ -1521,11 +1562,33 @@ mod tests {
         assert_eq!(display.scene().seq, 0);
         assert_eq!(display.host().map(|h| h.0), Some(HostStatus { stale_ms: 700, serial: 1 }));
         assert!(!driver.busy(), "taken");
+        // (See `motions_keep_their_first_arrival` for motions.)
         // With other updates: a new scene, the latest status kept.
         driver.send(vec![Update::Tick(3), Update::Host(HostStatus { stale_ms: 0, serial: 2 })]);
         assert!(display.receive(Duration::ZERO));
         assert_eq!((display.scene().seq, display.scene().tick), (1, 3));
         assert_eq!(display.host().map(|h| h.0.serial), Some(2));
+    }
+
+    #[test]
+    fn motions_keep_their_first_arrival() {
+        let (driver, mut display) = connect();
+        let motion = |serial| Motion { serial, sprites: (0, 1), way: (64, 32), duration_ms: 100 };
+        let before = std::time::Instant::now();
+        driver.send(vec![Update::Motions(vec![motion(1)])]);
+        assert!(display.receive(Duration::ZERO));
+        let first = display.motion_arrival(1).unwrap();
+        assert!(first >= before);
+        std::thread::sleep(Duration::from_millis(2));
+        // Told again (its range moved): the same clock.
+        driver.send(vec![Update::Motions(vec![Motion { sprites: (2, 3), ..motion(1) }, motion(2)])]);
+        assert!(display.receive(Duration::ZERO));
+        assert_eq!(display.motion_arrival(1), Some(first));
+        assert!(display.motion_arrival(2).unwrap() > first);
+        // Gone from the scene: forgotten.
+        driver.send(vec![Update::Motions(vec![motion(2)])]);
+        assert!(display.receive(Duration::ZERO));
+        assert_eq!(display.motion_arrival(1), None);
     }
 
     #[test]

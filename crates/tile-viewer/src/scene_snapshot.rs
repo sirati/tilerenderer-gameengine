@@ -12,7 +12,7 @@ pub(crate) struct Work {
 pub(crate) fn update(shown: &mut Scene, latest: &Scene, changes: &Changes) -> Work {
     // Keep this exhaustive so a new Scene control field cannot be silently
     // omitted from an adopted immutable snapshot.
-    let Scene { seq, tick, shape, layers, slots, bindings, sprites, sprite_lifetimes,
+    let Scene { seq, tick, shape, layers, slots, bindings, sprites, sprite_lifetimes, motions,
         views, zooms, assets, focus, camera_focus, camera_arrival, map_wheel_step, minimap, patches, settings, settings_preview,
         interface, interactables, cursor, screen_size, looks } = latest;
     let mut work = Work::default();
@@ -48,6 +48,8 @@ pub(crate) fn update(shown: &mut Scene, latest: &Scene, changes: &Changes) -> Wo
         shown.sprites.clone_from(sprites);
         shown.sprite_lifetimes.clone_from(sprite_lifetimes);
     }
+    // (Small, and their ranges are only meaningful with the latest sprites.)
+    shown.motions.clone_from(motions);
     if changes.views || changes.world || shown.seq == 0 { shown.views.clone_from(views); }
     shown.seq = *seq;
     shown.tick = *tick;
