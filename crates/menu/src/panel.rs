@@ -1936,31 +1936,41 @@ mod tests {
     fn zoom_preferences_are_separate_and_controls_fit_without_overlap() {
         let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
         let panel = panels.panel("preferences").unwrap();
-        for tab in ["layout", "zoom"] {
-            for mode in ["Off", "Floating131", "Floating171", "Mouse111", "Mouse131", "TopStrip"] {
-                let mut state = PanelState::default();
-                state.values.insert("tab".into(), Value::Text(tab.into()));
-                state.values.insert("layout.zoom".into(), Value::Text(mode.into()));
-                state.values.insert("layout.split".into(), Value::Text("Vertical1To1".into()));
-                let looks = panels.looks(panel, &state, [0, 0, 1024, 768], &estimate);
-                for (i, look) in looks.iter().enumerate() {
-                    let [x, y, w, h] = look.rect;
-                    assert!(x >= 49 && x+w <= 973 && y >= 40 && y+h <= 690, "{tab} {mode}: {:?}", look.rect);
-                    for other in &looks[..i] {
-                        let [a, b, c, d] = other.rect;
-                        assert!(x+w <= a || a+c <= x || y+h <= b || b+d <= y, "{tab} {mode}: {:?} overlaps {:?}", look.rect, other.rect);
+        for menu_zoom in [false, true] {
+            for tab in ["layout", "zoom"] {
+                for mode in ["Off", "Floating131", "Floating171", "Mouse111", "Mouse131", "TopStrip"] {
+                    let mut state = PanelState::default();
+                    state.values.insert("tab".into(), Value::Text(tab.into()));
+                    state.values.insert("layout.zoom".into(), Value::Text(mode.into()));
+                    state.values.insert("layout.split".into(), Value::Text("Vertical1To1".into()));
+                    state.values.insert("layout.menu_zoom".into(), Value::On(menu_zoom));
+                    state.values.insert("layout.zoom_controls".into(), Value::On(menu_zoom || mode != "Off"));
+                    state.values.insert("layout.zoom_lens_controls".into(), Value::On(menu_zoom || !matches!(mode, "Off" | "TopStrip")));
+                    let looks = panels.looks(panel, &state, [0, 0, 1024, 768], &estimate);
+                    for (i, look) in looks.iter().enumerate() {
+                        let [x, y, w, h] = look.rect;
+                        assert!(x >= 49 && x+w <= 973 && y >= 40 && y+h <= 690, "{tab} {mode}: {:?}", look.rect);
+                        for other in &looks[..i] {
+                            let [a, b, c, d] = other.rect;
+                            assert!(x+w <= a || a+c <= x || y+h <= b || b+d <= y, "{tab} {mode}: {:?} overlaps {:?}", look.rect, other.rect);
+                        }
                     }
-                }
-                for item in &panel.items {
-                    if item.control().is_some_and(|k| k.starts_with("layout.zoom")) {
-                        let cond = item.show_if.as_ref().unwrap();
-                        let mut layout = state.clone();
-                        layout.values.insert("tab".into(), Value::Text("layout".into()));
-                        assert!(!cond.holds(&layout.values), "zoom control on Layout");
+                    for item in &panel.items {
+                        if item.control().is_some_and(|k| k.starts_with("layout.zoom") || k == "layout.menu_zoom") {
+                            let cond = item.show_if.as_ref().unwrap();
+                            let mut layout = state.clone();
+                            layout.values.insert("tab".into(), Value::Text("layout".into()));
+                            assert!(!cond.holds(&layout.values), "zoom control on Layout");
+                        }
                     }
                 }
             }
         }
+        let menu_zoom = panel.items.iter().find(|i| i.control() == Some("layout.menu_zoom")).unwrap();
+        assert!(matches!(menu_zoom.kind, Kind::Checkbox { .. }));
+        let mut state = PanelState::default();
+        state.values.insert("tab".into(), Value::Text("zoom".into()));
+        assert!(menu_zoom.show_if.as_ref().unwrap().holds(&state.values));
         let item = panel.items.iter().find(|i| i.control() == Some("layout.zoom_magnification_step")).unwrap();
         let Kind::Slider { tick_labels, .. } = &item.kind else { panic!("magnification slider") };
         assert_eq!(tick_labels.as_ref().unwrap(), &["1.5×", "2×", "3×", "4×"]);

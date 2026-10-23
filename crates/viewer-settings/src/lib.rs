@@ -352,6 +352,9 @@ pub struct Layout {
     /// Where the zoom box goes in a vertical split (else unused).
     pub zoom_place: Place,
     pub zoom: Zoom,
+    /// Screen magnifier beside the pointer, including menus. Takes priority
+    /// over world zoom; shares its magnification, height and lens appearance.
+    pub menu_zoom: bool,
     /// Height of every zoom ([`Zoom::TopStrip`], the floating boxes and the
     /// boxes at the mouse) as a fraction of the window (or of the view it
     /// is in), 0.05..=0.5, default 0.2.
@@ -401,6 +404,7 @@ impl Default for Layout {
             zoom_glass: true,
             zoom_place: Place::Floating,
             zoom: Zoom::Off,
+            menu_zoom: false,
             zoom_strip: 0.2,
             zoom_box_top: 0.025,
             zoom_box_drop: 0.3,
@@ -946,6 +950,11 @@ mod zoom_glass_tests {
     fn old_layouts_default_to_glass_and_new_controls_round_trip() {
         let mut settings: Settings = toml::from_str("[layout]\nzoom = 'Floating131'\nzoom_strip = 0.35").unwrap();
         assert!(settings.layout.zoom_rounded && settings.layout.zoom_glass);
+        assert!(!settings.layout.menu_zoom);
+        assert_eq!(settings.control("layout.menu_zoom"), Some(ControlValue::On(false)));
+        assert!(!settings.set_control("layout.menu_zoom", &ControlValue::Number(1.0)));
+        assert!(settings.set_control("layout.menu_zoom", &ControlValue::On(true)));
+        assert_eq!(settings.control("layout.menu_zoom"), Some(ControlValue::On(true)));
         assert_eq!(settings.layout.separator_width, 4);
         assert_eq!(settings.layout.zoom_strip, 0.35);
         for key in ["layout.zoom_rounded", "layout.zoom_glass"] {

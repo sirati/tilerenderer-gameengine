@@ -657,6 +657,8 @@ pub struct Layout {
     /// The zoom box's or strip's zoom the settings last asked for: it stays
     /// as the wheel changed it until they ask for another.
     zoom_box_zoom: Option<usize>,
+    /// Menu lens height in thousandths of the window, sharing zoom_strip.
+    menu_zoom_height: Option<u32>,
     /// Map detail independently for A, B and the world magnifier.
     pub clean_map: viewer_settings::clean_map::CleanMap,
     /// Whether to draw the arrow at the driver's point of interest.
@@ -910,6 +912,7 @@ impl Default for Layout {
             separator_width: 4,
             window_pixel_scale: 1.0,
             zoom_box_zoom: None,
+            menu_zoom_height: None,
             clean_map: Default::default(),
             focus_arrow: false,
             window: (1, 1),
@@ -1350,7 +1353,7 @@ impl Layout {
         // The magnification asked for; kept as the wheel changed it while
         // the setting stays the same.
         let wanted = Self::ZOOM_BOX_ZOOMS.start() + s.zoom_magnification_step();
-        let zoom = match self.magnifier.filter(|m| m.place != ZoomPlace::Beside) {
+        let zoom = match self.magnifier.filter(|m| (m.mode == MagnifierMode::Screen) == s.menu_zoom) {
             Some(m) if self.zoom_box_zoom == Some(wanted) => m.zoom,
             _ => wanted,
         };
@@ -1367,7 +1370,11 @@ impl Layout {
             Zoom::Mouse131 => Some(ZoomPlace::AboutPointer(3, strip)),
             Zoom::TopStrip => Some(ZoomPlace::Strip(strip)),
         };
-        self.magnifier = place.map(|place| Magnifier { mode: MagnifierMode::World, zoom, place, region: s.zoom_place, ..Self::MAGNIFIER });
+        // Menu zoom temporarily replaces world zoom. Its selection is kept
+        // in settings, so switching menu zoom off restores the world lens.
+        self.menu_zoom_height = s.menu_zoom.then_some(strip);
+        self.magnifier = if s.menu_zoom { Some(Magnifier { zoom, ..Self::MAGNIFIER }) }
+            else { place.map(|place| Magnifier { mode: MagnifierMode::World, zoom, place, region: s.zoom_place, ..Self::MAGNIFIER }) };
         self.zoom_box_block_pointer = s.zoom_box_block_pointer;
         self.zoom_rounded = s.zoom_rounded;
         self.zoom_glass = s.zoom_glass;
@@ -2160,7 +2167,12 @@ impl Layout {
             }
             ZoomPlace::Strip(_) => return (self.strip().map_or([0, 0, 0, 0], |(s, _)| s), None),
         }
-        let (w, h) = (m.size.0 as i32, m.size.1 as i32);
+        let (w, h) = if m.mode == MagnifierMode::Screen {
+            self.menu_zoom_height.map(|height| {
+                let h = (self.window.1 as u64 * height as u64 / 1000).max(1) as i32;
+                ((h * 3 / 2).min(self.window.0 as i32), h)
+            }).unwrap_or((m.size.0 as i32, m.size.1 as i32))
+        } else { (m.size.0 as i32, m.size.1 as i32) };
         let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
         let (px, py) = self.pointer;
         let y = (py - h / 2).clamp(0, (wh - h).max(0));
@@ -2170,7 +2182,7 @@ impl Layout {
             return ([x.clamp(0, (ww - w).max(0)), y, w, h], None);
         }
         let (n, d) = ZOOMS[m.zoom];
-        let (sw, sh) = ((m.size.0 * d).div_ceil(n) as i32, (m.size.1 * d).div_ceil(n) as i32);
+        let (sw, sh) = ((w as u32 * d).div_ceil(n) as i32, (h as u32 * d).div_ceil(n) as i32);
         let (sx, sy) = ((px - sw / 2).clamp(0, (ww - sw).max(0)), (py - sh / 2).clamp(0, (wh - sh).max(0)));
         // Right of what it magnifies, else left of it, its frame clear of it.
         let x = if sx + sw + GAP + w <= ww {
@@ -2191,12 +2203,12 @@ impl Layout {
         (source[0] + (p.0 - rect[0]) * d / n, source[1] + (p.1 - rect[1]) * d / n)
     }
 
-    /// Only floating and mouse boxes have a lens; strips keep a plain line.
+    /// Floating, pointer and menu boxes have a lens; strips keep a plain line.
     fn zoom_lens(&self, m: &Magnifier, rect: [i32; 4]) -> Option<tile_render::Lens> {
-        if !matches!(m.place, ZoomPlace::Box(..) | ZoomPlace::AboutPointer(..)) { return None; }
+        if matches!(m.place, ZoomPlace::Strip(..)) || (m.place == ZoomPlace::Beside && m.mode == MagnifierMode::World) { return None; }
         Some(tile_render::Lens {
-            radius: if self.zoom_rounded { rect[2].min(rect[3]) as f32 * 0.075 } else { 0.0 },
-            rim: (if self.zoom_glass { 7.0 } else { self.separator_width as f32 }) / self.window_pixel_scale.max(1.0) as f32,
+            radius: if self.zoom_rounded { (rect[2].min(rect[3]) as f32 * 0.18).min(30.0 / self.window_pixel_scale.max(1.0) as f32) } else { 0.0 },
+            rim: (if self.zoom_glass { 14.0 } else { self.separator_width as f32 }) / self.window_pixel_scale.max(1.0) as f32,
             glass: self.zoom_glass,
         })
     }
@@ -2808,10 +2820,11 @@ impl Layout {
         if let Some(m) = magnifier.filter(|_| zoom_box.is_none()) {
             let (rect, source) = self.magnifier_geometry(&m);
             let zoom = ZOOMS[m.zoom];
-            push(&mut frame, frame_of(rect));
+            let lens = self.zoom_lens(&m, rect);
+            if lens.is_none() { push(&mut frame, frame_of(rect)); }
             match source {
                 // The window around the pointer, at the magnifier's zoom.
-                Some(source) => frame.copies.push(ScreenCopy { source, at: (rect[0], rect[1]), zoom }),
+                Some(source) => frame.copies.push(ScreenCopy { source, at: (rect[0], rect[1]), zoom, lens }),
                 None => {
                     // The world under the pointer (the world cursor while
                     // the mouse is captured; where it looked last while
@@ -2821,6 +2834,7 @@ impl Layout {
                     let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None, (1, 1));
                     camera.zoomed_art = self.zoomed_art(camera.zoom);
                     camera.downscale = downscale;
+                    camera.lens = lens;
                     push(&mut frame, self.magnifier_art_camera(camera));
                     self.shown.push((Hit::Magnifier, camera));
                 }
@@ -4482,7 +4496,7 @@ impl Layout {
             Some(Hit::Magnifier) => {
                 if let Some(m) = &mut self.magnifier {
                     // (A zoom box or strip: within the settings' choices.)
-                    let (lo, hi) = if m.place == ZoomPlace::Beside { (ONE, ZOOMS.len() - 1) } else { Self::ZOOM_BOX_ZOOMS.into_inner() };
+                    let (lo, hi) = if m.place == ZoomPlace::Beside && self.menu_zoom_height.is_none() { (ONE, ZOOMS.len() - 1) } else { Self::ZOOM_BOX_ZOOMS.into_inner() };
                     m.zoom = next(m.zoom).clamp(lo, hi);
                 }
             }
@@ -4669,12 +4683,53 @@ mod tests {
                 let lens = camera.lens.unwrap();
                 assert_eq!(lens.glass, glass);
                 assert_eq!(lens.radius > 0.0, rounded);
-                assert_eq!(lens.rim * scale as f32, if glass { 7.0 } else { 4.0 });
+                assert_eq!(lens.rim * scale as f32, if glass { 14.0 } else { 4.0 });
                 let corner = (logical.origin.0, logical.origin.1);
                 assert_eq!(l.hit(corner) == Hit::Magnifier, !rounded);
                 assert_eq!(l.hit((logical.origin.0 + logical.viewport.0 as i32 / 2, logical.origin.1 + logical.viewport.1 as i32 / 2)), Hit::Magnifier);
             } } }
         }
+    }
+
+    #[test]
+    fn menu_zoom_settings_share_size_and_magnification_and_restore_world_zoom() {
+        use viewer_settings::Zoom;
+        for scale in [1, 2] { for rounded in [false, true] { for glass in [false, true] {
+            let mut l = Layout::default();
+            l.window_pixel_scale = scale as f64;
+            let mut settings = viewer_settings::Layout { menu_zoom: true, zoom: Zoom::TopStrip,
+                zoom_magnification: 1.5, zoom_strip: 0.3, zoom_rounded: rounded, zoom_glass: glass, ..Default::default() };
+            l.apply_settings(&settings);
+            l.pointer = (300, 300);
+            let f = frame(&mut l, vec![]);
+            assert_eq!(l.magnifier.unwrap().mode, MagnifierMode::Screen);
+            assert!(l.strip().is_none(), "menu zoom replaces the world strip");
+            let [copy] = f.copies[..] else { panic!("one screen copy") };
+            assert_eq!(copy.zoom, (3, 2));
+            let rect = l.magnifier_geometry(&l.magnifier.unwrap()).0;
+            assert_eq!(rect[3], 600 * 3 / 10);
+            let lens = copy.lens.unwrap();
+            assert_eq!(lens.glass, glass);
+            assert_eq!(lens.radius > 0.0, rounded);
+            assert_eq!(lens.rim * scale as f32, if glass { 14.0 } else { 4.0 });
+            assert!((lens.radius * scale as f32 - if rounded { 30.0 } else { 0.0 }).abs() < 0.01);
+            assert_eq!(l.hit((rect[0], rect[1])) == Hit::Magnifier, !rounded);
+            let source = copy.source;
+            assert!(!overlap(rect, source));
+            // An unrelated preference update preserves a wheel-adjusted zoom.
+            l.magnifier.as_mut().unwrap().zoom = 7;
+            l.apply_settings(&settings);
+            assert_eq!(l.magnifier.unwrap().zoom, 7);
+            settings.zoom_magnification = 4.0;
+            l.apply_settings(&settings);
+            assert_eq!(ZOOMS[l.magnifier.unwrap().zoom], (4, 1));
+            settings.menu_zoom = false;
+            l.apply_settings(&settings);
+            assert_eq!(l.magnifier.unwrap().mode, MagnifierMode::World);
+            let f = frame(&mut l, vec![]);
+            assert!(f.copies.is_empty());
+            assert!(l.strip().is_some());
+        } } }
     }
 
     #[test]
@@ -4822,7 +4877,7 @@ mod tests {
         l.route(Input::MouseMove { x: 300, y: 300 });
         let f = frame(&mut l, vec![]);
         // Beside what it magnifies, its frame clear of it.
-        assert_eq!(f.copies, [ScreenCopy { source: [250, 275, 100, 50], at: (354, 250), zoom: (2, 1) }]);
+        assert_eq!(f.copies, [ScreenCopy { source: [250, 275, 100, 50], at: (354, 250), zoom: (2, 1), lens: f.copies[0].lens }]);
         // A click on the magnifier goes to what it shows.
         assert_eq!(click(&mut l, (364, 260))[0], Input::MouseButton { button: Button::Left, down: true, x: 255, y: 280 });
     }

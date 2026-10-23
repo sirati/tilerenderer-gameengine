@@ -73,7 +73,7 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 36] = [
+pub const KEYS: [&str; 37] = [
     "resolution.pixel_scale",
     "resolution.base_ui_scale",
     "resolution.scale_menus",
@@ -87,6 +87,7 @@ pub const KEYS: [&str; 36] = [
     "layout.zoom_glass",
     "layout.zoom_place",
     "layout.zoom",
+    "layout.menu_zoom",
     "layout.zoom_strip",
     "layout.zoom_box_top",
     "layout.zoom_box_drop",
@@ -236,6 +237,7 @@ impl Settings {
             "layout.split" => choice(l.split),
             "layout.zoom_place" => choice(l.zoom_place),
             "layout.zoom" => choice(l.zoom),
+            "layout.menu_zoom" => Some(ControlValue::On(l.menu_zoom)),
             "layout.separator_width" => Some(ControlValue::Number(l.separator_width.clamp(1, 16) as f32)),
             "layout.zoom_rounded" => Some(ControlValue::On(l.zoom_rounded)),
             "layout.zoom_glass" => Some(ControlValue::On(l.zoom_glass)),
@@ -317,9 +319,13 @@ impl Settings {
                     if ok { l.separator_width = width as u32; }
                     ok
                 }
-                "layout.zoom_rounded" | "layout.zoom_glass" => match value {
+                "layout.zoom_rounded" | "layout.zoom_glass" | "layout.menu_zoom" => match value {
                     ControlValue::On(on) => {
-                        if key == "layout.zoom_rounded" { l.zoom_rounded = *on; } else { l.zoom_glass = *on; }
+                        match key {
+                            "layout.zoom_rounded" => l.zoom_rounded = *on,
+                            "layout.menu_zoom" => l.menu_zoom = *on,
+                            _ => l.zoom_glass = *on,
+                        }
                         true
                     }
                     _ => false,

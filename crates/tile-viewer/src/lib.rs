@@ -2453,7 +2453,7 @@ mod cached_picture_tests {
         plan.present = Present { canvas: (640, 480), zoom: (2, 1), at: (0, 0), target: (1280, 960) };
         CachedPicture {
             plan,
-            copies: vec![ScreenCopy { source: [100, 80, 120, 100], at: (300, 180), zoom: (2, 1) }],
+            copies: vec![ScreenCopy { source: [100, 80, 120, 100], at: (300, 180), zoom: (2, 1), lens: None }],
             pixel_box: 1,
         }
     }
