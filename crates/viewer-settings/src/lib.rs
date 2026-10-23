@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod controls;
 pub mod clean_map;
+pub mod accessibility;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
@@ -37,6 +38,7 @@ pub struct Settings {
     pub animation: Animation,
     pub display: Display,
     pub clean_map: clean_map::CleanMap,
+    pub accessibility: accessibility::Accessibility,
     /// What is shown once ever. A file without it is an existing install's:
     /// that has seen it all (only no file at all is a first run).
     #[serde(default = "FirstRun::done")]

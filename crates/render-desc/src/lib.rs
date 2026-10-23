@@ -790,7 +790,7 @@ pub enum BlendDesc {
 }
 
 /// Sources made without the loader (full colour).
-const GENERATED: [&str; 8] = ["solid:", "line:", "arrow:", "crosshair:", "panes:", "pointer:", "rects:", "glyphs:"];
+const GENERATED: [&str; 9] = ["solid:", "line:", "arrow:", "gilded_arrow:", "crosshair:", "panes:", "pointer:", "rects:", "glyphs:"];
 
 /// The characters of a [`glyphs`] image, one cell each, in this order.
 pub const GLYPHS: &str = " 0123456789.%fpsmkingartCPUGbuld/~";
@@ -896,6 +896,44 @@ fn arrow(spec: &str) -> Result<RgbaImage, String> {
         }
     };
     Ok(outlined(w, h, color, inside))
+}
+
+/// A painted, bevelled map marker: warm metal, a brown ink edge and a
+/// soft shadow, matching the palette of Civ III's parchment and brass UI.
+/// The supplied RGB sets the metal's midtone; alpha applies to the art.
+fn gilded_arrow(spec: &str) -> Result<RgbaImage, String> {
+    let (color, (w, h)) = shape_spec(spec, "gilded_arrow")?;
+    let inside = |x: i32, y: i32| {
+        let (x, y) = (x as f32 / w as f32, y as f32 / h as f32);
+        let d = (x - 0.46).abs();
+        (0.07..0.50).contains(&y) && d < 0.14 && (y > 0.10 || d < 0.11)
+            || (0.47..0.88).contains(&y) && d < (0.89 - y) * 0.94
+    };
+    Ok(RgbaImage::from_fn(w, h, |x, y| {
+        let (x, y) = (x as i32, y as i32);
+        let near = |x, y| (-1..=1).any(|dy| (-1..=1).any(|dx| inside(x+dx, y+dy)));
+        if inside(x, y) {
+            let light_edge = !inside(x-2, y-1);
+            let dark_edge = !inside(x+2, y+1);
+            let grain = ((x * 37 + y * 61 + x * y * 7) % 11 - 5) as f32;
+            let shade = 1.08 - 0.28 * x as f32 / w as f32 - 0.10 * y as f32 / h as f32;
+            let mut rgb = [0; 4];
+            for c in 0..3 {
+                let mid = color[c] as f32 * shade + grain;
+                let value = if light_edge { mid * 0.60 + [255.0, 244.0, 176.0][c] * 0.40 }
+                    else if dark_edge { mid * 0.55 + [102.0, 49.0, 12.0][c] * 0.45 } else { mid };
+                rgb[c] = value.clamp(0.0, 255.0) as u8;
+            }
+            rgb[3] = color[3];
+            rgb
+        } else if near(x, y) {
+            [57, 35, 12, color[3]]
+        } else {
+            let shadow = (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dx, dy)))
+                .filter(|&(dx, dy)| near(x-2+dx, y-3+dy)).count();
+            [22, 15, 8, (shadow as u32 * 9 * color[3] as u32 / 255) as u8]
+        }
+    }))
 }
 
 /// `source = "crosshair:R,G,B,A:WxH"`: a cross through the middle with a
@@ -1346,10 +1384,11 @@ impl Description {
     /// boxes makes them (`blank_loader`, then the image's own `blank`).
     fn load_frames(&self, loader: &dyn ImageLoader, name: &str, img: &ImageDesc, blank: bool) -> Result<Vec<RgbaImage>, DescError> {
         let options = self.image_options(img, blank);
-        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 8] = [
+        let generators: [(&str, fn(&str) -> Result<RgbaImage, String>); 9] = [
             ("solid:", solid),
             ("line:", line),
             ("arrow:", arrow),
+            ("gilded_arrow:", gilded_arrow),
             ("crosshair:", crosshair),
             ("panes:", panes),
             ("pointer:", pointer),

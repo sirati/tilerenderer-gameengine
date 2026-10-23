@@ -1971,12 +1971,12 @@ mod tests {
                         assert_eq!(t.clip, [x, y, x + w as i32, y + h as i32]);
                         assert!(t.x >= x && t.x + m.width <= x + w as i32, "{control}: {}", t.text);
                         assert!(t.y - m.ascent >= y && t.y + m.descent <= y + h as i32);
-                        assert!(t.text.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '×'));
+                        assert!(t.text.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '×' || c == '%'));
                     }
                 }
             }
         }
-        assert_eq!(count, 13);
+        assert_eq!(count, 15);
     }
 
     #[test]
@@ -2081,6 +2081,39 @@ mod tests {
         for step in ["0", "-1", "inf", "nan", "0.00001"] {
             let text = PANELS.replace("slider = \"scale\"", &format!("slider = \"scale\"\ntick_step = {step}"));
             assert!(Panels::parse(&text).is_err(), "tick step {step}");
+        }
+    }
+
+    #[test]
+    fn accessibility_controls_are_visible_hit_testable_and_fit() {
+        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
+        let p = panels.panel("preferences").unwrap();
+        let mut state = PanelState::default();
+        state.values.insert("tab".into(), Value::Text("accessibility".into()));
+        state.values.insert("accessibility.unit_rings".into(), Value::On(true));
+        state.values.insert("accessibility.active_unit_arrow".into(), Value::On(true));
+        for item in p.items.iter().filter(|i| i.control().is_some_and(|k| k.starts_with("accessibility."))) {
+            assert!(Panels::visible(item, &state));
+            assert!(Panels::enabled(item, &state));
+            let [x, y, w, h] = panels.rect(item, &state, (0, 0)).unwrap();
+            assert!(x >= 70 && y >= 95 && x+w <= 952 && y+h <= 655);
+            let hit = panels.hit(p, &state, [0, 0, 1024, 768], x+w/2, y+h/2);
+            assert_eq!(hit, Some(p.items.iter().position(|i| std::ptr::eq(i, item)).unwrap()));
+        }
+        let looks = panels.looks(p, &state, [0, 0, 1024, 768], &estimate);
+        for (i, a) in looks.iter().enumerate() {
+            let [x, y, w, h] = a.rect;
+            for b in &looks[..i] {
+                let [l, t, bw, bh] = b.rect;
+                assert!(x+w <= l || l+bw <= x || y+h <= t || t+bh <= y, "{:?} overlaps {:?}", a.rect, b.rect);
+            }
+        }
+        let bob = p.items.iter().find(|i| i.control() == Some("accessibility.arrow_bobbing")).unwrap();
+        state.values.insert("accessibility.active_unit_arrow".into(), Value::On(false));
+        assert!(!Panels::visible(bob, &state));
+        for tab in ["civ3", "resolution", "layout", "zoom", "clean_map"] {
+            state.values.insert("tab".into(), Value::Text(tab.into()));
+            assert!(p.items.iter().filter(|i| i.control().is_some_and(|k| k.starts_with("accessibility."))).all(|i| !Panels::visible(i, &state)));
         }
     }
 

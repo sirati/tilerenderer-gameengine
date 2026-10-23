@@ -768,26 +768,108 @@ pub const DIVIDER_ROW_SPRITE: &str = "Viewer@divider_h/0";
 pub const ARROW_SPRITE: &str = "Viewer@arrow/0";
 
 /// The markers as world sprites on top of everything (but the world
-/// cursor, which `cursor` draws). The arrow blinks twice every three
-/// seconds (`time`: since the viewer started). The markers' points are in
+/// cursor, which `cursor` draws). The arrow gently bobs when enabled
+/// (`time`: since the viewer started). The markers' points are in
 /// the pixels of views showing the world `downscale` times smaller; world
 /// sprites are placed at full size.
-fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u32, time: Duration) -> Vec<tile_render::PlacedSprite> {
-    let blink = time.as_millis() % 3000;
-    let arrow_off = blink < 150 || (300..450).contains(&blink);
+pub fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u32, time: Duration, bobbing: bool) -> Vec<tile_render::PlacedSprite> {
     markers
         .iter()
         .filter_map(|m| {
             let (name, (x, y)) = match *m {
                 layout::Marker::Cursor(_) => return None,
-                layout::Marker::Focus(_) if arrow_off => return None,
                 layout::Marker::Focus(p) => (ARROW_SPRITE, p),
             };
             let (set, _) = compiled.set(name)?;
             let n = downscale.max(1) as i32;
-            Some(tile_render::PlacedSprite::new(set, x * n, y * n))
+            let offset = if bobbing { arrow_bob_offset(time).round() as i32 } else { 0 };
+            Some(tile_render::PlacedSprite { category: viewer_settings::clean_map::UNITS,
+                ..tile_render::PlacedSprite::new(set, x * n, y * n + offset) })
         })
         .collect()
+}
+
+/// Full-size world pixels; cameras apply world zoom and pixel scale once.
+pub fn arrow_bob_offset(time: Duration) -> f32 {
+    (std::f64::consts::TAU * (time.as_secs_f64() % 1.3) / 1.3).sin() as f32 * 3.0
+}
+
+/// Only animate when at least one world camera can show the marker. Static
+/// markers stay identical, allowing the renderer to reuse its last picture.
+pub fn arrow_bobbing_visible(bobbing: bool, markers: &[layout::Marker], cameras: &[Camera], downscale: u32) -> bool {
+    bobbing && markers.iter().any(|m| {
+        let layout::Marker::Focus((x, y)) = *m else { return false };
+        let n = downscale.max(1) as f64;
+        cameras.iter().any(|c| {
+            if !c.cells || c.hidden_categories & viewer_settings::clean_map::UNITS != 0 { return false; }
+            let d = c.downscale.max(1) as f64;
+            let z = c.zoom.0 as f64 / c.zoom.1.max(1) as f64;
+            let (left, top) = (((x as f64*n - 16.0)/d - c.x as f64)*z, ((y as f64*n - 115.0)/d - c.y as f64)*z);
+            left < c.viewport.0 as f64 && top < c.viewport.1 as f64 && left + 33.0*z/d > 0.0 && top + 54.0*z/d > 0.0
+        })
+    })
+}
+
+#[cfg(test)]
+mod accessibility_arrow_tests {
+    use super::*;
+    #[test]
+    fn bobbing_uses_elapsed_time_and_is_bounded_and_periodic() {
+        for ms in 0..5200 {
+            let t = Duration::from_millis(ms);
+            assert!(arrow_bob_offset(t).abs() <= 3.0);
+            assert!((arrow_bob_offset(t) - arrow_bob_offset(t+Duration::from_millis(1300))).abs() < 0.0001);
+        }
+        assert!((arrow_bob_offset(Duration::from_millis(325)) - 3.0).abs() < 0.0001);
+        assert!((arrow_bob_offset(Duration::from_millis(975)) + 3.0).abs() < 0.0001);
+    }
+    #[test]
+    fn redraw_changes_only_for_visible_bobbing_arrows() {
+        struct NoFiles;
+        impl render_desc::ImageLoader for NoFiles {
+            fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> { unreachable!() }
+        }
+        let desc = "grid = { layout = \"orthogonal\", step = [32,32] }\n[images.arrow]\nsource = \"gilded_arrow:248,194,56,255:33x48\"\n[sheets.arrow]\nimage = \"arrow\"\ncell = [33,48]\ngrid = [1,1]\nanchor = [-16,-112]\ngroup = \"Viewer@arrow\"\n";
+        let compiled = render_desc::Description::parse(desc).unwrap().compile(&NoFiles, 128).unwrap();
+        let m = [layout::Marker::Focus((100, 160))];
+        let cameras = [Camera::new((320, 240))];
+        assert!(arrow_bobbing_visible(true, &m, &cameras, 1));
+        assert!(!arrow_bobbing_visible(false, &m, &cameras, 1));
+        assert!(!arrow_bobbing_visible(true, &[], &cameras, 1));
+        assert!(!arrow_bobbing_visible(true, &[layout::Marker::Focus((1000, 160))], &cameras, 1));
+        assert!(!arrow_bobbing_visible(true, &m, &[Camera { cells: false, ..cameras[0] }], 1));
+        assert!(!arrow_bobbing_visible(true, &m, &[Camera { hidden_categories: viewer_settings::clean_map::UNITS, ..cameras[0] }], 1));
+        let (a, b) = (Duration::from_millis(325), Duration::from_millis(975));
+        assert_eq!(marker_sprites(&compiled, &m, 1, a, false), marker_sprites(&compiled, &m, 1, b, false));
+        assert_ne!(marker_sprites(&compiled, &m, 1, a, true), marker_sprites(&compiled, &m, 1, b, true));
+        // No blinking at any phase; native reduced positions return to full
+        // world coordinates before the camera applies its own downscale.
+        for ms in (0..3000).step_by(50) { assert_eq!(marker_sprites(&compiled, &m, 2, Duration::from_millis(ms), true).len(), 1); }
+        assert_eq!(marker_sprites(&compiled, &m, 2, a, true)[0].y, 323);
+        // The actual GPU retained-picture decision, not just marker math:
+        // moving the arrow invalidates its world, a static/absent one does
+        // not create further full redraws as the animation clock advances.
+        let gpu = tile_render::Headless::new().unwrap();
+        let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
+        let mut world = compiled.world(1, 1, false, false);
+        world.color = tile_render::ColorModel::Quantized { bits: 5 };
+        renderer.set_world(&gpu.device, &world);
+        let check = |renderer: &mut tile_render::TileRenderer, time, bobbing, markers: &[layout::Marker]| {
+            renderer.set_markers(&gpu.device, &gpu.queue, &marker_sprites(&compiled, markers, 1, time, bobbing));
+            gpu.render_views(renderer, &cameras, (320, 240), 0, [64, 72, 48, 255]);
+        };
+        check(&mut renderer, a, false, &m);
+        check(&mut renderer, b, false, &m);
+        assert!(renderer.reused());
+        check(&mut renderer, a, true, &m);
+        assert!(!renderer.reused());
+        check(&mut renderer, b, true, &m);
+        assert!(!renderer.reused());
+        check(&mut renderer, a, true, &[]);
+        check(&mut renderer, b, true, &[]);
+        assert!(renderer.reused());
+    }
 }
 
 /// The divider's glass (`layout::Frame::divider`, `layout::glass`): one
@@ -2524,6 +2606,7 @@ impl App {
         self.input_revision = self.input_revision.wrapping_add(1);
         self.layout.apply_settings(&settings.layout);
         self.layout.clean_map = settings.clean_map.clone();
+        self.layout.focus_arrow = settings.accessibility.active_unit_arrow;
         self.layout.set_map_movement(settings.input.map_movement);
         self.layout.set_capture_sensitivity(settings.input.capture_sensitivity);
         if let Ok(spec) = std::env::var("TILE_VIEWER_LAYOUT") {
@@ -3530,7 +3613,8 @@ impl App {
             }
         }
         // The viewer's markers on top of the world, for this frame only.
-        let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed());
+        let bobbing = arrow_bobbing_visible(self.settings.accessibility.arrow_bobbing, &arranged.markers, &arranged.cameras, world_downscale(scene));
+        let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed(), bobbing);
         markers.extend(glass_sprites(&self.compiled, &arranged.divider));
         markers.extend(separator_sprites(&arranged.separators));
         // The cursor where the viewer draws it, in a camera of its own on

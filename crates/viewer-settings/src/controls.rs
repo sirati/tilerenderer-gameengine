@@ -115,6 +115,7 @@ pub const KEYS: [&str; 37] = [
 
 /// The range of number control `key`, if it is one.
 pub fn range(key: &str) -> Option<Range> {
+    if key.starts_with("accessibility.") { return crate::accessibility::range(key); }
     match key {
         "resolution.base_ui_scale" => Some(Range { min: 1.0, max: Resolution::MAX_PIXEL_SCALE as f32, step: 0.5 }),
         "resolution.menu_scale_percent" => Some(MENU_SCALE_PERCENT_RANGE),
@@ -226,6 +227,7 @@ impl Settings {
     pub fn control(&self, key: &str) -> Option<ControlValue> {
         let (r, l, i) = (&self.resolution, &self.layout, &self.input);
         if key.starts_with("clean_map.") { return self.clean_map.control(key); }
+        if key.starts_with("accessibility.") { return self.accessibility.control(key); }
         match key {
             "resolution.pixel_scale" => Some(ControlValue::Choice(r.effective_pixel_scale().to_string())),
             "resolution.base_ui_scale" => Some(ControlValue::Number(r.effective_base_ui_scale())),
@@ -278,6 +280,7 @@ impl Settings {
             .map(|k| k.to_string())
             .chain(std::iter::once("layout.orientation".to_owned()))
             .chain(crate::clean_map::CleanMap::keys())
+            .chain(crate::accessibility::KEYS.into_iter().map(str::to_owned))
             .filter_map(|k| self.control(&k).map(|v| (k, v)))
             .collect()
     }
@@ -322,6 +325,7 @@ impl Settings {
     /// place is set for the split's orientation, the other kept.
     pub fn set_control(&mut self, key: &str, value: &ControlValue) -> bool {
         if key.starts_with("clean_map.") { return self.clean_map.set_control(key, value); }
+        if key.starts_with("accessibility.") { return self.accessibility.set_control(key, value); }
         let before = self.clone();
         let ok = {
             let (r, l, i, d) = (&mut self.resolution, &mut self.layout, &mut self.input, &mut self.display);
@@ -769,8 +773,8 @@ mod tests {
     fn controls_list_every_setting_and_screen() {
         let s = Settings::default();
         let controls = s.controls();
-        assert_eq!(controls.len(), KEYS.len() + 1 + crate::clean_map::CleanMap::keys().count());
-        for key in crate::clean_map::CleanMap::keys() {
+        assert_eq!(controls.len(), KEYS.len() + 1 + crate::clean_map::CleanMap::keys().count() + crate::accessibility::KEYS.len());
+        for key in crate::clean_map::CleanMap::keys().chain(crate::accessibility::KEYS.into_iter().map(str::to_owned)) {
             assert_eq!(controls.iter().filter(|(k, _)| *k == key).count(), 1, "{key}");
         }
         assert!(controls.contains(&("layout.screen_place".into(), ControlValue::Choice("Floating".into()))));
