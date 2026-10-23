@@ -1207,6 +1207,12 @@ impl SnapInput {
                     layout.attractor_clicked(p);
                     log::debug!("snap: an attractor clicked: off, the mouse {} at {p:?}", if layout.captured() { "captured" } else { "free" });
                 }
+                // A press on the menu outside the view the mouse is captured
+                // in (beside the menu) lets the mouse go; it goes to the menu.
+                Action::Button { down: true, at, .. } => {
+                    layout.menu_clicked((at.0.round() as i32, at.1.round() as i32));
+                    out.extend(to_input(a, layout));
+                }
                 a => out.extend(to_input(a, layout)),
             }
         }
@@ -1622,7 +1628,8 @@ impl SnapInput {
     /// With [`SnapInput::set_alt_in_menus`]: a menu opening turns the mode
     /// on (where it has something to snap to), the last one closing turns
     /// it off again, a mode the player had turned on stays as it is. The
-    /// player turning it off (Alt, Ctrl, an attractor, focus) keeps it off
+    /// player turning it off (Alt, Ctrl, an attractor, focus, capturing the
+    /// mouse beside the menu) keeps it off
     /// until the menus are all closed.
     fn menu_mode(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
         let menu = layout.menu_open();
@@ -1637,6 +1644,13 @@ impl SnapInput {
                 return self.leave(layout, "the menus closed");
             }
             return vec![];
+        }
+        // The player captured the mouse beside the menu (a click into a
+        // view the menu is not over): as the mode turned off, not on again
+        // by itself until the menus are all closed.
+        if layout.captured() && !self.snapper.snapping() && !self.menu_declined {
+            self.menu_declined = true;
+            log::debug!("snap: the mouse captured beside a menu: no button snapping by itself");
         }
         if self.alt_in_menus && !self.by_menu && !self.menu_declined && !self.snapper.snapping() && !self.alt && Self::targets(scene, layout).iter().any(|t| !t.is_capture()) {
             self.by_menu = true;

@@ -135,3 +135,95 @@ fn a_menu_opening_over_a_captured_mouse_snaps_with_the_mouse_let_go_and_captures
     assert!(!snap.active());
     assert!(l.captured(), "the world's capture taken up again");
 }
+
+/// A vertical split, B following the world cursor, menus placed in A; a
+/// popup open in A (`popup`) or not.
+fn beside(popup: bool) -> Scene {
+    let mut s = scene(None);
+    if popup {
+        let view = View { interface_only: true, origin: (300, 200), viewport: (300, 150), ..Default::default() };
+        s.views.push(ViewState { id: 257, view, overlay: vec![] });
+        s.interface.popup = Some(257);
+    }
+    s
+}
+
+fn beside_setup() -> (SnapInput, Layout) {
+    let mut l = Layout::default();
+    l.apply_settings(&viewer_settings::Layout {
+        split: viewer_settings::Split::Vertical1To1,
+        roles: viewer_settings::Roles::UnitMouse,
+        screen_place: viewer_settings::ScreenPlace { vertical: viewer_settings::Place::LeftOrBottom, horizontal: viewer_settings::Place::Floating },
+        ..Default::default()
+    });
+    show(&mut l, &beside(false));
+    l.route(Input::MouseMove { x: 600, y: 300 });
+    let mut snap = SnapInput::default();
+    snap.set_alt_in_menus(true);
+    (snap, l)
+}
+
+fn press(snap: &mut SnapInput, l: &mut Layout, s: &Scene, now: f64) -> Vec<Input> {
+    let mut out = snap.route(Input::MouseButton { button: Button::Left, down: true, x: 600, y: 300 }, l, s, now, Rates::default());
+    out.extend(snap.route(Input::MouseButton { button: Button::Left, down: false, x: 600, y: 300 }, l, s, now + 0.05, Rates::default()));
+    out
+}
+
+#[test]
+fn beside_a_popup_the_other_views_attractor_captures_and_the_menus_mode_stays_off() {
+    let (mut snap, mut l) = beside_setup();
+    let menu = beside(true);
+    run(&mut snap, &mut l, &menu, 0.0, 0.3);
+    assert!(snap.snapper.snapping() && !l.captured(), "the popup: on by itself");
+    assert!(snap.attractor_points().iter().any(|&((x, _), captures)| captures && x > 400.0), "B's attractor captures");
+    // Steered to B's attractor: its click captures, nothing to the game.
+    steer(&mut snap, &mut l, &menu, 0.3, 2.0, (12.0, -10.0), 0.5);
+    assert_eq!(snap.snapper.target(), Some((602.0, 300.0)));
+    let out = press(&mut snap, &mut l, &menu, 2.1);
+    assert!(l.captured());
+    assert!(out.iter().all(|i| !matches!(i, Input::MouseButton { .. } | Input::WorldButton { .. })), "{out:?}");
+    run(&mut snap, &mut l, &menu, 2.2, 1.0);
+    assert!(l.captured(), "kept while the popup is open");
+    assert!(!snap.active(), "the menu's mode declined");
+}
+
+#[test]
+fn captured_beside_a_popup_the_mode_waits_and_its_click_on_the_menu_lets_go() {
+    let (mut snap, mut l) = beside_setup();
+    let menu = beside(true);
+    // (Without the setting: the free pointer's click into B captures.)
+    snap.set_alt_in_menus(false);
+    run(&mut snap, &mut l, &menu, 0.0, 0.2);
+    let out = press(&mut snap, &mut l, &menu, 0.25);
+    assert!(l.captured() && out.is_empty(), "{out:?}");
+    // The setting on: not on by itself over the player's capture.
+    snap.set_alt_in_menus(true);
+    run(&mut snap, &mut l, &menu, 0.3, 0.5);
+    assert!(!snap.active() && l.captured());
+    // The player's Alt: steered to the strip's left button (in A), its
+    // click goes to the game and lets the mouse go.
+    key(&mut snap, &mut l, &menu, ALT, true, 0.9);
+    key(&mut snap, &mut l, &menu, ALT, false, 0.95);
+    assert!(snap.snapper.snapping());
+    steer(&mut snap, &mut l, &menu, 1.0, 3.0, (-20.0, 10.0), 1.2);
+    assert_eq!(snap.snapper.rested(), Some(1), "on the left button");
+    assert!(l.captured());
+    let out = press(&mut snap, &mut l, &menu, 3.1);
+    assert!(!l.captured(), "the click on the menu let go");
+    assert!(out.iter().any(|i| matches!(i, Input::MouseButton { button: Button::Left, down: true, x, y } if (100..160).contains(x) && (520..550).contains(y))), "{out:?}");
+}
+
+/// Frames and ticks of `s` from `from` to `to`, with `motion` raw counts
+/// a tick while `t < until`.
+fn steer(snap: &mut SnapInput, l: &mut Layout, s: &Scene, from: f64, to: f64, motion: Point, until: f64) {
+    let mut t = from;
+    while t < to {
+        t += TICK;
+        if t < until {
+            snap.motion(motion);
+        }
+        l.advance(std::time::Duration::from_secs_f64(TICK));
+        show(l, s);
+        snap.tick(l, s, t, Rates::default());
+    }
+}

@@ -723,6 +723,9 @@ pub struct Layout {
     /// A capture a menu interrupted, taken up again once no menu is open
     /// (`capture`).
     resume: capture::Resume,
+    /// Where the open menus lie over the window, as of the last frame
+    /// (`capture`: a view they overlap does not capture the mouse).
+    menu_cover: capture::Cover,
     /// The pointer goes to the screen just opened (this frame), or to the
     /// popup.
     pointer_to_screen: bool,
@@ -929,6 +932,7 @@ impl Default for Layout {
             popup_pan: None,
             world_period: (0, 0),
             resume: capture::Resume::default(),
+            menu_cover: capture::Cover::default(),
             pointer_to_screen: false,
             pointer_to_popup: false,
             focus_after_scale: None,
@@ -1693,7 +1697,11 @@ impl Layout {
         self.locked = true;
         self.grab = Some(true);
         self.against = None;
-        log::info!("viewer: mouse captured, it moves the world cursor at {:?} (Ctrl on its own or Ctrl+Shift+Space releases it)", self.cursor);
+        if self.menu_open() {
+            log::info!("viewer: mouse captured in {hit:?} beside the open menu, it moves the world cursor at {:?} (a click on the menu, Ctrl on its own or Ctrl+Shift+Space releases it)", self.cursor);
+        } else {
+            log::info!("viewer: mouse captured, it moves the world cursor at {:?} (Ctrl on its own or Ctrl+Shift+Space releases it)", self.cursor);
+        }
     }
 
     /// Releases the mouse (never captures it).
@@ -2308,6 +2316,7 @@ impl Layout {
         self.screen = parts.screen.clone();
         // With the screen and popups known: no capture under a menu, and
         // one a menu interrupted taken up once all are gone (`capture`).
+        self.cover_menus(following_menu, over_menu);
         self.settle_capture();
         self.focus = scene.focus;
         // Where the views look (from what the last frame showed). (While a
@@ -8575,14 +8584,22 @@ mod tests {
                         other => panic!("{what}: the click on the popup went to {other:?}"),
                     }
                 }
-                // B's world beside the popup: no capture while a menu is
-                // open (`capture`); once it closes, the capture it let go of
-                // is taken up again.
+                // B's world beside the popup: the popup in A, a click there
+                // captures the mouse (nothing to the game); the popup in B,
+                // it does not (`capture`). Once the popup closes the mouse
+                // is captured (again).
                 let world = (b[0] + 8, b[1] + b[3] - 8);
                 assert!(!overlap([c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32], [world.0, world.1, 1, 1]), "{what}");
                 mv(&mut l, world);
-                click(&mut l, world);
-                assert!(!l.captured(), "{what}: a click on B's uncovered world does not capture under a popup");
+                let out = click(&mut l, world);
+                if side == Side::A {
+                    assert!(l.captured(), "{what}: a click on B's world beside the popup in A captures");
+                    assert_eq!(out, [], "{what}");
+                    l.frame(&scene(), plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
+                    assert!(l.captured(), "{what}: stays captured as the popup closes");
+                    continue;
+                }
+                assert!(!l.captured(), "{what}: a click on B's world beside the popup in B does not capture");
                 l.frame(&scene(), plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
                 assert!(!l.captured(), "{what}: not at once");
                 for _ in 0..3 {
@@ -8607,6 +8624,7 @@ impl Layout {
         self.screen_content = frame.screen_content;
         self.menu_side = frame.menu_side;
         self.popup_side = frame.popup_side;
+        self.menu_cover = frame.menu_cover;
         self.walls = frame.walls;
         self.reachable = frame.reachable;
         self.screen = frame.screen;

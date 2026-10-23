@@ -22,10 +22,24 @@
 //! under the screen.
 //!
 //! The player may still click into the view following the world cursor
-//! beside a screen placed in the other pane (playing there while the
-//! screen is open, `docs/modal-input.md`): that is the player's capture,
-//! not a menu's. Over a floating screen, and while any popup is open, such
-//! a click does not capture.
+//! beside the menu (playing there while it is open, `docs/modal-input.md`):
+//! that is the player's capture, not a menu's. A view is beside the menu
+//! when no open menu lies over it ([`Cover`], as of the last frame): a
+//! screen fitted into the other pane (or the game menu following the
+//! pointer into it), a popup placed in the other pane by the screen place
+//! setting or the view it was opened from. A floating screen, and a popup
+//! placed nowhere in particular (a single view, at a click), lie over every
+//! view; a popup opened at a world click is dismissed by such a click
+//! instead (and the mouse captured once it is gone). Over a view beside
+//! the menu the pointer shows that a click captures
+//! ([`Layout::take_pointer_icon`]); the click captures and goes nowhere
+//! else. That capture stays while the menu is open (`settle_capture` lets
+//! go only of a capture in a view a menu lies over); the divider and the
+//! window's edges hold the mouse as for any capture. Ctrl on its own lets
+//! it go, and so does the Alt mode's click on the menu outside the captured
+//! view ([`Layout::menu_clicked`], the click going to the menu). Capturing
+//! beside a menu turns off the Alt mode the menu turned on, as Alt or Ctrl
+//! would (`crate::snap`: off until the menus are all closed).
 //!
 //! Losing the window's focus forgets a pending capture: coming back, a
 //! click captures the mouse, as before. Activation never captures it.
@@ -61,6 +75,17 @@ pub struct Attractor {
     pub captures: bool,
 }
 
+/// Where the open menus lie over the window (window rectangles), as of
+/// the last frame: the pane a screen is fitted into or a menu follows the
+/// pointer into, the view a popup is placed in, else the whole window.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Cover {
+    /// The named screen's.
+    pub screen: Vec<[i32; 4]>,
+    /// The popup's (over a screen in a pane: that pane).
+    pub popup: Vec<[i32; 4]>,
+}
+
 /// A capture a menu interrupted, waiting for the menus to be gone.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub(super) struct Resume {
@@ -92,19 +117,63 @@ impl Layout {
         if self.map_movement() == MapMovement::Drag {
             return Some("map movement is Drag: no capture");
         }
-        if popup && self.popup_shown {
+        // (One opened at a world click: a press beside it dismisses it,
+        // `Layout::dismissing_press`.)
+        if popup && self.click_popup_open() {
             return Some("a popup is open");
         }
-        if self.screen.is_some() && !self.screen_beside_world() {
-            return Some("a screen is open over the world");
+        let view = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| [c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32]);
+        let covers = |rects: &[[i32; 4]]| view.is_none_or(|v| rects.iter().any(|&r| super::overlap(r, v)));
+        if popup && self.popup_shown && covers(&self.menu_cover.popup) {
+            return Some("a popup is open over it");
+        }
+        if self.screen.is_some() && covers(&self.menu_cover.screen) {
+            return Some("a screen is open over it");
         }
         None
     }
 
-    /// Whether the open screen is placed into one pane, the other showing
-    /// the world to play in.
-    fn screen_beside_world(&self) -> bool {
-        self.fit_target(self.screen.as_deref()).is_some()
+    /// Where the open menus lie this frame ([`Cover`]), once the screen and
+    /// the popup are known: `following_menu`, the game menu placed in the
+    /// pane it was opened from; `over_menu`, the popup is over a menu.
+    pub(super) fn cover_menus(&mut self, following_menu: bool, over_menu: bool) {
+        let whole = [0, 0, self.window.0 as i32, self.window.1 as i32];
+        let (a, b) = self.panes();
+        let pane = |h: Hit| if h == Hit::Pane { b.unwrap_or(a) } else { a };
+        let fitted = self.fit_target(self.screen.as_deref()).or(following_menu.then(|| self.menu_side.unwrap_or(super::Side::A).hit()));
+        let screen = match (&self.screen, fitted) {
+            (None, _) => vec![],
+            (Some(_), Some(h)) => vec![pane(h)],
+            (Some(_), None) => vec![whole],
+        };
+        let popup = if !self.popup_shown {
+            vec![]
+        } else if over_menu {
+            // (Over a screen in a pane it goes over that pane.)
+            if screen.is_empty() || screen.contains(&whole) { vec![whole] } else { screen.clone() }
+        } else {
+            vec![self.popup_region().unwrap_or(whole)]
+        };
+        self.menu_cover = Cover { screen, popup };
+    }
+
+    /// The view following the world cursor the mouse is captured in.
+    fn captured_view(&self) -> Option<Hit> {
+        if !self.locked {
+            return None;
+        }
+        self.shown.iter().map(|(h, _)| *h).find(|&h| matches!(h, Hit::Main | Hit::Pane | Hit::Inset(_)) && self.follow_of(h) == Some(super::Follow::Pointer))
+    }
+
+    /// A click of the Alt mode's pointer at window pixel `p` on the
+    /// driver's interface while a menu is open: outside the view the mouse
+    /// is captured in, it lets the mouse go (the click goes to the menu).
+    pub fn menu_clicked(&mut self, p: (i32, i32)) {
+        let Some(hit) = self.captured_view().filter(|_| self.menu_open()) else { return };
+        let inside = self.shown.iter().find(|(h, _)| *h == hit).is_some_and(|(_, c)| super::inside([c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32], p));
+        if !inside {
+            self.release("a click on the menu outside the captured view");
+        }
     }
 
     /// Whether the mouse may be captured in a view following the world
@@ -228,11 +297,12 @@ impl Layout {
             if self.map_movement() == MapMovement::Drag {
                 self.forget_resume();
                 self.release_here("map movement is Drag");
-            } else if self.popup_shown || (self.screen.is_some() && !self.screen_beside_world()) {
+            } else if self.menu_open() && self.captured_view().is_none_or(|h| self.capture_refused(h).is_some()) {
                 // (The menu's own opening let go already; any other way it
-                // got captured since is undone here.)
+                // got captured since is undone here. The player's capture
+                // in a view no menu lies over stays.)
                 self.suspend_capture();
-                self.release_here("a menu is open");
+                self.release_here("a menu is open over the captured view");
             }
         }
         if self.menu_open() {

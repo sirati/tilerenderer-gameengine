@@ -174,3 +174,98 @@ fn clicks_capture_beside_a_screen_in_the_other_pane_but_not_under_floating_menus
     // All closed: taken up again.
     assert_eq!(wait(&mut l, &scene(), 0.5).last(), Some(&true));
 }
+
+/// UnitMouse roles, screens and popups placed in A: B, following the world
+/// cursor, beside them. A popup open, the mouse free.
+fn beside_popup() -> Layout {
+    let mut l = screen_layout(Place::LeftOrBottom, Roles::UnitMouse, false);
+    show(&mut l, &popup());
+    assert!(!l.captured());
+    l
+}
+
+/// A point on the popup (in A, below the corner's buttons).
+fn on_popup(l: &Layout) -> (i32, i32) {
+    (0..400).step_by(4).flat_map(|x| (60..600).step_by(4).map(move |y| (x, y))).find(|&p| matches!(l.hit(p), Hit::Interface | Hit::Moved(_))).expect("the popup in A")
+}
+
+#[test]
+fn beside_a_popup_the_pointer_over_the_world_cursors_view_shows_a_click_captures() {
+    let mut l = beside_popup();
+    mv(&mut l, (600, 300));
+    assert_eq!(l.take_pointer_icon(), Some(PointerIcon::Capture));
+    let p = on_popup(&l);
+    mv(&mut l, p);
+    assert_eq!(l.take_pointer_icon(), Some(PointerIcon::Default), "over the popup at {p:?}");
+}
+
+#[test]
+fn a_click_beside_a_popup_captures_sends_nothing_and_stays_while_it_is_open() {
+    let mut l = beside_popup();
+    mv(&mut l, (600, 300));
+    assert_eq!(click(&mut l, (600, 300)), [], "no action in the game");
+    assert!(l.captured());
+    assert_eq!(l.take_grab(), Some(true));
+    // `settle_capture` keeps it, the popup staying open.
+    assert_eq!(wait(&mut l, &popup(), 1.0), []);
+    assert!(l.captured());
+    // The popup closing changes nothing.
+    assert_eq!(wait(&mut l, &scene(), 1.0), []);
+    assert!(l.captured());
+}
+
+#[test]
+fn a_click_on_the_menu_outside_the_captured_view_lets_go_and_reaches_it() {
+    let mut l = beside_popup();
+    mv(&mut l, (600, 300));
+    click(&mut l, (600, 300));
+    let _ = l.take_grab();
+    // (The Alt mode's click, `crate::snap`.) In the captured view: kept.
+    l.menu_clicked((600, 300));
+    assert!(l.captured());
+    let p = on_popup(&l);
+    l.menu_clicked(p);
+    assert!(!l.captured());
+    assert_eq!(l.take_grab(), Some(false));
+    // The click itself goes to the popup.
+    assert!(matches!(click(&mut l, p).first(), Some(Input::MouseButton { button: Button::Left, down: true, .. })));
+    assert!(!l.captured());
+    // Not captured again by itself while the popup is open.
+    assert_eq!(wait(&mut l, &popup(), 1.0), []);
+}
+
+#[test]
+fn a_menu_opening_beside_the_captured_view_still_lets_go() {
+    let mut l = screen_layout(Place::LeftOrBottom, Roles::UnitMouse, false);
+    mv(&mut l, (600, 300));
+    click(&mut l, (600, 300));
+    assert!(l.captured());
+    let _ = l.take_grab();
+    show(&mut l, &popup());
+    assert!(!l.captured());
+    assert_eq!(wait(&mut l, &popup(), 1.0), [false], "let go, never captured by itself");
+    assert_eq!(wait(&mut l, &scene(), 0.5), [true]);
+}
+
+#[test]
+fn a_popup_over_the_world_cursors_view_does_not_capture_there() {
+    let mut l = screen_layout(Place::RightOrTop, Roles::UnitMouse, false);
+    show(&mut l, &popup());
+    let p = (600, 560);
+    assert_eq!(l.capture_hit(p), Some(Hit::Pane), "B's world, beside the popup's body");
+    mv(&mut l, p);
+    assert_ne!(l.take_pointer_icon(), Some(PointerIcon::Capture));
+    assert!(!click(&mut l, p).is_empty(), "a click on the world there");
+    assert!(!l.captured());
+}
+
+#[test]
+fn drag_map_movement_never_captures_beside_a_popup() {
+    let mut l = beside_popup();
+    l.set_map_movement(viewer_settings::MapMovement::Drag);
+    show(&mut l, &popup());
+    mv(&mut l, (600, 300));
+    assert_ne!(l.take_pointer_icon(), Some(PointerIcon::Capture));
+    assert!(!click(&mut l, (600, 300)).is_empty(), "a click on the world there");
+    assert!(!l.captured());
+}
