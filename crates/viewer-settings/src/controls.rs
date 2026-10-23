@@ -306,6 +306,8 @@ impl Settings {
             "input.snap_ghost_fps" => copy!(input, snap_ghost_fps),
             "input.capture_sensitivity" => copy!(input, capture_sensitivity),
             "animation.combat_speed" => copy!(animation, combat_speed),
+            "accessibility.ring_width" => copy!(accessibility, ring_width),
+            "accessibility.hud_size" => copy!(accessibility, hud_size),
             "display.fps_limit" => {
                 if (self.display.max_fps > 0) == (source.display.max_fps > 0) {
                     copy!(display, fps_limit);
