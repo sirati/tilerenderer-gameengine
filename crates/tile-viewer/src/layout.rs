@@ -782,6 +782,11 @@ pub struct Layout {
     /// popup.
     pointer_to_screen: bool,
     pointer_to_popup: bool,
+    /// What this layout's frames changed that is worth a line in the log
+    /// (a screen or popup opening or closing), logged once the frame is
+    /// presented ([`Layout::take_notes`]): a frame the worker retries is
+    /// prepared again from the layout before it, and noted again.
+    notes: Vec<String>,
     /// Driver pixel to focus again after interface scaling has its final map.
     focus_after_scale: Option<(i32, i32)>,
     /// Whether button snapping is on (see [`Layout::set_snapping`]).
@@ -1000,6 +1005,7 @@ impl Default for Layout {
             menu_cover: capture::Cover::default(),
             pointer_to_screen: false,
             pointer_to_popup: false,
+            notes: Vec::new(),
             focus_after_scale: None,
             snapping: false,
             moved: Vec::new(),
@@ -1424,6 +1430,27 @@ impl Layout {
     /// taken by the next frame.
     pub fn advance(&mut self, dt: std::time::Duration) {
         self.step += dt.as_secs_f64();
+    }
+
+    /// What the frames presented since last asked changed that is worth a
+    /// line in the log (see `notes`).
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
+    }
+
+    /// What a screen opening (`opens`) or closing does: an opening
+    /// cancels a pending unit order, and lets go of a captured mouse, the
+    /// pointer on the screen's main control (the next frame, once it is
+    /// placed); captured again once no menu is open (`settle_capture`).
+    fn screen_changes(&mut self, opens: bool) {
+        if opens {
+            self.cancel_unit_order();
+        }
+        if opens && self.screen.is_none() && self.locked {
+            self.suspend_capture();
+            self.release_here("a screen opened");
+            self.pointer_to_screen = true;
+        }
     }
 
     /// Where the window is to move the system pointer (the divider held it
@@ -2393,21 +2420,12 @@ impl Layout {
         let hinting = hint.is_some() && self.locked && !self.snapping;
         self.reachable = parts.reachable;
         if parts.screen != self.screen {
-            if parts.screen.is_some() { self.cancel_unit_order(); }
-            match &parts.screen {
-                Some(name) => log::info!("viewer: screen {name} open, placed {}", self.fit_target(Some(name)).or_else(|| following_menu.then(|| self.menu_side.unwrap_or(Side::A).hit())).map_or("over the window", |h| if h == Hit::Main { "in A" } else { "in B" })),
-                None => log::info!("viewer: screen {} closed", self.screen.as_deref().unwrap_or_default()),
-            }
-            // A screen opening lets go of a captured mouse, the pointer on
-            // its main control (below, once it is placed); captured again
-            // once no menu is open (`settle_capture`, below).
-            if let (Some(_), None) = (&parts.screen, &self.screen) {
-                if self.locked {
-                    self.suspend_capture();
-                    self.release_here("a screen opened");
-                    self.pointer_to_screen = true;
-                }
-            }
+            let note = match &parts.screen {
+                Some(name) => format!("viewer: screen {name} open, placed {}", self.fit_target(Some(name)).or_else(|| following_menu.then(|| self.menu_side.unwrap_or(Side::A).hit())).map_or("over the window", |h| if h == Hit::Main { "in A" } else { "in B" })),
+                None => format!("viewer: screen {} closed", self.screen.as_deref().unwrap_or_default()),
+            };
+            self.notes.push(note);
+            self.screen_changes(parts.screen.is_some());
         }
         self.clock += dt;
         // A popup over a menu (a screen part or the menus): placed over that
@@ -2426,7 +2444,7 @@ impl Layout {
         self.popup_body = popup.map(|i| rect_of(&base[i]));
         if popup.is_some() != self.popup_shown {
             self.popup_shown = popup.is_some();
-            log::info!("viewer: popup {}", if self.popup_shown { "open, a view of its own" } else { "closed" });
+            self.notes.push(format!("viewer: popup {}", if self.popup_shown { "open, a view of its own" } else { "closed" }));
             match popup {
                 Some(i) => { self.cancel_unit_order(); self.popup_opened(rect_of(&base[i]), scene.interface.popup_anchor, over_menu); }
                 None => self.popup_closed(),
@@ -7853,6 +7871,62 @@ mod tests {
         assert_eq!((l.take_warp(), l.pointer), (None, (100, 100)));
     }
 
+    /// The app prepares a frame on its layout and puts the layout back
+    /// (`ui_submission::Mapping`): a frame the worker retries is prepared
+    /// again from the layout as it was; one presented after input arrived
+    /// installs only its geometry into the live layout
+    /// (`Layout::adopt_presented_mapping`).
+    #[test]
+    fn a_screen_opens_once_however_its_frame_reaches_the_window() {
+        let unit_mouse = settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse));
+        let mut s = with_screen("City");
+        s.interface.focus_control = Some([480, 380, 40, 40]);
+        let captured = || {
+            let mut l = arranged(&unit_mouse);
+            mv(&mut l, (600, 300));
+            frame(&mut l, vec![]);
+            click(&mut l, (600, 300));
+            assert!(l.captured());
+            let _ = l.take_grab();
+            l
+        };
+        // Retried frames: each prepared copy notes the opening; only the
+        // presented one's note reaches the live layout.
+        let mut live = captured();
+        for _ in 0..5 {
+            let mut retried = live.clone();
+            retried.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert_eq!(retried.notes.len(), 1, "{:?}", retried.notes);
+        }
+        assert!(live.notes.is_empty() && live.captured(), "retries leave the live layout as it was");
+        let mut presented = live.clone();
+        presented.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        live = presented;
+        assert_eq!(live.take_notes(), ["viewer: screen City open, placed over the window"]);
+        assert!(!live.captured());
+        live.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(live.take_notes().is_empty(), "open once");
+        // Presented after the mouse moved: the live layout takes the screen
+        // and what its opening does (the mouse let go, the pointer on its
+        // main control), once.
+        let mut live = captured();
+        let mut presented = live.clone();
+        presented.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        mv(&mut live, (610, 305));
+        live.adopt_presented_mapping(presented);
+        assert_eq!(live.take_notes(), ["viewer: screen City open, placed over the window"]);
+        assert!(!live.captured(), "the screen's opening lets the mouse go");
+        assert_eq!(live.take_grab(), Some(false));
+        live.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!((live.take_warp(), live.pointer), (Some((500, 400)), (500, 400)));
+        assert!(live.take_notes().iter().all(|n| !n.contains("open")), "open once");
+        for _ in 0..3 {
+            live.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert_eq!((live.take_warp(), live.take_notes().len()), (None, 0), "nothing again");
+        }
+        assert!(!live.captured());
+    }
+
     #[test]
     fn a_click_capturing_the_mouse_is_only_that() {
         let unit_mouse = settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse));
@@ -9064,7 +9138,14 @@ impl Layout {
     /// Adopt only the routing geometry of the frame just presented. Live
     /// pointer, keys, gestures and desired camera changes may have advanced
     /// while its immutable GPU packet was in flight.
-    pub(crate) fn adopt_presented_mapping(&mut self, frame: Self) {
+    pub(crate) fn adopt_presented_mapping(&mut self, mut frame: Self) {
+        // A screen the frame opened or closed: what that does to the live
+        // pointer and capture, once (the live layout is as it was before
+        // that frame was prepared; the next frames see the screen as it is).
+        if frame.screen != self.screen {
+            self.screen_changes(frame.screen.is_some());
+        }
+        self.notes.append(&mut frame.notes);
         self.fit = frame.fit;
         self.placed_screen = frame.placed_screen;
         self.screen_content = frame.screen_content;

@@ -35,6 +35,7 @@ impl Mapping {
         app.shown_scene = self.scene;
         if unchanged_input { app.layout = self.layout; }
         else { app.layout.adopt_presented_mapping(self.layout); }
+        for note in app.layout.take_notes() { log::info!("{note}"); }
         app.look_scene = self.looks;
         app.plan = self.plan;
         app.reported_size = self.reported_size;
