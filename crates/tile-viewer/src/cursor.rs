@@ -23,6 +23,9 @@
 //! - While the mouse is free, every other view showing the world pixel
 //!   under the pointer (the other pane, insets, a zoom box) shows it too,
 //!   drawn by the viewer; not where the system draws it.
+//! - With edge scrolling only the zoom box mirrors the pointer (free or
+//!   captured): in the other pane a copy reads as a second pointer
+//!   ([`Marks::mirror_only_in`]).
 //!
 //! The viewer's drawings are screen sprites in a camera of their own, on
 //! top of every view, clipped to the view they mark; they change without
@@ -602,11 +605,11 @@ impl Machine {
         } else if f.captured {
             let at = f.cursor_view.map(|(_, at, _)| at);
             let system = if self.edge && !f.unlocking && !entering { at } else { None };
-            Marks { world: f.world_cursor.clone(), window: vec![], system, input: if system.is_none() { at } else { None } }
+            Marks { world: f.world_cursor.clone(), window: vec![], system, input: if system.is_none() { at } else { None }, mirror_only_in: None }
         } else {
             // (Mirrored in the other views only over the plain map.)
             let world = f.pointer_world.filter(|_| f.pointer_inside && !f.interface_open).into_iter().collect();
-            Marks { world, window: vec![], system: (!f.unlocking).then_some(f.pointer), input: None }
+            Marks { world, window: vec![], system: (!f.unlocking).then_some(f.pointer), input: None, mirror_only_in: None }
         };
         plan
     }
@@ -629,6 +632,11 @@ pub struct Marks {
     /// everything; the marks in other views mirror it, drawn under the
     /// driver's interface (a click there would not reach that interface).
     pub input: Option<(i32, i32)>,
+    /// Where marks that only mirror the pointer may show (window rectangles
+    /// x, y, w, h; a mark shows in a view inside one of them): none, every
+    /// view. With edge scrolling only the zoom box mirrors it, a copy in
+    /// the other pane being a second pointer to the player.
+    pub mirror_only_in: Option<Vec<[i32; 4]>>,
 }
 
 /// A cursor mark as drawn: where (window pixels, the hot spot), clipped to
@@ -663,6 +671,10 @@ pub fn placements(marks: &Marks, cameras: &[Camera], period: (i32, i32)) -> Vec<
             continue;
         }
         let rect = [c.origin.0, c.origin.1, c.origin.0 + c.viewport.0 as i32, c.origin.1 + c.viewport.1 as i32];
+        // (Whether a mark only mirroring the pointer may show in this view.)
+        let mirrors_here = marks.mirror_only_in.as_ref().is_none_or(|only| {
+            only.iter().any(|r| rect[0] >= r[0] && rect[1] >= r[1] && rect[2] <= r[0] + r[2] && rect[3] <= r[1] + r[3])
+        });
         let (n, d) = (c.zoom.0.max(1) as i32, c.zoom.1.max(1) as i32);
         // How far a world pixel spans on the screen (the system's pointer
         // is on the one under it).
@@ -680,8 +692,9 @@ pub fn placements(marks: &Marks, cameras: &[Camera], period: (i32, i32)) -> Vec<
                         o.cells && !o.stacked && q.0 >= o.origin.0 && q.1 >= o.origin.1 && q.0 < o.origin.0 + o.viewport.0 as i32 && q.1 < o.origin.1 + o.viewport.1 as i32
                     });
                     let system = marks.system.is_some_and(|s| (s.0 - q.0).abs() <= span && (s.1 - q.1).abs() <= span);
-                    if !covered && !system {
-                        out.push(Placed { at: q, clip: Some(rect), view: Some(k), own: Some(k) == input_view });
+                    let own = Some(k) == input_view;
+                    if !covered && !system && (own || mirrors_here) {
+                        out.push(Placed { at: q, clip: Some(rect), view: Some(k), own });
                     }
                 }
             }
@@ -847,7 +860,7 @@ mod tests {
         let interface = Camera { cells: false, ..Camera::new((800, 300)) };
         let cameras = [a, b, interface];
         // The pointer over A at world (150, 120): drawn in B only, clipped.
-        let marks = Marks { world: vec![(150, 120)], window: vec![], system: Some((150, 120)), input: None };
+        let marks = Marks { world: vec![(150, 120)], window: vec![], system: Some((150, 120)), input: None, mirror_only_in: None };
         let s = sprites(set, &marks, &cameras, 3, (0, 0));
         assert_eq!(s.len(), 1);
         assert_eq!((s[0].x, s[0].y, s[0].view, s[0].screen), (400 + 100, 40, Some(3), true));
@@ -856,9 +869,30 @@ mod tests {
         let s = sprites(set, &Marks { system: None, ..marks.clone() }, &cameras, 3, (0, 0));
         assert_eq!(s.len(), 2);
         // A world that wraps every 1000 pixels: (1150, 120) is the same.
-        let s = sprites(set, &Marks { world: vec![(1150, 120)], window: vec![(5, 6)], system: None, input: None }, &cameras, 3, (1000, 0));
+        let s = sprites(set, &Marks { world: vec![(1150, 120)], window: vec![(5, 6)], system: None, input: None, mirror_only_in: None }, &cameras, 3, (1000, 0));
         assert_eq!(s.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>(), [(150, 120), (500, 40), (5, 6)]);
         assert_eq!(s[2].clip, None);
+    }
+
+    #[test]
+    fn with_edge_scrolling_only_the_zoom_box_mirrors_the_pointer() {
+        let set = SpriteSetId::from_raw(3);
+        let a = cam((0, 0), (400, 300), (0, 0), (1, 1));
+        let b = cam((400, 0), (400, 300), (100, 80), (1, 1));
+        let zoom = cam((500, 200), (100, 60), (130, 110), (2, 1));
+        let cameras = [a, b, zoom];
+        let only = Some(vec![[500, 200, 100, 60]]);
+        // Free over A at world (150, 120): not in B, still in the zoom box.
+        let free = Marks { world: vec![(150, 120)], window: vec![], system: Some((150, 120)), input: None, mirror_only_in: only.clone() };
+        let s = sprites(set, &free, &cameras, 3, (0, 0));
+        assert_eq!(s.iter().map(|s| s.clip).collect::<Vec<_>>(), [Some([500, 200, 600, 260])]);
+        // Captured in A: drawn there (the pointer itself) and in the zoom box.
+        let captured = Marks { system: None, input: Some((150, 120)), ..free.clone() };
+        let s = sprites(set, &captured, &cameras, 3, (0, 0));
+        assert_eq!(s.iter().map(|s| s.clip).collect::<Vec<_>>(), [Some([0, 0, 400, 300]), Some([500, 200, 600, 260])]);
+        // No restriction: mirrored in B as well.
+        let s = sprites(set, &Marks { mirror_only_in: None, ..captured }, &cameras, 3, (0, 0));
+        assert_eq!(s.len(), 3);
     }
 
     #[test]
@@ -1230,7 +1264,7 @@ mod tests {
         let cameras = [a, b, empty_camera(), interface];
         // The mouse captured, the world cursor drawn in A (where the input
         // goes) and mirrored in B.
-        let marks = Marks { world: vec![(100, 50)], window: vec![], system: None, input: Some((100, 50)) };
+        let marks = Marks { world: vec![(100, 50)], window: vec![], system: None, input: Some((100, 50)), mirror_only_in: None };
         for scale in [Scale::default(), Scale::new(48, 1)] {
             let c = compose(art, &marks, &cameras, &[2], scale, (800, 300), 4, (0, 0));
             assert_eq!(c.sprites.len(), 2, "{scale:?}");
@@ -1246,7 +1280,7 @@ mod tests {
             assert_eq!(c.top.len(), if scale.unscaled() { 0 } else { 1 });
         }
         // The pointer free (the system's): every drawn mark is a mirror.
-        let free = Marks { world: vec![(100, 50)], window: vec![], system: Some((100, 50)), input: None };
+        let free = Marks { world: vec![(100, 50)], window: vec![], system: Some((100, 50)), input: None, mirror_only_in: None };
         let c = compose(art, &free, &cameras, &[2], Scale::default(), (800, 300), 4, (0, 0));
         assert_eq!(c.sprites.iter().map(|s| s.view).collect::<Vec<_>>(), [Some(2)]);
         // No slot (e.g. the world beside a screen): on top as before.

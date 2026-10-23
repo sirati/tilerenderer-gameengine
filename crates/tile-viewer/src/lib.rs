@@ -3542,6 +3542,13 @@ impl App {
         } else {
             steps.marks
         };
+        // With edge scrolling the other panes do not mirror the pointer (it
+        // would look like a second one); the zoom box still does.
+        let marks = if self.layout.map_movement() == viewer_settings::MapMovement::EdgeScroll {
+            cursor::Marks { mirror_only_in: Some(self.layout.zoom_area().into_iter().collect()), ..marks }
+        } else {
+            marks
+        };
         if let Some(q) = steps.enter_edge {
             // A change from a line to a corner, or to another line, may
             // need a new Wayland position hint. Own the lock before it.
