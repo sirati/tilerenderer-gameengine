@@ -1992,7 +1992,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(count, 15);
+        assert_eq!(count, 17);
     }
 
     #[test]
