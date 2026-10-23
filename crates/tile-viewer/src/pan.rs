@@ -275,8 +275,9 @@ pub struct Pan {
     /// A view flying to a place picked on the minimap (smooth movement):
     /// its spring, from its continuous centre, and where it goes.
     flight: Option<Flight>,
-    /// Buttons pressed on the minimap: their releases are ours too.
-    minimap_press: [bool; 3],
+    /// The right button went down on the minimap (B there): it drags B
+    /// while held, and its release is ours too.
+    minimap_right: bool,
 }
 
 /// A view flying to `to` ([`Layout::minimap_button`]).
@@ -436,37 +437,68 @@ impl Layout {
             || self.pan.flight.is_some_and(|f| f.hit == hit)
     }
 
-    /// A left or right press at `p` on the driver's minimap with B shown:
-    /// B goes to the world pixel picked there (flying, with smooth movement, else
+    /// The right button at `p` on the driver's minimap with B shown: B goes
+    /// to the world pixel picked there (flying, with smooth movement, else
     /// at once), through its continuous centre, and neither the press nor
-    /// its release reach the driver. B keeps that place as a hand pan does;
-    /// the game's camera does not pull it back. Without B (no split), over
-    /// a view, captured or snapping: not ours (the driver's as ever).
+    /// its release reach the driver; held, moving over the minimap drags B
+    /// along ([`Layout::minimap_drag`]). B keeps that place as a hand pan
+    /// does; the game's camera does not pull it back. The left button stays
+    /// the game's: its minimap moves the game's camera, which A shows. Without
+    /// B (no split), over a view, captured or snapping: not ours (the
+    /// driver's as ever).
     pub(super) fn minimap_button(&mut self, button: Button, down: bool, p: (i32, i32)) -> bool {
-        if !matches!(button, Button::Left | Button::Right) {
+        if button != Button::Right {
             return false;
         }
-        let b = super::button_index(button);
         if !down {
-            return std::mem::take(&mut self.pan.minimap_press[b]);
+            return std::mem::take(&mut self.pan.minimap_right);
         }
-        if self.locked || self.snapping || self.split.is_none() || !self.shown.iter().any(|(h, _)| *h == Hit::Pane) {
-            return false;
-        }
-        let Some(minimap) = self.minimap else { return false };
-        if !matches!(self.hit(p), Hit::Interface | Hit::Moved(_)) {
-            return false;
-        }
-        let Some(world) = self.route_free(p).ok().and_then(|q| minimap.world_at(q)) else { return false };
-        let Some(from) = self.exact_center(Hit::Pane) else { return false };
+        let Some(to) = self.minimap_b_target(p) else { return false };
         self.pan.coast = self.pan.coast.filter(|c| c.hit != Hit::Pane);
         self.pan.grab = self.pan.grab.filter(|g| g.hit != Hit::Pane);
-        self.pan.minimap_press[b] = true;
+        self.pan.minimap_right = true;
+        log::info!("viewer: B to world pixel {to:?} (right click on the minimap)");
+        self.send_b(to);
+        true
+    }
+
+    /// The pointer moved to `p` with the right button held since a press on
+    /// the minimap: B follows it over the minimap (off it, B stays).
+    pub(super) fn minimap_drag(&mut self, p: (i32, i32)) {
+        if !self.pan.minimap_right {
+            return;
+        }
+        if let Some(to) = self.minimap_b_target(p) {
+            self.send_b(to);
+        }
+    }
+
+    /// Where B goes for the minimap at `p`: its centre clamped to the world,
+    /// if B is shown, the pointer is free and `p` is on the minimap.
+    fn minimap_b_target(&self, p: (i32, i32)) -> Option<(i32, i32)> {
+        if self.locked || self.snapping || self.split.is_none() || !self.shown.iter().any(|(h, _)| *h == Hit::Pane) {
+            return None;
+        }
+        let minimap = self.minimap?;
+        if !matches!(self.hit(p), Hit::Interface | Hit::Moved(_)) {
+            return None;
+        }
+        let world = self.route_free(p).ok().and_then(|q| minimap.world_at(q))?;
+        self.exact_center(Hit::Pane)?;
         // (Not past the edge of a world that does not wrap.)
         let (to, _) = self.clamp_view_center(Hit::Pane, (world.0 as f64, world.1 as f64));
-        let to = (to.0.round() as i32, to.1.round() as i32);
-        log::info!("viewer: B to world pixel {to:?} ({button:?} click on the minimap)");
+        Some((to.0.round() as i32, to.1.round() as i32))
+    }
+
+    /// B to world pixel `to`: a flight with smooth movement (one under way
+    /// turns there), else at once.
+    fn send_b(&mut self, to: (i32, i32)) {
+        let Some(from) = self.exact_center(Hit::Pane) else { return };
         if self.smooth {
+            if let Some(f) = self.pan.flight.as_mut().filter(|f| f.hit == Hit::Pane) {
+                f.to = to;
+                return;
+            }
             let glide = super::Glide { pos: from, vel: (0.0, 0.0), placed: true };
             self.pan.flight = Some(Flight { hit: Hit::Pane, glide, to });
             self.place_exact(Hit::Pane, from);
@@ -474,7 +506,6 @@ impl Layout {
             self.pan.flight = None;
             self.place_exact(Hit::Pane, (to.0 as f64, to.1 as f64));
         }
-        true
     }
 
     /// A minimap flight `dt` seconds on (the short way round a wrapping
@@ -2083,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn both_buttons_on_the_drawn_minimap_move_b_without_reaching_the_game() {
+    fn on_the_drawn_minimap_right_moves_b_and_left_goes_to_the_game_for_a() {
         use crate::scaling;
         let mut s = minimap_scene();
         s.screen_size = (1920, 1080);
@@ -2118,6 +2149,18 @@ mod tests {
                         let at = p.to_screen((physical.0 as f64, physical.1 as f64));
                         let q = l.route_window(at).expect("drawn HUD reaches the driver");
                         let expected = s.minimap.unwrap().world_at(q).expect("over the minimap");
+                        let b0 = b(&l);
+                        if mouse == Button::Left {
+                            // The game's own minimap click: it moves the
+                            // game's camera, which A shows; B stays.
+                            let press = button(&mut l, mouse, true, at);
+                            assert!(press.contains(&Input::MouseButton { button: mouse, down: true, x: q.0, y: q.1 }), "{case}: {press:?}");
+                            let release = button(&mut l, mouse, false, at);
+                            assert!(release.iter().any(|i| matches!(i, Input::MouseButton { button: Button::Left, down: false, .. })), "{case}: {release:?}");
+                            frame(&mut l);
+                            assert_eq!(b(&l), b0, "{case}: B moved");
+                            continue;
+                        }
                         assert_eq!(button(&mut l, mouse, true, at), [], "{case}");
                         // The release stays ours after leaving the minimap.
                         assert_eq!(button(&mut l, mouse, false, (400, 300)), [], "{case}");
@@ -2149,35 +2192,94 @@ mod tests {
     }
 
     #[test]
-    fn minimap_releases_belong_to_each_button_even_after_the_minimap_closes() {
+    fn the_right_release_is_ours_even_after_the_minimap_closes_and_left_stays_the_games() {
         let mut l = Layout::default();
         l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles: Roles::Free, ..Default::default() });
         let mut s = minimap_scene();
         minimap_frame(&mut l, &s, 16);
-        for mouse in [Button::Left, Button::Right] {
-            assert_eq!(button(&mut l, mouse, true, (100, 550)), []);
-        }
+        assert_eq!(button(&mut l, Button::Right, true, (100, 550)), []);
+        // The left button with the right one held on the minimap: the game's.
+        assert_eq!(button(&mut l, Button::Left, true, (100, 550)), [Input::MouseButton { button: Button::Left, down: true, x: 100, y: 550 }]);
+        assert_eq!(button(&mut l, Button::Left, false, (100, 550)), [Input::MouseButton { button: Button::Left, down: false, x: 100, y: 550 }]);
         s.minimap = None;
         minimap_frame(&mut l, &s, 16);
-        for mouse in [Button::Left, Button::Right] {
-            assert_eq!(button(&mut l, mouse, false, (400, 300)), []);
-        }
-        // Clearing one button's press must not leave the other stuck.
+        assert_eq!(button(&mut l, Button::Right, false, (400, 300)), []);
+        // Taken: the next right click off the minimap is the game's again.
         assert_eq!(button(&mut l, Button::Right, true, (100, 550)), [Input::MouseButton { button: Button::Right, down: true, x: 100, y: 550 }]);
         assert_eq!(button(&mut l, Button::Right, false, (100, 550)), [Input::MouseButton { button: Button::Right, down: false, x: 100, y: 550 }]);
-        // A different button's game press keeps its own release.
+        // A right press the game had keeps its release with the game even
+        // when it ends on the minimap.
         s.minimap = Some(scene::Minimap { shown: [0, 500, 100, 100], ..MINIMAP });
         minimap_frame(&mut l, &s, 16);
-        assert_eq!(button(&mut l, Button::Right, true, (50, 550)), []);
-        assert_eq!(button(&mut l, Button::Left, true, (150, 550)), [Input::MouseButton { button: Button::Left, down: true, x: 150, y: 550 }]);
-        assert_eq!(button(&mut l, Button::Left, false, (150, 550)), [Input::MouseButton { button: Button::Left, down: false, x: 150, y: 550 }]);
-        assert!(l.pan.minimap_press[super::super::button_index(Button::Right)]);
-        assert_eq!(button(&mut l, Button::Right, false, (50, 550)), []);
+        assert!(!l.pan.minimap_right);
+        assert_eq!(button(&mut l, Button::Right, true, (150, 550)), [Input::MouseButton { button: Button::Right, down: true, x: 150, y: 550 }]);
+        assert_eq!(button(&mut l, Button::Right, false, (50, 550)), [Input::MouseButton { button: Button::Right, down: false, x: 50, y: 550 }]);
     }
 
     #[test]
-    fn either_click_on_the_minimap_sends_b_there_and_the_game_never_pulls_it() {
-        for (mouse, roles) in [Button::Left, Button::Right].into_iter().flat_map(|mouse| [Roles::Free, Roles::UnitMouse].map(|roles| (mouse, roles))) {
+    fn a_right_drag_on_the_minimap_drags_b_and_leaves_a() {
+        for smooth in [false, true] {
+            let mut l = Layout::default();
+            l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles: Roles::Free, smooth_world_movement: smooth, ..Default::default() });
+            let s = minimap_scene();
+            for _ in 0..2 {
+                minimap_frame(&mut l, &s, 16);
+            }
+            let a = l.main_view.center;
+            mv(&mut l, (100, 550));
+            assert_eq!(button(&mut l, Button::Right, true, (100, 550)), []);
+            // Dragged on along the minimap: B follows to the last point.
+            let out = mv(&mut l, (150, 560));
+            assert!(!out.iter().any(|i| matches!(i, Input::MouseButton { .. })), "{out:?}");
+            let to = MINIMAP.world_at((150, 560)).unwrap();
+            // Off the minimap B stays where the drag left it.
+            mv(&mut l, (400, 300));
+            for _ in 0..120 {
+                minimap_frame(&mut l, &s, 16);
+            }
+            assert_eq!(center_of(&l, Hit::Pane), to, "smooth={smooth}");
+            assert_eq!(l.main_view.center, a, "smooth={smooth}: A moved");
+            assert_eq!(button(&mut l, Button::Right, false, (400, 300)), []);
+            // Released, moving over the minimap no longer moves B.
+            mv(&mut l, (20, 520));
+            for _ in 0..60 {
+                minimap_frame(&mut l, &s, 16);
+            }
+            assert_eq!(center_of(&l, Hit::Pane), to, "smooth={smooth}");
+        }
+    }
+
+    #[test]
+    fn a_left_click_on_the_minimap_is_the_games_and_moves_a_only() {
+        for roles in [Roles::Free, Roles::UnitMouse] {
+            let mut l = Layout::default();
+            l.apply_settings(&viewer_settings::Layout { split: S::Vertical1To1, roles, ..Default::default() });
+            let mut s = minimap_scene();
+            for _ in 0..2 {
+                minimap_frame(&mut l, &s, 16);
+            }
+            let b0 = b(&l);
+            mv(&mut l, (100, 550));
+            assert_eq!(button(&mut l, Button::Left, true, (100, 550)), [Input::MouseButton { button: Button::Left, down: true, x: 100, y: 550 }], "{roles:?}");
+            // A left drag over the minimap is the game's too.
+            assert_eq!(mv(&mut l, (120, 560)).iter().filter(|i| matches!(i, Input::MouseMove { .. })).count(), 1, "{roles:?}");
+            assert_eq!(button(&mut l, Button::Left, false, (120, 560)), [Input::MouseButton { button: Button::Left, down: false, x: 120, y: 560 }], "{roles:?}");
+            assert!(l.pan.flight.is_none());
+            // The game centres its camera there: A goes, B stays.
+            let to = MINIMAP.world_at((120, 560)).unwrap();
+            s.camera_focus = Some(scene::CameraFocus { serial: 2, center: to });
+            for _ in 0..90 {
+                minimap_frame(&mut l, &s, 16);
+            }
+            assert_eq!(l.main_view.center, to, "{roles:?}");
+            assert_eq!(b(&l), b0, "{roles:?}");
+        }
+    }
+
+    #[test]
+    fn a_right_click_on_the_minimap_sends_b_there_and_the_game_never_pulls_it() {
+        let mouse = Button::Right;
+        for roles in [Roles::Free, Roles::UnitMouse] {
             for smooth in [false, true] {
                 let case = format!("{mouse:?} {roles:?} smooth={smooth}");
                 let mut l = Layout::default();

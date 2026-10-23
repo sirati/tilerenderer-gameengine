@@ -4248,6 +4248,8 @@ impl Layout {
                     }
                 }
                 self.pointer = (x, y);
+                // (A right drag begun on the minimap drags B.)
+                self.minimap_drag((x, y));
                 if let Some(out) = self.unit_order_motion((x, y)) { return out; }
                 if let Some(drag) = self.drag {
                     self.dragged(drag, (x, y));
@@ -4265,7 +4267,8 @@ impl Layout {
             }
             Input::MouseButton { button, down, x, y } => {
                 let p = self.held_back((x, y));
-                // (On the minimap: B goes there, `pan`.)
+                // (A right click on the minimap: B goes there, `pan`; a left one is
+                // the game's, which moves A.)
                 if self.minimap_button(button, down, p) {
                     return vec![];
                 }
