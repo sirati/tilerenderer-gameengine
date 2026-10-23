@@ -298,9 +298,10 @@ pub enum Zoom {
     Floating131,
     /// As `Floating131`, `1:7:1`.
     Floating171,
-    /// A box at the mouse: above it (below where there is no room), centred
-    /// on it across; `1:1:1` of the width, [`Layout::zoom_strip`] of the
-    /// height.
+    /// A box at the mouse: [`Layout::zoom_mouse_above`] above it (else
+    /// [`Layout::zoom_mouse_below`] below it, where there is no room above),
+    /// centred on it across; `1:1:1` of the width, [`Layout::zoom_strip`]
+    /// of the height.
     Mouse111,
     /// As `Mouse111`, `1:3:1` of the width.
     Mouse131,
@@ -386,6 +387,14 @@ pub struct Layout {
     /// pointer they dropped) meant something else and is not read.
     #[serde(rename = "zoom_box_gap")]
     pub zoom_box_drop: f32,
+    /// The boxes at the mouse ([`Zoom::Mouse111`], [`Zoom::Mouse131`]): the
+    /// space between the pointer and the bottom of the box above it, as a
+    /// fraction of its region's height, 0..=0.3, default 0.1.
+    pub zoom_mouse_above: f32,
+    /// The boxes at the mouse, below the pointer where there is no room
+    /// above it: the space between the pointer and the box's top, as a
+    /// fraction of its region's height, 0..=0.4, default 0.2.
+    pub zoom_mouse_below: f32,
     /// How much the zoom box or strip enlarges the world beyond how large
     /// the view under it shows it (world scale and view zoom): one of
     /// [`Layout::MAGNIFICATIONS`] (another value counts as the nearest),
@@ -428,6 +437,8 @@ impl Default for Layout {
             zoom_strip: 0.2,
             zoom_box_top: 0.025,
             zoom_box_drop: 0.05,
+            zoom_mouse_above: 0.1,
+            zoom_mouse_below: 0.2,
             zoom_magnification: 2.0,
             zoom_box_height: 0.0,
             zoom_box_block_pointer: false,

@@ -55,6 +55,12 @@ pub const ZOOM_BOX_TOP_RANGE: Range = Range { min: 0.0, max: 0.05, step: 0.005 }
 /// The gap between where a floating box rests and where it moves out of the
 /// pointer's way ([`Layout::zoom_box_drop`]).
 pub const ZOOM_BOX_DROP_RANGE: Range = Range { min: 0.05, max: 0.15, step: 0.005 };
+/// The space between the pointer and a box at the mouse above it
+/// ([`Layout::zoom_mouse_above`]).
+pub const ZOOM_MOUSE_ABOVE_RANGE: Range = Range { min: 0.0, max: 0.3, step: 0.01 };
+/// The space between the pointer and a box at the mouse below it, where
+/// there is no room above ([`Layout::zoom_mouse_below`]).
+pub const ZOOM_MOUSE_BELOW_RANGE: Range = Range { min: 0.0, max: 0.4, step: 0.01 };
 /// The zoom's magnification as an index into [`Layout::MAGNIFICATIONS`]
 /// (`"layout.zoom_magnification_step"`).
 pub const ZOOM_MAGNIFICATION_STEP_RANGE: Range = Range { min: 0.0, max: (Layout::MAGNIFICATIONS.len() - 1) as f32, step: 1.0 };
@@ -74,7 +80,7 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 37] = [
+pub const KEYS: [&str; 39] = [
     "resolution.pixel_scale",
     "resolution.base_ui_scale",
     "resolution.scale_menus",
@@ -92,6 +98,8 @@ pub const KEYS: [&str; 37] = [
     "layout.zoom_strip",
     "layout.zoom_box_top",
     "layout.zoom_box_drop",
+    "layout.zoom_mouse_above",
+    "layout.zoom_mouse_below",
     "layout.zoom_magnification_step",
     "layout.zoom_box_block_pointer",
     "layout.menu_follows_pointer",
@@ -125,6 +133,8 @@ pub fn range(key: &str) -> Option<Range> {
         "layout.zoom_strip" => Some(ZOOM_STRIP_RANGE),
         "layout.zoom_box_top" => Some(ZOOM_BOX_TOP_RANGE),
         "layout.zoom_box_drop" => Some(ZOOM_BOX_DROP_RANGE),
+        "layout.zoom_mouse_above" => Some(ZOOM_MOUSE_ABOVE_RANGE),
+        "layout.zoom_mouse_below" => Some(ZOOM_MOUSE_BELOW_RANGE),
         "layout.zoom_magnification_step" => Some(ZOOM_MAGNIFICATION_STEP_RANGE),
         "input.snap_updates_per_second" => Some(SNAP_RATE_RANGE),
         "input.snap_ghost_fps" => Some(SNAP_GHOST_RANGE),
@@ -247,6 +257,8 @@ impl Settings {
             "layout.zoom_strip" => Some(ControlValue::Number(l.zoom_strip)),
             "layout.zoom_box_top" => Some(ControlValue::Number(l.zoom_box_top)),
             "layout.zoom_box_drop" => Some(ControlValue::Number(l.zoom_box_drop)),
+            "layout.zoom_mouse_above" => Some(ControlValue::Number(l.zoom_mouse_above)),
+            "layout.zoom_mouse_below" => Some(ControlValue::Number(l.zoom_mouse_below)),
             "layout.zoom_magnification_step" => Some(ControlValue::Number(l.zoom_magnification_step() as f32)),
             "layout.zoom_box_block_pointer" => Some(ControlValue::On(l.zoom_box_block_pointer)),
             "layout.menu_follows_pointer" => Some(ControlValue::On(l.menu_follows_pointer)),
@@ -302,6 +314,8 @@ impl Settings {
             "layout.zoom_strip" => copy!(layout, zoom_strip),
             "layout.zoom_box_top" => copy!(layout, zoom_box_top),
             "layout.zoom_box_drop" => copy!(layout, zoom_box_drop),
+            "layout.zoom_mouse_above" => copy!(layout, zoom_mouse_above),
+            "layout.zoom_mouse_below" => copy!(layout, zoom_mouse_below),
             "layout.zoom_magnification_step" => copy!(layout, zoom_magnification),
             "input.snap_updates_per_second" => copy!(input, snap_updates_per_second),
             "input.snap_ghost_fps" => copy!(input, snap_ghost_fps),
@@ -375,6 +389,8 @@ impl Settings {
                 "layout.zoom_strip" => set_number(&mut l.zoom_strip, key, value),
                 "layout.zoom_box_top" => set_number(&mut l.zoom_box_top, key, value),
                 "layout.zoom_box_drop" => set_number(&mut l.zoom_box_drop, key, value),
+                "layout.zoom_mouse_above" => set_number(&mut l.zoom_mouse_above, key, value),
+                "layout.zoom_mouse_below" => set_number(&mut l.zoom_mouse_below, key, value),
                 "layout.zoom_magnification_step" => {
                     let mut step = l.zoom_magnification_step() as f32;
                     let set = set_number(&mut step, key, value);
@@ -513,6 +529,13 @@ mod tests {
         assert_eq!(draft.resolution.frame_scale, 1.234);
         assert_eq!(draft.layout.zoom_strip, 0.123);
         assert_eq!(draft.layout.zoom_box_drop, 0.5);
+        // The boxes at the mouse: each its own.
+        (draft.layout.zoom_mouse_above, draft.layout.zoom_mouse_below) = (0.3, 0.4);
+        accepted.layout.zoom_mouse_above = 0.123;
+        assert!(draft.restore_number_control("layout.zoom_mouse_above", &accepted));
+        assert_eq!((draft.layout.zoom_mouse_above, draft.layout.zoom_mouse_below), (0.123, 0.4));
+        assert!(draft.restore_number_control("layout.zoom_mouse_below", &accepted));
+        assert_eq!(draft.layout.zoom_mouse_below, 0.2);
         assert!(!draft.restore_number_control("resolution.frame_scale", &accepted));
         assert!(!draft.restore_number_control("resolution.pixel_scale", &accepted));
         accepted.display.max_fps = 144;
@@ -605,6 +628,8 @@ mod tests {
             ("layout.zoom_strip", ControlValue::Number(0.35)),
             ("layout.zoom_box_top", ControlValue::Number(0.04)),
             ("layout.zoom_box_drop", ControlValue::Number(0.075)),
+            ("layout.zoom_mouse_above", ControlValue::Number(0.25)),
+            ("layout.zoom_mouse_below", ControlValue::Number(0.05)),
             ("layout.zoom_magnification_step", ControlValue::Number(3.0)),
             ("layout.zoom_box_block_pointer", ControlValue::On(true)),
             ("layout.menu_follows_pointer", ControlValue::On(false)),
@@ -739,6 +764,14 @@ mod tests {
         assert!(s.set_control("layout.zoom_box_drop", &ControlValue::Number(-1.0)));
         assert_eq!(s.layout.zoom_box_drop, 0.05);
         assert!(!s.set_control("layout.zoom_box_drop", &ControlValue::Number(f32::NAN)));
+        assert!(s.set_control("layout.zoom_mouse_above", &ControlValue::Number(0.9)));
+        assert_eq!(s.layout.zoom_mouse_above, 0.3);
+        assert!(s.set_control("layout.zoom_mouse_above", &ControlValue::Number(-1.0)));
+        assert_eq!(s.layout.zoom_mouse_above, 0.0);
+        assert!(s.set_control("layout.zoom_mouse_below", &ControlValue::Number(0.9)));
+        assert_eq!(s.layout.zoom_mouse_below, 0.4);
+        assert!(s.set_control("layout.zoom_mouse_below", &ControlValue::Number(0.1249)));
+        assert_eq!(s.layout.zoom_mouse_below, 0.12);
         assert_eq!(s.layout.zoom_strip, 0.2);
     }
 
