@@ -536,7 +536,7 @@ pub enum UnitOrdersPlace {
     /// right of it, so the gap stays clear for the pointer.
     Gap((i32, i32)),
     /// Inside this view area (the active view's), at the same height where
-    /// that is inside it, centred across.
+    /// that is inside it, centred between the interface pieces on its row.
     In([i32; 4]),
 }
 
