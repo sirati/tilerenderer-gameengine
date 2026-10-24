@@ -587,6 +587,11 @@ pub struct Frame {
     /// A click-anchored popup's top-left corner on the canvas and its zoom
     /// (canvas pixels per driver pixel): placed there exactly, unclipped.
     pub popup_at: Option<((i32, i32), (u32, u32))>,
+    /// A popup the driver opened at a click on its screen (placed with the
+    /// screen) moves by this many driver pixels: the click reached the
+    /// driver elsewhere than the pointer showed it (a list shown scrolled by
+    /// pixels, `smooth_menus`), and the popup goes where the pointer was.
+    pub popup_nudge: (i32, i32),
     /// World-anchored lower modal views retain their own place under a child.
     pub popup_places: Vec<(u32, ((i32, i32), (u32, u32)))>,
     /// Generic menus retain their requested scale in their opening view.
@@ -807,6 +812,11 @@ pub struct Layout {
     last_press: Option<((i32, i32), (i32, i32), f64)>,
     /// How far the open popup moves, when it opened at a click.
     popup_anchor: Option<(i32, i32)>,
+    /// How far the last press reached the driver from where the layout
+    /// sent it (`press_delivered`), and when; and how far the popup open
+    /// now moves for it (`Frame::popup_nudge`).
+    press_shift: Option<((i32, i32), f64)>,
+    popup_nudge: (i32, i32),
     /// The last press on a world pixel (`Input::WorldButton`).
     world_press: Option<WorldPress>,
     /// The tile boxes the driver left to the viewer (`detached_popups`).
@@ -1070,6 +1080,8 @@ impl Default for Layout {
             clock: 0.0,
             last_press: None,
             popup_anchor: None,
+            press_shift: None,
+            popup_nudge: (0, 0),
             world_press: None,
             detached: Default::default(),
             queued: Default::default(),
@@ -2810,14 +2822,16 @@ impl Layout {
         self.moved.clear();
         self.view_ui.clear();
         let menu_region = following_menu.then(|| if self.menu_side == Some(Side::B) { pane_rect.unwrap_or(main_rect) } else { main_rect });
-        let mut frame = Frame { view_cameras: vec![None; scene.views.len()], popup_region: popup.filter(|_| !over_menu).and_then(|_| self.popup_region()), menu_region, ..Default::default() };
+        let mut frame = Frame { view_cameras: vec![None; scene.views.len()], popup_region: popup.filter(|_| !over_menu).and_then(|_| self.popup_region()), menu_region, popup_nudge: self.popup_nudge, ..Default::default() };
         // A modal popup over the menu (`over_menu`) keeps out of the screen
         // fitted into a pane: that screen's fit stays as without it, the
         // popup goes over it in that pane (`scaling::MODAL_TOP`).
         // (Not one the driver opened at a click on its screen, e.g. a city
         // screen garrison unit's menu: that one stays at the click, with the
         // screen.)
-        let on_screen = parts.popup_on_screen && parts.screen.is_some() && parts.screen_view.is_none();
+        // (A screen part too: an advisor's menu opened at a click on its
+        // table, e.g. the domestic advisor's production menu.)
+        let on_screen = parts.popup_on_screen && parts.screen.is_some();
         let modal = popup.filter(|_| over_menu && self.anchored.is_none() && !on_screen);
         let push = |frame: &mut Frame, camera: Camera| {
             frame.cameras.push(camera);
@@ -3096,9 +3110,12 @@ impl Layout {
             named.sort_by_key(|&i| (scene.views[i].view.interface_only, popup_layers.iter().position(|&l| l == i).map_or(0, |k| k + 1), i));
             for i in named {
                 let camera = base[i];
+                // (A popup the driver opened at a click on the screen: where
+                // the pointer made it, `Frame::popup_nudge`.)
+                let d = if popup_layers.contains(&i) { self.popup_nudge } else { (0, 0) };
                 let stacked = Camera {
-                    origin: (camera.origin.0 - sx, camera.origin.1 - sy),
-                    screen_shift: (camera.screen_shift.0 - sx, camera.screen_shift.1 - sy),
+                    origin: (camera.origin.0 - sx + d.0, camera.origin.1 - sy + d.1),
+                    screen_shift: (camera.screen_shift.0 - sx + d.0, camera.screen_shift.1 - sy + d.1),
                     stacked: true,
                     hairline: true,
                     zoomed_art: self.zoomed_art(fit.zoom),
@@ -3513,6 +3530,9 @@ impl Layout {
         // that view (its camera moved as little as it takes for the popup
         // to fit the window), whatever the screen place setting says.
         self.popup_anchor_seen = anchor;
+        // (A press the list took elsewhere, just made: the popup opened at
+        // it goes where the pointer was.)
+        self.popup_nudge = self.press_shift.filter(|&(_, t)| self.clock - t < 2.0).map_or((0, 0), |(d, _)| d);
         let fresh = self.world_press.filter(|p| self.clock - p.clock < 2.0);
         // (Opened from an entry of the popup at a click, the one in its
         // place or one just closed: that click's.)
@@ -3561,6 +3581,7 @@ impl Layout {
         if let Some((_, q, _)) = &mut self.last_press {
             if *q == from { *q = to }
         }
+        self.press_shift = Some(((from.0 - to.0, from.1 - to.1), self.clock));
     }
 
     /// Where driver window pixel `p` shows in the window (as of this frame):
@@ -3591,6 +3612,7 @@ impl Layout {
     /// menu is open: `settle_capture`).
     fn popup_closed(&mut self) {
         self.popup_anchor = None;
+        self.popup_nudge = (0, 0);
         self.chain_press = self.anchored.map(|(_, p)| (p, self.clock));
         self.anchored = None;
         self.popup_anchor_seen = None;
@@ -4226,6 +4248,13 @@ impl Layout {
                 let q = (sx + ((p.0 - ox) * d).div_euclid(n), sy + ((p.1 - oy) * d).div_euclid(n));
                 // (Never onto a modal popup over it shown elsewhere.)
                 let q = self.modal_shown().map_or(q, |m| crate::scaling::ShownPiece::beside_modal(q, m.driver));
+                // (A popup shown moved to where its click was made: its own
+                // pixel there.)
+                let d = self.popup_nudge;
+                let q = match self.popup_body {
+                    Some([x, y, w, h]) if d != (0, 0) && inside([x + d.0, y + d.1, w, h], q) => (q.0 - d.0, q.1 - d.1),
+                    _ => q,
+                };
                 inside([sx, sy, sw, sh], q).then_some(q).ok_or(None)
             }
             Hit::Interface => Ok(self.to_driver(p)),
@@ -4304,6 +4333,9 @@ impl Layout {
         let fit = self.fit.or_else(|| self.placed_screen.filter(|f| inside(f.source, middle)));
         if let Some(Fit { source: [sx, sy, ..], origin: (ox, oy), zoom: (n, d), .. }) = fit {
             let s = n.max(1) as f64 / d.max(1) as f64;
+            // (In the popup shown moved to its click: moved with it.)
+            let nudge = if self.fit.is_none() && self.popup_body.is_some_and(|b| inside(b, middle)) { self.popup_nudge } else { (0, 0) };
+            let r = [r[0] + nudge.0, r[1] + nudge.1, r[2], r[3]];
             return [ox as f64 + (r[0] - sx) as f64 * s, oy as f64 + (r[1] - sy) as f64 * s, r[2] as f64 * s, r[3] as f64 * s];
         }
         let shown = self.interface_shown.as_deref().unwrap_or_default();

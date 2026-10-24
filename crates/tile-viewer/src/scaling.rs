@@ -664,7 +664,8 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     // A popup the driver opened at a click on its named screen (a city
     // screen garrison unit's menu) is no modal: it stays where the driver
     // put it on that screen, placed and scaled with it.
-    let on_screen = parts.popup_on_screen && parts.screen.is_some() && parts.screen_view.is_none();
+    // (On a screen part too, an advisor: placed with that part.)
+    let on_screen = parts.popup_on_screen && parts.screen.is_some();
     // (The popup placed: the dialog on top, with what is attached to it,
     // its combo box's open list: `scene::Interface::placed_popup`.)
     let placed_popup = parts.placed_popup();
@@ -810,8 +811,11 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let (place_id, place_camera) = Some(parts.popup_root(v.id)).filter(|&r| r != v.id && parts.is_popup_view(v.id))
             .and_then(|r| camera_of(r).map(|c| (r, c))).unwrap_or((v.id, camera));
         let piece = if on_screen && placed_popup == Some(parts.popup_root(v.id)) && parts.is_popup_view(v.id) {
-            // As the screen it was opened on: the game's place on it.
-            menu
+            // As the screen it was opened on: the game's place on it (an
+            // advisor's: that part's map), where the pointer made the click.
+            let screen = parts.screen_view.and_then(|sv| camera_of(sv).map(|c| panned(screen_piece(c, false, sv)))).unwrap_or(menu);
+            let d = frame.popup_nudge;
+            Affine { from: (screen.from.0 - d.0, screen.from.1 - d.1), ..screen }
         } else if parts.is_popup_view(v.id) || parts.screen_view == Some(v.id) {
             // A popup, or a screen part (an advisor): about its middle,
             // placed as the menus are (and moved as the layout moved it),

@@ -535,6 +535,68 @@ fn a_garrison_units_menu_opens_at_its_click_on_the_city_screen() {
     }
 }
 
+/// The domestic advisor's production menu, which the game opens at a
+/// right click on a city's row of its table: at that click on the advisor
+/// as the viewer shows it (a screen part, fitted and moved), not over it
+/// as a modal. With the table shown scrolled by pixels the click reached
+/// the game a row's place away (`Layout::press_delivered`): the menu goes
+/// where the pointer was all the same.
+#[test]
+fn an_advisors_menu_opens_at_the_pointer_on_the_advisor_at_any_list_offset() {
+    use viewer_settings::{Place, ScreenPlace};
+    let compiled = compiled();
+    let mut base = advisor_scene(&compiled, "F1");
+    base.screen_size = SCREEN;
+    let menu = [1200, 480, 160, 300];
+    let shown = |layout: &Layout, r: [i32; 4]| layout.interface_shown.as_ref()
+        .and_then(|shown| shown.iter().find(|piece| piece.driver == r)).map_or_else(|| layout.driver_rect_to_window(r), |piece| piece.to_canvas(r));
+    for (window, pixel_scale) in [((1920, 1080), 1), ((1280, 800), 1), ((3840, 2160), 2)] {
+        for split in [Split::Standard, Split::Vertical1To1] {
+            for place in [Place::Floating, Place::RightOrTop] {
+                for shift in [0, 13, -29] {
+                    let what = format!("{window:?} pixel{pixel_scale} {split:?} {place:?} shift {shift}");
+                    let resolution = viewer_settings::Resolution { pixel_scale, ..Default::default() };
+                    let mut layout = Layout::default();
+                    layout.apply_settings(&Settings { split, screen_place: ScreenPlace { vertical: place, horizontal: place }, ..Default::default() });
+                    let draw = |layout: &mut Layout, scene: &Scene| {
+                        let plan = scaling::plan(window, SCREEN, &resolution).for_scene(scene, |s| sprite_rect(&compiled, s));
+                        layout.driver_screen = Some(SCREEN);
+                        layout.menu_scale = plan.menu.zoom;
+                        layout.world_scale = plan.world;
+                        layout.screen_content = named_screen_content(&compiled, scene);
+                        let mut frame = layout.frame(scene, plan.canvas(), (0, 0, 0, 0), interface_rects(&compiled, scene), Some(world_bounds(&compiled, scene)));
+                        let arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, |s| sprite_rect(&compiled, s));
+                        layout.set_interface_shown(arranged.shown);
+                    };
+                    for _ in 0..3 { draw(&mut layout, &base); }
+                    let part = layout.driver_rect_to_window(CITY_PANEL);
+                    let s = part[2] / CITY_PANEL[2] as f64;
+                    // The pointer on the row at the menu's corner, shifted
+                    // by the list; the game got it at the corner.
+                    let [x, y, w, h] = menu;
+                    layout.press_delivered((x, y + shift), (x, y));
+                    let mut scene = base.clone();
+                    scene.interface.popup = Some(257);
+                    scene.interface.popup_on_screen = true;
+                    scene.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (x, y), viewport: (w as u32, h as u32), ..Default::default() }, overlay: panel(&compiled, menu) });
+                    draw(&mut layout, &scene);
+                    draw(&mut layout, &scene);
+                    assert_eq!(layout.driver_rect_to_window(CITY_PANEL), part, "{what}: the advisor stays");
+                    let pointer = (part[0] + (x - CITY_PANEL[0]) as f64 * s, part[1] + (y + shift - CITY_PANEL[1]) as f64 * s);
+                    let r = shown(&layout, menu);
+                    assert!((r[0] - pointer.0).abs() <= 1.0 + s && (r[1] - pointer.1).abs() <= 1.0 + s, "{what}: the menu at {r:?}, the pointer at {pointer:?}");
+                    assert!(((r[2] / w as f64) - s).abs() < 0.01, "{what}: at the advisor's scale");
+                    // Its entries take the clicks where they show.
+                    let at = ((r[0] + r[2] / 2.0).floor() as i32, (r[1] + r[3] / 2.0).floor() as i32);
+                    let driver = layout.route_window(at).unwrap_or_else(|| panic!("{what}: {at:?} goes nowhere"));
+                    let tolerance = (1.0 / s).ceil() as i32 + 2;
+                    assert!((driver.0 - (x + w / 2)).abs() <= tolerance && (driver.1 - (y + h / 2)).abs() <= tolerance, "{what}: {at:?} reaches {driver:?}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn an_opaque_popup_changes_pixels_only_inside_its_overlay_not_the_screen_beneath_it() {
     check_opaque_modal_stack(None);
