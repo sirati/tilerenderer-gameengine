@@ -2343,9 +2343,9 @@ mod tests {
     /// scales, zoom kinds and active views: with one view (and spanning a
     /// stacked split) where the frame's scale puts them; spanning a side
     /// by side split, split at the divider with its gap clear of them and
-    /// open where they are drawn (the pointer crosses there, also at
-    /// rows they reach only scaled); in the active view, inside its area,
-    /// the divider open alongside them. Never under the zoom box or strip,
+    /// open exactly along their rows as drawn (the pointer crosses there,
+    /// also at rows they reach only scaled); in the active view, inside its
+    /// area, the divider running on beside them, closed. Never under the zoom box or strip,
     /// nor the corner's buttons; clicks reach each button.
     #[test]
     fn unit_buttons_leave_the_divider_open_or_go_into_the_active_view() {
@@ -2416,16 +2416,39 @@ mod tests {
                             } else {
                                 assert!(all[0] >= area[0] && all[1] >= area[1] && all[0] + all[2] <= area[0] + area[2] && all[1] + all[3] <= area[1] + area[3], "{what}: {all:?} in {area:?}");
                             }
-                            // (Spanning a 2:1 split they stay in A, clear of its gap.)
-                            if split == S::Vertical1To1 || (split == S::Vertical2To1 && mode == UnitButtons::ActiveView) {
-                                // The divider is open at their rows as drawn: the pointer crosses there.
-                                let row = all[1] + all[3] / 2;
-                                assert!(layout.open_spans().iter().any(|&(a, b)| a <= all[1] && b >= all[1] + all[3]), "{what}: rows {all:?} open in {:?}", layout.open_spans());
-                                let ((g0, g1), _) = layout.gap().unwrap();
-                                let (from, to) = if b_active { ((g1 + 10, row), (g0 - 10, row)) } else { ((g0 - 10, row), (g1 + 10, row)) };
-                                layout.route(scene::Input::MouseMove { x: from.0, y: from.1 });
-                                layout.route(scene::Input::MouseMove { x: to.0, y: to.1 });
-                                assert_eq!(layout.pointer_in_window(), to, "{what}: crossing at row {row}");
+                            // The divider is open along their rows exactly where they are
+                            // drawn over it (spanning a 1:1 split, their two halves and the
+                            // gap between them): the pointer crosses there. Drawn clear of
+                            // it (in the active view; spanning a 2:1 or a stacked split, in
+                            // A), it runs on beside them and holds the pointer in its view.
+                            if let Some(((g0, g1), (s0, s1))) = layout.gap() {
+                                let vertical = split != S::Horizontal1To1;
+                                let (c0, c1, a0, a1) = if vertical { (all[0], all[0] + all[2], all[1], all[1] + all[3]) } else { (all[1], all[1] + all[3], all[0], all[0] + all[2]) };
+                                let over = c0 < g1 && c1 > g0;
+                                assert_eq!(over, split == S::Vertical1To1 && mode == UnitButtons::Spanning, "{what}: {all:?} over the gap {g0}..{g1}");
+                                let open = layout.open_spans();
+                                if over {
+                                    assert!(open.contains(&(a0.max(s0), a1.min(s1))), "{what}: rows of {all:?} open in {open:?}");
+                                } else {
+                                    // (Its middle third aside, open while the mouse is free, and
+                                    // the rows of the rest of the interface drawn over it, the
+                                    // menu over a stacked split.)
+                                    let third = (s1 - s0) / 3;
+                                    let others: Vec<(i32, i32)> = shown.iter().filter(|s| !buttons.contains(&s.driver)).map(|s| s.rect).filter_map(|r| {
+                                        let (c0, c1, a0, a1) = if vertical { (r[0], r[0] + r[2], r[1], r[1] + r[3]) } else { (r[1], r[1] + r[3], r[0], r[0] + r[2]) };
+                                        (c0 < g1 && c1 > g0).then_some((a0.max(s0), a1.min(s1)))
+                                    }).collect();
+                                    let theirs = |o: &(i32, i32)| *o != (s0 + third, s1 - third) && !others.iter().any(|r| r.0 <= o.0 && o.1 <= r.1 || o.0 <= r.0 && r.1 <= o.1);
+                                    assert!(open.iter().filter(|o| theirs(o)).all(|&(a, b)| b <= a0 || a >= a1), "{what}: an opening beside {all:?}: {open:?}");
+                                }
+                                if vertical {
+                                    let row = all[1] + all[3] / 2;
+                                    let (from, to) = if b_active { ((g1 + 10, row), (g0 - 10, row)) } else { ((g0 - 10, row), (g1 + 10, row)) };
+                                    layout.route(scene::Input::MouseMove { x: from.0, y: from.1 });
+                                    layout.route(scene::Input::MouseMove { x: to.0, y: to.1 });
+                                    let held = if b_active { (g1, row) } else { (g0 - 1, row) };
+                                    assert_eq!(layout.pointer_in_window(), if over { to } else { held }, "{what}: crossing at row {row}");
+                                }
                             }
                             checked += 1;
                         }
@@ -2446,8 +2469,8 @@ mod tests {
                 for separate_view in [false, true] {
                     for frame_scale in [1.0, 1.5] {
                         for canvas in [(1280, 720), (1920, 1080), (2560, 1440)] {
-                            for pixel_scale in [1, 2] {
-                                let what = format!("{side:?}, panel {with_panel}, separate {separate_view}, frame ×{frame_scale}, {canvas:?} ×{pixel_scale}");
+                            for (pixel_scale, glass) in [(1, false), (2, false), (1, true), (2, true)] {
+                                let what = format!("{side:?}, panel {with_panel}, separate {separate_view}, frame ×{frame_scale}, {canvas:?} ×{pixel_scale}, glass {glass}");
                                 let (mut scene, base_rect) = game_scene();
                                 scene.views.truncate(2);
                                 scene.interface = scene::Interface { reachable: Some([832, 1030, 256, 32]), ..Default::default() };
@@ -2463,7 +2486,7 @@ mod tests {
                                 let rect_of = |s: &FreeSprite| if s.y == 1030 { Some([s.x, s.y, 32, 32]) } else { base_rect(s) };
                                 let p = fixed_plan((canvas.0 * pixel_scale, canvas.1 * pixel_scale), (1920, 1080), (pixel_scale, 1.0, frame_scale, 1.0));
                                 let mut l = layout::Layout::default();
-                                l.apply_settings(&viewer_settings::Layout { split: Split::Vertical1To1, unit_buttons: UnitButtons::ActiveView, ..Default::default() });
+                                l.apply_settings(&viewer_settings::Layout { split: Split::Vertical1To1, unit_buttons: UnitButtons::ActiveView, glass_dividers: glass, ..Default::default() });
                                 l.driver_screen = Some(p.screen);
                                 l.frame(&scene, canvas, (0, 0, 0, 0), vec![], None);
                                 let area = l.view_area(side);
@@ -2481,7 +2504,11 @@ mod tests {
                                 }
                                 assert!(all[0] >= span.0 && all[0] + all[2] <= span.1, "{what}: {all:?} inside {span:?}");
                                 assert!(((all[0] - span.0) - (span.1 - all[0] - all[2])).abs() <= 1, "{what}: {all:?} centred in {span:?}");
-                                assert!(l.open_spans().iter().any(|&(a, b)| a <= all[1] && all[1] + all[3] <= b), "{what}: divider open along {all:?}");
+                                // Clear of the divider: it runs on along their rows, open
+                                // only in its middle third.
+                                let (_, (s0, s1)) = l.gap().unwrap();
+                                let third = (s1 - s0) / 3;
+                                assert_eq!(l.open_spans(), [(s0 + third, s1 - third)], "{what}: buttons at {all:?}");
                                 for (button, s) in buttons.iter().zip(&drawn) {
                                     let (x, y) = (s.rect[0] + s.rect[2] / 2, s.rect[1] + s.rect[3] / 2);
                                     let back = s.to_driver((x, y));

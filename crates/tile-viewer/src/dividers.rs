@@ -28,7 +28,7 @@
 //! is drawn whole and holds nothing: `wall` is false there, the pointer
 //! goes anywhere, the line only separates the pictures.)
 
-use super::{subtract_spans, Axis, Hit, Layout, Side, ZoomPlace, GAP};
+use super::{subtract_spans, Axis, Hit, Layout, Side, ZoomPlace};
 
 /// Which divider.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -286,22 +286,26 @@ impl Layout {
             let extent = if b.vertical { h } else { w };
             let ends = [end(b, b.along.0, out.strip, extent), end(b, b.along.1, out.strip, extent)];
             let (s0, s1) = b.along;
+            // The stretch along it (exactly) of an interface rectangle drawn
+            // over its band, where the viewer drew it: none where it is
+            // drawn clear of it, however close.
+            let over = |r: [i32; 4]| {
+                let (c0, c1) = if b.vertical { (r[0], r[0] + r[2]) } else { (r[1], r[1] + r[3]) };
+                let (a0, a1) = if b.vertical { (r[1], r[1] + r[3]) } else { (r[0], r[0] + r[2]) };
+                (c0 < b.across.1 && c1 > b.across.0).then_some((a0.max(s0), a1.min(s1)))
+            };
             // Where a press grabs it: its middle third while the mouse is
-            // free, and the rows of the always reachable controls.
+            // free, and the rows of the always reachable controls where
+            // they are drawn over it (their bounding rectangle: split at
+            // the gap, the gap between their two halves too). Moved into
+            // the active view they are clear of it: the pointer reaches
+            // them in the view it is in, the divider runs on beside them.
             let mut grab = Vec::new();
             if !self.locked {
                 let third = (s1 - s0) / 3;
                 grab.push((s0 + third, s1 - third));
             }
-            if let Some(r) = self.orders_shown() {
-                // Where they are drawn, along all of their rows (columns),
-                // whether they reach over the gap or not, a little around
-                // them: the pointer crosses from one view to the other
-                // anywhere there.
-                let r = [r[0] - GAP, r[1] - GAP, r[2] + 2 * GAP, r[3] + 2 * GAP];
-                let (a0, a1) = if b.vertical { (r[1], r[1] + r[3]) } else { (r[0], r[0] + r[2]) };
-                grab.push((a0.max(s0), a1.min(s1)));
-            }
+            grab.extend(self.orders_shown().and_then(over));
             grab.retain(|&(a, z)| z > a);
             if self.pointer_free_everywhere() {
                 // (Drag map movement: the pointer goes anywhere, the line
@@ -309,17 +313,10 @@ impl Layout {
                 out.segments.extend(carve(b, &[], false, ends));
             } else {
                 // Open where a press grabs it, and where the driver's
-                // interface reaches across the gap (over it there).
+                // interface is drawn over it (`Layout::interface_drawn`).
                 let mut open = grab.clone();
-                if self.fit.is_none() {
-                    let moved = self.moved.iter().map(|(r, _)| r);
-                    for &r in self.interface.iter().chain(&self.driver_rects).chain(moved) {
-                        let (c0, c1) = if b.vertical { (r[0], r[0] + r[2]) } else { (r[1], r[1] + r[3]) };
-                        if c0 < b.across.0 && c1 > b.across.1 {
-                            open.push(if b.vertical { (r[1], r[1] + r[3]) } else { (r[0], r[0] + r[2]) });
-                        }
-                    }
-                }
+                open.extend(self.interface_drawn().into_iter().filter_map(over));
+                open.retain(|&(a, z)| z > a);
                 out.segments.extend(carve(b, &open, true, ends));
             }
             out.handles = grab.iter().map(|&a| {
@@ -385,6 +382,13 @@ impl Layout {
             c[3] = c[3].max(reach[1] + reach[3] - c[1]);
             c
         }).collect()
+    }
+
+    /// The driver's interface where it is drawn over the views (none over
+    /// a screen fitted into a pane): where the viewer showed it, after
+    /// placing it (`interface_shown`), else where the layout put it.
+    fn interface_drawn(&self) -> Vec<[i32; 4]> {
+        if self.fit.is_some() { vec![] } else { self.interface_holes() }
     }
 
     /// The driver's interface the pointer reaches over a zoom.
