@@ -446,6 +446,8 @@ dependencies = [
  "gdi-text",
  "image",
  "inproc",
+ "jgl",
+ "jgl-ffi",
  "log",
  "menu",
  "render-desc",
@@ -458,6 +460,7 @@ dependencies = [
  "viewer-settings",
  "viewer-transport",
  "wgpu",
+ "windows-sys 0.61.2",
  "wine-unixlib",
 ]
 
