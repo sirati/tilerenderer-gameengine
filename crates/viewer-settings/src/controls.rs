@@ -80,7 +80,7 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 44] = [
+pub const KEYS: [&str; 45] = [
     "resolution.pixel_scale",
     "resolution.base_ui_scale",
     "resolution.scale_menus",
@@ -116,6 +116,7 @@ pub const KEYS: [&str; 44] = [
     "input.smooth_menu_scrolling",
     "input.snap_lists_to_items",
     "input.alt_in_menus",
+    "input.record_alt_mode",
     "input.capture_function_keys",
     "input.media_keys_as_function_keys",
     "display.show_fps",
@@ -286,6 +287,7 @@ impl Settings {
             "input.smooth_menu_scrolling" => Some(ControlValue::On(i.smooth_menu_scrolling)),
             "input.snap_lists_to_items" => Some(ControlValue::On(i.snap_lists_to_items)),
             "input.alt_in_menus" => Some(ControlValue::On(i.alt_in_menus)),
+            "input.record_alt_mode" => Some(ControlValue::On(i.record_alt_mode)),
             "input.capture_function_keys" => Some(ControlValue::On(i.capture_function_keys)),
             "input.media_keys_as_function_keys" => Some(ControlValue::On(i.media_keys_as_function_keys)),
             "display.vsync" => Some(ControlValue::On(self.display.present == crate::Present::Vsync)),
@@ -461,6 +463,13 @@ impl Settings {
                 "input.alt_in_menus" => match value {
                     ControlValue::On(on) => {
                         i.alt_in_menus = *on;
+                        true
+                    }
+                    _ => false,
+                },
+                "input.record_alt_mode" => match value {
+                    ControlValue::On(on) => {
+                        i.record_alt_mode = *on;
                         true
                     }
                     _ => false,
@@ -692,6 +701,7 @@ mod tests {
             ("input.smooth_menu_scrolling", ControlValue::On(true)),
             ("input.snap_lists_to_items", ControlValue::On(false)),
             ("input.alt_in_menus", ControlValue::On(false)),
+            ("input.record_alt_mode", ControlValue::On(false)),
             ("input.capture_function_keys", ControlValue::On(false)),
             ("input.media_keys_as_function_keys", ControlValue::On(true)),
             ("layout.screen_place", ControlValue::Choice("LeftOrBottom".into())),

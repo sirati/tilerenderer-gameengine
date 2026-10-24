@@ -2348,7 +2348,8 @@ mod tests {
                     ("accessibility.hud_size", "Unit markers"), ("accessibility.stack_count", "Unit markers"),
                     ("accessibility.unit_rings", "Diplomacy rings"), ("accessibility.war.color", "Diplomacy rings"),
                     ("accessibility.peace.invert", "Diplomacy rings"), ("accessibility.ring_width", "Diplomacy rings"),
-                    ("input.alt_in_menus", "Mouse (Alt mode)"), ("input.snap_updates_per_second", "Mouse (Alt mode)")] {
+                    ("input.alt_in_menus", "Mouse (Alt mode)"), ("input.snap_updates_per_second", "Mouse (Alt mode)"),
+                    ("input.record_alt_mode", "Mouse (Alt mode)")] {
                     assert_eq!(card_named(control), card, "{control}");
                 }
                 // Each undo button in its slider's card, on its row.
@@ -2362,7 +2363,7 @@ mod tests {
         }
         // The Alt mode settings left the Layout tab for Accessibility.
         state.values.insert("tab".into(), Value::Text("layout".into()));
-        assert!(!panel.items.iter().any(|i| Panels::visible(i, &state) && matches!(i.control(), Some("input.alt_in_menus" | "input.snap_updates_per_second"))));
+        assert!(!panel.items.iter().any(|i| Panels::visible(i, &state) && matches!(i.control(), Some("input.alt_in_menus" | "input.snap_updates_per_second" | "input.record_alt_mode"))));
     }
 
     #[test]

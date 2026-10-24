@@ -591,6 +591,12 @@ pub struct Input {
     /// open (a screen, popup, dialog or context menu) and goes off when the
     /// last one closes. In the world Alt still turns it on.
     pub alt_in_menus: bool,
+    /// Record the Alt mode's interactions for tuning its picking: raw mouse
+    /// motion, where its pointer rests and is clicked, and the boxes it can
+    /// snap to (geometry and timing only, no game text or names), in files
+    /// `alt-mode-*.altrec` next to the game's log, 64 MB at most in all
+    /// (`docs/alt-mode-recording.md`).
+    pub record_alt_mode: bool,
     /// macOS: while the game's window is in front, the system shortcuts
     /// on F1-F12 (F11 Show Desktop, Ctrl+F1..F8, ...) are paused so the keys
     /// reach the game, and restored when it is not (`function_keys`).
@@ -604,7 +610,7 @@ pub struct Input {
 
 impl Default for Input {
     fn default() -> Self {
-        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 3.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false, snap_lists_to_items: true, alt_in_menus: true, capture_function_keys: true, media_keys_as_function_keys: false }
+        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 3.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false, snap_lists_to_items: true, alt_in_menus: true, record_alt_mode: true, capture_function_keys: true, media_keys_as_function_keys: false }
     }
 }
 
@@ -874,6 +880,10 @@ mod tests {
         assert!(Settings::default().input.alt_in_menus && old.input.alt_in_menus);
         let off: Settings = toml::from_str("[input]\nalt_in_menus = false\n").unwrap();
         assert!(!off.input.alt_in_menus);
+        // Recording the Alt mode: on by default, older files too; off stays off.
+        assert!(Settings::default().input.record_alt_mode && old.input.record_alt_mode);
+        let off: Settings = toml::from_str("[input]\nrecord_alt_mode = false\n").unwrap();
+        assert!(!off.input.record_alt_mode);
         assert_eq!(toml::from_str::<Settings>(&toml::to_string(&off).unwrap()).unwrap(), off);
         let drag: Settings = toml::from_str("[input]\nmap_movement = \"Drag\"\n").unwrap();
         assert_eq!(drag.input.map_movement, MapMovement::Drag);
