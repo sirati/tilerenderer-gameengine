@@ -381,7 +381,7 @@ impl AppDiagnostics {
     pub fn report_if_due(&mut self, elapsed: Duration, id: u64, logical_canvas: (u32,u32), pixel_box: u32) {
         if self.logged.elapsed() < Duration::from_secs(5) { return; }
         self.logged = Instant::now();
-        log::info!("civ3r-profile-v1 {{\"source\":\"app\",\"elapsed_ms\":{},\"frame_id\":{},\"accepted_world\":{},\"accepted_replay\":{},\"rejected\":{},\"presented\":{},\"retried\":{},\"obsolete\":{},\"logical_canvas\":[{},{}],\"pixel_box\":{}}}",
+        log::info!("tile-viewer-profile-v1 {{\"source\":\"app\",\"elapsed_ms\":{},\"frame_id\":{},\"accepted_world\":{},\"accepted_replay\":{},\"rejected\":{},\"presented\":{},\"retried\":{},\"obsolete\":{},\"logical_canvas\":[{},{}],\"pixel_box\":{}}}",
             elapsed.as_millis(), id, self.accepted_world, self.accepted_replay,
             self.rejected, self.presented, self.retried, self.obsolete, logical_canvas.0, logical_canvas.1, pixel_box);
     }
@@ -428,7 +428,7 @@ impl NativeDiagnostics {
         // are copied or hashed. The bounded sample describes draw commands.
         let observation = frame_observation(frame);
         let adapter = gpu.device.adapter_info();
-        log::info!("civ3r-profile-v1 {{\"source\":\"worker\",\"elapsed_ms\":{},\"frame_id\":{},\"config_revision\":{},\"assets_base\":{},\"assets_through\":{},\"taken\":{},\"retried\":{},\"submitted\":{},\"full_submitted\":{},\"reused_submitted\":{},\"present_enqueued\":{},\"surface\":[{},{}],\"present_mode\":\"{:?}\",\"software\":{},\"gpu_vendor\":{},\"gpu_device\":{},\"timer_enabled\":{},\"timer_epoch\":{},\"timer_attempted_frames\":{},\"timer_prepared_samples\":{},\"timer_submitted_samples\":{},\"timer_collected_samples\":{},\"timer_empty_frames\":{},\"timer_discarded_frames\":{},\"timer_over_budget_frames\":{},\"timer_readback_busy_frames\":{},\"timer_map_failed_frames\":{},\"timer_mapped_range_failed_frames\":{},{} }}",
+        log::info!("tile-viewer-profile-v1 {{\"source\":\"worker\",\"elapsed_ms\":{},\"frame_id\":{},\"config_revision\":{},\"assets_base\":{},\"assets_through\":{},\"taken\":{},\"retried\":{},\"submitted\":{},\"full_submitted\":{},\"reused_submitted\":{},\"present_enqueued\":{},\"surface\":[{},{}],\"present_mode\":\"{:?}\",\"software\":{},\"gpu_vendor\":{},\"gpu_device\":{},\"timer_enabled\":{},\"timer_epoch\":{},\"timer_attempted_frames\":{},\"timer_prepared_samples\":{},\"timer_submitted_samples\":{},\"timer_collected_samples\":{},\"timer_empty_frames\":{},\"timer_discarded_frames\":{},\"timer_over_budget_frames\":{},\"timer_readback_busy_frames\":{},\"timer_map_failed_frames\":{},\"timer_mapped_range_failed_frames\":{},{} }}",
             self.started.elapsed().as_millis(), frame.id, frame.config_revision, frame.base, frame.through,
             self.taken, self.retried, self.submitted, self.full_submitted, self.reused_submitted, self.present_enqueued,
             gpu.config.width, gpu.config.height, gpu.config.present_mode, gpu.software, adapter.vendor, adapter.device,

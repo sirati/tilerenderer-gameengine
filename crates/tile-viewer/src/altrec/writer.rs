@@ -213,7 +213,7 @@ pub fn start(dir: PathBuf, wall_us: u64, limits: Limits) -> std::io::Result<Arc<
         failed: false,
     };
     let shared = sink.clone();
-    std::thread::Builder::new().name("civ3r-altrec".into()).spawn(move || {
+    std::thread::Builder::new().name("altrec".into()).spawn(move || {
         let mut last_t = 0;
         loop {
             let closing = shared.closing.load(Ordering::Acquire);

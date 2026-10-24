@@ -149,12 +149,6 @@ impl Record {
     }
 }
 
-/// Where a host records the Alt mode: `CIV3R_ALTREC_DIR` if set, else
-/// `default` (the folder of the game's log).
-pub fn recording_dir(default: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
-    std::env::var_os("CIV3R_ALTREC_DIR").filter(|d| !d.is_empty()).map(Into::into).or(default)
-}
-
 /// Seconds on the viewer's clock as a record's microseconds.
 pub fn micros(now: f64) -> u64 {
     if now.is_finite() && now > 0.0 { (now * 1e6).round() as u64 } else { 0 }

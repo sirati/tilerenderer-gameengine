@@ -69,6 +69,12 @@ pub struct ViewerConfig {
     /// `viewer_settings::Input::record_alt_mode` is on (`altrec`): the
     /// folder of the driver's log. None: not recorded.
     pub recording_dir: Option<std::path::PathBuf>,
+    /// A file to write once a complete title menu was presented (a
+    /// launcher waits for it); none: nothing written.
+    pub startup_ready_file: Option<std::path::PathBuf>,
+    /// The desktop scale a native viewer's launcher gave the game (it
+    /// sizes the game too), reported to the driver instead of the window's.
+    pub launcher_scale: Option<f64>,
     /// Where the user's settings are kept (`viewer_settings::Settings::load`).
     pub settings_path: std::path::PathBuf,
     /// Behaviour plugged in by crates built on the viewer (`extension`).
@@ -77,7 +83,7 @@ pub struct ViewerConfig {
 
 impl Default for ViewerConfig {
     fn default() -> Self {
-        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None, settings_path: viewer_settings::Settings::default_path_for("tile-viewer", "TILE_VIEWER_SETTINGS"), extensions: extension::Extensions::default() }
+        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None, startup_ready_file: None, launcher_scale: None, settings_path: viewer_settings::Settings::default_path_for("tile-viewer", "TILE_VIEWER_SETTINGS"), extensions: extension::Extensions::default() }
     }
 }
 
@@ -3530,10 +3536,10 @@ impl App {
             }
         }
         // The desktop's scale (for the driver; not the pixel scale): the window's, or a native
-        // viewer's launcher's (`CIV3R_SCALE`, which sizes the game too; a
+        // viewer's launcher's (`ViewerConfig::launcher_scale`, which sizes the game too; a
         // viewer in a Wine program has its window in Wine's own pixels,
         // which Wine scales for the desktop itself).
-        let launcher = std::env::var("CIV3R_SCALE").ok().and_then(|s| s.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s >= 1.0);
+        let launcher = self.config.launcher_scale.filter(|s| s.is_finite() && *s >= 1.0);
         let desktop = if cfg!(windows) { scale } else { launcher.unwrap_or(scale) };
         let native = (window.0, window.1, (desktop * 1000.0).round() as u32);
         if native != self.reported_window {
@@ -3811,7 +3817,7 @@ impl App {
             self.map_drawn = true;
             log::info!("viewer: first map drawn (scene {})", scene.seq);
         }
-        startup_ready::presented(scene, true, scene.views.iter().filter(|view| view.view.interface_only)
+        startup_ready::presented(self.config.startup_ready_file.as_deref(), scene, true, scene.views.iter().filter(|view| view.view.interface_only)
             .flat_map(|view| &view.overlay).any(|sprite| sprite_rect(&self.compiled, sprite).is_some_and(|[_, _, width, height]| width > 0 && height > 0)));
     }
 
