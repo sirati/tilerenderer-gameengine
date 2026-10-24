@@ -48,7 +48,11 @@ use winit::window::{Fullscreen, Window, WindowId};
 /// The shader module the viewer draws with: `viewer-shaders` (the tile
 /// renderer's, the glass lens's and the selection marker's shaders, one
 /// SPIR-V module), with what the renderer draws from it.
-pub const SHADERS: tile_render::Shaders = tile_render::Shaders::new(viewer_spirv::SPIRV, viewer_spirv::SPIRV_FALLBACK);
+pub const SHADERS: tile_render::Shaders = tile_render::Shaders::new(viewer_spirv::SPIRV, viewer_spirv::SPIRV_FALLBACK)
+    .with_effect(glass_lens::effect);
+
+/// The CPU oracle of a renderer drawing with [`SHADERS`] (the glass lens's).
+pub const ORACLE: tile_render::reference::Oracle<'static> = tile_render::reference::Oracle { effect: Some(&glass_lens::ORACLE) };
 
 #[derive(Clone, Debug)]
 pub struct ViewerConfig {
@@ -754,7 +758,7 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
                 cull: v.cull,
                 origin: v.origin,
                 target_clip: None,
-                lens: None,
+                effect: None,
                 cells: !v.interface_only,
                 screen_shift: (0, 0),
                 zoomed_art: false,
@@ -2829,7 +2833,7 @@ mod cached_picture_tests {
         plan.present = Present { canvas: (640, 480), zoom: (2, 1), at: (0, 0), target: (1280, 960) };
         CachedPicture {
             plan,
-            copies: vec![ScreenCopy { source: [100, 80, 120, 100], at: (300, 180), zoom: (2, 1), lens: None }],
+            copies: vec![ScreenCopy { source: [100, 80, 120, 100], at: (300, 180), zoom: (2, 1), effect: None }],
             pixel_box: 1,
         }
     }

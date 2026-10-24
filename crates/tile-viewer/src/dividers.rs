@@ -88,7 +88,7 @@ impl Band {
     }
 }
 
-/// How a segment is drawn as a glass bar (a `tile_render::Lens`): the
+/// How a segment is drawn as a glass bar (a `glass_lens::Lens`): the
 /// lens's rectangle (the segment's, run on past the window's edge and
 /// into a divider it meets, so that only its free ends show their round
 /// caps), its corner radius and rim (half the thickness: a rounded rod),
@@ -140,7 +140,7 @@ impl Segment {
             End::Free => 0,
         };
         let along = (self.along.0 - run(self.ends[0]), self.along.1 + run(self.ends[1]));
-        // (The halo: `tile_render::Lens`, 0.28 of the rim.)
+        // (The halo: `glass_lens::Lens`, 0.28 of the rim.)
         let halo = (t as f32 / 2.0 * 0.28).ceil() as i32 + 1;
         let shown = |at: i32, end: End, out: i32| if end == End::Junction { at } else { at + out };
         let (a0, a1) = (shown(self.along.0, self.ends[0], -halo - run(self.ends[0])), shown(self.along.1, self.ends[1], halo + run(self.ends[1])));

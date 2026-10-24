@@ -10,6 +10,8 @@ render-errors = { path = "../render-errors" }
 application-icon = { path = "../application-icon" }
 handoff = { path = "../handoff" }
 tile-render.workspace = true
+# (Not `glass`: the viewer has a module of that name, its frosted divider.)
+glass-lens = { package = "glass", path = "../glass" }
 viewer-spirv.workspace = true
 render-desc = { path = "../render-desc" }
 scene = { path = "../scene" }

@@ -44,6 +44,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass-shaders"
+version = "0.1.0"
+dependencies = [
+ "glass-shared",
+ "spirv-std",
+ "tile-render-shared",
+]
+
+[[package]]
+name = "glass-shared"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -145,6 +161,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 name = "viewer-shaders"
 version = "0.1.0"
 dependencies = [
+ "glass-shaders",
  "spirv-std",
  "tile-render-shaders",
 ]

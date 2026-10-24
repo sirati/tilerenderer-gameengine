@@ -15,6 +15,8 @@ members = [
     "crates/pointer-api",
     "crates/tile-render-shared",
     "crates/tile-render",
+    "crates/glass-shared",
+    "crates/glass",
     "crates/viewer-spirv",
     "crates/civ3-assets",
     "crates/render-desc",
@@ -43,7 +45,7 @@ members = [
 ]
 # The shader crates are compiled by rust-gpu (pinned nightly), as one module
 # (viewer-shaders), from viewer-spirv's build script, never by the workspace toolchain.
-exclude = ["crates/tile-render-shaders", "crates/viewer-shaders", "vendor"]
+exclude = ["crates/tile-render-shaders", "crates/glass-shaders", "crates/viewer-shaders", "vendor"]
 
 [workspace.package]
 edition = "2024"

@@ -1049,6 +1049,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glass-shared",
+ "image",
+ "pollster",
+ "tile-render",
+ "viewer-spirv",
+ "wgpu",
+]
+
+[[package]]
+name = "glass-shared"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "glow"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2945,6 +2965,7 @@ dependencies = [
  "application-icon",
  "dispatch2",
  "function-keys",
+ "glass",
  "handoff",
  "log",
  "pointer-control",

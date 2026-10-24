@@ -20,7 +20,7 @@ use cargo_gpu_install::spirv_builder::{ShaderPanicStrategy, SpirvMetadata};
 use cargo_gpu_install::spirv_source::{CrateMetadata, SpirvSource};
 
 /// The crates (beside this one) the shader module is compiled from.
-const SHADER_SOURCES: &[&str] = &["viewer-shaders", "tile-render-shaders", "tile-render-shared"];
+const SHADER_SOURCES: &[&str] = &["viewer-shaders", "tile-render-shaders", "tile-render-shared", "glass-shaders", "glass-shared"];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(mode) = std::env::args_os().nth(1) {

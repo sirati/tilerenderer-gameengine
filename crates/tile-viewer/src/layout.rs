@@ -2432,9 +2432,9 @@ impl Layout {
     /// the world or the menus), with the rounded corners and glass rim the
     /// settings ask for; a strip has none (no corners, a line or a glass
     /// divider below it, `Layout::dividers`).
-    fn zoom_lens(&self, m: &Magnifier, rect: [i32; 4]) -> Option<tile_render::Lens> {
+    fn zoom_lens(&self, m: &Magnifier, rect: [i32; 4]) -> Option<glass_lens::Lens> {
         if matches!(m.place, ZoomPlace::Strip(..)) { return None; }
-        Some(tile_render::Lens {
+        Some(glass_lens::Lens {
             radius: if self.zoom_rounded { (rect[2].min(rect[3]) as f32 * 0.32).min(56.0 / self.window_pixel_scale.max(1.0) as f32) } else { 0.0 },
             rim: (if self.zoom_glass { 24.0 } else { self.separator_width as f32 }) / self.window_pixel_scale.max(1.0) as f32,
             glass: self.zoom_glass,
@@ -3056,8 +3056,8 @@ impl Layout {
                     break;
                 }
                 let [x, y, w, h] = bar.rect;
-                let lens = tile_render::Lens { radius: bar.radius, rim: bar.rim, glass: true };
-                let camera = Camera { origin: (x, y), cells: false, lens: Some(lens), target_clip: Some(bar.clip), ..Camera::new((w.max(1) as u32, h.max(1) as u32)) };
+                let lens = glass_lens::Lens { radius: bar.radius, rim: bar.rim, glass: true };
+                let camera = Camera { origin: (x, y), cells: false, effect: Some(lens.into()), target_clip: Some(bar.clip), ..Camera::new((w.max(1) as u32, h.max(1) as u32)) };
                 let at = push(&mut frame, camera);
                 frame.glass_dividers.push((at, segment));
             }
@@ -3087,7 +3087,7 @@ impl Layout {
             let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None, self.magnified_view_zoom());
             camera.zoomed_art = self.zoomed_art(camera.zoom);
             camera.downscale = downscale;
-            camera.lens = lens;
+            camera.effect = lens.map(Into::into);
             push(&mut frame, self.magnifier_art_camera(camera));
             self.shown.push((Hit::Magnifier, camera));
         }
@@ -3144,7 +3144,7 @@ impl Layout {
             if matches!(m.place, ZoomPlace::Strip(_)) { self.strip_line(&mut frame); }
             match source {
                 // The window around the pointer, at the magnifier's zoom.
-                Some(source) => frame.copies.push(ScreenCopy { source, at: (rect[0], rect[1]), zoom, lens }),
+                Some(source) => frame.copies.push(ScreenCopy { source, at: (rect[0], rect[1]), zoom, effect: lens.map(Into::into) }),
                 None => {
                     // The world under the pointer (the world cursor while
                     // the mouse is captured; where it looked last while
@@ -3154,7 +3154,7 @@ impl Layout {
                     let mut camera = FreeView::new(center.unwrap_or((0, 0)), m.zoom, Follow::Free).camera(rect, overhang, None, self.magnified_view_zoom());
                     camera.zoomed_art = self.zoomed_art(camera.zoom);
                     camera.downscale = downscale;
-                    camera.lens = lens;
+                    camera.effect = lens.map(Into::into);
                     push(&mut frame, self.magnifier_art_camera(camera));
                     self.shown.push((Hit::Magnifier, camera));
                 }
@@ -5119,14 +5119,14 @@ mod tests {
                             let logical = l.shown.iter().find(|(h, _)| *h == Hit::Magnifier).unwrap().1;
                             assert_eq!(rect_of(&logical), rect, "{what}");
                             // (Not the glass dividers' bars, clipped to their own place.)
-                            let lensed: Vec<_> = f.cameras.iter().filter(|c| c.lens.is_some() && c.target_clip.is_none()).collect();
+                            let lensed: Vec<_> = f.cameras.iter().filter(|c| c.effect.is_some() && c.target_clip.is_none()).collect();
                             assert!(lensed.len() <= 1, "{what}: one zoom lens");
-                            lensed.first().map(|c| c.lens.unwrap())
+                            lensed.first().map(|c| glass_lens::Lens::of(c.effect.unwrap()))
                         }
                         ZoomContent::WorldAndMenus => {
                             let [copy] = f.copies[..] else { panic!("{what}: one screen copy") };
                             assert_eq!(copy.at, (rect[0], rect[1]), "{what}");
-                            copy.lens
+                            copy.effect.map(glass_lens::Lens::of)
                         }
                     };
                     if zoom == Zoom::TopStrip {
@@ -5172,7 +5172,7 @@ mod tests {
             assert_eq!(copy.zoom, (3, 2));
             let rect = l.magnifier_geometry(&l.magnifier.unwrap()).0;
             assert_eq!(rect[3], 600 * 3 / 10);
-            let lens = copy.lens.unwrap();
+            let lens = glass_lens::Lens::of(copy.effect.unwrap());
             assert_eq!(lens.glass, glass);
             assert_eq!(lens.radius > 0.0, rounded);
             assert_eq!(lens.rim * scale as f32, if glass { 24.0 } else { 4.0 });
@@ -5396,7 +5396,7 @@ mod tests {
         l.route(Input::MouseMove { x: 300, y: 300 });
         let f = frame(&mut l, vec![]);
         // Beside what it magnifies, its frame clear of it.
-        assert_eq!(f.copies, [ScreenCopy { source: [250, 275, 100, 50], at: (354, 250), zoom: (2, 1), lens: f.copies[0].lens }]);
+        assert_eq!(f.copies, [ScreenCopy { source: [250, 275, 100, 50], at: (354, 250), zoom: (2, 1), effect: f.copies[0].effect }]);
         // A click on the magnifier goes to what it shows.
         assert_eq!(click(&mut l, (364, 260))[0], Input::MouseButton { button: Button::Left, down: true, x: 255, y: 280 });
     }
@@ -6163,10 +6163,10 @@ mod tests {
         let mut world = TileWorld::new(grid, sets);
         world.free.push(PlacedSprite::new(set, rendered.x, rendered.y));
         // (The art alone, without the lens's rounded corners and rim.)
-        let local = Camera { origin: (0, 0), lens: None, ..*rendered };
+        let local = Camera { origin: (0, 0), effect: None, ..*rendered };
         let actual = tile_render::reference::render(&world, &atlas, &local, 0, [0; 4]);
         assert_eq!(actual, original);
-        let old = Camera { origin: (0, 0), lens: None, ..logical };
+        let old = Camera { origin: (0, 0), effect: None, ..logical };
         let pixelated = tile_render::reference::render(&world, &atlas, &old, 0, [0; 4]);
         assert_ne!(pixelated, actual);
         assert_eq!(pixelated.get(0, 0), [255, 0, 255, 255]);
