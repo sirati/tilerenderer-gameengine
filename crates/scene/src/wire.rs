@@ -1528,7 +1528,7 @@ mod tests {
         settings.input.snap_updates_per_second = 4.5;
         s.settings = Some(settings);
         s.interface = Interface {
-            screen: Some("F4".into()),
+            screen: Some("Report".into()),
             menu_fit: true,
             screen_role: ScreenRole::Site,
             roaming: Some(256),

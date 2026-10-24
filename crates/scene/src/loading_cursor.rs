@@ -1,8 +1,8 @@
 //! Shared cadence and geometry of the loading (busy) cursor: the wait
-//! cursor's hourglass (`IDC_WAIT`, see `civ3_assets::syscursor`), turned
+//! cursor's hourglass (`IDC_WAIT`, from the driver's system cursors), turned
 //! in discrete steps. The art has a single still frame, so the loader
 //! pre-renders [`FRAME_COUNT`] rotations of it (`rotations` on its image,
-//! `civ3_assets::rotate`), each [`STEP_DEGREES`] further clockwise.
+//! the driver's art loader), each [`STEP_DEGREES`] further clockwise.
 use std::time::Duration;
 
 /// The rotated frames, in order (frame `k`: `k` × [`STEP_DEGREES`]).

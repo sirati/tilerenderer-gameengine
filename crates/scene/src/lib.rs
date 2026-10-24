@@ -107,7 +107,7 @@ pub enum SpriteBlend {
     PaletteAlpha256,
 }
 
-/// A sprite not tied to a cell (units, effects, UI).
+/// A sprite not tied to a cell (pieces, effects, UI).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FreeSprite {
     /// Sprite set (animation) id, resolved from a set name by the
@@ -232,11 +232,11 @@ pub struct SpriteLifetime {
     pub duration_ms: u32,
 }
 
-/// What draws a unit that may be on a walk (see [`Walk`]): `sprites` (a
+/// What draws a piece that may be on a walk (see [`Walk`]): `sprites` (a
 /// half-open range in [`Scene::sprites`]) and `cells` (layer, column, row:
-/// the unit's cells, at the depth the driver draws it) draw unit `key` with
-/// its anchor at world pixel `anchor` (full size). While the unit's walk is
-/// played, a renderer draws them moved by where the walk has the unit then,
+/// the piece's cells, at the depth the driver draws it) draw piece `key` with
+/// its anchor at world pixel `anchor` (full size). While the piece's walk is
+/// played, a renderer draws them moved by where the walk has the piece then,
 /// less `anchor` (the cells by that added to their offsets); else where the
 /// scene has them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,10 +247,10 @@ pub struct Motion {
     pub anchor: (i32, i32),
 }
 
-/// A unit's walk from tile to tile, told the moment each tile starts (not
+/// A piece's walk from tile to tile, told the moment each tile starts (not
 /// with the scene: see [`Update::Walk`]). `serial` identifies the walk
 /// (increasing across the session); `origin` is the world pixel (full
-/// size) of the unit's anchor where it began; `tiles` are its tiles started
+/// size) of the piece's anchor where it began; `tiles` are its tiles started
 /// so far, in order; `planned` how many more the driver expects to follow
 /// (its path), 0 for a single step or the walk's last tile.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -290,11 +290,11 @@ pub struct Scene {
     /// same cells share one, and one no view differs by is not sent.
     pub slots: Vec<LayerSlot>,
     pub bindings: Vec<Binding>,
-    /// World-space sprites (units, effects), drawn in every view, in
+    /// World-space sprites (pieces, effects), drawn in every view, in
     /// drawing order (within the pass each follows).
     pub sprites: Vec<FreeSprite>,
     pub sprite_lifetimes: Vec<SpriteLifetime>,
-    /// World sprites drawing units that may be on a walk.
+    /// World sprites drawing pieces that may be on a walk.
     pub motions: Vec<Motion>,
     /// By id.
     pub views: Vec<ViewState>,
@@ -305,12 +305,12 @@ pub struct Scene {
     /// refer to; 0: whatever the renderer has.
     pub assets: u64,
     /// The world pixel the driver considers its point of interest (e.g. the
-    /// unit a player is moving), if any (in the pixels of its views, see
+    /// piece a player is moving), if any (in the pixels of its views, see
     /// [`View::downscale`]).
     pub focus: Option<(i32, i32)>,
     /// Where a marker over the point of interest goes instead of `focus`
     /// (which follows the driver's own frames): `from` (in the pixels of
-    /// `focus`) moved as the walk of unit `key` moves its sprites
+    /// `focus`) moved as the walk of piece `key` moves its sprites
     /// ([`Motion`]: from its anchor; `key` 0, or no walk: not moved).
     pub focus_motion: Option<FocusMotion>,
     /// Semantic main-camera request independent of the native rendering camera.
@@ -546,11 +546,11 @@ pub struct Interface {
     /// views over the window (and map pointer input there back).
     pub screen_view: Option<u32>,
     /// The named screen's main control (x, y, w, h, in the driver's window
-    /// pixels; e.g. a city screen's production box): where a renderer that
+    /// pixels; e.g. a site screen's production box): where a renderer that
     /// lets go of a captured mouse when the screen opens puts the pointer.
     pub focus_control: Option<[i32; 4]>,
     /// A rectangle (x, y, w, h) of controls the pointer has to reach from
-    /// every view of the renderer's (e.g. the active unit's orders), while
+    /// every view of the renderer's (e.g. the selected piece's orders), while
     /// they are shown.
     pub reachable: Option<[i32; 4]>,
     /// The tooltip the driver shows (x, y, w, h), if any: drawn over
@@ -567,7 +567,7 @@ pub struct Interface {
     /// in the view the click was made in, not with the screens.
     pub popup_anchor: Option<PopupAnchor>,
     /// The open popup is one the driver opened at a click on its named
-    /// screen (`screen`; e.g. the menu of a unit in a city screen's
+    /// screen (`screen`; e.g. the menu of a piece in a site screen's
     /// garrison): it belongs where the driver put it on that screen, placed
     /// and scaled with the screen, not over it as a modal of the screen's.
     pub popup_on_screen: bool,
@@ -594,11 +594,11 @@ pub struct Interface {
     /// front of them where it cannot.
     pub loading_bar: Option<u32>,
     /// A command of the driver's waits for the player to pick a place of
-    /// the world (e.g. a unit's go-to destination, a bombard target): the
+    /// the world (e.g. a piece's go-to destination, a bombard target): the
     /// next click that matters is one on the world (a renderer may give
     /// the world the pointer for it).
     pub targeting: bool,
-    /// The command waiting for its tile is a move (a unit's or a stack's
+    /// The command waiting for its tile is a move (a piece's or a stack's
     /// go-to, whose target shows the turns it takes): a renderer may show
     /// the cursor tile by tile. Other commands (bombard, rebase, airlift,
     /// ...) keep the cursor at the pointer.
@@ -738,7 +738,7 @@ pub struct Interactable {
     pub id: u64,
     /// In button snapping only, a left click on it reaches the driver as a
     /// right click at the same point: for elements whose only action is
-    /// on the right button (the F1 advisor's production cells). Ordinary
+    /// on the right button (a report screen's production cells). Ordinary
     /// mouse input is never changed.
     pub alt_right_click: bool,
 }
@@ -883,7 +883,7 @@ pub enum Update {
     SpriteLifetimes(Vec<SpriteLifetime>),
     /// See [`Scene::motions`] (replaced).
     Motions(Vec<Motion>),
-    /// A unit's walk as it is now (replacing any it had): kept by the
+    /// A piece's walk as it is now (replacing any it had): kept by the
     /// [`Display`], not the scene, and sent the moment a tile starts (a
     /// batch of these alone is no new scene).
     Walk(Walk),
@@ -1575,7 +1575,7 @@ pub struct Display {
     changes_from_seq: u64,
     /// The host's status last received, and when (see [`Display::host`]).
     host: Option<(HostStatus, std::time::Instant)>,
-    /// The walk each unit was told last (see [`Update::Walk`]), with when
+    /// The walk each piece was told last (see [`Update::Walk`]), with when
     /// each of its tiles first arrived.
     walks: std::collections::HashMap<u32, (Walk, Vec<std::time::Instant>)>,
     /// The last [`Input::MouseMove`] sent (see [`Display::last_pointer_move`]).
@@ -1727,14 +1727,14 @@ impl Display {
         self.host
     }
 
-    /// The walk unit `key` was told last, and when each of its tiles first
+    /// The walk piece `key` was told last, and when each of its tiles first
     /// arrived on the renderer's clock (the driver sent it then).
     pub fn walk(&self, key: u32) -> Option<(&Walk, &[std::time::Instant])> {
         self.walks.get(&key).map(|(w, at)| (w, &at[..]))
     }
 
     fn take_walk(&mut self, walk: Walk, now: std::time::Instant) {
-        // (Walks a minute old are let go: their units stand still.)
+        // (Walks a minute old are let go: their pieces stand still.)
         self.walks.retain(|_, (_, at)| at.last().is_some_and(|t| now.saturating_duration_since(*t) < Duration::from_secs(60)));
         let entry = self.walks.entry(walk.key).or_insert_with(|| (Walk::default(), Vec::new()));
         if entry.0.serial != walk.serial {
@@ -1894,7 +1894,7 @@ mod tests {
         let (w, at) = display.walk(7).unwrap();
         assert_eq!((w.tiles.len(), at[0]), (2, first), "an earlier tile keeps its arrival");
         assert!(at[1] > first);
-        // A new walk of the unit: its own arrivals.
+        // A new walk of the piece: its own arrivals.
         driver.send(vec![Update::Walk(walk(2, vec![tile(900)]))]);
         display.receive(Duration::ZERO);
         let (w, at) = display.walk(7).unwrap();
@@ -1984,7 +1984,7 @@ mod tests {
         let (changes, scene) = display.take_changes();
         assert!(changes.slots && changes.slot_cells.is_empty() && changes.cells.is_empty() && !changes.world);
         assert_eq!((scene.slots.clone(), scene.bindings.clone(), scene.view(1).unwrap().view.binding), (s.slots.clone(), s.bindings.clone(), 1));
-        // Its city moves: only the slot's changed values travel.
+        // Its site moves: only the slot's changed values travel.
         let before = s.clone();
         s.slots[0].cells.values[2] = 2;
         s.slots[0].cells.values[0] = 1;
