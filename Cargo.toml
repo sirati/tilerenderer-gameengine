@@ -42,6 +42,7 @@ members = [
     "crates/jgl-ffi",
     "crates/tile-game",
     "crates/civ3-ui",
+    "crates/civ3-world",
     "crates/civ3-bridge",
 ]
 # The shader crates are compiled by rust-gpu (pinned nightly), as one module

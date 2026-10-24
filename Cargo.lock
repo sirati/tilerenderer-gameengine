@@ -441,6 +441,7 @@ dependencies = [
  "civ3-assets",
  "civ3-sys",
  "civ3-ui",
+ "civ3-world",
  "civ3r-native",
  "env_logger",
  "gdi-text",
@@ -490,6 +491,16 @@ dependencies = [
  "tile-game",
  "tile-viewer",
  "viewer-settings",
+]
+
+[[package]]
+name = "civ3-world"
+version = "0.1.0"
+dependencies = [
+ "civ3-assets",
+ "scene",
+ "tile-game",
+ "tile-render",
 ]
 
 [[package]]
