@@ -30,6 +30,21 @@ fn a_check_boxs_label_draws_the_pointer_to_its_box() {
 }
 
 #[test]
+fn a_menu_check_box_taking_clicks_on_its_label_draws_the_pointer_from_it_too() {
+    // A menu's check box: it takes clicks on its label as on its box (the
+    // region its own rectangle), its pointer spot the box.
+    let menu_check = |region: Option<[i32; 4]>| Interactable { region, alt_right_click: false, anchor: Some([308, 108]), rect: [300, 100, 200, 18], kind: InteractableKind::Button, id: 7 };
+    let from = (480.0, 300.0);
+    let with = targets(&[button(1, 480, 300), menu_check(Some([300, 100, 200, 18])), button(3, 560, 110)], IDENTITY, WINDOW);
+    let k = pick(&with, from, Some(1), (0.0, -190.0)).unwrap();
+    assert_eq!(with[k].id, 7);
+    assert_eq!(with[k].center(), (308.0, 108.0));
+    // Without a region it is the spot on its box alone.
+    let without = targets(&[button(1, 480, 300), menu_check(None), button(3, 560, 110)], IDENTITY, WINDOW);
+    assert_eq!(without[pick(&without, from, Some(1), (0.0, -190.0)).unwrap()].id, 3);
+}
+
+#[test]
 fn snapping_on_over_the_label_takes_the_check_box_and_clicks_its_box() {
     // Beside the label, C nearer; over it, the check box though its box is far.
     let t = targets(&[check(true), button(3, 560, 110)], IDENTITY, WINDOW);
