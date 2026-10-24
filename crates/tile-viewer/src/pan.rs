@@ -588,7 +588,7 @@ impl Layout {
     /// the divider's wall it pushes against (at its outermost pixel); only
     /// the game's thin zone over the interface. Pushed past the window's
     /// edge, it is on that edge.
-    fn view_edge(&self, p: (i32, i32)) -> Option<(Hit, (i32, i32))> {
+    pub(super) fn view_edge(&self, p: (i32, i32)) -> Option<(Hit, (i32, i32))> {
         let p = self.pushed_in(p)?;
         let hit = self.pan_view_at(p)?;
         Some((hit, self.edge_target(hit)?.edge_of(p)))
@@ -601,8 +601,9 @@ impl Layout {
         let rect = super::rect_of(cam);
         let [x, y, _, _] = rect;
         // A top strip reserves the window's top. The first map row below
-        // it becomes the upward scroll boundary for the affected pane.
-        let top_row = self.strip().filter(|(strip, _)| y == strip[1] + strip[3] + super::GAP).map(|(strip, _)| (strip[0], strip[0] + strip[2]));
+        // it (right below the strip's divider, `Layout::dividers`) becomes
+        // the upward scroll boundary for the affected pane.
+        let top_row = self.dividers().strip.filter(|band| y == band.across.1).map(|band| band.along);
         let against = match (self.against, self.split) {
             (Some(side), Some(split)) if side.hit() == hit => {
                 let toward = if side == Side::A { 1 } else { -1 };

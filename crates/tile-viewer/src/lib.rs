@@ -1236,7 +1236,13 @@ pub fn render_planned(
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world_arranged(compiled, scene, &frame.view_cameras, &arranged.overlay_cameras));
     apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
-    gpu.render_views(&mut renderer, &frame.cameras, plan.canvas(), scene.tick, config.clear)
+    // The dividers' frosted strips and the strip's separator, as the
+    // window adds them to its markers.
+    let dividers: Vec<_> = glass_sprites(compiled, &frame.divider).into_iter().chain(separator_sprites(&frame.separators)).collect();
+    renderer.set_markers(&gpu.device, &gpu.queue, &dividers);
+    // (Shown in the window as the viewer shows it: a pixel scale's boxes,
+    // glass shaded at window resolution.)
+    gpu.render_presented(&mut renderer, &frame.cameras, &[], plan.present, scene.tick, config.clear)
 }
 
 /// A device on `adapter` with `surface` configured for a window of `size`

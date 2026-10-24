@@ -92,6 +92,7 @@ pub const KEYS: [&str; 42] = [
     "layout.separator_width",
     "layout.zoom_rounded",
     "layout.zoom_glass",
+    "layout.glass_dividers",
     "layout.zoom_place",
     "layout.zoom",
     "layout.zoom_content",
@@ -262,6 +263,7 @@ impl Settings {
             "layout.separator_width" => Some(ControlValue::Number(l.separator_width.clamp(1, 16) as f32)),
             "layout.zoom_rounded" => Some(ControlValue::On(l.zoom_rounded)),
             "layout.zoom_glass" => Some(ControlValue::On(l.zoom_glass)),
+            "layout.glass_dividers" => Some(ControlValue::On(l.glass_dividers)),
             "layout.zoom_strip" => Some(ControlValue::Number(l.zoom_strip)),
             "layout.zoom_box_top" => Some(ControlValue::Number(l.zoom_box_top)),
             "layout.zoom_box_drop" => Some(ControlValue::Number(l.zoom_box_drop)),
@@ -388,10 +390,11 @@ impl Settings {
                     if ok { l.separator_width = width as u32; }
                     ok
                 }
-                "layout.zoom_rounded" | "layout.zoom_glass" => match value {
+                "layout.zoom_rounded" | "layout.zoom_glass" | "layout.glass_dividers" => match value {
                     ControlValue::On(on) => {
                         match key {
                             "layout.zoom_rounded" => l.zoom_rounded = *on,
+                            "layout.glass_dividers" => l.glass_dividers = *on,
                             _ => l.zoom_glass = *on,
                         }
                         true

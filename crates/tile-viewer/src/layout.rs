@@ -126,6 +126,11 @@
 //! own releases a captured mouse; over a view following the world cursor
 //! the pointer then shows that a click captures it again
 //! ([`Layout::take_pointer_icon`]).
+//!
+//! Where every divider is, how thick, where it stops and where the
+//! pointer passes it comes from one place, [`Layout::dividers`]
+//! (`dividers`): the drawing, the pointer's walls, hit testing and the
+//! edge scrolling below a zoom strip all read it.
 
 
 use scene::{Button, Input, Scene};
@@ -136,6 +141,8 @@ mod pan;
 mod prepared_motion;
 #[path = "glass.rs"]
 mod glass;
+#[path = "dividers.rs"]
+pub(crate) mod dividers;
 #[path = "capture.rs"]
 mod capture;
 #[path = "world_rescale.rs"]
@@ -157,6 +164,7 @@ mod cursor_screen_tests;
 pub use pan::{DRAG_THRESHOLD, Momentum, Tracker};
 pub use capture::{Attractor, RESUME_AFTER};
 pub use glass::Shade;
+pub use dividers::{Band, Dividers, End as DividerEnd, Kind as DividerKind, Segment as DividerSegment};
 use tile_render::{Camera, ScreenCopy};
 use viewer_settings::{Place, Roles, ScreenPlace, UnitButtons};
 
@@ -607,6 +615,9 @@ pub struct Frame {
     /// going on there) to draw it in, its rectangle (x, y, w, h), whether
     /// the split is side by side, and its shade (`crate::glass_sprite`).
     pub divider: Vec<(u32, [i32; 4], bool, Shade)>,
+    /// With glass dividers: the camera of each glass bar (its lens) and the
+    /// divider segment it draws (`dividers`), in drawing order.
+    pub glass_dividers: Vec<(u32, DividerSegment)>,
     /// Where the cursor drawn in a view the pointer is not in (the world
     /// cursor mirrored there) goes in the drawing order: before this camera,
     /// the first of the driver's interface over the world views, so that
@@ -728,6 +739,8 @@ pub struct Layout {
     pub zoom_mouse_below: u32,
     pub zoom_rounded: bool,
     pub zoom_glass: bool,
+    /// The dividers drawn as glass bars (`dividers`).
+    pub glass_dividers: bool,
     pub separator_width: u32,
     /// Physical window pixels per composition pixel.
     pub window_pixel_scale: f64,
@@ -1018,6 +1031,7 @@ impl Default for Layout {
             zoom_mouse_below: 200,
             zoom_rounded: true,
             zoom_glass: true,
+            glass_dividers: false,
             separator_width: 4,
             window_pixel_scale: 1.0,
             zoom_box_zoom: None,
@@ -1505,6 +1519,7 @@ impl Layout {
         self.zoom_mouse_below = thousandths(s.zoom_mouse_below, viewer_settings::controls::ZOOM_MOUSE_BELOW_RANGE.max);
         self.zoom_rounded = s.zoom_rounded;
         self.zoom_glass = s.zoom_glass;
+        self.glass_dividers = s.glass_dividers;
         self.separator_width = s.separator_width.clamp(1, 16);
         self.screen_place = s.screen_place;
         self.menu_follows_pointer = s.menu_follows_pointer;
@@ -1586,41 +1601,14 @@ impl Layout {
     /// The divider's walls as of the last frame, for the system to keep the
     /// pointer out of ([`Walls::Confined`]): canvas rectangles; none where
     /// the divider holds nothing back (no split, relative mouse capture,
-    /// the divider dragged, a screen beside its world, button snapping). They
-    /// are the gap's closed stretches less where the driver's interface
-    /// reaches across the gap (and the always reachable controls, a little
-    /// around them), as [`Layout::constrain`] lets the pointer through.
+    /// the divider dragged, a screen beside its world, button snapping).
+    /// They are the split's drawn segments ([`Layout::dividers`]), as
+    /// [`Layout::constrain`] holds the pointer back.
     fn divider_pointer_walls(&self) -> Option<Vec<[i32; 4]>> {
         if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping || self.pointer_free_everywhere() {
             return None;
         }
-        let (((g0, g1), _), split) = (self.gap()?, self.split?);
-        let vertical = split.axis == Axis::Vertical;
-        // (across from, across to, along from, along to)
-        let spans = |r: [i32; 4]| if vertical { (r[0], r[0] + r[2], r[1], r[1] + r[3]) } else { (r[1], r[1] + r[3], r[0], r[0] + r[2]) };
-        // Along the divider: where the interface reaches across the gap.
-        let mut open: Vec<(i32, i32)> = Vec::new();
-        if self.fit.is_none() {
-            let moved = self.moved.iter().map(|(r, _)| r);
-            for &r in self.interface.iter().chain(&self.driver_rects).chain(moved) {
-                let (lo, hi, a0, a1) = spans(r);
-                if lo < g0 && hi > g1 {
-                    open.push((a0, a1));
-                }
-            }
-        }
-        if let Some(r) = self.orders_shown() {
-            // (All along their rows, a little around them: `open_spans`.)
-            let (_, _, a0, a1) = spans([r[0] - GAP, r[1] - GAP, r[2] + 2 * GAP, r[3] + 2 * GAP]);
-            open.push((a0, a1));
-        }
-        let mut walls = Vec::new();
-        for (r, _) in self.divider_pieces() {
-            let (_, _, a0, a1) = spans(r);
-            for (b0, b1) in subtract_spans((a0, a1), &open) {
-                walls.push(if vertical { [g0, b0, g1 - g0, b1 - b0] } else { [b0, g0, b1 - b0, g1 - g0] });
-            }
-        }
+        let walls: Vec<[i32; 4]> = self.dividers().segments.iter().filter(|s| s.wall && s.band.kind == DividerKind::Split).map(|s| s.rect()).collect();
         (!walls.is_empty()).then_some(walls)
     }
 
@@ -1675,41 +1663,40 @@ impl Layout {
             return vec![];
         }
         let Some(m) = self.magnifier.filter(|_| self.magnifier_shown && self.world_shown) else { return vec![] };
-        let r = match m.place {
+        match m.place {
             ZoomPlace::Strip(_) => {
-                let Some((mut r, _)) = self.strip() else { return vec![] };
-                r[3] += self.separator_gap();
-                r
+                // The strip and its divider below it (`Layout::dividers`: its
+                // drawn segments are this wall's bottom rows), in one piece
+                // (the pointer is held at its nearest side).
+                let (Some((s, _)), Some(band)) = (self.strip(), self.dividers().strip) else { return vec![] };
+                let mut walls = vec![[s[0], s[1], s[2], band.across.1 - s[1]]];
+                // Keep each control connected to the map below: an
+                // isolated hole would be unreachable with OS confinement.
+                for cut in self.strip_holes(s) {
+                    walls = walls.into_iter().flat_map(|r| subtract_rect(r, cut)).collect();
+                }
+                walls
             }
             ZoomPlace::Box(..) if self.zoom_box_block_pointer => {
                 let [x, y, w, h] = self.magnifier_geometry(&m).0;
-                [x - GAP / 2, y - GAP / 2, w + GAP, h + GAP]
-            }
-            _ => return vec![],
-        };
-        let mut walls = vec![r];
-        let holes: Vec<[i32; 4]> = if let Some(shown) = &self.interface_shown {
-            shown.iter().map(|s| s.rect).collect()
-        } else if self.fit.is_none() {
-            self.interface.iter().chain(&self.driver_rects).copied().chain(self.moved.iter().map(|(r, _)| *r)).collect()
-        } else { vec![] };
-        for mut cut in holes.into_iter().filter(|cut| overlap(r, *cut)) {
-            // Keep each control connected to the map outside the wall.
-            // An isolated hole would be unreachable with OS confinement.
-            if matches!(m.place, ZoomPlace::Strip(_)) {
-                cut[3] = cut[3].max(r[1] + r[3] - cut[1]);
-            } else {
-                let distances = [cut[0] - r[0], r[0] + r[2] - cut[0] - cut[2], cut[1] - r[1], r[1] + r[3] - cut[1] - cut[3]];
-                match distances.iter().enumerate().min_by_key(|(_, distance)| *distance).map(|(side, _)| side) {
-                    Some(0) => { cut[2] += cut[0] - r[0]; cut[0] = r[0]; }
-                    Some(1) => cut[2] = r[0] + r[2] - cut[0],
-                    Some(2) => { cut[3] += cut[1] - r[1]; cut[1] = r[1]; }
-                    _ => cut[3] = r[1] + r[3] - cut[1],
+                let r = [x - GAP / 2, y - GAP / 2, w + GAP, h + GAP];
+                let mut walls = vec![r];
+                for mut cut in self.interface_holes().into_iter().filter(|cut| overlap(r, *cut)) {
+                    // Keep each control connected to the map outside the
+                    // wall, through its nearest side.
+                    let distances = [cut[0] - r[0], r[0] + r[2] - cut[0] - cut[2], cut[1] - r[1], r[1] + r[3] - cut[1] - cut[3]];
+                    match distances.iter().enumerate().min_by_key(|(_, distance)| *distance).map(|(side, _)| side) {
+                        Some(0) => { cut[2] += cut[0] - r[0]; cut[0] = r[0]; }
+                        Some(1) => cut[2] = r[0] + r[2] - cut[0],
+                        Some(2) => { cut[3] += cut[1] - r[1]; cut[1] = r[1]; }
+                        _ => cut[3] = r[1] + r[3] - cut[1],
+                    }
+                    walls = walls.into_iter().flat_map(|r| subtract_rect(r, cut)).collect();
                 }
+                walls
             }
-            walls = walls.into_iter().flat_map(|r| subtract_rect(r, cut)).collect();
+            _ => vec![],
         }
-        walls
     }
 
     fn constrain_zoom(&self, from: (i32, i32), to: (i32, i32)) -> (i32, i32) {
@@ -2006,14 +1993,14 @@ impl Layout {
             }
         };
         let height = ((column[3] as i64 * thousandths as i64) / 1000) as i32;
-        Some(([column[0], column[1], column[2], height.clamp(0, (column[3] - GAP).max(0))], side))
+        Some(([column[0], column[1], column[2], height.clamp(0, (column[3] - self.divider_thickness()).max(0))], side))
     }
 
     /// The main pane's rectangle, and the second pane's if split (below the
     /// zoom strip, if there is one).
     pub(crate) fn panes(&self) -> ([i32; 4], Option<[i32; 4]>) {
         let (w, h) = (self.window.0 as i32, self.window.1 as i32);
-        let below = |r: [i32; 4], s: [i32; 4]| [r[0], s[1] + s[3] + self.separator_gap(), r[2], (r[3] - s[3] - self.separator_gap()).max(1)];
+        let below = |r: [i32; 4], s: [i32; 4]| [r[0], s[1] + s[3] + self.divider_thickness(), r[2], (r[3] - s[3] - self.divider_thickness()).max(1)];
         match self.strip() {
             None => self.panes_in([0, 0, w, h]),
             Some((s, None)) => self.panes_in(below([0, 0, w, h], s)),
@@ -2074,7 +2061,7 @@ impl Layout {
     /// The panes in `area`.
     fn panes_in(&self, [x, y, w, h]: [i32; 4]) -> ([i32; 4], Option<[i32; 4]>) {
         if !self.world_shown { return ([x, y, w, h], None); }
-        let gap = self.separator_gap();
+        let gap = self.divider_thickness();
         match self.split {
             None => ([x, y, w, h], None),
             Some(s) => match s.axis {
@@ -2090,7 +2077,8 @@ impl Layout {
         }
     }
 
-    /// Round to composition pixels, keeping at least one visible pixel.
+    /// The frame around insets: the separator width rounded to
+    /// composition pixels, keeping at least one visible pixel.
     fn separator_gap(&self) -> i32 {
         (f64::from(self.separator_width.clamp(1, 16)) / self.window_pixel_scale.max(1.0)).round().max(1.0) as i32
     }
@@ -2106,76 +2094,25 @@ impl Layout {
         })
     }
 
-    /// The stretches along the divider (from, to) where the pointer passes
-    /// from one view to the other: its middle third while the mouse is not
-    /// captured, and where the driver's always reachable controls are.
+    /// The stretches along the split's divider (from, to) where the
+    /// pointer passes from one view to the other (where it is not drawn,
+    /// [`Layout::dividers`]): its middle third while the mouse is not
+    /// captured, where the driver's always reachable controls are (a little
+    /// around them), and where its interface reaches across the gap.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_spans(&self) -> Vec<(i32, i32)> {
-        let Some((_, (s0, s1))) = self.gap() else { return vec![] };
-        let mut spans = Vec::new();
-        if !self.locked {
-            let third = (s1 - s0) / 3;
-            spans.push((s0 + third, s1 - third));
-        }
-        if let (Some([x, y, w, h]), Some(split)) = (self.orders_shown(), self.split) {
-            // Where they are drawn, along all of their rows (columns),
-            // whether they reach over the gap or not: the pointer crosses
-            // from one view to the other anywhere there.
-            let (a0, a1) = match split.axis {
-                Axis::Vertical => (y, y + h),
-                Axis::Horizontal => (x, x + w),
-            };
-            if a1 > a0 {
-                spans.push((a0.max(s0), a1.min(s1)));
-            }
-        }
-        spans.retain(|&(a, b)| b > a);
-        spans
-    }
-
-    /// The gap's closed stretches (x, y, w, h), and whether the split is
-    /// side by side.
-    fn divider_pieces(&self) -> Vec<([i32; 4], bool)> {
-        let (Some(((g0, g1), (s0, s1))), Some(split)) = (self.gap(), self.split) else { return vec![] };
-        let vertical = split.axis == Axis::Vertical;
-        let mut spans = self.open_spans();
-        spans.sort();
-        let mut pieces = Vec::new();
-        let mut at = s0;
-        for (a, b) in spans.into_iter().chain(std::iter::once((s1, s1))) {
-            if a > at {
-                pieces.push(if vertical { [g0, at, g1 - g0, a - at] } else { [at, g0, a - at, g1 - g0] });
-            }
-            at = at.max(b);
-        }
-        pieces.into_iter().map(|r| (r, vertical)).collect()
-    }
-
-    /// The divider's rectangle (the gap and two pixels into each pane).
-    fn divider(&self) -> Option<[i32; 4]> {
-        let ((g0, g1), (s0, s1)) = self.gap()?;
-        Some(match self.split?.axis {
-            Axis::Vertical => [g0 - 2, s0, g1 - g0 + 4, s1 - s0],
-            Axis::Horizontal => [s0, g0 - 2, s1 - s0, g1 - g0 + 4],
-        })
+        self.dividers().split_openings()
     }
 
     /// Which side of the divider window pixel `p` is on (none: in the gap,
     /// or no split).
     fn side_of(&self, p: (i32, i32)) -> Option<Side> {
-        let ((g0, g1), _) = self.gap()?;
-        let v = if self.split?.axis == Axis::Vertical { p.0 } else { p.1 };
-        if v < g0 {
-            Some(Side::A)
-        } else if v >= g1 {
-            Some(Side::B)
-        } else {
-            None
-        }
+        self.dividers().side_of(p)
     }
 
     /// The pointer moving from `from` to `to`: where it goes, held back at
-    /// the divider unless it crosses through an open stretch (or within the
-    /// always reachable controls). Notes the view it is in and whether it
+    /// the split's divider where it is drawn as a wall ([`Layout::dividers`];
+    /// it passes where it is open). Notes the view it is in and whether it
     /// pushes against the divider.
     fn constrain(&mut self, from: (i32, i32), to: (i32, i32)) -> (i32, i32) {
         self.against = None;
@@ -2185,24 +2122,20 @@ impl Layout {
             self.side = self.side_of(to);
             return to;
         }
-        let Some(((g0, g1), _)) = self.gap().filter(|_| !self.locked && self.drag.is_none() && self.beside.is_none()) else {
+        let dividers = self.dividers();
+        let Some(band) = dividers.split.filter(|_| !self.locked && self.drag.is_none() && self.beside.is_none()) else {
             self.side = None;
             return to;
         };
-        let vertical = self.split.is_some_and(|s| s.axis == Axis::Vertical);
-        let target = self.side_of(to);
+        let ((g0, g1), vertical) = (band.across, band.vertical);
+        let target = dividers.side_of(to);
         let Some(side) = self.side else {
             // Not known where it was (it just came in): where it is now.
             self.side = target;
             return to;
         };
         let (fa, fb, ta, tb) = if vertical { (from.0, from.1, to.0, to.1) } else { (from.1, from.0, to.1, to.0) };
-        let spans = self.open_spans();
-        let in_span = |v: i32| spans.iter().any(|&(a, b)| v >= a && v < b);
-        let reachable = self.orders_shown().is_some_and(|r| {
-            let grown = [r[0] - GAP, r[1] - GAP, r[2] + 2 * GAP, r[3] + 2 * GAP];
-            inside(grown, from) || inside(grown, to)
-        });
+        let holds = |along: i32| dividers.holds(DividerKind::Split, along);
         // Its side's last pixel before the divider.
         let held = if side == Side::A { g0 - 1 } else { g1 };
         let crossing = match side {
@@ -2213,7 +2146,7 @@ impl Layout {
             self.side = Some(side);
             // Resting against a wall pushes against it (as at the window's
             // edge; also where the window moved the pointer back to).
-            if ta == held && !in_span(tb) && !reachable {
+            if ta == held && holds(tb) {
                 self.against = Some(side);
             }
             return to;
@@ -2221,14 +2154,13 @@ impl Layout {
         // Where the move meets the divider (along it).
         let edge = if side == Side::A { g0 } else { g1 - 1 };
         let along = if ta == fa { tb } else { fb + ((tb - fb) as i64 * (edge - fa) as i64 / (ta - fa) as i64) as i32 };
-        let open = reachable
-            || self.interface_over_divider(if vertical { (edge, along) } else { (along, edge) })
-            || match target {
-                // Into the gap: only where it is open.
-                None => in_span(tb),
-                // Already in the gap through an open stretch: on through it.
-                Some(_) => in_span(along) || (self.side_of(from).is_none() && in_span(fb)),
-            };
+        let open = match target {
+            // Into the gap: only where it is open.
+            None => !holds(tb),
+            // Across: where it meets the divider, or on from the gap where
+            // it came in through an opening.
+            Some(_) => !holds(along) || (dividers.side_of(from).is_none() && !holds(fb)),
+        };
         if open {
             if let Some(t) = target {
                 self.side = Some(t);
@@ -2238,24 +2170,6 @@ impl Layout {
         // A wall: it stays at its side's last pixel and pushes against it.
         self.against = Some(side);
         if vertical { (held, to.1) } else { (to.0, held) }
-    }
-
-    /// Whether window pixel `p` of the divider lies under something of the
-    /// driver's reaching across the gap (its interface where it put it, a
-    /// popup or another part drawn elsewhere, its other world views): the
-    /// pointer is over that there, not over a view, and passes freely
-    /// (e.g. a screen floating over both views, or a popup).
-    fn interface_over_divider(&self, p: (i32, i32)) -> bool {
-        let (Some(((g0, g1), _)), Some(split)) = (self.gap(), self.split) else { return false };
-        if self.fit.is_some() {
-            return false;
-        }
-        let across = |r: &[i32; 4]| match split.axis {
-            Axis::Vertical => r[0] < g0 && r[0] + r[2] > g1,
-            Axis::Horizontal => r[1] < g0 && r[1] + r[3] > g1,
-        };
-        let moved = self.moved.iter().map(|(r, _)| r);
-        self.interface.iter().chain(&self.driver_rects).chain(moved).any(|r| across(r) && inside(*r, p))
     }
 
     /// The region a zoom box goes in: a vertical split's left or right
@@ -3016,6 +2930,13 @@ impl Layout {
             push(&mut frame, camera);
             self.shown.push((Hit::Pane, camera));
         }
+        // Whether the zoom box or strip is shown this frame (the strip's
+        // divider with it, `Layout::dividers`).
+        let fit_rect = fit.map(|f| if f.hit == Hit::Main { main_rect } else { pane_rect.unwrap_or(main_rect) });
+        self.move_zoom_box(dt);
+        self.move_zoom_mouse(dt);
+        let magnifier = magnifier.filter(|m| m.place == ZoomPlace::Beside || (self.world_shown && !fit_rect.is_some_and(|f| overlap(f, self.magnifier_geometry(m).0))));
+        self.magnifier_shown = magnifier.is_some();
         // Each pane's picture goes on under its half of the gap; the glass
         // over it where the divider is shown (`glass`).
         let mut halves = Vec::new();
@@ -3025,9 +2946,31 @@ impl Layout {
             }
             halves.push((rect, push(&mut frame, camera)));
         }
-        for (rect, vertical, shade) in self.glass_strips() {
-            if let Some(&(_, index)) = halves.iter().find(|(h, _)| inside(*h, (rect[0], rect[1]))) {
-                frame.divider.push((index, rect, vertical, shade));
+        if !self.glass_dividers {
+            for (rect, vertical, shade) in self.glass_strips() {
+                if let Some(&(_, index)) = halves.iter().find(|(h, _)| inside(*h, (rect[0], rect[1]))) {
+                    frame.divider.push((index, rect, vertical, shade));
+                }
+            }
+        } else {
+            // Glass bars: the panes' pictures go on under the strip's
+            // divider too, and each segment is a lens of glass over what
+            // lies under it (`dividers::GlassBar`).
+            let dividers = self.dividers();
+            for camera in self.strip_band_under(&dividers) {
+                if take(1) {
+                    push(&mut frame, camera);
+                }
+            }
+            for (segment, bar) in dividers.glass_order() {
+                if !take(1) {
+                    break;
+                }
+                let [x, y, w, h] = bar.rect;
+                let lens = tile_render::Lens { radius: bar.radius, rim: bar.rim, glass: true };
+                let camera = Camera { origin: (x, y), cells: false, lens: Some(lens), target_clip: Some(bar.clip), ..Camera::new((w.max(1) as u32, h.max(1) as u32)) };
+                let at = push(&mut frame, camera);
+                frame.glass_dividers.push((at, segment));
             }
         }
         for (k, inset) in self.insets.iter().enumerate().take(insets) {
@@ -3042,20 +2985,19 @@ impl Layout {
         // and under the driver's interface (whose menus stay usable); not
         // over a screen fitted into a pane. The magnifier beside the
         // pointer is on top.
-        let fit_rect = fit.map(|f| if f.hit == Hit::Main { main_rect } else { pane_rect.unwrap_or(main_rect) });
-        self.move_zoom_box(dt);
-        self.move_zoom_mouse(dt);
-        let magnifier = magnifier.filter(|m| m.place == ZoomPlace::Beside || (self.world_shown && !fit_rect.is_some_and(|f| overlap(f, self.magnifier_geometry(m).0))));
-        self.magnifier_shown = magnifier.is_some();
         let zoom_box = magnifier.filter(|m| m.place != ZoomPlace::Beside && m.mode == MagnifierMode::World);
         if let Some(m) = zoom_box {
             let (rect, _) = self.magnifier_geometry(&m);
             let lens = self.zoom_lens(&m, rect);
-            if lens.is_none() {
-                let border = Camera { origin: (rect[0], rect[1] + rect[3]), cells: false,
-                    ..Camera::new((rect[2].max(1) as u32, self.separator_gap() as u32)) };
+            // (A strip: its divider below it, as `Layout::dividers` has it.)
+            let dividers = if lens.is_none() && !self.glass_dividers { self.dividers() } else { Dividers::default() };
+            if let Some(band) = dividers.strip {
+                let [x, y, w, h] = band.rect();
+                let border = Camera { origin: (x, y), cells: false, ..Camera::new((w.max(1) as u32, h.max(1) as u32)) };
                 let at = push(&mut frame, border);
-                frame.separators.push((at, rect_of(&border)));
+                for s in dividers.segments.iter().filter(|s| s.band.kind == DividerKind::Strip) {
+                    frame.separators.push((at, s.rect()));
+                }
             }
             // The world under the pointer (the world cursor while the mouse
             // is captured; where it looked last while nothing is under it).
@@ -3825,9 +3767,8 @@ impl Layout {
         if let Some(k) = (0..self.insets_shown.min(self.insets.len())).rev().find(|&k| inside(self.insets[k].rect, p)) {
             return Hit::Inset(k);
         }
-        // (The divider is a wall but where it is open.)
-        let along = if self.split.is_some_and(|s| s.axis == Axis::Vertical) { p.1 } else { p.0 };
-        if self.divider().is_some_and(|r| inside(r, p)) && self.open_spans().iter().any(|&(a, b)| along >= a && along < b) {
+        // (Where a press grabs the divider: `Layout::dividers`.)
+        if self.dividers().handle_at(p) {
             return Hit::Divider;
         }
         let (main, pane) = self.panes();
@@ -4980,6 +4921,10 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     include!("layout/capture_focus_tests.rs");
+    mod divider_agreement {
+        use super::*;
+        include!("layout/divider_agreement_tests.rs");
+    }
     use super::*;
 
     /// The mouse capture across menus and modes (`capture`).
@@ -7978,9 +7923,10 @@ mod tests {
         s.interface.reachable = Some([340, 520, 128, 64]);
         l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(l.open_spans(), [(200, 400), (520, 584)]);
-        // No glass over their rows.
-        assert!(f.divider.iter().all(|d| d.1[1] + d.1[3] <= 520 || d.1[1] >= 584), "{:?}", f.divider);
+        // (Open a little around them, as the walls are: `Layout::dividers`.)
+        assert_eq!(l.open_spans(), [(200, 400), (520 - GAP, 584 + GAP)]);
+        // No glass over their rows (nor next to them, where it is open).
+        assert!(f.divider.iter().all(|d| d.1[1] + d.1[3] <= 520 - GAP || d.1[1] >= 584 + GAP), "{:?}", f.divider);
         // From A into them and on into B.
         mv(&mut l, (300, 540));
         mv(&mut l, (420, 540));
@@ -8002,7 +7948,7 @@ mod tests {
         let mut s = scene();
         s.interface.reachable = Some([100, 520, 128, 64]);
         l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(l.open_spans(), [(200, 400), (520, 584)]);
+        assert_eq!(l.open_spans(), [(200, 400), (520 - GAP, 584 + GAP)]);
         assert!(l.pointer_walls().unwrap_or_default().iter().all(|w| w[1] + w[3] <= 520 - GAP || w[1] >= 584 + GAP), "{:?}", l.pointer_walls());
         mv(&mut l, (300, 540));
         mv(&mut l, (500, 540));
