@@ -455,6 +455,7 @@ dependencies = [
  "render-errors",
  "scene",
  "thiserror 2.0.21",
+ "tile-game",
  "tile-render",
  "tile-viewer",
  "tokio",
@@ -484,6 +485,9 @@ version = "0.1.0"
 dependencies = [
  "jgl",
  "log",
+ "scene",
+ "tile-game",
+ "tile-viewer",
 ]
 
 [[package]]
@@ -510,6 +514,7 @@ dependencies = [
  "application-icon",
  "bytemuck",
  "civ3-assets",
+ "civ3-ui",
  "env_logger",
  "handoff",
  "log",
@@ -535,6 +540,7 @@ version = "0.1.0"
 dependencies = [
  "application-icon",
  "civ3-assets",
+ "civ3-ui",
  "crossbeam-channel",
  "env_logger",
  "handoff",
@@ -2896,6 +2902,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tile-game"
+version = "0.1.0"
+dependencies = [
+ "scene",
+ "tile-render",
+ "tile-viewer",
 ]
 
 [[package]]

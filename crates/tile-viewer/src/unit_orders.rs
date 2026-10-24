@@ -742,6 +742,7 @@ mod tests {
         preview(&mut l, (100, 100), (170, 190));
         let mut s = scene();
         s.interface.screen = Some("F1".into());
+        s.interface.screen_role = crate::screen_role_for_test("F1");
         frame(&mut l, &s, vec![]);
         assert_eq!(l.take_unit_order_events(), [order(UnitOrderAction::Cancel, (0, 0))]);
     }

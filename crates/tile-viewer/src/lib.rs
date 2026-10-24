@@ -30,7 +30,7 @@ mod presentation;
 pub mod snap;
 pub mod altrec;
 pub mod smooth_menus;
-pub mod build_queue;
+pub mod extension;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -67,13 +67,15 @@ pub struct ViewerConfig {
     pub native_thread_init: Option<fn()>,
     /// Where the Alt mode's interactions are recorded while
     /// `viewer_settings::Input::record_alt_mode` is on (`altrec`): the
-    /// folder of the game's log. None: not recorded.
+    /// folder of the driver's log. None: not recorded.
     pub recording_dir: Option<std::path::PathBuf>,
+    /// Behaviour plugged in by crates built on the viewer (`extension`).
+    pub extensions: extension::Extensions,
 }
 
 impl Default for ViewerConfig {
     fn default() -> Self {
-        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None }
+        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None, extensions: extension::Extensions::default() }
     }
 }
 
@@ -1160,10 +1162,10 @@ fn named_screen_content(compiled: &Compiled, scene: &Scene) -> Option<[i32; 4]> 
             return Some([v.origin.0, v.origin.1, v.viewport.0 as i32, v.viewport.1 as i32]);
         }
     }
-    let city = scene.interface.screen.as_deref() == Some("City");
+    let site = scene.interface.screen_role == scene::ScreenRole::Site;
     let parts = [scene.interface.roaming, scene.interface.capture_hint, scene.interface.popup];
     let rects = scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id)) && !scene.interface.is_popup_view(v.id)
-        && if city { v.view.camera_x == 0 && v.view.camera_y == 0 } else { v.view.menu })
+        && if site { v.view.camera_x == 0 && v.view.camera_y == 0 } else { v.view.menu })
         .flat_map(|v| v.overlay.iter().filter(|s| s.glyph.is_none()).filter_map(|s| sprite_rect(compiled, s)));
     let [l, t, r, b] = rects.map(|[x, y, w, h]| [x, y, x + w, y + h])
         .reduce(|a, r| [a[0].min(r[0]), a[1].min(r[1]), a[2].max(r[2]), a[3].max(r[3])])?;
@@ -1420,6 +1422,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
     let (assets_version, whole) = assets.whole();
     let whole = whole.expect("a new description");
     let native_thread_init = config.native_thread_init;
+    let running_extensions = config.extensions.build();
     let mut app = App {
         stop,
         config,
@@ -1516,7 +1519,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         look_scene: Arc::new(looks::LookScene::default()),
         menu_scroll: smooth_menus::SmoothMenus::default(),
         function_keys: function_keys::Controller::new(function_keys::journal_path(&viewer_settings::Settings::default_path())),
-        queue_drag: build_queue::BuildQueueDrag::default(),
+        extensions: running_extensions,
         host_closed: false,
     };
     // The arrangement to start with: the user's settings.
@@ -1862,8 +1865,8 @@ struct App {
     /// F1-F12 kept from the system's shortcuts while the window is in
     /// front (`viewer_settings::Input::capture_function_keys`; macOS only).
     function_keys: function_keys::Controller,
-    /// Dragging a city's build queue entries (`build_queue`).
-    queue_drag: build_queue::BuildQueueDrag,
+    /// The extensions plugged in (`ViewerConfig::extensions`).
+    extensions: extension::Running,
     /// The host is ending and this viewer closes ([`App::close_for_host`]).
     host_closed: bool,
 }
@@ -3006,16 +3009,17 @@ impl App {
 
     fn send(&mut self, input: Input) {
         let now = self.now();
-        // (Drags of the build queue's rows are the viewer's, Alt mode or not.)
-        let dragging = self.queue_drag.active();
-        if let Some(out) = self.queue_drag.route(&input, &self.shown_scene) {
+        // (What the extensions take is theirs, Alt mode or not: a drag of
+        // theirs, say.)
+        let dragging = self.extensions.active();
+        if let Some(out) = self.extensions.route(&input, &self.shown_scene) {
             for input in out {
                 frame_input(&mut self.preparing_inputs, &self.display, input);
             }
             if let Some(gpu) = &self.gpu { gpu.window.request_redraw(); }
             return;
         }
-        if dragging || self.queue_drag.active() {
+        if dragging || self.extensions.active() {
             if let Some(gpu) = &self.gpu { gpu.window.request_redraw(); }
         }
         // (Lists scrolled by the viewer: scroll input moves them, pointer
@@ -4031,7 +4035,7 @@ impl App {
         let replacements = self.feedback.replacements(&self.look_scene, now);
         let menu_was_scrolling = self.menu_scroll.running();
         let mut looks_changed = full || free_changed || looks_metadata_changed || self.feedback.drawn() != &self.drawn_looks[..]
-            || self.menu_scroll.running() || self.menu_scroll.patched() || scene.interface.build_queue.is_some();
+            || self.menu_scroll.running() || self.menu_scroll.patched() || self.extensions.draws(scene);
         if looks_changed {
             let compiled = &self.compiled;
             Arc::make_mut(self.world.as_mut().expect("built above")).free = looks::splice(&self.base_free, &self.spans, &replacements, |s, camera| placed_sprite(compiled, s, Some(camera), None));
@@ -4052,11 +4056,11 @@ impl App {
             frame_input(&mut self.preparing_inputs, &self.display, input);
         }
         self.snap.set_list_entries(self.menu_scroll.shown_entries());
-        // The build queue's handles, and a row being dragged (on the
-        // drawing as it is now, from the driver's: rebuilt every frame).
-        if scene.interface.build_queue.is_some() {
-            if let Some(queued) = self.queue_drag.draw(scene, &self.world.as_ref().expect("built above").free, |s| placed_rect(&self.compiled, s)) {
-                Arc::make_mut(self.world.as_mut().expect("built above")).free = queued;
+        // What the extensions draw over the interface (on the drawing as
+        // it is now, from the driver's: rebuilt every frame).
+        if self.extensions.draws(scene) {
+            if let Some(drawn) = self.extensions.draw(scene, &self.world.as_ref().expect("built above").free, &|s| placed_rect(&self.compiled, s)) {
+                Arc::make_mut(self.world.as_mut().expect("built above")).free = drawn;
                 looks_changed = true;
             }
         }
@@ -4439,7 +4443,7 @@ impl ApplicationHandler for App {
         if matches!(event, WindowEvent::Focused(_) | WindowEvent::Occluded(_)) { self.sync_function_keys(); }
         if matches!(event, WindowEvent::Focused(false) | WindowEvent::Occluded(true)) {
             self.menu_scroll.focus_lost();
-            self.queue_drag.cancel();
+            self.extensions.cancel();
             for input in self.snap.focus_lost(&mut self.layout) {
                 self.send(input);
             }
@@ -5035,5 +5039,16 @@ mod rejected_snapshot_recovery_tests {
         assert_eq!(adopted.changes.cells, [(0, 2)]);
         assert_eq!(shown.layers[0].values.as_ptr(), cells);
         assert_eq!(*shown, *display.scene());
+    }
+}
+
+/// The role a test's screen name stands for: "Site" a site's screen,
+/// "Menu" the driver's menu (the viewer itself never reads names).
+#[cfg(test)]
+pub(crate) fn screen_role_for_test(name: &str) -> scene::ScreenRole {
+    match name {
+        "Site" => scene::ScreenRole::Site,
+        "Menu" => scene::ScreenRole::Menu,
+        _ => scene::ScreenRole::Other,
     }
 }

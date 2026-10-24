@@ -24,6 +24,7 @@ fn scene(screen: Option<&str>) -> Scene {
         ..Default::default()
     };
     s.interface.screen = screen.map(String::from);
+    s.interface.screen_role = screen.map_or(Default::default(), crate::screen_role_for_test);
     s
 }
 
@@ -68,7 +69,7 @@ fn the_mode_comes_on_with_a_menu_and_goes_with_the_last_but_never_in_the_world()
     assert!(snap.active() && snap.snapper.snapping(), "a menu: on by itself");
     assert!(!l.captured());
     // Another menu after it: still on.
-    run(&mut snap, &mut l, &scene(Some("City")), 1.2, 0.2);
+    run(&mut snap, &mut l, &scene(Some("Site")), 1.2, 0.2);
     assert!(snap.snapper.snapping());
     // All closed: off (the pointer lands), the world's again.
     run(&mut snap, &mut l, &scene(None), 1.4, 2.0);

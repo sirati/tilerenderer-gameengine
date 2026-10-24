@@ -25,6 +25,7 @@ fn popup() -> Scene {
 fn screen_and_popup(kind: &str) -> Scene {
     let mut s = popup();
     s.interface.screen = Some(kind.into());
+    s.interface.screen_role = crate::screen_role_for_test(kind);
     s
 }
 
@@ -66,9 +67,9 @@ fn a_popup_giving_way_to_a_screen_never_captures_under_it() {
 #[test]
 fn a_screen_closing_under_its_popup_never_captures_under_the_popup() {
     let (mut l, _) = captured();
-    show(&mut l, &with_screen("City"));
+    show(&mut l, &with_screen("Site"));
     assert!(!l.captured());
-    show(&mut l, &screen_and_popup("City"));
+    show(&mut l, &screen_and_popup("Site"));
     show(&mut l, &popup());
     assert!(!l.captured(), "captured under the popup");
     let _ = l.take_grab();
@@ -83,7 +84,7 @@ fn a_screen_closing_under_its_popup_never_captures_under_the_popup() {
 fn menus_following_each_other_see_no_capture_in_between() {
     let (mut l, cursor) = captured();
     let mut grabs = Vec::new();
-    for menu in [popup(), with_screen("F1"), with_screen("F2"), popup(), with_screen("City")] {
+    for menu in [popup(), with_screen("F1"), with_screen("F2"), popup(), with_screen("Site")] {
         show(&mut l, &menu);
         grabs.extend(l.take_grab());
         grabs.extend(wait(&mut l, &menu, 0.3));

@@ -1408,7 +1408,7 @@ mod tests {
         for preferences in [false, true] {
             let mut scene = Scene {
                 screen_size: (1920, 1080),
-                interface: scene::Interface { screen: preferences.then(|| "Menu".into()), menu_fit: true,
+                interface: scene::Interface { screen: preferences.then(|| "Menu".into()), screen_role: if preferences { scene::ScreenRole::Menu } else { scene::ScreenRole::Other }, menu_fit: true,
                     screen_view: preferences.then_some(258), ..Default::default() },
                 views: vec![ViewState { id: if preferences { 258 } else { 255 }, view: View {
                     interface_only: true, menu: !preferences,
@@ -1886,6 +1886,7 @@ mod tests {
                             layout.route(Input::MouseMove { x: expected_region[0] + expected_region[2] / 2, y: expected_region[1] + expected_region[3] / 2 });
                             scene.views.push(menu);
                             scene.interface.screen = Some("Menu".into());
+                            scene.interface.screen_role = crate::screen_role_for_test("Menu");
                             scene.interface.menu_fit = !scale_menus;
                             let control = [448 + 480, 156 + 360, 64, 48];
                             scene.interactables = vec![Interactable { region: None, alt_right_click: false, id: 1, rect: control, anchor: None, kind: InteractableKind::Button }];
@@ -2171,7 +2172,7 @@ mod tests {
         let scene = Scene {
             views,
             shape: if world { scene::WorldShape { cols: 60, rows: 62, wrap_x: true, wrap_y: false } } else { scene::WorldShape::default() },
-            interface: scene::Interface { screen: Some(name.into()), screen_view: Some(258), ..Default::default() },
+            interface: scene::Interface { screen: Some(name.into()), screen_role: crate::screen_role_for_test(name), screen_view: Some(258), ..Default::default() },
             interactables: vec![Interactable { region: None, alt_right_click: false, id: 1, rect: [964, 548, 45, 30], anchor: None, kind: InteractableKind::Button }],
             screen_size: (1920, 1080),
             ..Default::default()
@@ -3163,6 +3164,7 @@ mod tests {
                     if kind == "screen" {
                         scene.interface.screen_view = Some(v.id);
                         scene.interface.screen = Some("Preferences".into());
+                        scene.interface.screen_role = crate::screen_role_for_test("Preferences");
                     } else if kind == "popup" {
                         scene.interface.popup = Some(v.id);
                     }
@@ -3275,7 +3277,7 @@ mod tests {
             for preferences in [true, false] {
                 let base = Scene {
                     screen_size: screen,
-                    interface: scene::Interface { screen: preferences.then(|| "Menu".into()), menu_fit: true, screen_view: preferences.then_some(258), ..Default::default() },
+                    interface: scene::Interface { screen: preferences.then(|| "Menu".into()), screen_role: if preferences { scene::ScreenRole::Menu } else { scene::ScreenRole::Other }, menu_fit: true, screen_view: preferences.then_some(258), ..Default::default() },
                     views: vec![ViewState { id: if preferences { 258 } else { 255 }, view: View {
                         interface_only: true, menu: !preferences,
                         origin: if preferences { (menu[0], menu[1]) } else { (0, 0) },
@@ -3559,7 +3561,7 @@ mod tests {
                     screen_size: screen,
                     views,
                     shape: scene::WorldShape { cols: 60, rows: 62, wrap_x: true, wrap_y: false },
-                    interface: scene::Interface { screen: Some("Menu".into()), menu_fit: true, screen_view: Some(258), popup: with.then_some(257), ..Default::default() },
+                    interface: scene::Interface { screen: Some("Menu".into()), screen_role: scene::ScreenRole::Menu, menu_fit: true, screen_view: Some(258), popup: with.then_some(257), ..Default::default() },
                     interactables: vec![
                         Interactable { region: None, alt_right_click: false, id: 1, rect: control, anchor: None, kind: InteractableKind::Button },
                         Interactable { region: None, alt_right_click: false, id: 2, rect: ok, anchor: None, kind: InteractableKind::Button },

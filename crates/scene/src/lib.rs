@@ -467,8 +467,8 @@ impl SystemCursor {
 /// Parts of the driver's interface a renderer may arrange (all in window
 /// pixels; views by id). A renderer that does not arrange anything draws
 /// every view where the driver put it, as always.
-/// The visible modal overlays in paint order, excluding the named screen.
-/// Civ III's dialog machinery permits at most four open forms.
+/// The visible modal overlays in paint order, excluding the named screen:
+/// at most four open forms.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModalStack(pub [Option<u32>; 4]);
 
@@ -477,16 +477,41 @@ impl ModalStack {
     pub fn contains(&self, id: u32) -> bool { self.iter().any(|view| view == id) }
 }
 
+/// What a named screen ([`Interface::screen`]) is, for a renderer that
+/// arranges it: the driver says so, a renderer never reads the name.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ScreenRole {
+    /// A screen of its own (a report, an overview): placed as a whole.
+    #[default]
+    Other,
+    /// The driver's menu (its title menu, its settings): a renderer keeps
+    /// the view the pointer was in when it opened as the one it belongs to,
+    /// and may let it follow the pointer between its views.
+    Menu,
+    /// The screen of a site: a place of the world with a screen of its own
+    /// that produces things (a town, a base, a star system). Its world
+    /// views (those with a viewport of their own: the site's surroundings)
+    /// are controls of the screen: placed, moved and scaled with it, every
+    /// category of the world shown in them. All of the driver's interface
+    /// views are parts of it, and its content is what its interface views
+    /// at camera (0, 0) draw.
+    Site,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Interface {
     /// The screen the interface shows, named by the driver (e.g. "F1",
-    /// "City", "Menu"); none: its usual screen over the world. A renderer
-    /// may place a named screen in one of its own views.
+    /// "Site", "Menu"); none: its usual screen over the world. A renderer
+    /// may place a named screen in one of its own views. It does not read
+    /// the name: what it arranges differently it learns from `screen_role`.
     pub screen: Option<String>,
     /// Keep the complete menu inside the visible canvas or assigned menu
     /// region, even when user menu scaling is disabled. Set for the title
     /// and Preferences using the driver's screen state, not rendered text.
     pub menu_fit: bool,
+    /// What the named screen (`screen`) is, as far as a renderer arranges
+    /// it differently.
+    pub screen_role: ScreenRole,
     /// An interface-only view holding controls that belong with whichever
     /// of the renderer's views the pointer is in (e.g. a game's menu buttons
     /// in the top-left corner, with the tooltip they show; the view's
@@ -578,11 +603,13 @@ pub struct Interface {
     /// the cursor tile by tile. Other commands (bombard, rebase, airlift,
     /// ...) keep the cursor at the pointer.
     pub snap_to_tiles: bool,
-    /// A build queue shown that the player may reorder by dragging.
-    pub build_queue: Option<BuildQueue>,
+    /// Messages of extensions of this protocol ([`Extension`]), e.g. a
+    /// game kind's list that a renderer lets the player reorder by
+    /// dragging; at most one of each kind.
+    pub extensions: Vec<Extension>,
     /// One of the driver's dialogues a player opens to get out of the game
-    /// is open (Civilization III: its game menu with Save, Load and Quit
-    /// Game, and the "really quit?" popup Escape opens on the map). While
+    /// is open (e.g. its game menu with Save, Load and Quit, or the "really
+    /// quit?" popup Escape opens on the map). While
     /// it is, a renderer holds the pointer in no way: no capture, no
     /// confinement, no walls, no warps, so it can leave the window. The
     /// driver sets it from its state in every scene, never from events.
@@ -1380,41 +1407,27 @@ pub enum Input {
     /// The renderer's user has read queued popup `serial`
     /// (`Interface::queued`): the driver stops sending it.
     CloseQueued { serial: u64 },
-    /// Move entry `from` of the build queue `Interface::build_queue` shows
-    /// (as of its `stamp`; a driver drops the edit for another) before
-    /// entry `to` (its length: to the end), or with `to` =
-    /// [`BUILD_QUEUE_CURRENT`] onto what is built now (built now instead,
-    /// what was built going to the front of the queue).
-    BuildQueue { stamp: u32, from: u8, to: u8 },
+    /// A message of an extension of this protocol (`Interface::extensions`):
+    /// the renderer's part of it sends what the driver's part reads.
+    Extension { kind: u32, data: Vec<u8> },
 }
 
-/// [`Input::BuildQueue`]'s `to` for the current build.
-pub const BUILD_QUEUE_CURRENT: u8 = u8::MAX;
-
-/// A build queue a renderer may let the player reorder by dragging
-/// ([`Input::BuildQueue`]): a city screen's queued orders where the screen
-/// lists them, and what the city builds now.
+/// What a crate that extends the protocol sends in an [`Interface`]
+/// (`Interface::extensions`) or in an [`Input::Extension`]: data this
+/// crate does not read, of a `kind` the extending crate chooses (one per
+/// message; extensions used together choose different ones, e.g. four
+/// letters of their name). A renderer without the extension ignores it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BuildQueue {
-    /// The queue as it is now (an edit names it).
-    pub stamp: u32,
-    /// What is built now (x, y, w, h), a place to drop an entry on.
-    pub current: [i32; 4],
-    /// The entries shown, in queue order.
-    pub rows: Vec<BuildQueueRow>,
+pub struct Extension {
+    pub kind: u32,
+    pub data: Vec<u8>,
 }
 
-/// An entry of a [`BuildQueue`] where it is shown.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct BuildQueueRow {
-    /// Its place in the queue (0: built next).
-    pub slot: u8,
-    /// The row (x, y, w, h) and, at its left, the handle it is dragged by:
-    /// also an interactable of its own, `grip_id` (a button), for pointing
-    /// aids.
-    pub rect: [i32; 4],
-    pub grip: [i32; 4],
-    pub grip_id: u64,
+impl Interface {
+    /// The data of the extension message `kind`, if the driver sent one.
+    pub fn extension(&self, kind: u32) -> Option<&[u8]> {
+        self.extensions.iter().find(|e| e.kind == kind).map(|e| e.data.as_slice())
+    }
 }
 
 /// How near the window's edge the pointer counts as at it ([`Input::Edge`]).

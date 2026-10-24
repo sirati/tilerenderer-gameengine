@@ -1133,6 +1133,7 @@ fn alt_targets_on_title_and_setup_keep_their_full_window_positions_with_saved_ga
         let mut s = scene();
         s.shape = Default::default();
         s.interface.screen = name.map(str::to_owned);
+        s.interface.screen_role = name.map_or(Default::default(), crate::screen_role_for_test);
         s.interactables = vec![button(44, [650, 400, 120, 40])];
         let mut l = Layout::default();
         l.configure("split=vertical,pane=pointer,magnifier=world,ui=pane").unwrap();

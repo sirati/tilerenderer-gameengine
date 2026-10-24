@@ -107,7 +107,7 @@ fn screens(compiled: &Compiled) -> Vec<(&'static str, Scene)> {
         ViewState { id: 0, view: View::default(), overlay: vec![] },
         ViewState { id: 258, view: View { interface_only: true, origin: (DIALOG[0], DIALOG[1]), viewport: (DIALOG[2] as u32, DIALOG[3] as u32), ..Default::default() }, overlay: panel(compiled, DIALOG) },
     ];
-    prefs.interface = scene::Interface { menu_fit: true, screen: Some("Menu".into()), screen_view: Some(258), ..Default::default() };
+    prefs.interface = scene::Interface { menu_fit: true, screen: Some("Menu".into()), screen_role: scene::ScreenRole::Menu, screen_view: Some(258), ..Default::default() };
     // Preferences over the map.
     let mut prefs_map = world(compiled);
     prefs_map.views = vec![game_view(), prefs.views[1].clone()];
@@ -119,6 +119,7 @@ fn screens(compiled: &Compiled) -> Vec<(&'static str, Scene)> {
         ViewState { id: 258, view: View { interface_only: true, origin: (DIALOG[0], DIALOG[1]), viewport: (DIALOG[2] as u32, DIALOG[3] as u32), ..Default::default() }, overlay: panel(compiled, DIALOG) },
     ];
     advisor.interface.screen = Some("F1".into());
+    advisor.interface.screen_role = crate::screen_role_for_test("F1");
     advisor.interface.screen_view = Some(258);
     // A popup over the map.
     let mut popup = world(compiled);

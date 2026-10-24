@@ -146,7 +146,8 @@ fn city_scene(compiled: &Compiled, city: (i32, i32), game_downscale: u32, game_c
         ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() }, overlay: ui },
     ];
     s.sprites.push(FreeSprite { screen: false, ..screen_sprite(compiled, "Mark/0", 64 * city.0 + 56, 32 * city.1 + 24) });
-    s.interface.screen = Some("City".into());
+    s.interface.screen = Some("Site".into());
+    s.interface.screen_role = crate::screen_role_for_test("Site");
     s
 }
 
@@ -159,6 +160,7 @@ fn advisor_scene(compiled: &Compiled, name: &str) -> Scene {
         ViewState { id: 258, view: View { interface_only: true, origin: (CITY_PANEL[0], CITY_PANEL[1]), viewport: (CITY_PANEL[2] as u32, CITY_PANEL[3] as u32), ..Default::default() }, overlay: panel(compiled, CITY_PANEL) },
     ];
     s.interface.screen = Some(name.into());
+    s.interface.screen_role = crate::screen_role_for_test(name);
     s.interface.screen_view = Some(258);
     s
 }
@@ -248,7 +250,7 @@ fn assert_overlay_on_city(c: &Composed, what: &str) -> (f64, f64) {
 fn named_screens_are_drawn_whole_in_their_pane_and_the_other_pane_keeps_its_world() {
     let compiled = compiled();
     let city = city_scene(&compiled, (21, 31), 1, city_camera((21, 31)));
-    for (name, scene) in [("City", city), ("F1", advisor_scene(&compiled, "F1")), ("Help", advisor_scene(&compiled, "Help"))] {
+    for (name, scene) in [("Site", city), ("F1", advisor_scene(&compiled, "F1")), ("Help", advisor_scene(&compiled, "Help"))] {
         for split in [Split::Standard, Split::Vertical1To1, Split::Vertical2To1, Split::Horizontal1To1] {
             for place in [Place::LeftOrBottom, Place::RightOrTop, Place::Floating] {
                 for capture in [false, true] {
@@ -277,7 +279,7 @@ fn named_screens_are_drawn_whole_in_their_pane_and_the_other_pane_keeps_its_worl
                             assert!((q.0 - corner.0).abs() <= 2 && (q.1 - corner.1).abs() <= 2, "{what}: {p:?} reaches {q:?}, not {corner:?}");
                         }
                     }
-                    if name == "City" {
+                    if name == "Site" {
                         let o = assert_overlay_on_city(&c, &what);
                         // A click on the city's tile reaches the game where its
                         // screen has that tile.
@@ -394,8 +396,8 @@ fn slots_follow_the_scene_incrementally_as_a_new_world_has_them() {
 fn popup_layers_never_change_the_underlying_named_screen_or_world_layout() {
     use viewer_settings::{Place, ScreenPlace};
     let compiled = compiled();
-    for kind in ["F6", "Menu", "City", "full-window"] {
-        let mut base = if kind == "City" { city_scene(&compiled, (10, 10), 1, (0, 0)) }
+    for kind in ["F6", "Menu", "Site", "full-window"] {
+        let mut base = if kind == "Site" { city_scene(&compiled, (10, 10), 1, (0, 0)) }
             else { advisor_scene(&compiled, if kind == "full-window" { "F1" } else { kind }) };
         base.screen_size = SCREEN;
         if kind == "full-window" {
@@ -629,8 +631,8 @@ fn opaque_modal_stack_gpu_matches_the_independent_cpu_pixels() {
 fn check_opaque_modal_stack(gpu: Option<&tile_render::Headless>) {
     use viewer_settings::{Place, ScreenPlace};
     let compiled = compiled();
-    for kind in ["F6", "City", "Menu", "title-Menu", "preview", "legacy-Menu"] {
-        let mut base = if kind == "City" { city_scene(&compiled, (10, 10), 1, (0, 0)) } else { advisor_scene(&compiled, if matches!(kind, "title-Menu" | "preview" | "legacy-Menu") { "Menu" } else { kind }) };
+    for kind in ["F6", "Site", "Menu", "title-Menu", "preview", "legacy-Menu"] {
+        let mut base = if kind == "Site" { city_scene(&compiled, (10, 10), 1, (0, 0)) } else { advisor_scene(&compiled, if matches!(kind, "title-Menu" | "preview" | "legacy-Menu") { "Menu" } else { kind }) };
         base.screen_size = SCREEN;
         if kind == "title-Menu" {
             base.shape = Default::default();

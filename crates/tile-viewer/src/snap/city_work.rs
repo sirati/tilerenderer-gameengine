@@ -8,7 +8,7 @@ fn city_worked_tile_alt_target_clicks_the_same_native_tile_across_splits_and_sca
     let scene = Scene {
         screen_size: (1920, 1080),
         shape: scene::WorldShape { cols: 40, rows: 30, wrap_x: true, wrap_y: false },
-        interface: scene::Interface { screen: Some("City".into()), ..Default::default() },
+        interface: scene::Interface { screen: Some("Site".into()), screen_role: scene::ScreenRole::Site, ..Default::default() },
         views: vec![
             ViewState { id: 0, view: View { interface_only: true, camera_x: 9999, camera_y: 9999, ..Default::default() }, overlay: vec![] },
             ViewState { id: 1, view: View { camera_x: 192, camera_y: 182, origin: (448, 306), viewport: (1024, 320), ..Default::default() }, overlay: vec![] },

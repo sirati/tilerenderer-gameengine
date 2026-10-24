@@ -1,0 +1,11 @@
+[package]
+name = "tile-game"
+description = "Game-agnostic concepts of tile-based strategy games (production queues of sites, ...), as scene protocol extensions and the viewer behaviour that plugs into tile-viewer"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+scene = { path = "../scene" }
+tile-render.workspace = true
+tile-viewer = { path = "../tile-viewer" }
