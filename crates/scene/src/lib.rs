@@ -1205,13 +1205,56 @@ pub enum SliderAction {
     Step,
 }
 
-/// Stable identity and rollback value for a temporary render multiplier.
+/// Stable identity and rollback value for a settings change the viewer
+/// confirms on its own clock (keep or revert, reverting by itself when
+/// nobody answers): a pixel scale, a menu size, the window mode.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SettingsPreview {
     pub session: u64,
     pub id: u64,
-    pub pixel_scale: u32,
-    pub previous_pixel_scale: u32,
+    /// What the change shows.
+    pub value: PreviewValue,
+    /// What it showed before (of the same kind): what a revert restores.
+    pub previous: PreviewValue,
+}
+
+/// The settings a [`SettingsPreview`] changes, of one kind.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PreviewValue {
+    /// `Resolution::pixel_scale`.
+    PixelScale(u32),
+    /// `Resolution::scale_menus` and `menu_scale_percent` (its `f32` bits).
+    Menus { scale: bool, percent_bits: u32 },
+    /// `Display::windowed`.
+    Windowed(bool),
+}
+
+impl PreviewValue {
+    /// The menu size `scale`, `percent`.
+    pub fn menus(scale: bool, percent: f32) -> Self {
+        PreviewValue::Menus { scale, percent_bits: percent.to_bits() }
+    }
+
+    /// Sets what it holds in `settings`.
+    pub fn apply(self, settings: &mut viewer_settings::Settings) {
+        match self {
+            PreviewValue::PixelScale(scale) => settings.resolution.pixel_scale = scale,
+            PreviewValue::Menus { scale, percent_bits } => {
+                settings.resolution.scale_menus = scale;
+                settings.resolution.menu_scale_percent = f32::from_bits(percent_bits);
+            }
+            PreviewValue::Windowed(on) => settings.display.windowed = on,
+        }
+    }
+
+    /// The value of the same kind that `settings` hold.
+    pub fn of(self, settings: &viewer_settings::Settings) -> Self {
+        match self {
+            PreviewValue::PixelScale(_) => PreviewValue::PixelScale(settings.resolution.pixel_scale),
+            PreviewValue::Menus { .. } => PreviewValue::menus(settings.resolution.scale_menus, settings.resolution.menu_scale_percent),
+            PreviewValue::Windowed(_) => PreviewValue::Windowed(settings.display.windowed),
+        }
+    }
 }
 
 /// User input captured by the renderer, in viewport pixels.
@@ -1923,7 +1966,7 @@ mod tests {
     fn settings_preview_metadata_repeats_neither_lease_nor_settings_and_clears_explicitly() {
         let mut active = Scene::default();
         active.settings = Some(viewer_settings::Settings::default());
-        active.settings_preview = Some(SettingsPreview {session:1,id:2,pixel_scale:3,previous_pixel_scale:1});
+        active.settings_preview = Some(SettingsPreview {session:1,id:2,value:PreviewValue::PixelScale(3),previous:PreviewValue::PixelScale(1)});
         assert!(active.updates_since(&active).is_empty());
         let mut cleared = active.clone();
         cleared.settings_preview = None;

@@ -630,11 +630,17 @@ pub struct Display {
     /// [`Display::SYSTEM_CURSOR_SIZE`] (0, the default): the operating
     /// system's cursor size (its accessibility size and display scale).
     pub cursor_size: u32,
+    /// The viewer's window is a window on the desktop rather than
+    /// borderless fullscreen. Switched at run time (Preferences previews it
+    /// behind a timed confirmation); at start the window opens so, or as a
+    /// window anyway when the launcher asks for one (`--window`). Off:
+    /// fullscreen, the launcher's default.
+    pub windowed: bool,
 }
 
 impl Default for Display {
     fn default() -> Self {
-        Self { show_fps: false, fps_detailed: false, present: Present::Vsync, max_fps: 0, fps_limit: 120, cursor_size: Self::SYSTEM_CURSOR_SIZE }
+        Self { show_fps: false, fps_detailed: false, present: Present::Vsync, max_fps: 0, fps_limit: 120, cursor_size: Self::SYSTEM_CURSOR_SIZE, windowed: false }
     }
 }
 

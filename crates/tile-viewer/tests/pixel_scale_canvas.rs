@@ -218,7 +218,7 @@ fn gpu_confirmation_costs_a_panel_not_a_frame() {
         let canvas = plan.canvas();
         let cams = cameras(canvas);
         let normal = scaling::drawn(&cams, &[], plan.present, |zoom| zoom.0 != zoom.1);
-        let (camera, sprites) = settings_preview::compose_presented(&compiled, normal.present, 7, normal.cameras.len() as u32);
+        let (camera, sprites) = settings_preview::compose_presented(&compiled, normal.present, 1.0, 7, normal.cameras.len() as u32);
         assert!(sprites.iter().filter(|s| s.text.is_some()).count() > 20, "the dialog's text");
         let mut with = normal.cameras.clone();
         with.push(camera);
@@ -227,7 +227,7 @@ fn gpu_confirmation_costs_a_panel_not_a_frame() {
         let k = plan.present.pixel_box().unwrap_or(1);
         let at_window = if k > 1 { plan.present.at_target() } else { plan.present };
         let mut before: Vec<Camera> = normal.cameras.iter().map(|c| Camera { zoomed_art: !c.cells, ..c.boxed(k) }).collect();
-        let (old, mut old_sprites) = settings_preview::compose(&compiled, window, 7, before.len() as u32);
+        let (old, mut old_sprites) = settings_preview::compose(&compiled, window, 1.0, 7, before.len() as u32);
         before.push(Camera { viewport: at_window.canvas, screen_shift: (-at_window.at.0, -at_window.at.1), ..old });
         old_sprites.insert(0, tile_render::PlacedSprite {
             screen: true, view: Some(before.len() as u32 - 1),
@@ -240,7 +240,7 @@ fn gpu_confirmation_costs_a_panel_not_a_frame() {
             let (before_ms, _, _) = run(&before, cams.len(), &old_sprites, at_window, ticking);
             let what = format!("×{n}, {}", if ticking { "a new tick each frame" } else { "the scene unchanged" });
             assert_eq!(composed, Some(canvas), "{what}: the picture composed at the canvas under the dialog");
-            let [x, y, w, h] = settings_preview::drawn_rect(window);
+            let [x, y, w, h] = settings_preview::drawn_rect(window, 1.0);
             let inside = |px: u32, py: u32| (x..x + w).contains(&(px as i32)) && (y..y + h).contains(&(py as i32));
             if !ticking {
                 // Outside the panel, the window shows the frame as without it.

@@ -2906,11 +2906,40 @@ impl App {
 
     /// Input for the driver: also what the interaction looks follow (a
     /// frame is drawn at once when they may change).
-    fn resolve_settings_preview(&mut self, result: Option<(Input, u32)>) {
-        if let Some((input, scale)) = result {
+    /// The window mode the driver's settings ask for (`Display::windowed`),
+    /// switched at once where it differs from the window's: borderless
+    /// fullscreen on the window's monitor, or a window sized to the
+    /// driver's screen again ([`Self::update_plan`]). The viewer's own
+    /// settings file never switches it (the launcher chose the mode it
+    /// starts in; the driver's settings agree with it from the start).
+    ///
+    /// winit does it on every system: Windows (also under Wine) and X11
+    /// switch at once; on Wayland the compositor decides (it may refuse
+    /// or keep the size); on macOS the window moves to or from its own
+    /// fullscreen Space, animated, its size following when that ends.
+    fn follow_window_mode(&mut self, windowed: bool) {
+        if windowed != self.config.fullscreen { return; }
+        self.config.fullscreen = !windowed;
+        log::info!("viewer: {}", if windowed { "windowed" } else { "fullscreen" });
+        (self.sized_to_screen, self.fitted_on_screen) = (None, None);
+        if let Some(gpu) = &self.gpu {
+            gpu.window.set_fullscreen((!windowed).then_some(Fullscreen::Borderless(None)));
+            gpu.window.request_redraw();
+        }
+    }
+
+    /// The desktop's scale (window pixels per logical pixel; 1 before the
+    /// window is made).
+    fn desktop_scale(&self) -> f64 {
+        self.gpu.as_ref().map_or(1.0, |gpu| gpu.window.scale_factor())
+    }
+
+    fn resolve_settings_preview(&mut self, result: Option<(Input, scene::PreviewValue)>) {
+        if let Some((input, value)) = result {
             self.input.reset_wheel();
             let mut settings = self.settings.clone();
-            settings.resolution.pixel_scale = scale;
+            value.apply(&mut settings);
+            self.follow_window_mode(settings.display.windowed);
             self.set_settings(settings);
             // Confirmation and rollback never wait for a render submission.
             self.display.send_input(input);
@@ -4159,7 +4188,7 @@ impl App {
         self.settings_preview.drew(preview_seconds);
         if let Some(seconds) = preview_seconds {
             if drawn.cameras.len() < tile_render::MAX_VIEWS {
-                let (camera, sprites) = settings_preview::compose_presented(&self.compiled, drawn.present, seconds, drawn.cameras.len() as u32);
+                let (camera, sprites) = settings_preview::compose_presented(&self.compiled, drawn.present, self.desktop_scale(), seconds, drawn.cameras.len() as u32);
                 markers.extend(sprites);
                 drawn.cameras.push(camera);
             }
@@ -4297,7 +4326,8 @@ impl ApplicationHandler for App {
             self.feedback.pointer_gone(self.started.elapsed().as_secs_f64());
         }
         let (now, rates) = (self.now(), snap::Rates::of(&self.settings.input));
-        self.input.set_wheel_scale(self.gpu.as_ref().map_or(1.0, |gpu| gpu.window.scale_factor()));
+        self.input.set_wheel_scale(self.desktop_scale());
+        self.settings_preview.set_desktop_scale(self.desktop_scale());
         self.input.sync_wheel_context(self.display.scene(), self.layout.route_window(self.layout.pointer_in_window()), self.snap.snap_mode_active() || self.layout.captured());
         for input in self.input.translate(&event) {
             let pointer = self.input.window_pointer();
@@ -4398,6 +4428,7 @@ impl ApplicationHandler for App {
             self.settings_preview.project(lease, &mut settings);
             if settings != self.settings {
                 log::info!("viewer: new settings from the driver");
+                self.follow_window_mode(settings.display.windowed);
                 self.set_settings(settings);
             }
         }
