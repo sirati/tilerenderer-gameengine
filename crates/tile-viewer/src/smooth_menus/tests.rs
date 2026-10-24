@@ -26,7 +26,8 @@ fn frame(first: u64, count: u64) -> (Scene, Vec<PlacedSprite>, Vec<Span>) {
 }
 
 fn rect(s: &PlacedSprite) -> Option<[i32; 4]> {
-    let r = bounds([s.x, s.y, 100, ROW]);
+    // (The bar's track: the whole bar between its arrows.)
+    let r = if s.set.raw() == 900 { bounds([s.x, s.y, 14, 44]) } else { bounds([s.x, s.y, 100, ROW]) };
     let r = s.clip.map_or(Some(r), |c| intersect(r, c))?;
     Some([r[0], r[1], r[2] - r[0], r[3] - r[1]])
 }
@@ -45,11 +46,13 @@ struct Sim {
     snap: bool,
     shown: Vec<PlacedSprite>,
     notches: Vec<i32>,
+    /// The list has the game's scroll bar ([`with_bar`]).
+    bar: bool,
 }
 
 impl Sim {
     fn new(count: u64, snap: bool) -> Self {
-        let mut sim = Sim { state: SmoothMenus::default(), first: 1, count, now: 0.0, snap, shown: vec![], notches: vec![] };
+        let mut sim = Sim { state: SmoothMenus::default(), first: 1, count, now: 0.0, snap, shown: vec![], notches: vec![], bar: false };
         sim.frame();
         sim
     }
@@ -65,7 +68,7 @@ impl Sim {
     }
 
     fn frame(&mut self) {
-        let (scene, free, spans) = frame(self.first, self.count);
+        let (scene, free, spans) = if self.bar { with_bar(self.first, self.count) } else { frame(self.first, self.count) };
         self.shown = self.state.draw(&scene, &free, &spans, self.now, true, self.snap, 1, None, rect).unwrap_or(free);
         let out = self.state.take_inputs();
         self.apply(out);
@@ -390,4 +393,142 @@ fn a_new_screen_starts_afresh() {
     scene.interface.popup = Some(5);
     assert!(sim.state.draw(&scene, &free, &spans, sim.now, true, false, 1, None, rect).is_none());
     assert!(!sim.state.running());
+}
+
+// --- the scroll bar ---
+
+const BAR: u64 = 500;
+const THUMB: u32 = 901;
+
+/// The bar's value with `first` shown of `count`.
+fn bar_value(first: u64, count: u64) -> i32 { ((first - 1) as f64 * 1e6 / (count - 3) as f64).round() as i32 }
+
+/// The game's thumb's top with that value: its middle travels 23..57.
+fn thumb_top(value: i32) -> i32 { 23 + (f64::from(value) * 34.0 / 1e6).round() as i32 - 5 }
+
+/// [`frame`] with the game's scroll bar at the right: arrows (buttons)
+/// 10..18 and 62..70, the track 18..62 drawn whole, a 10 px thumb.
+fn with_bar(first: u64, count: u64) -> (Scene, Vec<PlacedSprite>, Vec<Span>) {
+    let (mut scene, mut free, _) = frame(first, count);
+    let value = bar_value(first, count);
+    let button = |id, y| Interactable { region: None, alt_right_click: false, anchor: None, id, rect: [96, y, 14, 8], kind: InteractableKind::Button };
+    scene.interactables.extend([
+        Interactable { region: None, alt_right_click: false, anchor: None, id: BAR, rect: [96, 10, 14, 60], kind: InteractableKind::Slider { track: [103, 23, 1, 34], value } },
+        button(501, 10), button(502, 62),
+    ]);
+    let ty = thumb_top(value);
+    free.push(PlacedSprite { screen: true, view: Some(0), clip: Some([96, 18, 110, 62]), ..PlacedSprite::new(SpriteSetId::from_raw(900), 96, 18) });
+    free.push(PlacedSprite { screen: true, view: Some(0), clip: Some([96, ty, 110, ty + 10]), ..PlacedSprite::new(SpriteSetId::from_raw(THUMB), 96, ty) });
+    let spans = vec![Span { view: 7, start: 0, len: free.len(), cameras: vec![0; free.len()] }];
+    (scene, free, spans)
+}
+
+fn shown_thumb(sim: &Sim) -> i32 {
+    sim.shown.iter().find(|s| s.set.raw() == THUMB).expect("the thumb").y
+}
+
+/// A list with its bar whose scale is known: one notch down and back.
+fn sim_with_bar(snap: bool) -> Sim {
+    let mut sim = Sim::new(20, snap);
+    sim.bar = true;
+    sim.frames(2);
+    sim.wheel(1);
+    sim.frames(40);
+    sim.wheel(-1);
+    sim.frames(40);
+    assert_eq!((sim.first, sim.pos()), (1, 0.0));
+    assert!(sim.state.lists[0].range().is_some(), "the bar's scale is known");
+    sim
+}
+
+#[test]
+fn the_thumb_moves_with_the_list_by_pixels_and_lands_on_the_games() {
+    let mut sim = sim_with_bar(true);
+    sim.wheel(3);
+    let mut tops = vec![];
+    for _ in 0..60 {
+        sim.frame();
+        let top = shown_thumb(&sim);
+        // At the list's position, the bar's scale: 340 content pixels a
+        // 34 pixel travel.
+        let want = 18 + (sim.shown() as f64 * 34.0 / 340.0).round() as i32;
+        assert!((top - want).abs() <= 1, "thumb at {top}, list at {} ({want})", sim.shown());
+        tops.push(top);
+    }
+    assert!(tops.windows(2).all(|w| w[1] >= w[0]), "never back: {tops:?}");
+    let distinct: std::collections::BTreeSet<_> = tops.iter().collect();
+    assert!(distinct.len() >= 5, "moves every few frames, not in item jumps: {tops:?}");
+    // At rest: the game's own thumb, unmoved.
+    assert_eq!(sim.first, 4);
+    assert_eq!(shown_thumb(&sim), thumb_top(bar_value(4, 20)));
+}
+
+#[test]
+fn a_press_in_the_track_glides_the_list_there_and_snaps() {
+    let mut sim = sim_with_bar(true);
+    // (The thumb's middle travels 23..57: 52 puts it 29/34 down, content
+    // 290, snapped on to 300 in the direction it went.)
+    assert!(sim.route(Input::MouseButton { button: Button::Left, down: true, x: 103, y: 52 }).is_empty(), "the press is the viewer's");
+    assert!(sim.route(Input::MouseButton { button: Button::Left, down: false, x: 103, y: 52 }).is_empty());
+    let mut seen = vec![];
+    for _ in 0..90 {
+        sim.frame();
+        seen.push(sim.pos());
+    }
+    assert!(seen.windows(2).all(|w| w[1] >= w[0]), "one glide: {seen:?}");
+    assert!(seen.iter().filter(|p| **p > 0.0 && **p < 300.0).count() >= 6, "a glide, not a jump: {seen:?}");
+    assert_eq!(sim.pos(), 300.0);
+    assert_eq!(sim.first, 16, "the game's position in step");
+    assert!(sim.notches.iter().all(|&d| d == -NOTCH || d == NOTCH));
+}
+
+#[test]
+fn the_thumb_dragged_moves_the_list_by_pixels() {
+    let mut sim = sim_with_bar(false);
+    let top = shown_thumb(&sim);
+    assert!(sim.route(Input::MouseButton { button: Button::Left, down: true, x: 103, y: top + 5 }).is_empty());
+    for k in 1..=10 {
+        assert!(sim.route(Input::MouseMove { x: 103, y: top + 5 + k }).is_empty());
+        sim.frames(3);
+    }
+    sim.frames(30);
+    // Ten pixels of the bar: 100 of the list.
+    assert_eq!(sim.state.lists[0].target, 100.0);
+    assert_eq!(sim.pos(), 100.0, "stays where it was let go");
+    assert!(sim.route(Input::MouseButton { button: Button::Left, down: false, x: 103, y: top + 15 }).is_empty());
+    sim.frames(30);
+    assert_eq!(sim.pos(), 100.0);
+    assert_eq!(sim.first, 6, "the game's position in step");
+}
+
+#[test]
+fn the_alt_modes_edit_of_the_bar_glides_the_list_and_cancel_returns() {
+    let mut sim = sim_with_bar(false);
+    let edit = |action, value| Input::Slider { id: BAR, action, value };
+    assert!(sim.route(edit(SliderAction::Begin, 0)).is_empty());
+    assert!(sim.route(edit(SliderAction::Preview, 500_000)).is_empty());
+    assert_eq!(sim.state.lists[0].target, 170.0);
+    sim.frames(5);
+    assert!(sim.pos() > 0.0 && sim.pos() < 170.0, "gliding: {}", sim.pos());
+    assert!(sim.route(edit(SliderAction::Cancel, 500_000)).is_empty());
+    sim.frames(60);
+    assert_eq!(sim.pos(), 0.0);
+    assert!(sim.route(edit(SliderAction::Commit, 250_000)).is_empty());
+    sim.frames(60);
+    assert_eq!(sim.pos(), 85.0);
+    // (A step is the game's.)
+    assert_eq!(sim.route(edit(SliderAction::Step, 1)), vec![edit(SliderAction::Step, 1)]);
+}
+
+#[test]
+fn before_the_bars_scale_is_known_its_presses_are_the_games() {
+    let mut sim = Sim::new(20, true);
+    sim.bar = true;
+    sim.frames(2);
+    let press = Input::MouseButton { button: Button::Left, down: true, x: 103, y: 50 };
+    assert_eq!(sim.route(press.clone()), vec![press]);
+    // The arrows are always the game's.
+    let mut sim = sim_with_bar(true);
+    let arrow = Input::MouseButton { button: Button::Left, down: true, x: 103, y: 65 };
+    assert_eq!(sim.route(arrow.clone()), vec![arrow]);
 }

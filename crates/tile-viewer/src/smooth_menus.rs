@@ -20,7 +20,7 @@
 //! driver's pointer highlight is moved to the row under the pointer
 //! ([`highlight`]).
 
-use scene::{Button, Input, Interactable, InteractableKind, Scene};
+use scene::{Button, Input, Interactable, InteractableKind, Scene, SliderAction};
 use tile_render::PlacedSprite;
 
 use crate::looks::Span;
@@ -81,13 +81,39 @@ fn without_scroll_bars(scene: &Scene, mut rect: Rect) -> Rect {
     rect
 }
 
-/// Where the vertical scroll bar beside `rect` stands, if there is one:
-/// `Some(0)` at the top, `Some(1_000_000)` at the bottom.
-fn bar_value(scene: &Scene, wheel: Rect) -> Option<i32> {
+/// A list's vertical scroll bar as the driver shows it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Bar {
+    id: u64,
+    /// The whole bar (left, top, right, bottom).
+    rect: Rect,
+    /// Where its thumb's middle travels (x, y, w, h: top to bottom).
+    track: [i32; 4],
+    /// Where it stands: 0 at the top, 1_000_000 at the bottom.
+    value: i32,
+    /// Between its arrow buttons (top, bottom): where the thumb may show.
+    span: (i32, i32),
+}
+
+/// One million: a bar's value at the bottom.
+const FULL: f64 = 1_000_000.0;
+
+/// The vertical scroll bar beside `wheel` (a list's rectangle), if there
+/// is one.
+fn bar_of(scene: &Scene, wheel: Rect) -> Option<Bar> {
     scene.interactables.iter().find_map(|bar| match bar.kind {
-        InteractableKind::Slider { value, .. } => {
+        InteractableKind::Slider { track, value } => {
             let r = bounds(bar.rect);
-            (r[3] - r[1] > r[2] - r[0] && intersect(r, wheel).is_some()).then_some(value)
+            if r[3] - r[1] <= r[2] - r[0] || intersect(r, wheel).is_none() { return None }
+            // (Its arrows are buttons of their own at its ends.)
+            let middle = (r[1] + r[3]) / 2;
+            let mut span = (r[1], r[3]);
+            for b in scene.interactables.iter().filter(|b| b.kind == InteractableKind::Button) {
+                let a = bounds(b.rect);
+                if intersect(a, r).is_none() || a[3] - a[1] > (r[3] - r[1]) / 2 { continue }
+                if (a[1] + a[3]) / 2 < middle { span.0 = span.0.max(a[3]) } else { span.1 = span.1.min(a[1]) }
+            }
+            Some(Bar { id: bar.id, rect: r, track, value, span })
         }
         _ => None,
     })
@@ -115,7 +141,7 @@ struct Seen {
     picture: Picture,
     wheel: Rect,
     step: i32,
-    bar: Option<i32>,
+    bar: Option<Bar>,
 }
 
 impl Picture {
@@ -159,7 +185,7 @@ impl Picture {
                 }
             }
             let picture = Picture { id: list.id, rect, rows, sprites, extents, cameras };
-            Some(Seen { picture, wheel: bounds(list.rect), step, bar: bar_value(scene, bounds(list.rect)) })
+            Some(Seen { picture, wheel: bounds(list.rect), step, bar: bar_of(scene, bounds(list.rect)) })
         }).collect()
     }
 
@@ -280,6 +306,17 @@ struct List {
     /// The driver's entries where the last frame showed them, if it showed
     /// the list away from the driver's drawing.
     entries: Vec<Interactable>,
+    /// Its scroll bar in the driver's newest drawing, and the positions
+    /// seen with what the bar said there: (content offset, value).
+    bar: Option<Bar>,
+    samples: Vec<(i64, i32)>,
+    /// Where the thumb showed in the last frame (top, bottom), if found.
+    thumb: Option<(i32, i32)>,
+    /// The thumb held (where the pointer took it, from its middle), or a
+    /// press in the track (`None` inside): the bar's press is the viewer's.
+    gesture: Option<Option<i32>>,
+    /// Where an Alt mode edit of the bar began (the target then).
+    slider_from: Option<f64>,
 }
 
 impl List {
@@ -290,8 +327,9 @@ impl List {
             drawings: vec![Drawing { scroll: 0, picture: p.clone() }], drawn: 0, expected: 0, notched: (f64::NEG_INFINITY, 0),
             pos: 0.0, target: 0.0, shown: 0, input_at: f64::NEG_INFINITY, dir: 0.0, settled: true, glide: true,
             top: None, bottom: None, held: 0, highlight: None, entries: vec![],
+            bar: None, samples: vec![], thumb: None, gesture: None, slider_from: None,
         };
-        list.ends(seen.bar);
+        list.saw_bar(seen.bar);
         list
     }
 
@@ -300,6 +338,78 @@ impl List {
     fn current(&self) -> &Picture { &self.drawings.last().expect("a list has a drawing").picture }
 
     /// What the scroll bar says of the ends, at the driver's position.
+    /// The driver's bar with its newest drawing: what it says of the ends
+    /// and of the list's length.
+    fn saw_bar(&mut self, bar: Option<Bar>) {
+        self.bar = bar;
+        if let Some(b) = bar {
+            self.samples.retain(|(s, _)| *s != self.drawn);
+            self.samples.push((self.drawn, b.value));
+            if self.samples.len() > 16 { self.samples.remove(0); }
+        }
+        self.ends(bar.map(|b| b.value));
+    }
+
+    /// Where the bar's 0 is (content offset) and how far its 1_000_000 is
+    /// from there, if the bar's positions so far tell: two with values
+    /// apart, or one away from the top once the top is known.
+    fn range(&self) -> Option<(f64, f64)> {
+        let &(s1, v1) = self.samples.last()?;
+        let other = self.samples.iter().filter(|(_, v)| (v - v1).abs() >= 1000).max_by_key(|(_, v)| (v - v1).abs());
+        let (top, range) = match other {
+            Some(&(s2, v2)) => {
+                let range = (s1 - s2) as f64 * FULL / f64::from(v1 - v2);
+                (s1 as f64 - f64::from(v1) * range / FULL, range)
+            }
+            None => {
+                let top = self.top? as f64;
+                if v1 < 1000 { return None }
+                (top, (s1 as f64 - top) * FULL / f64::from(v1))
+            }
+        };
+        // (Whole items: the bar's range is a number of them; its top one of
+        // the driver's positions.)
+        let step = self.step as f64;
+        let (range, top) = ((range / step).round() * step, self.origin() + ((top - self.origin()) / step).round() * step);
+        (range > 0.0 && range.is_finite()).then_some((top, range))
+    }
+
+    /// The content offset the bar's `value` stands for.
+    fn scroll_of(&self, value: f64) -> Option<f64> {
+        let (top, range) = self.range()?;
+        // (To a 1/1024 pixel: no float dust in where a list rests.)
+        Some(((top + value.clamp(0.0, FULL) * range / FULL) * 1024.0).round() / 1024.0)
+    }
+
+    /// The bar's value where the pointer at `y` puts the thumb's middle.
+    fn value_at(bar: &Bar, y: i32) -> f64 {
+        f64::from(y - bar.track[1]) * FULL / f64::from(bar.track[3].max(1))
+    }
+
+    /// How far the thumb shows below the driver's (pixels): the list shown
+    /// `shown - drawn` pixels further, at the bar's scale.
+    fn thumb_shift(&self) -> Option<i32> {
+        let (bar, (_, range)) = (self.bar?, self.range()?);
+        Some(((self.shown - self.drawn) as f64 * f64::from(bar.track[3]) / range).round() as i32)
+    }
+
+    /// The list goes where the bar's `value` stands, gliding, as the
+    /// wheel's notches go.
+    fn glide_to_value(&mut self, value: f64, now: f64) -> bool {
+        let Some(to) = self.scroll_of(value) else { return false };
+        let to = self.clamp_to_ends(to);
+        if self.settled && self.pos == self.drawn as f64 {
+            let current = self.drawings.pop().expect("a list has a drawing");
+            self.drawings = vec![current];
+        }
+        self.dir = (to - self.target).signum();
+        self.target = to;
+        self.glide = true;
+        self.input_at = now;
+        self.settled = false;
+        true
+    }
+
     fn ends(&mut self, bar: Option<i32>) {
         if self.drawn != self.expected { return }
         match bar {
@@ -319,7 +429,13 @@ impl List {
     fn observe(&mut self, seen: &Seen, now: f64, hover: Option<(i32, i32)>) -> bool {
         let picture = &seen.picture;
         if i64::from(seen.step.max(1)) != self.step || picture.rect != self.rect || picture.cameras != self.cameras { return false }
-        let Some(dy) = picture.offset_from(self.current()) else { return false };
+        // (No rows in common: where its bar says, if its scale is known.)
+        let by_bar = || {
+            let v = seen.bar?.value;
+            let at = self.scroll_of(f64::from(v))?;
+            Some((self.drawn as f64 - at).round() as i32)
+        };
+        let Some(dy) = picture.offset_from(self.current()).or_else(by_bar) else { return false };
         if i64::from(dy) % self.step != 0 { return false }
         let scroll = self.drawn - i64::from(dy);
         if dy == 0 {
@@ -340,7 +456,7 @@ impl List {
             self.target = self.drawn as f64;
             self.glide = true;
         }
-        self.ends(seen.bar);
+        self.saw_bar(seen.bar);
         self.target = self.clamp_to_ends(self.target);
         true
     }
@@ -413,10 +529,15 @@ impl List {
         let (o, s) = (self.origin(), self.step as f64);
         let grid = |v: f64, f: fn(f64) -> f64| (o + f((v - o) / s) * s).round() as i64;
         let moving = (self.target - self.pos).abs() >= 0.5;
+        // Ahead an item, more on a long way (a click in the bar's track),
+        // up to the rows shown less one: what shows stays covered.
+        let (a, b) = self.current().band();
+        let rows = (i64::from(b - a) / self.step - 1).max(1);
+        let lead = (((self.target - self.pos).abs() / s).ceil() as i64).clamp(1, rows) * self.step;
         let w = if moving && self.target > self.pos {
-            (grid(self.pos, f64::ceil) + self.step).min(grid(self.target, f64::ceil))
+            (grid(self.pos, f64::ceil) + lead).min(grid(self.target, f64::ceil))
         } else if moving {
-            (grid(self.pos, f64::floor) - self.step).max(grid(self.target, f64::floor))
+            (grid(self.pos, f64::floor) - lead).max(grid(self.target, f64::floor))
         } else {
             grid(self.pos, f64::round)
         };
@@ -574,14 +695,32 @@ impl SmoothMenus {
         }
         self.lists = lists;
         let mut patches: Vec<(Rect, Vec<u32>, Vec<PlacedSprite>)> = Vec::new();
+        // The bars' thumbs moved with their lists: (sprite, how far, clip).
+        let mut thumbs: Vec<(usize, i32, Rect)> = Vec::new();
         for l in &mut self.lists {
             l.advance(now, dt, snap);
             if l.held == 0 {
-                let to = l.wanted();
+                // (Never more than the rows shown less one from what the
+                // driver drew: its next drawing has rows in common with it.)
+                let (a, b) = l.current().band();
+                let reach = (i64::from(b - a) / l.step - 1).max(1) * l.step;
+                let to = l.wanted().clamp(l.drawn - reach, l.drawn + reach);
                 self.out.extend(l.notches_to(to, now));
             }
             l.shown = l.pos.round() as i64;
             l.entries.clear();
+            // The thumb where the list shows: the game's art, moved
+            // proportionally to the list (exactly the game's own at a whole
+            // item).
+            l.thumb = None;
+            if let Some(bar) = l.bar {
+                let found = thumb_sprites(&bar, &l.cameras, free, &rect_of);
+                let dy = l.thumb_shift().unwrap_or(0);
+                let clip = [bar.rect[0], bar.span.0, bar.rect[2], bar.span.1];
+                let extent = found.iter().filter_map(|&k| rect_of(&free[k]).map(bounds)).fold(None, |a: Option<(i32, i32)>, r| Some(a.map_or((r[1], r[3]), |(t, b)| (t.min(r[1]), b.max(r[3])))));
+                l.thumb = extent.map(|(t, b)| (t + dy, b + dy));
+                if dy != 0 { thumbs.extend(found.into_iter().map(|k| (k, dy, clip))); }
+            }
             if l.shown == l.drawn { continue }
             let mut shown = l.compose(l.shown);
             l.entries = shown_entries(&shown);
@@ -593,9 +732,14 @@ impl SmoothMenus {
             }
             patches.push((l.rect, l.cameras.clone(), shown.sprites));
         }
-        if patches.is_empty() { return None }
+        if patches.is_empty() && thumbs.is_empty() { return None }
         self.patched = true;
         let mut result = free.to_vec();
+        for (k, dy, clip) in thumbs {
+            let s = &mut result[k];
+            s.y += dy;
+            s.clip = intersect(s.clip.map_or(clip, |c| shifted(c, dy)), clip).or(Some([clip[0], clip[1], clip[0], clip[1]]));
+        }
         for (rect, cameras, shown) in patches {
             let mut outside = Vec::new();
             for s in result {
@@ -628,6 +772,7 @@ impl SmoothMenus {
     pub fn route(&mut self, input: Input, alt: bool) -> Vec<Input> {
         if !self.enabled { return vec![input] }
         let now = self.drawn_at.unwrap_or(0.0);
+        if let Some(out) = self.bar_input(&input, now) { return out }
         match input {
             Input::Scroll { dy, pixels, x, y, .. } => {
                 self.scrolled = false;
@@ -690,6 +835,73 @@ impl SmoothMenus {
         }
     }
 
+    /// Input on a list's scroll bar that the viewer does itself: a press
+    /// in the track (not on the thumb or an arrow) glides the list to where
+    /// it puts the thumb's middle (as the wheel's notches glide; snapping
+    /// after); the thumb dragged moves the list with it by pixels; the Alt
+    /// mode's edit of the bar glides the list to its value. `None`: not
+    /// the viewer's (the arrows step the driver's list, the list glides
+    /// after it; a bar whose scale is not known yet is the driver's).
+    fn bar_input(&mut self, input: &Input, now: f64) -> Option<Vec<Input>> {
+        match *input {
+            Input::MouseButton { button: Button::Left, down: true, x, y } => {
+                let l = self.lists.iter_mut().find(|l| l.bar.is_some_and(|b| inside(b.rect, (x, y))))?;
+                let bar = l.bar?;
+                if y < bar.span.0 || y >= bar.span.1 { return None }
+                l.range()?;
+                match l.thumb {
+                    Some((top, bottom)) if y >= top && y < bottom => {
+                        l.gesture = Some(Some(y - (top + bottom) / 2));
+                        l.slider_from = None;
+                    }
+                    _ => {
+                        l.gesture = Some(None);
+                        l.glide_to_value(List::value_at(&bar, y), now);
+                    }
+                }
+                Some(vec![])
+            }
+            Input::MouseMove { y, .. } => {
+                let l = self.lists.iter_mut().find(|l| matches!(l.gesture, Some(Some(_))))?;
+                let (bar, Some(Some(grip))) = (l.bar?, l.gesture) else { return None };
+                let to = l.clamp_to_ends(l.scroll_of(List::value_at(&bar, y - grip))?);
+                let d = to - l.target;
+                l.scroll(d, true, now);
+                // (Exactly where the bar puts it, whatever the sums.)
+                if (l.pos - to).abs() < 1e-6 { l.pos = to }
+                l.target = to;
+                Some(vec![])
+            }
+            Input::MouseButton { button: Button::Left, down: false, .. } => {
+                let l = self.lists.iter_mut().find(|l| l.gesture.is_some())?;
+                l.gesture = None;
+                Some(vec![])
+            }
+            Input::Slider { id, action, value } => {
+                let l = self.lists.iter_mut().find(|l| l.bar.is_some_and(|b| b.id == id))?;
+                l.range()?;
+                match action {
+                    SliderAction::Begin => { l.slider_from = Some(l.target); }
+                    SliderAction::Preview | SliderAction::Commit => {
+                        if l.slider_from.is_none() { l.slider_from = Some(l.target) }
+                        l.glide_to_value(f64::from(value), now);
+                        if action == SliderAction::Commit { l.slider_from = None }
+                    }
+                    SliderAction::Cancel => {
+                        if let Some(from) = l.slider_from.take() {
+                            l.dir = (from - l.target).signum();
+                            (l.target, l.glide, l.input_at, l.settled) = (from, true, now, false);
+                        }
+                    }
+                    // (A step is the driver's; the list glides after it.)
+                    SliderAction::Step => return None,
+                }
+                Some(vec![])
+            }
+            _ => None,
+        }
+    }
+
     /// Where a point the pointer is at (driver pixels) goes in the driver:
     /// `None` on a row the driver does not hold.
     fn map(&self, x: i32, y: i32) -> Option<(i32, i32)> {
@@ -709,6 +921,22 @@ impl SmoothMenus {
         self.hover = Some((x, y));
         PointerRefresh::Move { x, y }
     }
+}
+
+/// The sprites of `bar`'s thumb among `free` (indices): in the bar between
+/// its arrows, shorter than half of it, across the point its value puts
+/// the thumb's middle at.
+fn thumb_sprites(bar: &Bar, cameras: &[u32], free: &[PlacedSprite], rect_of: &impl Fn(&PlacedSprite) -> Option<[i32; 4]>) -> Vec<usize> {
+    let middle = bar.track[1] + (f64::from(bar.track[3]) * f64::from(bar.value) / FULL).round() as i32;
+    let x = bar.track[0];
+    free.iter().enumerate().filter(|(_, s)| s.screen && !s.except_view && s.view.is_some_and(|v| cameras.contains(&v)))
+        .filter_map(|(k, s)| {
+            let r = bounds(rect_of(s)?);
+            let r = intersect(r, s.clip.unwrap_or(UNCLIPPED))?;
+            (r[0] <= x && x < r[2].max(r[0] + 1) && r[0] >= bar.rect[0] - 1 && r[2] <= bar.rect[2] + 1
+                && r[1] >= bar.span.0 && r[3] <= bar.span.1 && r[1] <= middle && middle < r[3]
+                && 2 * (r[3] - r[1]) < bar.span.1 - bar.span.0).then_some(k)
+        }).collect()
 }
 
 /// A composed picture's entries, each clipped to the list (an anchor kept
