@@ -28,6 +28,7 @@ pub mod scaling;
 pub mod profile;
 mod presentation;
 pub mod snap;
+pub mod altrec;
 pub mod smooth_menus;
 pub mod build_queue;
 
@@ -64,11 +65,15 @@ pub struct ViewerConfig {
     /// In-process hosts can supply signal/thread setup without exposing their
     /// platform details to the renderer. Never called on the event-loop thread.
     pub native_thread_init: Option<fn()>,
+    /// Where the Alt mode's interactions are recorded while
+    /// `viewer_settings::Input::record_alt_mode` is on (`altrec`): the
+    /// folder of the game's log. None: not recorded.
+    pub recording_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ViewerConfig {
     fn default() -> Self {
-        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None }
+        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None }
     }
 }
 
@@ -1478,6 +1483,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         system_cursor_size: cursor::NOMINAL,
         cursor_builds: CursorBuilds { native_thread_init, ..Default::default() },
         pointer_presentation: system_cursor::Presentation::default(),
+        recording_failed: false,
         capture_icon: false,
         pointer_inside: true,
         pointer_since: None,
@@ -1788,6 +1794,9 @@ struct App {
     /// waits for one).
     cursor_builds: CursorBuilds,
     pointer_presentation: system_cursor::Presentation,
+    /// The Alt mode's recording could not start, or the viewer closes: it
+    /// is not started again.
+    recording_failed: bool,
     capture_icon: bool,
     /// Whether the system pointer is in the window.
     pointer_inside: bool,
@@ -3062,6 +3071,37 @@ impl App {
         }
     }
 
+    /// Records the Alt mode while the setting is on (and the host gave a
+    /// folder for it), not when it is off.
+    /// The viewer closes: the recording is written out (waited for a
+    /// moment at most) and not started again.
+    fn close_recording(&mut self) {
+        self.recording_failed = true;
+        self.snap.finish_recording();
+    }
+
+    fn sync_recording(&mut self) {
+        let want = self.settings.input.record_alt_mode && !self.recording_failed;
+        if want == self.snap.recorder().is_some() {
+            return;
+        }
+        if !want {
+            self.snap.finish_recording();
+            return;
+        }
+        let Some(dir) = self.config.recording_dir.clone() else {
+            self.recording_failed = true;
+            return;
+        };
+        match altrec::Recorder::start(dir, altrec::writer::Limits::default()) {
+            Ok(r) => self.snap.set_recorder(Some(r)),
+            Err(e) => {
+                log::warn!("viewer: recording the Alt mode: {e}");
+                self.recording_failed = true;
+            }
+        }
+    }
+
     /// Seconds since the viewer started (the snapping pointer's clock).
     fn now(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
@@ -4313,6 +4353,8 @@ impl App {
 impl ApplicationHandler for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.function_keys.release();
+        // (Written out, waited for a moment at most.)
+        self.close_recording();
     }
 
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
@@ -4335,6 +4377,7 @@ impl ApplicationHandler for App {
         if !matches!(event, WindowEvent::RedrawRequested) { self.input_revision = self.input_revision.wrapping_add(1); }
         match &event {
             WindowEvent::CloseRequested => {
+                self.close_recording();
                 frame_input(&mut self.preparing_inputs, &self.display, Input::Quit);
                 event_loop.exit();
             }
@@ -4457,7 +4500,7 @@ impl ApplicationHandler for App {
             let edge = self.machine.edge() && self.unlock_pending.is_none();
             let s = self.plan.map_or(1.0, |p| p.factor());
             let delta = (delta.0 / s, delta.1 / s);
-            let inputs = self.snap.motion(delta).unwrap_or_else(|| if edge { self.layout.edge_motion(delta) } else { self.layout.motion(delta) });
+            let inputs = self.snap.motion_at(delta, self.now()).unwrap_or_else(|| if edge { self.layout.edge_motion(delta) } else { self.layout.motion(delta) });
             for input in inputs {
                 self.send(input);
             }
@@ -4534,6 +4577,7 @@ impl ApplicationHandler for App {
         // The Alt mode by itself in menus, only for the window in front.
         let focused = self.pointer_presentation.active() && self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus());
         self.snap.set_alt_in_menus(self.settings.input.alt_in_menus && focused);
+        self.sync_recording();
         self.sync_function_keys();
         let snapped_inputs = if self.settings_preview.active() { Vec::new() } else {
             self.snap.tick(&mut self.layout, &self.shown_scene, now, rates)
