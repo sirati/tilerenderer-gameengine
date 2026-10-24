@@ -61,6 +61,9 @@ impl Presentation {
                 }
                 other => {
                     log::warn!("surface: {other:?}");
+                    if matches!(other, wgpu::CurrentSurfaceTexture::Validation) {
+                        render_errors::report(render_errors::Kind::Gpu, "the window surface", format_args!("{other:?}"));
+                    }
                     None
                 }
             },

@@ -19,6 +19,7 @@ mod system_cursor;
 pub mod fps;
 mod startup_ready;
 pub mod host_status;
+pub mod render_error_notice;
 pub mod settings_preview;
 mod input;
 pub mod layout;
@@ -1220,6 +1221,22 @@ pub fn render_planned(
     settings: &viewer_settings::Layout,
     config: &ViewerConfig,
 ) -> RgbaImage {
+    render_planned_with_notice(gpu, compiled, scene, window, resolution, settings, config, None)
+}
+
+/// [`render_planned`] with the render error notice for `render_errors`
+/// errors over it, as the viewer draws it (`render_error_notice`).
+#[allow(clippy::too_many_arguments)]
+pub fn render_planned_with_notice(
+    gpu: &tile_render::Headless,
+    compiled: &Compiled,
+    scene: &Scene,
+    window: (u32, u32),
+    resolution: &viewer_settings::Resolution,
+    settings: &viewer_settings::Layout,
+    config: &ViewerConfig,
+    render_errors: Option<u64>,
+) -> RgbaImage {
     let rect_of = |s: &scene::FreeSprite| sprite_rect(compiled, s);
     let plan = scaling::plan(window, scene.screen_size, resolution).for_scene(scene, rect_of);
     let mut layout = layout::Layout::default();
@@ -1234,7 +1251,17 @@ pub fn render_planned(
     let arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
     let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
-    renderer.set_world(&gpu.device, &scene_world_arranged(compiled, scene, &frame.view_cameras, &arranged.overlay_cameras));
+    let mut world = scene_world_arranged(compiled, scene, &frame.view_cameras, &arranged.overlay_cameras);
+    let mut cameras = frame.cameras.clone();
+    if let Some(n) = render_errors {
+        let (corner, scale) = render_error_notice::corner(host_status::anchor(compiled, scene, &frame.cameras, &frame.view_cameras));
+        let lines = render_error_notice::message_lines(compiled, scene, &frame.cameras, &frame.view_cameras, &arranged.overlay_cameras, corner, scale);
+        if let Some((camera, sprites)) = render_error_notice::compose(compiled, n, corner, scale, &lines, plan.canvas(), cameras.len() as u32) {
+            world.free.extend(sprites);
+            cameras.push(camera);
+        }
+    }
+    renderer.set_world(&gpu.device, &world);
     apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
     // The dividers' frosted strips and the strip's separator, as the
     // window adds them to its markers.
@@ -1242,7 +1269,7 @@ pub fn render_planned(
     renderer.set_markers(&gpu.device, &gpu.queue, &dividers);
     // (Shown in the window as the viewer shows it: a pixel scale's boxes,
     // glass shaded at window resolution.)
-    gpu.render_presented(&mut renderer, &frame.cameras, &[], plan.present, scene.tick, config.clear)
+    gpu.render_presented(&mut renderer, &cameras, &[], plan.present, scene.tick, config.clear)
 }
 
 /// A device on `adapter` with `surface` configured for a window of `size`
@@ -1382,6 +1409,8 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         snap: snap::SnapInput::default(),
         fps: fps::Overlay::default(),
         host_status: host_status::Indicator::default(),
+        render_errors: render_errors::Rolling::default(),
+        render_error_notice: render_errors::Notice::default(),
         settings_preview: settings_preview::Preview::default(),
         snap_grabbed: false,
         cursor_art: cursor::Art::default(),
@@ -1529,6 +1558,7 @@ mod host_app {
                 // owner's guards report the end.)
                 if let Err(e) = event_loop.run_app_attached(Attached { app, on_exit: Some(on_exit) }) {
                     log::error!("viewer: {e}");
+                    render_errors::report(render_errors::Kind::Viewer, "running", format_args!("{e}"));
                 }
             }
             Err(e) => on_exit(Err(e)),
@@ -1678,6 +1708,10 @@ struct App {
     fps: fps::Overlay,
     /// Whether the driver's host answers, as last shown (`host_status`).
     host_status: host_status::Indicator,
+    /// Render errors of the last second, both sides', and their notice
+    /// (`render_error_notice`).
+    render_errors: render_errors::Rolling,
+    render_error_notice: render_errors::Notice,
     settings_preview: settings_preview::Preview,
     /// The cursor art kept for the system pointer, the system cursors made
     /// of it (by set), what the system pointer shows, and whether it is the
@@ -3521,7 +3555,11 @@ impl App {
                     {
                         let result = self.gpu.as_mut().and_then(|gpu| gpu.bitmap.as_mut()).ok_or_else(|| ViewerError::SoftwarePresent("bitmap presenter is absent".into()))
                             .and_then(|presenter| presenter.present(width, height, &pixels));
-                        if let Err(error) = result { self.error = Some(error); continue; }
+                        if let Err(error) = result {
+                            render_errors::report(render_errors::Kind::Gpu, "software present", format_args!("{error}"));
+                            self.error = Some(error);
+                            continue;
+                        }
                         self.commit_ui(id, worker_prepare);
                     }
                     #[cfg(not(target_os = "macos"))]
@@ -3553,6 +3591,7 @@ impl App {
                     }
                     self.pending_ui = None;
                     self.pending_replay = None;
+                    render_errors::report(render_errors::Kind::RenderWorker, "it failed", format_args!("{error}"));
                     self.error = Some(ViewerError::RenderWorker(error));
                 }
             }
@@ -3679,6 +3718,7 @@ impl App {
         }
         if !accepted {
             self.error = Some(ViewerError::RenderWorker("rejected a cached frame".into()));
+            render_errors::report(render_errors::Kind::RenderWorker, "a cached frame", format_args!("rejected"));
             return;
         }
         self.pending_replay = Some((id, gpu.config_revision, started, started.elapsed()));
@@ -4071,6 +4111,16 @@ impl App {
                 cameras.push(camera);
             }
         }
+        // Render errors of the last second, in the game's message area
+        // below its messages (`render_error_notice`).
+        if let Some(n) = self.render_error_notice.value().filter(|_| cameras.len() < tile_render::MAX_VIEWS) {
+            let (corner, scale) = render_error_notice::corner(host_status::anchor(&self.compiled, scene, &arranged.cameras, &arranged.view_cameras));
+            let lines = render_error_notice::message_lines(&self.compiled, scene, &arranged.cameras, &arranged.view_cameras, &self.drawn_overlay, corner, scale);
+            if let Some((camera, sprites)) = render_error_notice::compose(&self.compiled, n, corner, scale, &lines, window, cameras.len() as u32) {
+                markers.extend(sprites);
+                cameras.push(camera);
+            }
+        }
         markers.extend_from_slice(&cursor_sprites);
         markers.extend(snap_sprites);
         mark(&mut self.profile, "markers+cursor", &mut t);
@@ -4129,6 +4179,7 @@ impl App {
         if !accepted {
             self.pending_ui = None;
             self.error = Some(ViewerError::RenderWorker("rejected a complete frame".into()));
+            render_errors::report(render_errors::Kind::RenderWorker, "a complete frame", format_args!("frame {id}"));
         }
 
     }
@@ -4148,6 +4199,7 @@ impl ApplicationHandler for App {
         if self.gpu.is_none() {
             if let Err(e) = self.init(event_loop) {
                 log::error!("viewer init: {e}");
+                render_errors::report(render_errors::Kind::Viewer, "starting it", format_args!("{e}"));
                 self.error = Some(e);
                 event_loop.exit();
             }
@@ -4334,6 +4386,12 @@ impl ApplicationHandler for App {
                 self.set_settings(settings);
             }
         }
+        // The render errors of the last second: a frame when their notice
+        // comes, changes or goes.
+        let now = Instant::now();
+        let shown = self.render_error_notice.value();
+        self.render_errors.note(now, render_errors::total(), self.display.host().map(|h| h.0.render_errors));
+        changed |= self.render_error_notice.update(now, self.render_errors.count(now)) != shown;
         let expired = self.settings_preview.tick(Instant::now());
         // (Only when what the confirmation shows changes: once a second.)
         changed |= self.settings_preview.needs_frame(Instant::now()) || expired.is_some();
@@ -4394,6 +4452,11 @@ impl ApplicationHandler for App {
         let flow = match (flow, self.settings_preview.wake(Instant::now())) {
             (ControlFlow::WaitUntil(at), Some(preview)) => ControlFlow::WaitUntil(at.min(preview)),
             (ControlFlow::Wait, Some(preview)) => ControlFlow::WaitUntil(preview),
+            (flow, _) => flow,
+        };
+        let flow = match (flow, self.render_error_notice.wake()) {
+            (ControlFlow::WaitUntil(at), Some(notice)) => ControlFlow::WaitUntil(at.min(notice)),
+            (ControlFlow::Wait, Some(notice)) => ControlFlow::WaitUntil(notice),
             (flow, _) => flow,
         };
         event_loop.set_control_flow(flow);
@@ -4520,7 +4583,10 @@ impl CursorBuilds {
         std::thread::spawn(move || thread_start::initialized(initialize, || {
             let source = art.native_image(key.0, key.1).and_then(|native| {
                 winit::window::CustomCursor::from_rgba(native.rgba, native.size.0, native.size.1, native.hotspot.0, native.hotspot.1)
-                    .inspect_err(|e| log::warn!("viewer: cursor {:?}: {e}", key.0))
+                    .inspect_err(|e| {
+                        log::warn!("viewer: cursor {:?}: {e}", key.0);
+                        render_errors::report(render_errors::Kind::MissingSprite, "the system pointer's cursor image", format_args!("{:?}: {e}", key.0));
+                    })
                     .ok()
             });
             if tx.send((generation, key, source)).is_ok() {

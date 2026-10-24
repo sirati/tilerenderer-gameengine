@@ -2,7 +2,7 @@
 //! Reuses the FPS character rows; no font file or CPU text rasterizer.
 use super::{GLYPHS, GLYPH_ROWS};
 
-const EXTRA: [(char,[u8;7]);11]=[
+const EXTRA: [(char,[u8;7]);12]=[
     ('e',[0,0,14,17,31,16,15]),
     ('o',[0,0,14,17,17,17,14]),
     ('c',[0,0,15,16,16,16,15]),
@@ -14,6 +14,7 @@ const EXTRA: [(char,[u8;7]);11]=[
     ('D',[30,17,17,17,17,17,30]),
     ('R',[30,17,17,30,20,18,17]),
     ('K',[17,18,20,24,20,18,17]),
+    (',',[0,0,0,0,12,4,8]),
 ];
 
 pub(super) fn face()->tile_render::gpu_text::Face {
@@ -57,7 +58,7 @@ mod tests {
     #[test]
     fn builtin_outline_face_covers_warnings_and_settings_confirmation() {
         let face=super::face();
-        for text in ["Game appears busy", "Game appears stuck", "Do you want to keep this?", "Reverting in 0123456789 seconds", "Keep", "Revert"] {
+        for text in ["Game appears busy", "Game appears stuck", "Do you want to keep this?", "Reverting in 0123456789 seconds", "Keep", "Revert", "During the last second, 1234567890 rendering errors happened."] {
             for ch in text.chars() {
                 assert!(face.glyph(ch).is_some(),"missing {ch:?}");
                 assert_eq!(face.advance(ch),Some(6));

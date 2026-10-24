@@ -6,6 +6,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+render-errors = { path = "../render-errors" }
 application-icon = { path = "../application-icon" }
 civ3r-sync = { path = "../civ3r-sync" }
 tile-render.workspace = true

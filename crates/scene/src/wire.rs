@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, BuildQueue, BuildQueueRow, Button, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 58;
+pub const VERSION: u32 = 59;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -657,6 +657,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u8(23);
                 w.u32(h.stale_ms);
                 w.u32(h.serial);
+                w.u32(h.render_errors);
             }
             Update::Looks(looks) => {
                 w.u8(17);
@@ -972,7 +973,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     pixel_scale: r.u32()?, previous_pixel_scale: r.u32()?,
                 })
             } else { None }),
-            23 => Update::Host(crate::HostStatus { stale_ms: r.u32()?, serial: r.u32()? }),
+            23 => Update::Host(crate::HostStatus { stale_ms: r.u32()?, serial: r.u32()?, render_errors: r.u32()? }),
             17 => {
                 let n = r.len(22)?;
                 let mut looks = Vec::with_capacity(n);
@@ -1272,6 +1273,9 @@ pub struct Assets {
     /// Index pages to make room for in the atlas (art expected soon, see
     /// `tile_viewer::Assets::reserve`; 0: none).
     pub reserve: u32,
+    /// What the art is for (the screen shown when it was asked for, e.g.
+    /// "F7 screen"): the context of its render errors (`render_errors`).
+    pub context: String,
 }
 
 pub fn encode_assets(a: &Assets) -> Vec<u8> {
@@ -1288,6 +1292,8 @@ pub fn encode_assets(a: &Assets) -> Vec<u8> {
     w.u32((a.generation >> 32) as u32);
     w.bool(a.append);
     w.u32(a.reserve);
+    w.u32(a.context.len() as u32);
+    w.0.extend_from_slice(a.context.as_bytes());
     w.0
 }
 
@@ -1307,7 +1313,8 @@ pub fn decode_assets(bytes: &[u8]) -> Result<Assets, WireError> {
     let generation = r.u32()? as u64 | (r.u32()? as u64) << 32;
     let append = r.bool()?;
     let reserve = r.u32()?;
-    Ok(Assets { description, roots, generation, append, reserve })
+    let context = string(&mut r)?;
+    Ok(Assets { description, roots, generation, append, reserve, context })
 }
 
 #[cfg(test)]
@@ -1500,7 +1507,7 @@ mod tests {
         updates.push(Update::Cursor(Cursor::Sprite(42)));
         updates.push(Update::Cursor(Cursor::System(SystemCursor::ResizeNesw)));
         updates.push(Update::Cursor(Cursor::Default));
-        updates.push(Update::Host(crate::HostStatus { stale_ms: 3_250, serial: 77 }));
+        updates.push(Update::Host(crate::HostStatus { stale_ms: 3_250, serial: 77, render_errors: 9 }));
         updates.push(Update::SettingsPreview(Some(crate::SettingsPreview { session: 0x1_0000_0001, id: 0x2_0000_0002, pixel_scale: 3, previous_pixel_scale: 1 })));
         updates.push(Update::SettingsPreview(None));
         assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
@@ -1557,7 +1564,7 @@ mod tests {
             Input::Window { width: 3840, height: 2160, scale_milli: 1500 },
         ];
         assert_eq!(decode_input(&encode_input(&events)).unwrap(), events);
-        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], generation: 7, append: true, reserve: 300 };
+        let a = Assets { description: "[grid]\n".into(), roots: vec!["C:\\Games".into(), "Z:\\x".into()], generation: 7, append: true, reserve: 300, context: "F7 screen".into() };
         assert_eq!(decode_assets(&encode_assets(&a)).unwrap(), a);
         assert_eq!(decode_updates(&[VERSION as u8, 0, 0, 0, 5]), Err(WireError::Truncated));
         assert_eq!(decode_input(&[0xFE, 0, 0, 0]), Err(WireError::Version(0xFE)));
