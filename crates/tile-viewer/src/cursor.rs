@@ -1693,7 +1693,7 @@ mod busy_tests {
             cell = [32, 32]
             anchor = [-16, -16]
             group = "Viewer@command"
-            {}"#, include_str!("../../../assets/civ3/loading-cursor.toml"));
+            {}"#, include_str!("../../../assets/viewer/loading-cursor.toml"));
         assert!(!text.contains("Cursor.flc"), "never the piece-selection ring");
         let desc = render_desc::Description::parse(&text).unwrap();
         // (The arrow is generated; only the hourglass goes to the loader.)
