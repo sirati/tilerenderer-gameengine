@@ -18,7 +18,7 @@ pub struct Accessibility {
     pub hud_size: usize,
     pub stack_count: bool,
     /// The stack count on its dark translucent plate, as city labels;
-    /// off, bare with a dark shadow, as the game's messages.
+    /// off, bare white with a dark outline.
     pub stack_backdrop: bool,
 }
 
