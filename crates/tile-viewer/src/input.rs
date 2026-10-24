@@ -2,7 +2,7 @@
 
 use scene::{Button, Input};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{KeyCode, NativeKeyCode, PhysicalKey};
 
 use crate::scaling::Plan;
 
@@ -20,6 +20,11 @@ pub struct InputState {
     wheel_pixels: bool,
     wheel_scale: Option<f64>,
     wheel_context: Option<(Option<String>, Option<u32>, Option<u64>, bool)>,
+    /// The top row's Mission Control, Spotlight, Dictation and Do Not
+    /// Disturb keys are F3-F6 (macOS, the media keys setting on).
+    top_row_keys: bool,
+    /// macOS key codes with no key here, already logged.
+    logged_native: Vec<u16>,
 }
 
 impl InputState {
@@ -31,6 +36,29 @@ impl InputState {
             self.wheel_rest = 0.0;
             self.wheel_scale = Some(scale);
         }
+    }
+
+    /// Whether the top row's special keys that reach the window with codes
+    /// of their own (Mission Control, Spotlight, Dictation, Do Not
+    /// Disturb: `function_keys::keys::TOP_ROW_KEYS`) are taken as the
+    /// function keys they sit on. Normally the event tap has already made
+    /// them F3-F6; this is for when it did not.
+    pub fn set_top_row_keys(&mut self, on: bool) { self.top_row_keys = on; }
+
+    /// The key a code winit does not know stands for, if any; logged once
+    /// otherwise.
+    fn unidentified(&mut self, native: NativeKeyCode) -> Option<KeyCode> {
+        let NativeKeyCode::MacOS(code) = native else { return None };
+        const F: [KeyCode; 12] = [KeyCode::F1, KeyCode::F2, KeyCode::F3, KeyCode::F4, KeyCode::F5, KeyCode::F6, KeyCode::F7, KeyCode::F8, KeyCode::F9, KeyCode::F10, KeyCode::F11, KeyCode::F12];
+        let key = function_keys::keys::top_row_number(code).filter(|_| self.top_row_keys).and_then(|n| F.get(usize::from(n).checked_sub(1)?).copied());
+        if !self.logged_native.contains(&code) {
+            self.logged_native.push(code);
+            match key {
+                Some(key) => log::info!("input: macOS key code {code:#04x} (top row) taken as {key:?}"),
+                None => log::info!("input: macOS key code {code:#04x} has no key here; ignored"),
+            }
+        }
+        key
     }
 
     /// A viewer-owned modal or gesture took over the wheel.
@@ -167,8 +195,13 @@ impl InputState {
                 out
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                let PhysicalKey::Code(code) = event.physical_key else { return vec![] };
-                let text = event.text.as_ref().and_then(|t| t.chars().next()).filter(|c| !c.is_control());
+                let (code, text) = match event.physical_key {
+                    PhysicalKey::Code(code) => (code, event.text.as_ref().and_then(|t| t.chars().next()).filter(|c| !c.is_control())),
+                    PhysicalKey::Unidentified(native) => match self.unidentified(native) {
+                        Some(code) => (code, None),
+                        None => return vec![],
+                    },
+                };
                 self.key(code, event.state == ElementState::Pressed, text)
             }
             WindowEvent::Focused(false) => { self.wheel_rest = 0.0; self.release_keys() },
@@ -241,6 +274,26 @@ pub fn virtual_key(code: KeyCode) -> Option<u32> {
 mod tests {
     use super::*;
     use winit::event::{DeviceId, TouchPhase};
+
+    #[test]
+    fn top_row_codes_are_f3_to_f6_only_when_asked() {
+        let mut input = InputState::default();
+        for code in [0xA0u16, 0xB1, 0xB0, 0xCF, 0xB2] {
+            assert_eq!(input.unidentified(NativeKeyCode::MacOS(code)), None, "{code:#x}");
+        }
+        input.set_top_row_keys(true);
+        assert_eq!(input.unidentified(NativeKeyCode::MacOS(0xA0)), Some(KeyCode::F3));
+        assert_eq!(input.unidentified(NativeKeyCode::MacOS(0xB1)), Some(KeyCode::F4));
+        assert_eq!(input.unidentified(NativeKeyCode::MacOS(0xB0)), Some(KeyCode::F5));
+        assert_eq!(input.unidentified(NativeKeyCode::MacOS(0xCF)), Some(KeyCode::F5));
+        assert_eq!(input.unidentified(NativeKeyCode::MacOS(0xB2)), Some(KeyCode::F6));
+        assert_eq!(input.unidentified(NativeKeyCode::MacOS(0xB3)), None);
+        assert_eq!(input.unidentified(NativeKeyCode::Windows(0xA0)), None);
+        // Pressed and released as F3, VK_F3 (0x72), held in between.
+        assert_eq!(input.key(KeyCode::F3, true, None), [Input::Key { vk: 0x72, down: true, text: None }]);
+        assert_eq!(input.held_virtual_keys().collect::<Vec<_>>(), [0x72]);
+        assert_eq!(input.key(KeyCode::F3, false, None), [Input::Key { vk: 0x72, down: false, text: None }]);
+    }
 
     #[test]
     fn function_keys_map_to_their_windows_codes() {
