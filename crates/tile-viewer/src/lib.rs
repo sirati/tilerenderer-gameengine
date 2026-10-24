@@ -12,6 +12,7 @@ mod render_worker;
 mod atlas_reservation;
 mod thread_start;
 mod constraints;
+mod pointer_thread;
 pub mod cursor;
 mod system_cursor;
 pub mod fps;
@@ -1305,6 +1306,8 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         profile: profile::env_on("TILE_VIEWER_PROFILE").then(|| profile::Profile::new("viewer", Duration::from_secs(5))),
         received_seq: 0,
         constraints: constraints::Constraints::default(),
+        pointer_thread: None,
+        pointer_rate_at: None,
         feedback: looks::Feedback::from_env(),
         drawn_looks: Vec::new(),
         base_free: Vec::new(),
@@ -1627,6 +1630,11 @@ struct App {
     received_seq: u64,
     /// The display-independent pointer controller.
     constraints: constraints::Constraints,
+    /// The pointer's own thread (`pointer_thread`): samples the pointer on
+    /// a steady clock whatever this thread is doing.
+    pointer_thread: Option<pointer_thread::PointerThread>,
+    /// When its tick rate was last logged.
+    pointer_rate_at: Option<Instant>,
     /// The interaction looks drawn here (hover, pressed, selected), and
     /// those the last frame drew.
     feedback: looks::Feedback,
@@ -3033,6 +3041,48 @@ impl App {
         }
     }
 
+    /// Starts the pointer's own thread for `window`, at twice its display's
+    /// refresh rate.
+    fn start_pointer_thread(&mut self, window: &Window) {
+        let tick = pointer_thread::tick_for(window.current_monitor().and_then(|m| m.refresh_rate_millihertz()));
+        let feed = self.constraints.feed();
+        let init = self.config.native_thread_init;
+        let fed = feed.is_some();
+        let feed = feed.map(|feed| -> pointer_thread::Feed { feed });
+        match pointer_thread::PointerThread::spawn_with(tick, feed, Vec::new(), init) {
+            Ok(thread) => {
+                log::info!("viewer: pointer thread every {:.2} ms{}", tick.as_secs_f64() * 1000.0, if fed { ", reading the pointer off the main thread" } else { "" });
+                self.pointer_thread = Some(thread);
+            }
+            Err(error) => log::warn!("viewer: no pointer thread: {error}"),
+        }
+    }
+
+    /// The window may be on another display now: the pointer thread ticks
+    /// at twice its refresh rate.
+    fn retime_pointer_thread(&self) {
+        let (Some(thread), Some(gpu)) = (&self.pointer_thread, &self.gpu) else { return };
+        let tick = pointer_thread::tick_for(gpu.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()));
+        if tick != thread.tick() {
+            log::info!("viewer: pointer thread now every {:.2} ms", tick.as_secs_f64() * 1000.0);
+            thread.set_tick(tick);
+        }
+    }
+
+    /// Every 10 s while debug logging: how regularly the pointer thread
+    /// ticked (it must not follow the frames' timing).
+    fn log_pointer_rate(&mut self) {
+        let Some(thread) = &self.pointer_thread else { return };
+        let now = Instant::now();
+        let at = *self.pointer_rate_at.get_or_insert(now);
+        if now - at < Duration::from_secs(10) || !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
+        self.pointer_rate_at = Some(now);
+        let rate = thread.take_rate();
+        log::debug!("viewer: pointer thread: {} ticks, every {:.2?} on average, at most {:.2?}", rate.ticks, rate.mean, rate.max);
+    }
+
     /// The pointer moved: if the viewer draws the cursor, request a frame
     /// immediately. An explicit maximum rate still applies to its draw.
     fn pointer_moved(&mut self) {
@@ -3070,7 +3120,8 @@ impl App {
                 log::warn!("application icon: {error}");
             }
         }
-        self.constraints.attach(&window);
+        self.constraints.attach(&window, self.config.native_thread_init);
+        self.start_pointer_thread(&window);
         self.system_cursor_size = pointer_control::system_cursor_size(&window);
         log::info!("viewer: the system's cursor size is {} window pixels", self.system_cursor_size);
         let size = window.inner_size();
@@ -3948,6 +3999,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.retime_pointer_thread();
                 log::info!("viewer: the window's scale is now {scale_factor}");
                 if let Some(gpu) = &self.gpu {
                     self.system_cursor_size = pointer_control::system_cursor_size(&gpu.window);
@@ -3960,6 +4012,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.constraints.pointer_moved((position.x, position.y));
+                if let Some(thread) = &self.pointer_thread { thread.report(Some((position.x, position.y))); }
                 // (In the layout's pixels, the driver's.)
                 self.system_pointer = self.plan.map_or((position.x as i32, position.y as i32), |p| p.to_screen((position.x, position.y)));
                 // At the world's edge the system pointer moves the world
@@ -3972,7 +4025,11 @@ impl ApplicationHandler for App {
                 if !self.settings_preview.active() { self.pointer_moved(); }
             }
             WindowEvent::CursorEntered { .. } => self.pointer_inside = true,
-            WindowEvent::CursorLeft { .. } => self.pointer_inside = false,
+            WindowEvent::CursorLeft { .. } => {
+                self.pointer_inside = false;
+                if let Some(thread) = &self.pointer_thread { thread.report(None); }
+            }
+            WindowEvent::Moved(_) => self.retime_pointer_thread(),
             _ => {}
         }
         self.pointer_presentation.observe(&event);
@@ -4061,6 +4118,7 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.receive_worker();
+        self.log_pointer_rate();
         self.update_system_pointer(event_loop);
         if self.error.is_some() || self.stop.load(std::sync::atomic::Ordering::Acquire) {
             event_loop.exit();

@@ -17,7 +17,9 @@ pub struct Constraints {
 }
 
 impl Constraints {
-    pub fn attach(&mut self, window: &Arc<Window>) { self.control.attach(window.clone()); }
+    pub fn attach(&mut self, window: &Arc<Window>, thread_init: Option<fn()>) { self.control.attach(window.clone(), thread_init); }
+    /// See [`pointer_control::Controller::feed`].
+    pub fn feed(&self) -> Option<pointer_control::Feed> { self.control.feed() }
 
     /// Capture owns the pointer instead of layout regions. Returns whether
     /// the display can keep it locked, rather than merely inside the window.
