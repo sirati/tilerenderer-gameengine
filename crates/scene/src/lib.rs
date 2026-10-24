@@ -548,6 +548,8 @@ pub struct Interface {
     /// the cursor tile by tile. Other commands (bombard, rebase, airlift,
     /// ...) keep the cursor at the pointer.
     pub snap_to_tiles: bool,
+    /// A build queue shown that the player may reorder by dragging.
+    pub build_queue: Option<BuildQueue>,
 }
 
 impl Interface {
@@ -1278,6 +1280,41 @@ pub enum Input {
     /// The renderer's user has read queued popup `serial`
     /// (`Interface::queued`): the driver stops sending it.
     CloseQueued { serial: u64 },
+    /// Move entry `from` of the build queue `Interface::build_queue` shows
+    /// (as of its `stamp`; a driver drops the edit for another) before
+    /// entry `to` (its length: to the end), or with `to` =
+    /// [`BUILD_QUEUE_CURRENT`] onto what is built now (built now instead,
+    /// what was built going to the front of the queue).
+    BuildQueue { stamp: u32, from: u8, to: u8 },
+}
+
+/// [`Input::BuildQueue`]'s `to` for the current build.
+pub const BUILD_QUEUE_CURRENT: u8 = u8::MAX;
+
+/// A build queue a renderer may let the player reorder by dragging
+/// ([`Input::BuildQueue`]): a city screen's queued orders where the screen
+/// lists them, and what the city builds now.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BuildQueue {
+    /// The queue as it is now (an edit names it).
+    pub stamp: u32,
+    /// What is built now (x, y, w, h), a place to drop an entry on.
+    pub current: [i32; 4],
+    /// The entries shown, in queue order.
+    pub rows: Vec<BuildQueueRow>,
+}
+
+/// An entry of a [`BuildQueue`] where it is shown.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BuildQueueRow {
+    /// Its place in the queue (0: built next).
+    pub slot: u8,
+    /// The row (x, y, w, h) and, at its left, the handle it is dragged by:
+    /// also an interactable of its own, `grip_id` (a button), for pointing
+    /// aids.
+    pub rect: [i32; 4],
+    pub grip: [i32; 4],
+    pub grip_id: u64,
 }
 
 /// How near the window's edge the pointer counts as at it ([`Input::Edge`]).
