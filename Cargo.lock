@@ -439,6 +439,7 @@ version = "0.1.0"
 dependencies = [
  "civ3-assets",
  "civ3-sys",
+ "civ3-ui",
  "civ3r-native",
  "civ3r-sync",
  "env_logger",
@@ -470,6 +471,14 @@ dependencies = [
  "inproc",
  "log",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "civ3-ui"
+version = "0.1.0"
+dependencies = [
+ "jgl",
+ "log",
 ]
 
 [[package]]
