@@ -4144,7 +4144,7 @@ impl App {
         // shows there (as `pointer_hidden`): never both.
         let system_hidden = (captured && !self.machine.edge()) || facts.snap_mode || self.unlock_pending.is_some() || self.constraints.moving() || snapping;
         let snap = if cameras.len() < tile_render::MAX_VIEWS && system_hidden {
-            self.snap.compose_with_busy(&self.compiled, &self.cursor_art, overlay, overlay + 1 + composed.top.len() as u32, cursor_scale, window, busy_status)
+            self.snap.compose_with_busy(&self.compiled, &self.cursor_art, overlay, overlay + 1 + composed.top.len() as u32, cursor_scale, window, busy_status, self.cursor_art.shown(self.cursor))
         } else {
             cursor::Composed::default()
         };

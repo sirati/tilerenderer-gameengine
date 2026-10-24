@@ -772,6 +772,13 @@ impl Snapper {
         self.rested
     }
 
+    /// The pointer rests on a driver's element and the driver has it there
+    /// (not in flight, not on an attractor): what the driver shows as its
+    /// pointer now is the pointer for that element.
+    pub fn resting_on_driver(&self) -> bool {
+        self.holds_pointer() && self.arrived && self.snapped.is_some_and(|s| !s.capture)
+    }
+
     /// Where the pointer parked (landed after the mode), once.
     pub fn take_parked(&mut self) -> Option<Point> {
         self.parked.take()
@@ -1837,6 +1844,23 @@ impl SnapInput {
         self.compose(compiled, overlay, overlay + 1, crate::cursor::Scale::default(), (0, 0)).sprites
     }
 
+    /// The snapping pointer's art: the driver's own pointer (`driver`, a
+    /// sprite set with pixels) while the pointer rests on one of its
+    /// elements and the driver has it there, so that it tells what a click
+    /// does as the driver's pointer would (the game's Civilopedia book over
+    /// an entry a click opens the Civilopedia on); else, and for a system
+    /// icon the viewer has no art of, the driver's arrow (else the
+    /// viewer's own pointer). In flight it is the arrow: the driver's
+    /// pointer is still the one for the element left.
+    pub fn pointer_set(&self, compiled: &render_desc::Compiled, driver: scene::Cursor) -> Option<tile_render::SpriteSetId> {
+        let arrow = || [ARROW_SPRITE, POINTER_SPRITE, crate::CURSOR_SPRITE].iter().find_map(|n| compiled.set(n).map(|(s, _)| s));
+        let own = match driver {
+            scene::Cursor::Sprite(raw) if self.snapper.resting_on_driver() => Some(tile_render::SpriteSetId::from_raw(raw)),
+            _ => None,
+        };
+        own.filter(|&s| crate::cursor::SetArt::of(compiled, s).is_some()).or_else(arrow)
+    }
+
     /// The pointers at the cursor's size `scale`, as the viewer's cursor is
     /// drawn (`crate::cursor::compose`: the same whole canvas pixels and hot
     /// spot): 1:1 in camera `overlay`, else each in a camera of its own,
@@ -1844,16 +1868,23 @@ impl SnapInput {
     /// as long as the renderer draws that many views. `window`: the
     /// canvas.
     pub fn compose(&self, compiled: &render_desc::Compiled, overlay: u32, next: u32, scale: crate::cursor::Scale, window: (u32, u32)) -> crate::cursor::Composed {
-        self.compose_with_busy(compiled, &crate::cursor::Art::default(), overlay, next, scale, window, crate::host_status::Responsiveness::Answering)
+        self.compose_with_busy(compiled, &crate::cursor::Art::default(), overlay, next, scale, window, crate::host_status::Responsiveness::Answering, scene::Cursor::Default)
     }
 
-    pub fn compose_with_busy(&self, compiled: &render_desc::Compiled, pixels: &crate::cursor::Art, overlay: u32, next: u32, scale: crate::cursor::Scale, window: (u32, u32), status: crate::host_status::Responsiveness) -> crate::cursor::Composed {
+    /// As [`SnapInput::compose`], with the busy badge for `status` on the
+    /// pointer, and `driver` the pointer the driver shows (as
+    /// `crate::cursor::Art::shown` makes it): while the pointer rests on
+    /// one of the driver's elements, that pointer's art
+    /// ([`SnapInput::pointer_set`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compose_with_busy(&self, compiled: &render_desc::Compiled, pixels: &crate::cursor::Art, overlay: u32, next: u32, scale: crate::cursor::Scale, window: (u32, u32), status: crate::host_status::Responsiveness, driver: scene::Cursor) -> crate::cursor::Composed {
         let mut out = crate::cursor::Composed::default();
         let Some(pointer) = self.snapper.pointer() else { return out };
         let set = |names: &[&str]| names.iter().find_map(|n| compiled.set(n).map(|(s, _)| s));
+        let pointer_set = self.pointer_set(compiled, driver);
         // (Under the pointer it would not be seen.)
         let ghost = self.snapper.ghost().filter(|g| (g.0 - pointer.0).hypot(g.1 - pointer.1) >= 2.0).map(|g| (set(&[ARROW_GHOST_SPRITE, GHOST_SPRITE]), g));
-        let solid = Some((set(&[ARROW_SPRITE, POINTER_SPRITE, crate::CURSOR_SPRITE]), pointer));
+        let solid = Some((pointer_set, pointer));
         // Under them, the attractors: the translucent crosshair (a click
         // there goes back into the game), in each view's middle.
         let prefixed = |prefix: &str| compiled.sets_with_prefix(prefix).map(|(_, s)| s).next();
@@ -1880,7 +1911,7 @@ impl SnapInput {
         }
         if status != crate::host_status::Responsiveness::Answering {
             // (Placed on the solid pointer as on the system cursor.)
-            let badge = set(&[ARROW_SPRITE, POINTER_SPRITE, crate::CURSOR_SPRITE])
+            let badge = pointer_set
                 .and_then(|set| crate::cursor::SetArt::of(compiled, set))
                 .and_then(|art| pixels.badge_for(art.set.raw(), art.size, art.hotspot));
             if let Some(badge) = badge {
