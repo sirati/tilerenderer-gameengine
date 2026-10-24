@@ -4,7 +4,7 @@
 //! Nothing here knows which game it is showing.
 
 mod sprite_lifetimes;
-mod unit_motions;
+mod piece_motions;
 mod scene_prefix;
 mod scene_snapshot;
 mod ui_submission;
@@ -30,7 +30,7 @@ mod presentation;
 pub mod snap;
 pub mod altrec;
 pub mod smooth_menus;
-pub mod build_queue;
+pub mod extension;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
@@ -44,6 +44,17 @@ use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Fullscreen, Window, WindowId};
+
+/// The shader module the viewer draws with: `viewer-shaders` (the tile
+/// renderer's, the glass lens's and the selection marker's shaders, one
+/// SPIR-V module), with what the renderer draws from it.
+pub const SHADERS: tile_render::Shaders = tile_render::Shaders::new(viewer_spirv::SPIRV, viewer_spirv::SPIRV_FALLBACK)
+    .with_effect(glass_lens::effect)
+    .with_painter(viewer_spirv::PAINTER);
+
+/// The CPU oracle of a renderer drawing with [`SHADERS`] (the glass lens's
+/// and the selection marker's).
+pub const ORACLE: tile_render::reference::Oracle<'static> = tile_render::reference::Oracle { effect: Some(&glass_lens::ORACLE), painter: Some(&marker::PAINTER) };
 
 #[derive(Clone, Debug)]
 pub struct ViewerConfig {
@@ -67,13 +78,23 @@ pub struct ViewerConfig {
     pub native_thread_init: Option<fn()>,
     /// Where the Alt mode's interactions are recorded while
     /// `viewer_settings::Input::record_alt_mode` is on (`altrec`): the
-    /// folder of the game's log. None: not recorded.
+    /// folder of the driver's log. None: not recorded.
     pub recording_dir: Option<std::path::PathBuf>,
+    /// A file to write once a complete title menu was presented (a
+    /// launcher waits for it); none: nothing written.
+    pub startup_ready_file: Option<std::path::PathBuf>,
+    /// The desktop scale a native viewer's launcher gave the game (it
+    /// sizes the game too), reported to the driver instead of the window's.
+    pub launcher_scale: Option<f64>,
+    /// Where the user's settings are kept (`viewer_settings::Settings::load`).
+    pub settings_path: std::path::PathBuf,
+    /// Behaviour plugged in by crates built on the viewer (`extension`).
+    pub extensions: extension::Extensions,
 }
 
 impl Default for ViewerConfig {
     fn default() -> Self {
-        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None }
+        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None, startup_ready_file: None, launcher_scale: None, settings_path: viewer_settings::Settings::default_path_for("tile-viewer", "TILE_VIEWER_SETTINGS"), extensions: extension::Extensions::default() }
     }
 }
 
@@ -112,12 +133,12 @@ pub struct Assets(Arc<Shared>);
 /// were made for, so those of a replaced whole are dropped as before.
 struct Shared {
     /// The latest whole description, until the viewer has uploaded it.
-    whole: civ3r_sync::Latest<Whole>,
+    whole: handoff::Latest<Whole>,
     /// Epochs handed out, and the epoch of the whole last published.
     epochs: AtomicU64,
     base: AtomicU64,
     /// Growths and reservations in the order given.
-    added: civ3r_sync::Mailbox<Added>,
+    added: handoff::Mailbox<Added>,
     /// The latest generation given (whole or grown).
     latest: AtomicU64,
     /// Highest generation committed to the drawing renderer. CPU art
@@ -150,10 +171,10 @@ impl Assets {
 
     fn with_whole(compiled: Option<Arc<Compiled>>, generation: u64) -> Self {
         let shared = Shared {
-            whole: civ3r_sync::Latest::new(),
+            whole: handoff::Latest::new(),
             epochs: AtomicU64::new(0),
             base: AtomicU64::new(0),
-            added: civ3r_sync::Mailbox::new(),
+            added: handoff::Mailbox::new(),
             latest: AtomicU64::new(0),
             uploaded: AtomicU64::new(0),
         };
@@ -617,7 +638,7 @@ pub fn scene_cells_changed(compiled: &Compiled, scene: &Scene, world: &mut TileW
 }
 
 /// Moves what `motion` names in `scene` by `by` (world pixels, full size),
-/// as the viewer moves a unit along its walk (`unit_motions`): for
+/// as the viewer moves a piece along its walk (`piece_motions`): for
 /// comparing pictures of a walk.
 pub fn move_motion(scene: &mut Scene, motion: &scene::Motion, by: (i32, i32)) {
     for s in scene.sprites.iter_mut().take(motion.sprites.1 as usize).skip(motion.sprites.0 as usize) {
@@ -747,7 +768,7 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
                 cull: v.cull,
                 origin: v.origin,
                 target_clip: None,
-                lens: None,
+                effect: None,
                 cells: !v.interface_only,
                 screen_shift: (0, 0),
                 zoomed_art: false,
@@ -803,20 +824,20 @@ pub fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale
     marker_sprites_sized(compiled, markers, downscale, time, bobbing, 1.0)
 }
 
-/// The colour of the arrow's metal (as `civ3.toml`'s `viewer_arrow`) and of
+/// The colour of the arrow's metal (as the game description's `viewer_arrow`) and of
 /// its shadow at rest.
 const ARROW_RGBA: [u8; 4] = [232, 183, 87, 255];
 const ARROW_SHADOW_RGBA: [u8; 4] = [32, 23, 14, 255];
 /// The arrow's tip above the point it marks, and its shadow's centre from
-/// it, in full-size world pixels (as `civ3.toml` places the 1:1 art).
+/// it, in full-size world pixels (as the game description places the 1:1 art).
 const ARROW_TIP: (i32, i32) = (0, -68);
 const ARROW_SHADOW_CENTRE: (i32, i32) = (8, 4);
 
 /// [`marker_sprites`] with the arrow `size` times as large as its 1:1 art.
 /// Larger, it is painted at the resolution of each view showing it
-/// (`tile_render::Shape::Arrow`) rather than scaled from its art: crisp at
+/// (`marker::arrow`) rather than scaled from its art: crisp at
 /// any world scale and in the zoom box. Its tip stays where the 1:1 arrow's
-/// is, above the unit; it bobs `size` times as far, its shadow (on the
+/// is, above the piece; it bobs `size` times as far, its shadow (on the
 /// ground, as wide as it) shaped likewise.
 pub fn marker_sprites_sized(compiled: &Compiled, markers: &[layout::Marker], downscale: u32, time: Duration, bobbing: bool, size: f32) -> Vec<tile_render::PlacedSprite> {
     if size > 1.0 {
@@ -828,9 +849,8 @@ pub fn marker_sprites_sized(compiled: &Compiled, markers: &[layout::Marker], dow
             let sprite = |shape| tile_render::PlacedSprite { category: viewer_settings::clean_map::UNITS, shape: Some(shape),
                 ..tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, x * n, y * n) };
             vec![
-                sprite(tile_render::Shape::ArrowShadow { size: sixteenths, bob, rgba: ARROW_SHADOW_RGBA,
-                    centre: ((ARROW_SHADOW_CENTRE.0 as f32 * size).round() as i32, ARROW_SHADOW_CENTRE.1) }),
-                sprite(tile_render::Shape::Arrow { size: sixteenths, tip: ARROW_TIP, bob, rgba: ARROW_RGBA }),
+                sprite(marker::shadow(sixteenths, ((ARROW_SHADOW_CENTRE.0 as f32 * size).round() as i32, ARROW_SHADOW_CENTRE.1), bob, ARROW_SHADOW_RGBA)),
+                sprite(marker::arrow(sixteenths, ARROW_TIP, bob, ARROW_RGBA)),
             ]
         }).collect();
     }
@@ -941,7 +961,7 @@ mod accessibility_arrow_tests {
         // moving the arrow invalidates its world, a static/absent one does
         // not create further full redraws as the animation clock advances.
         let gpu = tile_render::Headless::new().unwrap();
-        let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
         renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
         let mut world = compiled.world(1, 1, false, false);
         world.color = tile_render::ColorModel::Quantized { bits: 5 };
@@ -965,9 +985,9 @@ mod accessibility_arrow_tests {
     /// `sprites` alone (its shadow left out) at `zoom` around (100, 230).
     fn arrow_extent(sprites: &[tile_render::PlacedSprite], zoom: u32) -> (u32, u32, u32, u32) {
         let mut world = tile_render::TileWorld::new(tile_render::Grid { cols: 1, rows: 1, layout: tile_render::Layout::Orthogonal, step: (32, 32), wrap_x: false, wrap_y: false }, Default::default());
-        world.free = sprites.iter().filter(|s| !matches!(s.shape, Some(tile_render::Shape::ArrowShadow { .. }))).cloned().collect();
+        world.free = sprites.iter().filter(|s| !marker::is_shadow(s.shape)).cloned().collect();
         let camera = Camera { zoom: (zoom, 1), zoomed_art: true, ..Camera::new((200 * zoom, 260 * zoom)) };
-        let image = tile_render::reference::render(&world, &tile_render::AtlasBuilder::new(16).finish(), &camera, 0, [0, 0, 0, 255]);
+        let image = crate::ORACLE.render(&world, &tile_render::AtlasBuilder::new(16).finish(), &camera, 0, [0, 0, 0, 255]);
         let lit: Vec<(u32, u32)> = (0..image.height).flat_map(|y| (0..image.width).map(move |x| (x, y))).filter(|&(x, y)| image.get(x, y) != [0, 0, 0, 255]).collect();
         let xs = lit.iter().map(|p| p.0);
         let ys = lit.iter().map(|p| p.1);
@@ -998,14 +1018,14 @@ mod accessibility_arrow_tests {
         for size in [1.5f32, 2.0, 2.5, 3.0] {
             let sprites = marker_sprites_sized(&compiled, &m, 1, Duration::ZERO, false, size);
             assert_eq!(sprites.len(), 2);
-            assert!(matches!(sprites[1].shape, Some(tile_render::Shape::Arrow { .. })), "the arrow over its shadow");
+            assert!(marker::is_arrow(sprites[1].shape), "the arrow over its shadow");
             for zoom in [1, 2, 3] {
                 let (l, t, r, b) = arrow_extent(&sprites, zoom);
                 let e = size * zoom as f32;
                 assert!(b.abs_diff(tip * zoom) <= 1 + zoom, "{size}x at {zoom}x: tip at {b}, not {}", tip * zoom);
                 assert!(((b - t) as f32 - 41.0 * e).abs() <= 2.0 + e, "{size}x at {zoom}x: {} high", b - t);
                 assert!(((r - l) as f32 - 26.0 * e).abs() <= 2.0 + e, "{size}x at {zoom}x: {} wide", r - l);
-                assert!((((l + r) as f32 / 2.0) - 100.0 * zoom as f32 - 0.25 * e).abs() <= 1.0 + e / 2.0, "{size}x at {zoom}x: centred over the unit");
+                assert!((((l + r) as f32 / 2.0) - 100.0 * zoom as f32 - 0.25 * e).abs() <= 1.0 + e / 2.0, "{size}x at {zoom}x: centred over the piece");
             }
             // Bobbing `size` times as far, its shadow on the ground.
             let (low, high) = (Duration::from_millis(325), Duration::from_millis(975));
@@ -1160,10 +1180,10 @@ fn named_screen_content(compiled: &Compiled, scene: &Scene) -> Option<[i32; 4]> 
             return Some([v.origin.0, v.origin.1, v.viewport.0 as i32, v.viewport.1 as i32]);
         }
     }
-    let city = scene.interface.screen.as_deref() == Some("City");
+    let site = scene.interface.screen_role == scene::ScreenRole::Site;
     let parts = [scene.interface.roaming, scene.interface.capture_hint, scene.interface.popup];
     let rects = scene.views.iter().filter(|v| v.view.interface_only && !parts.contains(&Some(v.id)) && !scene.interface.is_popup_view(v.id)
-        && if city { v.view.camera_x == 0 && v.view.camera_y == 0 } else { v.view.menu })
+        && if site { v.view.camera_x == 0 && v.view.camera_y == 0 } else { v.view.menu })
         .flat_map(|v| v.overlay.iter().filter(|s| s.glyph.is_none()).filter_map(|s| sprite_rect(compiled, s)));
     let [l, t, r, b] = rects.map(|[x, y, w, h]| [x, y, x + w, y + h])
         .reduce(|a, r| [a[0].min(r[0]), a[1].min(r[1]), a[2].max(r[2]), a[3].max(r[3])])?;
@@ -1202,7 +1222,7 @@ pub fn render_offscreen(
     size: (u32, u32),
     config: &ViewerConfig,
 ) -> RgbaImage {
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world(compiled, scene));
     apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
@@ -1220,7 +1240,7 @@ pub fn render_arranged(
     config: &ViewerConfig,
 ) -> RgbaImage {
     let frame = arranged_frame(compiled, scene, size, config);
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world_for(compiled, scene, &frame.view_cameras));
     apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
@@ -1312,7 +1332,7 @@ fn render_planned_inner(
     arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
     // (In the format windows mostly have.)
     let format = wgpu::TextureFormat::Bgra8Unorm;
-    let mut renderer = TileRenderer::new(&gpu.device, format);
+    let mut renderer = TileRenderer::new(&gpu.device, format, crate::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     let mut world = scene_world_arranged(compiled, scene, &frame.view_cameras, &arranged.overlay_cameras);
     let mut cameras = frame.cameras.clone();
@@ -1420,6 +1440,8 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
     let (assets_version, whole) = assets.whole();
     let whole = whole.expect("a new description");
     let native_thread_init = config.native_thread_init;
+    let running_extensions = config.extensions.build();
+    let settings_path = config.settings_path.clone();
     let mut app = App {
         stop,
         config,
@@ -1432,7 +1454,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         shown_scene: Arc::new(Scene::default()),
         camera_arrival_reported: None,
         sprite_lifetimes: sprite_lifetimes::SpriteLifetimes::default(),
-        unit_motions: unit_motions::UnitMotions::default(),
+        piece_motions: piece_motions::PieceMotions::default(),
         pending_scene: None,
         future_metadata: None,
         drawable_scene: None,
@@ -1515,12 +1537,12 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         spans: Vec::new(),
         look_scene: Arc::new(looks::LookScene::default()),
         menu_scroll: smooth_menus::SmoothMenus::default(),
-        function_keys: function_keys::Controller::new(function_keys::journal_path(&viewer_settings::Settings::default_path())),
-        queue_drag: build_queue::BuildQueueDrag::default(),
+        function_keys: function_keys::Controller::new(function_keys::journal_path(&settings_path)),
+        extensions: running_extensions,
         host_closed: false,
     };
     // The arrangement to start with: the user's settings.
-    app.set_settings(load_settings());
+    app.set_settings(load_settings(&settings_path));
     app
 }
 
@@ -1631,10 +1653,9 @@ mod host_app {
     }
 }
 
-/// The settings saved at `viewer_settings::Settings::default_path()`; the
+/// The settings saved at `path` (`ViewerConfig::settings_path`); the
 /// defaults if there are none or they do not load (logged).
-fn load_settings() -> viewer_settings::Settings {
-    let path = viewer_settings::Settings::default_path();
+fn load_settings(path: &std::path::Path) -> viewer_settings::Settings {
     viewer_settings::Settings::load(&path).unwrap_or_else(|e| {
         log::warn!("viewer settings: {e}; using the defaults");
         viewer_settings::Settings::default()
@@ -1691,7 +1712,7 @@ struct App {
     shown_scene: Arc<Scene>,
     camera_arrival_reported: Option<u64>,
     sprite_lifetimes: sprite_lifetimes::SpriteLifetimes,
-    unit_motions: unit_motions::UnitMotions,
+    piece_motions: piece_motions::PieceMotions,
     /// One immutable future snapshot prevents later optional art generations
     /// from moving the adoption target. Display keeps coalescing newer work.
     pending_scene: Option<PendingScene>,
@@ -1761,7 +1782,7 @@ struct App {
     drawn_at: Option<std::time::Instant>,
     error: Option<ViewerError>,
     /// The viewer's own settings (resolution, layout, input): read from
-    /// `viewer_settings::Settings::default_path()` at start, replaced by those
+    /// `ViewerConfig::settings_path` at start, replaced by those
     /// the driver sends (`scene::Update::Settings`; the driver keeps and saves
     /// them, e.g. edited on its preferences screen).
     settings: viewer_settings::Settings,
@@ -1862,8 +1883,8 @@ struct App {
     /// F1-F12 kept from the system's shortcuts while the window is in
     /// front (`viewer_settings::Input::capture_function_keys`; macOS only).
     function_keys: function_keys::Controller,
-    /// Dragging a city's build queue entries (`build_queue`).
-    queue_drag: build_queue::BuildQueueDrag,
+    /// The extensions plugged in (`ViewerConfig::extensions`).
+    extensions: extension::Running,
     /// The host is ending and this viewer closes ([`App::close_for_host`]).
     host_closed: bool,
 }
@@ -2711,7 +2732,7 @@ mod preparation_gpu_tests {
     fn delayed_required_growth_does_not_activate_an_intermediate_whole() {
         let gpu = Headless::new().unwrap();
         let whole = compiled();
-        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
         active.set_atlas(&gpu.device, &gpu.queue, &whole.atlas);
         let old_room = active.atlas_room();
         let mut assets = ArtInbox::new(Assets::new(whole.clone()));
@@ -2745,7 +2766,7 @@ mod preparation_gpu_tests {
     fn tight_peak_limit_replays_directly_into_mandatory_final_capacity() {
         let gpu = Headless::new().unwrap();
         let whole = compiled();
-        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
         active.set_atlas(&gpu.device, &gpu.queue, &whole.atlas);
         let old_resident = active.atlas_resident_bytes();
         let desc = std::mem::size_of_val(&whole.atlas.sprites[0]) as u64;
@@ -2821,7 +2842,7 @@ mod cached_picture_tests {
         plan.present = Present { canvas: (640, 480), zoom: (2, 1), at: (0, 0), target: (1280, 960) };
         CachedPicture {
             plan,
-            copies: vec![ScreenCopy { source: [100, 80, 120, 100], at: (300, 180), zoom: (2, 1), lens: None }],
+            copies: vec![ScreenCopy { source: [100, 80, 120, 100], at: (300, 180), zoom: (2, 1), effect: None }],
             pixel_box: 1,
         }
     }
@@ -3006,16 +3027,17 @@ impl App {
 
     fn send(&mut self, input: Input) {
         let now = self.now();
-        // (Drags of the build queue's rows are the viewer's, Alt mode or not.)
-        let dragging = self.queue_drag.active();
-        if let Some(out) = self.queue_drag.route(&input, &self.shown_scene) {
+        // (What the extensions take is theirs, Alt mode or not: a drag of
+        // theirs, say.)
+        let dragging = self.extensions.active();
+        if let Some(out) = self.extensions.route(&input, &self.shown_scene) {
             for input in out {
                 frame_input(&mut self.preparing_inputs, &self.display, input);
             }
             if let Some(gpu) = &self.gpu { gpu.window.request_redraw(); }
             return;
         }
-        if dragging || self.queue_drag.active() {
+        if dragging || self.extensions.active() {
             if let Some(gpu) = &self.gpu { gpu.window.request_redraw(); }
         }
         // (Lists scrolled by the viewer: scroll input moves them, pointer
@@ -3217,7 +3239,7 @@ impl App {
     /// before it shows again (while still captured: on Wayland the place
     /// is a hint the release takes).
     fn apply_layout_requests(&mut self, event_loop: &ActiveEventLoop) {
-        for input in self.layout.take_unit_order_events() {
+        for input in self.layout.take_world_order_events() {
             self.send(input);
         }
         let grab = self.layout.take_grab();
@@ -3524,10 +3546,10 @@ impl App {
             }
         }
         // The desktop's scale (for the driver; not the pixel scale): the window's, or a native
-        // viewer's launcher's (`CIV3R_SCALE`, which sizes the game too; a
+        // viewer's launcher's (`ViewerConfig::launcher_scale`, which sizes the game too; a
         // viewer in a Wine program has its window in Wine's own pixels,
         // which Wine scales for the desktop itself).
-        let launcher = std::env::var("CIV3R_SCALE").ok().and_then(|s| s.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s >= 1.0);
+        let launcher = self.config.launcher_scale.filter(|s| s.is_finite() && *s >= 1.0);
         let desktop = if cfg!(windows) { scale } else { launcher.unwrap_or(scale) };
         let native = (window.0, window.1, (desktop * 1000.0).round() as u32);
         if native != self.reported_window {
@@ -3805,7 +3827,7 @@ impl App {
             self.map_drawn = true;
             log::info!("viewer: first map drawn (scene {})", scene.seq);
         }
-        startup_ready::presented(scene, true, scene.views.iter().filter(|view| view.view.interface_only)
+        startup_ready::presented(self.config.startup_ready_file.as_deref(), scene, true, scene.views.iter().filter(|view| view.view.interface_only)
             .flat_map(|view| &view.overlay).any(|sprite| sprite_rect(&self.compiled, sprite).is_some_and(|[_, _, width, height]| width > 0 && height > 0)));
     }
 
@@ -4031,7 +4053,7 @@ impl App {
         let replacements = self.feedback.replacements(&self.look_scene, now);
         let menu_was_scrolling = self.menu_scroll.running();
         let mut looks_changed = full || free_changed || looks_metadata_changed || self.feedback.drawn() != &self.drawn_looks[..]
-            || self.menu_scroll.running() || self.menu_scroll.patched() || scene.interface.build_queue.is_some();
+            || self.menu_scroll.running() || self.menu_scroll.patched() || self.extensions.draws(scene);
         if looks_changed {
             let compiled = &self.compiled;
             Arc::make_mut(self.world.as_mut().expect("built above")).free = looks::splice(&self.base_free, &self.spans, &replacements, |s, camera| placed_sprite(compiled, s, Some(camera), None));
@@ -4052,11 +4074,11 @@ impl App {
             frame_input(&mut self.preparing_inputs, &self.display, input);
         }
         self.snap.set_list_entries(self.menu_scroll.shown_entries());
-        // The build queue's handles, and a row being dragged (on the
-        // drawing as it is now, from the driver's: rebuilt every frame).
-        if scene.interface.build_queue.is_some() {
-            if let Some(queued) = self.queue_drag.draw(scene, &self.world.as_ref().expect("built above").free, |s| placed_rect(&self.compiled, s)) {
-                Arc::make_mut(self.world.as_mut().expect("built above")).free = queued;
+        // What the extensions draw over the interface (on the drawing as
+        // it is now, from the driver's: rebuilt every frame).
+        if self.extensions.draws(scene) {
+            if let Some(drawn) = self.extensions.draw(scene, &self.world.as_ref().expect("built above").free, &|s| placed_rect(&self.compiled, s)) {
+                Arc::make_mut(self.world.as_mut().expect("built above")).free = drawn;
                 looks_changed = true;
             }
         }
@@ -4073,24 +4095,24 @@ impl App {
                 }
             }
         }
-        // Units sliding to the next tile (`unit_motions`), where this
+        // Pieces sliding to the next tile (`piece_motions`), where this
         // frame's time has them: the driver tells each slide once.
-        if let Some(offsets) = self.unit_motions.offsets(scene, started, full || cells_changed || free_changed || looks_changed, |key| self.display.walk(key)) {
+        if let Some(offsets) = self.piece_motions.offsets(scene, started, full || cells_changed || free_changed || looks_changed, |key| self.display.walk(key)) {
             if !offsets.is_empty() {
-                unit_motions::apply(Arc::make_mut(self.world.as_mut().expect("built above")), scene, &offsets);
+                piece_motions::apply(Arc::make_mut(self.world.as_mut().expect("built above")), scene, &offsets);
                 looks_changed = true;
                 // (A frame-timing trace of the slides: `TILE_VIEWER_MOTION_TRACE=1`.)
                 static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| profile::env_on("TILE_VIEWER_MOTION_TRACE"));
                 if *TRACE {
-                    // Each moved unit: its key and where it is drawn (anchor + offset).
-                    let at: Vec<_> = scene.motions.iter().filter_map(|m| self.unit_motions.moved(m.key).map(|o| (m.key, m.anchor.0 + o.0, m.anchor.1 + o.1))).collect();
-                    log::info!("viewer: motion at {:.1} ms (scene {}): units at {at:?}", started.duration_since(self.started).as_secs_f64() * 1000.0, scene.seq);
+                    // Each moved piece: its key and where it is drawn (anchor + offset).
+                    let at: Vec<_> = scene.motions.iter().filter_map(|m| self.piece_motions.moved(m.key).map(|o| (m.key, m.anchor.0 + o.0, m.anchor.1 + o.1))).collect();
+                    log::info!("viewer: motion at {:.1} ms (scene {}): pieces at {at:?}", started.duration_since(self.started).as_secs_f64() * 1000.0, scene.seq);
                 }
             }
         }
         // The viewer's markers on top of the world, for this frame only.
-        // (The arrow over a unit on its way goes with it, on the same clock.)
-        let focus = self.unit_motions.focus_at(scene, world_downscale(scene));
+        // (The arrow over a piece on its way goes with it, on the same clock.)
+        let focus = self.piece_motions.focus_at(scene, world_downscale(scene));
         for m in &mut arranged.markers {
             if let (layout::Marker::Focus(at), Some(f)) = (m, focus) { *at = f; }
         }
@@ -4439,7 +4461,7 @@ impl ApplicationHandler for App {
         if matches!(event, WindowEvent::Focused(_) | WindowEvent::Occluded(_)) { self.sync_function_keys(); }
         if matches!(event, WindowEvent::Focused(false) | WindowEvent::Occluded(true)) {
             self.menu_scroll.focus_lost();
-            self.queue_drag.cancel();
+            self.extensions.cancel();
             for input in self.snap.focus_lost(&mut self.layout) {
                 self.send(input);
             }
@@ -5035,5 +5057,16 @@ mod rejected_snapshot_recovery_tests {
         assert_eq!(adopted.changes.cells, [(0, 2)]);
         assert_eq!(shown.layers[0].values.as_ptr(), cells);
         assert_eq!(*shown, *display.scene());
+    }
+}
+
+/// The role a test's screen name stands for: "Site" a site's screen,
+/// "Menu" the driver's menu (the viewer itself never reads names).
+#[cfg(test)]
+pub(crate) fn screen_role_for_test(name: &str) -> scene::ScreenRole {
+    match name {
+        "Site" => scene::ScreenRole::Site,
+        "Menu" => scene::ScreenRole::Menu,
+        _ => scene::ScreenRole::Other,
     }
 }

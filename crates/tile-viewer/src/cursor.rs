@@ -257,7 +257,7 @@ pub fn busy_effect(status: crate::host_status::Responsiveness, special: bool) ->
 }
 
 /// The busy badge's frames: the small upright hourglass whose sand drains
-/// and which flips over once a cycle (`assets/civ3/loading-cursor.toml`,
+/// and which flips over once a cycle (the game's loading-cursor description,
 /// render-desc's `hourglass:` art; frame `k` shows at step `k` of
 /// `scene::loading_cursor`). Pixel art at the cursor art's scale: the
 /// system cursor's image and the viewer's drawing scale it as the pointer.
@@ -583,7 +583,7 @@ fn gcd(a: u32, b: u32) -> u32 {
 }
 
 /// The centre of the map tile whose diamond holds world pixel `p` on a
-/// staggered grid with half-tile `step` (Civ III: tile (x, y), x + y even,
+/// staggered grid with half-tile `step` (e.g. tile (x, y), x + y even,
 /// its 128×64 box at (64·x, 32·y), its centre at (64·x + 64, 32·y + 32)),
 /// or of the cell holding it on an orthogonal grid.
 pub fn tile_centre(p: (i32, i32), step: (u32, u32), staggered: bool) -> (i32, i32) {
@@ -751,7 +751,7 @@ pub struct Facts {
 }
 
 /// Whether `scene` shows more than the driver's plain map: no world (the
-/// title and setup screens), a named screen (an advisor, Preferences), the
+/// title and setup screens), a named screen (a report screen, Preferences), the
 /// Load Scenario screen with its preview beside it, a popup, menus, or
 /// menus fitted to the window. The free pointer is then not mirrored in any
 /// view ([`Facts::interface_open`]): what is under it is the interface, not
@@ -1055,7 +1055,7 @@ pub struct Latency {
     /// When the last sample was taken.
     pub last: Option<Instant>,
     /// Sent by the GPU's completion callbacks, whichever thread runs them.
-    pub done: std::sync::Arc<civ3r_sync::Mailbox<f64>>,
+    pub done: std::sync::Arc<handoff::Mailbox<f64>>,
 }
 
 impl std::fmt::Debug for Latency {
@@ -1560,7 +1560,7 @@ mod tests {
 
     #[test]
     fn tile_centres_are_the_games_diamonds_at_every_world_zoom() {
-        // Civ III: tile (x, y), x + y even, its centre at (64x + 64, 32y + 32).
+        // The game's grid: tile (x, y), x + y even, its centre at (64x + 64, 32y + 32).
         let game = |(wx, wy): (i32, i32)| -> (i32, i32) {
             let mut best = (i64::MAX, (0, 0));
             for y in -2..40 {
@@ -1693,8 +1693,8 @@ mod busy_tests {
             cell = [32, 32]
             anchor = [-16, -16]
             group = "Viewer@command"
-            {}"#, include_str!("../../../assets/civ3/loading-cursor.toml"));
-        assert!(!text.contains("Cursor.flc"), "never the unit-selection ring");
+            {}"#, include_str!("../../../assets/viewer/loading-cursor.toml"));
+        assert!(!text.contains("Cursor.flc"), "never the piece-selection ring");
         let desc = render_desc::Description::parse(&text).unwrap();
         // (The arrow is generated; only the hourglass goes to the loader.)
         desc.compile(&Hourglass { clear }, 256).unwrap()

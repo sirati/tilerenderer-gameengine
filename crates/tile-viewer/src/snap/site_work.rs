@@ -2,13 +2,13 @@ use super::*;
 use scene::{FreeSprite, Scene, View, ViewState};
 
 #[test]
-fn city_worked_tile_alt_target_clicks_the_same_native_tile_across_splits_and_scales() {
+fn site_worked_tile_alt_target_clicks_the_same_native_tile_across_splits_and_scales() {
     let item = Interactable { region: None, alt_right_click: false, rect: [1056, 460, 64, 32], anchor: Some([1088, 476]),
         kind: InteractableKind::Button, id: 0x740C34_0F000002 };
     let scene = Scene {
         screen_size: (1920, 1080),
         shape: scene::WorldShape { cols: 40, rows: 30, wrap_x: true, wrap_y: false },
-        interface: scene::Interface { screen: Some("City".into()), ..Default::default() },
+        interface: scene::Interface { screen: Some("Site".into()), screen_role: scene::ScreenRole::Site, ..Default::default() },
         views: vec![
             ViewState { id: 0, view: View { interface_only: true, camera_x: 9999, camera_y: 9999, ..Default::default() }, overlay: vec![] },
             ViewState { id: 1, view: View { camera_x: 192, camera_y: 182, origin: (448, 306), viewport: (1024, 320), ..Default::default() }, overlay: vec![] },
@@ -42,8 +42,8 @@ fn city_worked_tile_alt_target_clicks_the_same_native_tile_across_splits_and_sca
                 let input = to_input(action, &layout).unwrap();
                 let Input::MouseButton { button: Button::Left, down: true, x, y } = input else { panic!("worked tile became a world-camera action: {input:?}") };
                 assert!((x - 1088).abs() <= 1 && (y - 476).abs() <= 1,
-                    "{split:?}, pixels {pixel_scale}, frame {frame_scale}: native city point {:?}", (x, y));
-                // Bridge's city camera inverse restores native game camera
+                    "{split:?}, pixels {pixel_scale}, frame {frame_scale}: native site point {:?}", (x, y));
+                // The driver's site camera inverse restores native game camera
                 // coordinates: tile(12,10) centre is (832,352) at camera0.
                 assert!((x - 256 - 832).abs() <= 1 && (y - 124 - 352).abs() <= 1);
             }

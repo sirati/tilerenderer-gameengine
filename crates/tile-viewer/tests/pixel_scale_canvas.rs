@@ -48,7 +48,7 @@ fn every_pixel_scale_renders_the_window_divided_by_it() {
     }
 }
 
-/// A Civ III-like world: RGB555, two passes (terrain and a translucent
+/// A world like the game's: RGB555, two passes (terrain and a translucent
 /// one) of 64×32 cells, enough to cover a 4K canvas.
 fn world() -> (tile_render::Atlas, TileWorld) {
     let mut atlas = tile_render::AtlasBuilder::new(512);
@@ -78,7 +78,7 @@ fn world() -> (tile_render::Atlas, TileWorld) {
 fn gpu_renders_the_canvas_not_the_window() {
     let gpu = Headless::new().expect("GPU");
     let (atlas, world) = world();
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, tile_viewer::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &atlas);
     renderer.set_world(&gpu.device, &world);
     let timing = renderer.enable_timing(&gpu.device, &gpu.queue);
@@ -174,7 +174,7 @@ fn gpu_confirmation_costs_a_panel_not_a_frame() {
     let gpu = Headless::new().expect("GPU");
     let (atlas, mut world) = world();
     world.fonts = compiled.fonts.iter().map(|(_, f)| f.clone()).collect();
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, tile_viewer::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &atlas);
     renderer.set_world(&gpu.device, &world);
     let timing = renderer.enable_timing(&gpu.device, &gpu.queue);

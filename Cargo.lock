@@ -423,8 +423,8 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 name = "civ3-assets"
 version = "0.1.0"
 dependencies = [
- "civ3r-sync",
  "gdi-text",
+ "handoff",
  "image",
  "log",
  "render-desc",
@@ -442,9 +442,9 @@ dependencies = [
  "civ3-sys",
  "civ3-ui",
  "civ3r-native",
- "civ3r-sync",
  "env_logger",
  "gdi-text",
+ "handoff",
  "image",
  "inproc",
  "jgl",
@@ -455,6 +455,7 @@ dependencies = [
  "render-errors",
  "scene",
  "thiserror 2.0.21",
+ "tile-game",
  "tile-render",
  "tile-viewer",
  "tokio",
@@ -471,8 +472,8 @@ name = "civ3-sys"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "civ3r-sync",
  "gdi-text",
+ "handoff",
  "inproc",
  "log",
  "thiserror 2.0.21",
@@ -484,6 +485,11 @@ version = "0.1.0"
 dependencies = [
  "jgl",
  "log",
+ "menu",
+ "scene",
+ "tile-game",
+ "tile-viewer",
+ "viewer-settings",
 ]
 
 [[package]]
@@ -499,6 +505,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "tile-render",
+ "viewer-spirv",
  "wgpu",
  "winit",
 ]
@@ -510,8 +517,9 @@ dependencies = [
  "application-icon",
  "bytemuck",
  "civ3-assets",
- "civ3r-sync",
+ "civ3-ui",
  "env_logger",
+ "handoff",
  "log",
  "render-desc",
  "render-errors",
@@ -530,22 +538,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "civ3r-sync"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "crossbeam-channel",
-]
-
-[[package]]
 name = "civ3r-viewer"
 version = "0.1.0"
 dependencies = [
  "application-icon",
  "civ3-assets",
- "civ3r-sync",
+ "civ3-ui",
  "crossbeam-channel",
  "env_logger",
+ "handoff",
  "image",
  "log",
  "render-desc",
@@ -1050,6 +1051,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glass-shared",
+ "image",
+ "pollster",
+ "tile-render",
+ "viewer-spirv",
+ "wgpu",
+]
+
+[[package]]
+name = "glass-shared"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "glow"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1103,6 +1124,14 @@ dependencies = [
  "crunchy",
  "num-traits",
  "zerocopy",
+]
+
+[[package]]
+name = "handoff"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "crossbeam-channel",
 ]
 
 [[package]]
@@ -1272,7 +1301,7 @@ name = "inproc"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "civ3r-sync",
+ "handoff",
  "log",
  "thiserror 2.0.21",
  "tokio",
@@ -1513,6 +1542,15 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "marker"
+version = "0.1.0"
+dependencies = [
+ "tile-render",
+ "viewer-spirv",
+ "wgpu",
+]
 
 [[package]]
 name = "memchr"
@@ -2168,10 +2206,17 @@ dependencies = [
 name = "pointer-windows"
 version = "0.1.0"
 dependencies = [
- "inproc",
  "pointer-api",
  "pointer-fallback",
+ "pointer-windows-ffi",
  "winit",
+]
+
+[[package]]
+name = "pointer-windows-ffi"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2396,12 +2441,14 @@ name = "render-desc"
 version = "0.1.0"
 dependencies = [
  "log",
+ "marker",
  "render-errors",
  "serde",
  "thiserror 2.0.21",
  "tile-render",
  "tile-render-shared",
  "toml 0.9.12+spec-1.1.0",
+ "viewer-spirv",
  "wgpu",
 ]
 
@@ -2409,7 +2456,7 @@ dependencies = [
 name = "render-errors"
 version = "0.1.0"
 dependencies = [
- "civ3r-sync",
+ "handoff",
  "log",
 ]
 
@@ -2503,8 +2550,8 @@ dependencies = [
 name = "scene"
 version = "0.1.0"
 dependencies = [
- "civ3r-sync",
  "crossbeam-channel",
+ "handoff",
  "thiserror 2.0.21",
  "toml 0.9.12+spec-1.1.0",
  "viewer-settings",
@@ -2892,11 +2939,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tile-game"
+version = "0.1.0"
+dependencies = [
+ "scene",
+ "tile-render",
+ "tile-viewer",
+]
+
+[[package]]
 name = "tile-render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "cargo-gpu-install",
  "gpu-text",
  "image",
  "log",
@@ -2904,6 +2959,7 @@ dependencies = [
  "render-errors",
  "thiserror 2.0.21",
  "tile-render-shared",
+ "viewer-spirv",
  "wgpu",
 ]
 
@@ -2919,10 +2975,12 @@ name = "tile-viewer"
 version = "0.1.0"
 dependencies = [
  "application-icon",
- "civ3r-sync",
  "dispatch2",
  "function-keys",
+ "glass",
+ "handoff",
  "log",
+ "marker",
  "pointer-control",
  "pollster",
  "render-desc",
@@ -2933,6 +2991,7 @@ dependencies = [
  "tile-render",
  "toml 0.9.12+spec-1.1.0",
  "viewer-settings",
+ "viewer-spirv",
  "wgpu",
  "winit",
 ]
@@ -3180,10 +3239,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "viewer-spirv"
+version = "0.1.0"
+dependencies = [
+ "cargo-gpu-install",
+]
+
+[[package]]
 name = "viewer-transport"
 version = "0.1.0"
 dependencies = [
- "civ3r-sync",
+ "handoff",
  "scene",
 ]
 

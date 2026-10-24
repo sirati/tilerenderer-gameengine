@@ -1,8 +1,8 @@
 //! The cursor on every screen, as the viewer's frame decides it
 //! (`App::draw_frame`): with the mouse free the system pointer is the
 //! cursor, never a sprite of ours, on the title and setup screens, Load
-//! Scenario with its preview beside it, Preferences, an advisor and the
-//! plain map; captured, or with button snapping on, the viewer draws it.
+//! Scenario with its preview beside it, Preferences, a report screen and
+//! the plain map; captured, or with button snapping on, the viewer draws it.
 
 use super::*;
 use crate::cursor::{self, Facts, Machine, Marks, Plan, SetArt, Shown};
@@ -87,7 +87,7 @@ fn menu_view(compiled: &Compiled, r: [i32; 4]) -> ViewState {
     ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() }, overlay: panel(compiled, r) }
 }
 
-/// The scenes as the bridge publishes them (`civ3_bridge::live`).
+/// The scenes as the driver publishes them.
 fn screens(compiled: &Compiled) -> Vec<(&'static str, Scene)> {
     let no_world = || Scene::empty(scene::WorldShape::default(), compiled.layers.len());
     // The title: no world, our own menu fitted to the window.
@@ -107,24 +107,25 @@ fn screens(compiled: &Compiled) -> Vec<(&'static str, Scene)> {
         ViewState { id: 0, view: View::default(), overlay: vec![] },
         ViewState { id: 258, view: View { interface_only: true, origin: (DIALOG[0], DIALOG[1]), viewport: (DIALOG[2] as u32, DIALOG[3] as u32), ..Default::default() }, overlay: panel(compiled, DIALOG) },
     ];
-    prefs.interface = scene::Interface { menu_fit: true, screen: Some("Menu".into()), screen_view: Some(258), ..Default::default() };
+    prefs.interface = scene::Interface { menu_fit: true, screen: Some("Menu".into()), screen_role: scene::ScreenRole::Menu, screen_view: Some(258), ..Default::default() };
     // Preferences over the map.
     let mut prefs_map = world(compiled);
     prefs_map.views = vec![game_view(), prefs.views[1].clone()];
     prefs_map.interface = prefs.interface.clone();
-    // An advisor: a screen part over the map.
-    let mut advisor = world(compiled);
-    advisor.views = vec![
+    // A report screen: a screen part over the map.
+    let mut report = world(compiled);
+    report.views = vec![
         game_view(),
         ViewState { id: 258, view: View { interface_only: true, origin: (DIALOG[0], DIALOG[1]), viewport: (DIALOG[2] as u32, DIALOG[3] as u32), ..Default::default() }, overlay: panel(compiled, DIALOG) },
     ];
-    advisor.interface.screen = Some("F1".into());
-    advisor.interface.screen_view = Some(258);
+    report.interface.screen = Some("Report".into());
+    report.interface.screen_role = crate::screen_role_for_test("Report");
+    report.interface.screen_view = Some(258);
     // A popup over the map.
     let mut popup = world(compiled);
     popup.views = vec![game_view(), ViewState { id: 257, view: View { interface_only: true, ..Default::default() }, overlay: panel(compiled, [800, 400, 320, 200]) }];
     popup.interface.popup = Some(257);
-    vec![("title", title), ("setup", setup), ("Load Scenario", preview), ("Preferences", prefs), ("Preferences over the map", prefs_map), ("advisor", advisor), ("popup", popup)]
+    vec![("title", title), ("setup", setup), ("Load Scenario", preview), ("Preferences", prefs), ("Preferences over the map", prefs_map), ("report", report), ("popup", popup)]
 }
 
 fn map(compiled: &Compiled) -> Scene {

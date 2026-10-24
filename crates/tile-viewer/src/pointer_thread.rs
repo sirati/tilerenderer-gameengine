@@ -9,7 +9,7 @@
 //! scrolling, `edge_clock`) reads it from here.
 //!
 //! Nothing here waits on the main thread or the renderer, nor they on it:
-//! values go through `civ3r_sync::Latest` and atomics. The thread sleeps
+//! values go through `handoff::Latest` and atomics. The thread sleeps
 //! to absolute deadlines (`std::thread::sleep`, high-resolution on every
 //! platform), never spins, and checks once a tick whether to end; dropping
 //! [`PointerThread`] ends and joins it within one tick.
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use civ3r_sync::Latest;
+use handoff::Latest;
 
 /// A reader of the pointer's position (physical window pixels) callable
 /// from any thread (`pointer_control::Feed`).

@@ -173,7 +173,7 @@ impl Picture {
             let mut extents = Vec::new();
             let mut cameras = Vec::new();
             // Overlays are the driver's screen pixels; world sprites are
-            // excluded, even when the city map lies behind its list.
+            // excluded, even when the site map lies behind its list.
             for s in free.iter().filter(|s| s.screen && !s.except_view && s.view.is_some_and(|v| overlay_cameras.contains(&v))) {
                 if let Some(extent) = rect_of(s).map(bounds).filter(|r| intersect(*r, rect).is_some()) {
                     if let Some(s) = clipped(*s, rect) {

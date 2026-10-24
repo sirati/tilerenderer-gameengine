@@ -4,7 +4,7 @@ use tile_render::SpriteSetId;
 
 const ROW: i32 = 20;
 const FRAME: f64 = 1.0 / 60.0;
-/// Where each row's name ends (its entry's anchor, as the bridge sets it).
+/// Where each row's name ends (its entry's anchor, as the driver sets it).
 const TEXT_END: i32 = 52;
 
 /// The driver's list: `count` rows of 20 pixels, three shown from `first`

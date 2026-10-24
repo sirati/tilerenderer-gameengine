@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn function_keys_map_to_their_windows_codes() {
-        // VK_F1..VK_F12 (Civ III's advisors, F11 demographics), and on to VK_F24.
+        // VK_F1..VK_F12 (a game's report screens, say), and on to VK_F24.
         assert_eq!(virtual_key(KeyCode::F1), Some(0x70));
         assert_eq!(virtual_key(KeyCode::F8), Some(0x77));
         assert_eq!(virtual_key(KeyCode::F11), Some(0x7A));

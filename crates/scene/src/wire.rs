@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Beside, Binding, BuildQueue, BuildQueueRow, Button, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
+use crate::{Beside, Binding, Button, Extension, ScreenRole, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, WorldOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 64;
+pub const VERSION: u32 = 65;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -571,6 +571,11 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u32(screen.len() as u32);
                 w.0.extend_from_slice(screen.as_bytes());
                 w.bool(i.menu_fit);
+                w.u8(match i.screen_role {
+                    ScreenRole::Other => 0,
+                    ScreenRole::Menu => 1,
+                    ScreenRole::Site => 2,
+                });
                 for view in [i.roaming, i.popup, i.screen_view, i.capture_hint] {
                     w.bool(view.is_some());
                     w.u32(view.unwrap_or_default());
@@ -636,20 +641,11 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.bool(i.targeting);
                 w.bool(i.snap_to_tiles);
                 w.bool(i.releases_pointer);
-                w.bool(i.build_queue.is_some());
-                let q = i.build_queue.clone().unwrap_or_default();
-                w.u32(q.stamp);
-                for v in q.current {
-                    w.i32(v);
-                }
-                w.u32(q.rows.len() as u32);
-                for row in &q.rows {
-                    w.u8(row.slot);
-                    for v in row.rect.into_iter().chain(row.grip) {
-                        w.i32(v);
-                    }
-                    w.u32(row.grip_id as u32);
-                    w.u32((row.grip_id >> 32) as u32);
+                w.u32(i.extensions.len() as u32);
+                for e in &i.extensions {
+                    w.u32(e.kind);
+                    w.u32(e.data.len() as u32);
+                    w.0.extend_from_slice(&e.data);
                 }
             }
             Update::Interactables(items) => {
@@ -751,7 +747,8 @@ const INTERACTABLE_BYTES: usize = 16 + 1 + 8 + 16 + 8 + 1 + 16 + 4;
 const DETACHED_BYTES: usize = 4 + 8 + 6 * 4 + 1;
 /// One `QueuedPopup`: view, serial, whether it has a button, the button.
 const QUEUED_BYTES: usize = 4 + 8 + 1 + 4 * 4;
-const BUILD_QUEUE_ROW_BYTES: usize = 1 + 8 * 4 + 8;
+/// One `Extension` without its data: kind, length.
+const EXTENSION_BYTES: usize = 4 + 4;
 
 /// Decodes a batch of updates.
 pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
@@ -895,6 +892,12 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let n = r.len(1)?;
                 let screen = String::from_utf8_lossy(r.take(n)?).into_owned();
                 let menu_fit = r.bool()?;
+                let screen_role = match r.u8()? {
+                    0 => ScreenRole::Other,
+                    1 => ScreenRole::Menu,
+                    2 => ScreenRole::Site,
+                    t => return Err(WireError::Tag(t)),
+                };
                 let mut view = || -> Result<Option<u32>, WireError> {
                     let some = r.bool()?;
                     let id = r.u32()?;
@@ -949,22 +952,15 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let targeting = r.bool()?;
                 let snap_to_tiles = r.bool()?;
                 let releases_pointer = r.bool()?;
-                let build_queue = {
-                    let some = r.bool()?;
-                    let stamp = r.u32()?;
-                    let current = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-                    let rows = (0..r.len(BUILD_QUEUE_ROW_BYTES)?).map(|_| -> Result<BuildQueueRow, WireError> {
-                        let slot = r.u8()?;
-                        let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-                        let grip = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
-                        let grip_id = r.u32()? as u64 | (r.u32()? as u64) << 32;
-                        Ok(BuildQueueRow { slot, rect, grip, grip_id })
-                    }).collect::<Result<Vec<_>, _>>()?;
-                    some.then_some(BuildQueue { stamp, current, rows })
-                };
+                let extensions = (0..r.len(EXTENSION_BYTES)?).map(|_| -> Result<Extension, WireError> {
+                    let kind = r.u32()?;
+                    let n = r.len(1)?;
+                    Ok(Extension { kind, data: r.take(n)?.to_vec() })
+                }).collect::<Result<Vec<_>, _>>()?;
                 Update::Interface(Interface {
                     screen: named.then_some(screen),
                     menu_fit,
+                    screen_role,
                     roaming,
                     capture_hint,
                     popup,
@@ -983,7 +979,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     loading_bar,
                     targeting,
                     snap_to_tiles,
-                    build_queue,
+                    extensions,
                     releases_pointer,
                 })
             }
@@ -1155,11 +1151,11 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.bool(keep);
             }
             Input::DismissPopup => w.u8(17),
-            Input::BuildQueue { stamp, from, to } => {
+            Input::Extension { kind, ref data } => {
                 w.u8(24);
-                w.u32(stamp);
-                w.u8(from);
-                w.u8(to);
+                w.u32(kind);
+                w.u32(data.len() as u32);
+                w.0.extend_from_slice(data);
             }
             Input::CloseDetached { serial } => {
                 w.u8(22);
@@ -1176,12 +1172,12 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
-            Input::UnitOrder { action, x, y } => {
+            Input::WorldOrder { action, x, y } => {
                 w.u8(15);
                 w.u8(match action {
-                    UnitOrderAction::Preview => 0,
-                    UnitOrderAction::Confirm => 1,
-                    UnitOrderAction::Cancel => 2,
+                    WorldOrderAction::Preview => 0,
+                    WorldOrderAction::Confirm => 1,
+                    WorldOrderAction::Cancel => 2,
                 });
                 w.i32(x);
                 w.i32(y);
@@ -1296,19 +1292,23 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
                 id: r.u32()? as u64 | (r.u32()? as u64) << 32, keep: r.bool()?,
             },
             17 => Input::DismissPopup,
-            24 => Input::BuildQueue { stamp: r.u32()?, from: r.u8()?, to: r.u8()? },
+            24 => {
+                let kind = r.u32()?;
+                let n = r.len(1)?;
+                Input::Extension { kind, data: r.take(n)?.to_vec() }
+            }
             22 => Input::CloseDetached { serial: r.u32()? as u64 | (r.u32()? as u64) << 32 },
             23 => Input::CloseQueued { serial: r.u32()? as u64 | (r.u32()? as u64) << 32 },
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
             14 => Input::WorldMove { x: r.i32()?, y: r.i32()? },
             15 => {
                 let action = match r.u8()? {
-                    0 => UnitOrderAction::Preview,
-                    1 => UnitOrderAction::Confirm,
-                    2 => UnitOrderAction::Cancel,
+                    0 => WorldOrderAction::Preview,
+                    1 => WorldOrderAction::Confirm,
+                    2 => WorldOrderAction::Cancel,
                     tag => return Err(WireError::Tag(tag)),
                 };
-                Input::UnitOrder { action, x: r.i32()?, y: r.i32()? }
+                Input::WorldOrder { action, x: r.i32()?, y: r.i32()? }
             }
             11 => Input::Edge { x: r.i32()?, y: r.i32()? },
             12 => Input::MainView { x: r.i32()?, y: r.i32()?, w: r.i32()?, h: r.i32()?, downscale: r.u32()? },
@@ -1528,8 +1528,9 @@ mod tests {
         settings.input.snap_updates_per_second = 4.5;
         s.settings = Some(settings);
         s.interface = Interface {
-            screen: Some("F4".into()),
+            screen: Some("Report".into()),
             menu_fit: true,
+            screen_role: ScreenRole::Site,
             roaming: Some(256),
             capture_hint: Some(259),
             popup: Some(261),
@@ -1554,7 +1555,7 @@ mod tests {
             loading_bar: Some(0xFFFF_0100),
             targeting: true,
             snap_to_tiles: true,
-            build_queue: None,
+            extensions: vec![Extension { kind: 0x5051_7565, data: vec![1, 2, 3] }, Extension { kind: 7, data: vec![] }],
             releases_pointer: true,
         };
         s.interactables = vec![
@@ -1586,8 +1587,7 @@ mod tests {
         updates.push(Update::Bindings(Vec::new()));
         updates.push(Update::View { id: 2, view: None });
         updates.push(Update::Interface(Interface { popup: Some(7), ..Default::default() }));
-        updates.push(Update::Interface(Interface { build_queue: Some(BuildQueue { stamp: 0xDEAD_BEEF, current: [1, 2, 3, 4],
-            rows: vec![BuildQueueRow { slot: 2, rect: [5, -6, 7, 8], grip: [5, -6, 9, 8], grip_id: 0x7_0000_0002 }] }), ..Default::default() }));
+        updates.push(Update::Interface(Interface { screen_role: ScreenRole::Menu, extensions: vec![Extension { kind: 0xDEAD_BEEF, data: (0..=255).collect() }], ..Default::default() }));
         updates.push(Update::Cursor(Cursor::Sprite(42)));
         updates.push(Update::Cursor(Cursor::System(SystemCursor::ResizeNesw)));
         updates.push(Update::Cursor(Cursor::Default));
@@ -1632,14 +1632,15 @@ mod tests {
             Input::Quit,
             Input::Look { x: -5, y: 7000 },
             Input::DismissPopup,
-            Input::BuildQueue { stamp: 0x1234_5678, from: 3, to: crate::BUILD_QUEUE_CURRENT },
+            Input::Extension { kind: 0x1234_5678, data: vec![3, 255, 0, 9] },
+            Input::Extension { kind: 0, data: vec![] },
             Input::CloseDetached { serial: 0x2_0000_0009 },
             Input::CloseQueued { serial: 0x5_0000_000B },
             Input::SettingsPreviewDecision { session: 0x3_0000_0003, id: 0x4_0000_0004, keep: false },
             Input::WorldMove { x: -64, y: 12345 },
-            Input::UnitOrder { action: UnitOrderAction::Preview, x: -100, y: 9999 },
-            Input::UnitOrder { action: UnitOrderAction::Confirm, x: 1234, y: -555 },
-            Input::UnitOrder { action: UnitOrderAction::Cancel, x: 0, y: 0 },
+            Input::WorldOrder { action: WorldOrderAction::Preview, x: -100, y: 9999 },
+            Input::WorldOrder { action: WorldOrderAction::Confirm, x: 1234, y: -555 },
+            Input::WorldOrder { action: WorldOrderAction::Cancel, x: 0, y: 0 },
             Input::Zooms([(3, 2), (2, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]),
             Input::Views { views: [(10, -20, 300, 200), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)], downscale: 2 },
             Input::MainView { x: 5, y: -6, w: 700, h: 400, downscale: 1 },

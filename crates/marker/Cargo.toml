@@ -1,0 +1,14 @@
+[package]
+name = "marker"
+description = "The selection marker: a bouncing gilded arrow and its ground shadow, painted shapes of a tile renderer (their CPU oracle, their 1:1 art)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+tile-render.workspace = true
+
+[dev-dependencies]
+wgpu.workspace = true
+# The module its GPU tests draw with (it holds the marker's shaders).
+viewer-spirv.workspace = true

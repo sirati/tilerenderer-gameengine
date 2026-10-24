@@ -56,7 +56,7 @@ fn layout_of(c: &Case) -> (Layout, Frame) {
     let mut s = scene();
     let (w, h) = (c.canvas.0 as i32, c.canvas.1 as i32);
     let vertical = c.split != S::Horizontal1To1;
-    // The unit's orders: low in the window, over the gap where it is.
+    // The piece's orders: low in the window, over the gap where it is.
     if c.orders {
         s.interface.reachable = Some(if vertical { [w / 3, h - 40 * c.ui - 20, w / 3 + 30 * c.ui, 30 * c.ui] } else { [w - 70 * c.ui - 10, h / 3, 60 * c.ui, h / 3] });
     }
@@ -259,7 +259,7 @@ fn glass_bars_are_as_thick_as_their_walls_and_round_only_at_free_ends() {
             assert_eq!(f.glass_dividers.len(), dividers.segments.len(), "{c:?}");
             for &(at, s) in &f.glass_dividers {
                 let camera = f.cameras[at as usize];
-                let lens = camera.lens.unwrap_or_else(|| panic!("{c:?}: no lens"));
+                let lens = camera.effect.map(glass_lens::Lens::of).unwrap_or_else(|| panic!("{c:?}: no lens"));
                 let t = s.band.thickness();
                 assert_eq!(t, l.divider_thickness(), "{c:?}");
                 assert!(lens.glass && lens.radius == t as f32 / 2.0 && lens.rim == t as f32 / 2.0, "{c:?}: {lens:?}");
@@ -361,7 +361,7 @@ fn under_the_glass_one_views_picture_goes_on_and_only_the_drawing_extends() {
             for u in under {
                 let view = l.shown.iter().find(|(h, c)| *h == if u.side == Some(Side::A) { Hit::Main } else { Hit::Pane } && !c.stacked).unwrap().1;
                 let (x, y) = world_at_floor(&view, (u.rect[0], u.rect[1]));
-                let drawn = f.cameras.iter().filter(|cam| rect_of(cam) == u.rect && cam.lens.is_none()).collect::<Vec<_>>();
+                let drawn = f.cameras.iter().filter(|cam| rect_of(cam) == u.rect && cam.effect.is_none()).collect::<Vec<_>>();
                 assert!(drawn.iter().any(|cam| (cam.x, cam.y, cam.zoom, cam.cells) == (x, y, view.zoom, true)), "{c:?}: {u:?} not drawn as its view: {drawn:?}");
                 checked.1 += 1;
             }
@@ -434,7 +434,7 @@ fn the_picture_under_the_glass_continues_its_views_picture() {
                 for u in &dividers.under {
                     let hit = if u.side == Some(Side::A) { Hit::Main } else { Hit::Pane };
                     let view = l.shown.iter().find(|(h, _)| *h == hit).unwrap().1;
-                    let drawn = *f.cameras.iter().find(|cam| rect_of(cam) == u.rect && cam.lens.is_none()).unwrap_or_else(|| panic!("{c:?}: {u:?} not drawn"));
+                    let drawn = *f.cameras.iter().find(|cam| rect_of(cam) == u.rect && cam.effect.is_none()).unwrap_or_else(|| panic!("{c:?}: {u:?} not drawn"));
                     // The view going on as far as the stretch.
                     let (v, r) = (rect_of(&view), u.rect);
                     let (x0, y0) = (v[0].min(r[0]), v[1].min(r[1]));

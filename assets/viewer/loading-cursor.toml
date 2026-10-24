@@ -1,0 +1,40 @@
+# The viewer's loading (busy) cursor: the wait cursor's hourglass (the
+# system's IDC_WAIT; under Wine the hourglass of Wine's user32.dll). The
+# art is one still frame, so it is turned in twelve 30-degree steps,
+# pre-rendered by the driver's art loader (`rotations`): 46x46 frames, the
+# hourglass centred and spinning in place. One set for the OS pointer (hot
+# spot in the middle), a loading progress bar and the viewer's "Game
+# appears busy / stuck" panel (scene `loading_cursor`). Game-agnostic: a
+# driver appends it to its own render description.
+[images.viewer_loading_cursor]
+source = "system-cursor:32514/32"
+rotations = 12
+
+[sheets.viewer_loading_cursor]
+image = "viewer_loading_cursor"
+cell = [46, 46]
+grid = [1, 1]
+all_frames = true
+anchor = [-23, -23]
+group = "Viewer@loading_cursor_frame"
+
+[sets."Viewer@loading_cursor/0"]
+frames = ["Viewer@loading_cursor_frame/0", "Viewer@loading_cursor_frame/1", "Viewer@loading_cursor_frame/2", "Viewer@loading_cursor_frame/3", "Viewer@loading_cursor_frame/4", "Viewer@loading_cursor_frame/5", "Viewer@loading_cursor_frame/6", "Viewer@loading_cursor_frame/7", "Viewer@loading_cursor_frame/8", "Viewer@loading_cursor_frame/9", "Viewer@loading_cursor_frame/10", "Viewer@loading_cursor_frame/11"]
+
+# The busy badge: the small upright hourglass the viewer attaches to the
+# pointer while the game is busy (tile-viewer `cursor::BADGE_SPRITES`),
+# like Windows XP's "Working in Background" pointer: its sand drains over
+# eleven steps and it flips over in the twelfth (`scene::loading_cursor`
+# cadence). Pixel art at the cursor art's scale, scaled with the pointer:
+# the system cursor's image and the viewer's drawing show the same pixels.
+[images.viewer_busy_badge]
+source = "hourglass:11x17:12"
+
+[sheets.viewer_busy_badge]
+image = "viewer_busy_badge"
+cell = [11, 17]
+grid = [12, 1]
+group = "Viewer@busy_badge_frame"
+
+[sets."Viewer@busy_badge/0"]
+frames = ["Viewer@busy_badge_frame/0", "Viewer@busy_badge_frame/1", "Viewer@busy_badge_frame/2", "Viewer@busy_badge_frame/3", "Viewer@busy_badge_frame/4", "Viewer@busy_badge_frame/5", "Viewer@busy_badge_frame/6", "Viewer@busy_badge_frame/7", "Viewer@busy_badge_frame/8", "Viewer@busy_badge_frame/9", "Viewer@busy_badge_frame/10", "Viewer@busy_badge_frame/11"]

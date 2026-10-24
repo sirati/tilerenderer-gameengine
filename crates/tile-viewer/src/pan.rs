@@ -49,8 +49,8 @@
 //! the deceleration of Apple's scroll views); a pointer held still before
 //! it was let go does not slide, and any press on a view stops a slide. No
 //! edge scrolling in this mode except while a held right drag previews a
-//! unit go-to order. That preview scrolls at the edge until release; a
-//! separate left click confirms it. `unit_orders` owns that gesture.
+//! go-to order. That preview scrolls at the edge until release; a
+//! separate left click confirms it. `world_orders` owns that gesture.
 //! Insets, A and B alike; a view following
 //! the world cursor moves the world cursor (it keeps it in its middle).
 //!
@@ -64,7 +64,7 @@
 //! over chained pans. A view moved by something else (a game camera
 //! request, a glide, a popup) is taken over once from where that put it
 //! (a glide's own continuous position). Nothing goes back to the game.
-//! While a gesture moves a view, what the view follows (the active unit,
+//! While a gesture moves a view, what the view follows (the selected piece,
 //! a standing game request, the driver's camera) leaves it alone
 //! ([`Layout::pan_holds`]); otherwise the two would pull it in turn.
 //!
@@ -336,7 +336,7 @@ impl Layout {
     /// How the mouse moves the map (from the settings).
     pub fn set_map_movement(&mut self, m: MapMovement) {
         if self.pan.mode != m {
-            self.cancel_unit_order();
+            self.cancel_world_order();
             log::info!("viewer: map movement: {}", if m == MapMovement::Drag { "dragging (left or middle button)" } else { "edge scrolling" });
             self.pan.mode = m;
             self.pan.press = None;
@@ -358,7 +358,7 @@ impl Layout {
     }
 
     /// Forgets a left press that may have become a drag: it was a click
-    /// taken by someone else (`unit_orders`), never replayed to the driver.
+    /// taken by someone else (`world_orders`), never replayed to the driver.
     pub(super) fn pan_forget_press(&mut self) {
         self.pan.press = None;
     }
@@ -943,9 +943,9 @@ impl Layout {
 
     /// Whether the pointer scrolls a view at its edges now (not where it is).
     fn edge_scroll_active(&self) -> bool {
-        // A held right-button unit preview can reach beyond this pane in
+        // A held right-button piece preview can reach beyond this pane in
         // Drag mode. Its pending destination stops scrolling on release.
-        let enabled = self.pan.mode == MapMovement::EdgeScroll || self.unit_order_dragging();
+        let enabled = self.pan.mode == MapMovement::EdgeScroll || self.world_order_dragging();
         // (Not under a popup opened at a world click: the map stays put.)
         enabled && self.pan.inside && !self.locked && !self.snapping && self.drag.is_none() && self.pan.grab.is_none() && !self.click_popup_open()
     }
@@ -1501,8 +1501,8 @@ mod tests {
 
     #[test]
     fn a_view_of_the_viewers_own_in_a_scrolls_itself_and_pushing_the_divider_adds_to_an_edge() {
-        // A follows the unit: the viewer scrolls it at the window's corner
-        // (until the unit moves); the driver hears of no edge.
+        // A follows the piece: the viewer scrolls it at the window's corner
+        // (until the piece moves); the driver hears of no edge.
         let mut l = split(MapMovement::EdgeScroll, Roles::UnitMouse);
         assert_eq!(l.main_view.center, (3000, 2000));
         assert!(edges(&mv(&mut l, (0, 0))).iter().all(|&e| e == (0, 0)));
@@ -1721,8 +1721,8 @@ mod tests {
                 assert_eq!(l.main_view.center, (1407, 803), "smooth={smooth}");
             }
             assert!(l.main_panned_by_hand());
-            // A real native camera change (minimap click, active-unit
-            // focus, city navigation) resumes normal following.
+            // A real native camera change (minimap click, selected-piece
+            // focus, site navigation) resumes normal following.
             for _ in 0..120 {
                 l.advance(Duration::from_millis(16));
                 l.frame(&scene_at(1128), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
@@ -2083,7 +2083,7 @@ mod tests {
 
     #[test]
     fn middle_drags_and_slides_never_turn_back_while_what_the_view_follows_moves() {
-        // The unit A follows in UnitMouse roles walks every frame, a game
+        // The piece A follows in UnitMouse roles walks every frame, a game
         // camera request (and a combat arrival) stands, the views glide:
         // none of it may pull the dragged or sliding view back between the
         // pointer's motions or the slide's steps. At every zoom and pixel
@@ -2231,7 +2231,7 @@ mod tests {
         }
         assert_eq!(l.main_view.center, (3000, 2000));
         let parked = l.main;
-        // The game centres on a unit: A glides there.
+        // The game centres on a piece: A glides there.
         scene.camera_focus = Some(scene::CameraFocus { serial: 2, center: (5000, 2000) });
         for _ in 0..4 {
             step(&mut l, &scene, 16, BOUNDS);

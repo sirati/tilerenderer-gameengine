@@ -25,6 +25,7 @@ fn popup() -> Scene {
 fn screen_and_popup(kind: &str) -> Scene {
     let mut s = popup();
     s.interface.screen = Some(kind.into());
+    s.interface.screen_role = crate::screen_role_for_test(kind);
     s
 }
 
@@ -48,10 +49,10 @@ fn a_popup_giving_way_to_a_screen_never_captures_under_it() {
     show(&mut l, &popup());
     assert!(!l.captured());
     assert_eq!(l.take_grab(), Some(false));
-    // The popup closes as the advisor opens.
-    show(&mut l, &with_screen("F1"));
+    // The popup closes as the report screen opens.
+    show(&mut l, &with_screen("Report"));
     assert!(!l.captured(), "captured under the screen");
-    assert_eq!(wait(&mut l, &with_screen("F1"), 2.0), [], "nothing captures while it is open");
+    assert_eq!(wait(&mut l, &with_screen("Report"), 2.0), [], "nothing captures while it is open");
     assert!(!l.captured());
     // All closed: captured again, once, at the world cursor it had.
     show(&mut l, &scene());
@@ -66,9 +67,9 @@ fn a_popup_giving_way_to_a_screen_never_captures_under_it() {
 #[test]
 fn a_screen_closing_under_its_popup_never_captures_under_the_popup() {
     let (mut l, _) = captured();
-    show(&mut l, &with_screen("City"));
+    show(&mut l, &with_screen("Site"));
     assert!(!l.captured());
-    show(&mut l, &screen_and_popup("City"));
+    show(&mut l, &screen_and_popup("Site"));
     show(&mut l, &popup());
     assert!(!l.captured(), "captured under the popup");
     let _ = l.take_grab();
@@ -78,12 +79,12 @@ fn a_screen_closing_under_its_popup_never_captures_under_the_popup() {
 }
 
 /// A menu following another a moment later (the game's turn-start
-/// popups, one advisor after another): no capture in between.
+/// popups, one report after another): no capture in between.
 #[test]
 fn menus_following_each_other_see_no_capture_in_between() {
     let (mut l, cursor) = captured();
     let mut grabs = Vec::new();
-    for menu in [popup(), with_screen("F1"), with_screen("F2"), popup(), with_screen("City")] {
+    for menu in [popup(), with_screen("Report"), with_screen("Overview"), popup(), with_screen("Site")] {
         show(&mut l, &menu);
         grabs.extend(l.take_grab());
         grabs.extend(wait(&mut l, &menu, 0.3));
@@ -99,7 +100,7 @@ fn menus_following_each_other_see_no_capture_in_between() {
 #[test]
 fn nested_menus_capture_again_only_when_the_last_closes() {
     let (mut l, _) = captured();
-    for s in [with_screen("Menu"), screen_and_popup("Menu"), with_screen("Menu"), screen_and_popup("Menu"), screen_and_popup("F3"), with_screen("F3")] {
+    for s in [with_screen("Menu"), screen_and_popup("Menu"), with_screen("Menu"), screen_and_popup("Menu"), screen_and_popup("Summary"), with_screen("Summary")] {
         show(&mut l, &s);
         assert_eq!(wait(&mut l, &s, 0.5).into_iter().filter(|&g| g).count(), 0);
         assert!(!l.captured());
@@ -153,21 +154,21 @@ fn drag_map_movement_lets_go_and_never_captures_menus_or_not() {
 fn clicks_capture_beside_a_screen_in_the_other_pane_but_not_under_floating_menus() {
     // Floating over the window: a click on B's world does not capture.
     let mut l = arranged(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse)));
-    show(&mut l, &with_screen("F1"));
+    show(&mut l, &with_screen("Report"));
     mv(&mut l, (600, 300));
     click(&mut l, (600, 300));
     assert!(!l.captured());
     assert_ne!(l.take_pointer_icon(), Some(PointerIcon::Capture));
     // The screen in A: playing in B beside it (docs/modal-input.md).
     let mut l = screen_layout(Place::LeftOrBottom, Roles::UnitMouse, false);
-    let s = with_screen("F1");
+    let s = with_screen("Report");
     show(&mut l, &s);
     mv(&mut l, (600, 300));
     click(&mut l, (600, 300));
     assert!(l.captured());
     // A popup over it lets go; it closing, the screen still open: not
     // again by itself (the player clicks into B again).
-    show(&mut l, &screen_and_popup("F1"));
+    show(&mut l, &screen_and_popup("Report"));
     assert!(!l.captured());
     assert_eq!(wait(&mut l, &s, 1.0).into_iter().filter(|&g| g).count(), 0);
     assert!(!l.captured());

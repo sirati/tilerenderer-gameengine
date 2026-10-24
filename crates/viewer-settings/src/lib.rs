@@ -354,8 +354,8 @@ pub enum UnitButtons {
     ActiveView,
 }
 
-/// A screen of the game that can be placed (named by the driver, e.g.
-/// "F1".."F8", "City", "Palace", "Spy", "Menu", "Help").
+/// A screen of the driver's that can be placed (named by the driver; the
+/// viewer does not read the name).
 pub type ScreenKind = String;
 
 /// Where a screen goes, kept for each orientation separately (switching
@@ -486,7 +486,10 @@ impl Layout {
         (0..Self::MAGNIFICATIONS.len()).min_by(|&a, &b| (Self::MAGNIFICATIONS[a] - m).abs().total_cmp(&(Self::MAGNIFICATIONS[b] - m).abs())).unwrap_or(1)
     }
 
-    /// The screens older settings files placed one by one, in the order
+    /// The screens older settings files placed one by one (written by the
+    /// renderer's older versions under the screen names of the game they
+    /// drove: kept only to read
+    /// those files as they were), in the order
     /// their places are migrated ([`Layout::migrated_place`]).
     pub const SCREENS: [&'static str; 13] = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "City", "Palace", "Spy", "Menu", "Help"];
 
@@ -558,11 +561,11 @@ pub enum MapMovement {
     /// the divider) scrolls the view it is in, faster nearer the edge.
     #[default]
     EdgeScroll,
-    /// Civilization IV style: the left button held on the map and dragged
+    /// As in many strategy games: the left button held on the map and dragged
     /// past a few pixels grabs it, the map following the pointer 1:1 and
     /// sliding on with momentum when let go (a shorter click is a click);
-    /// no edge scrolling. A quick right click opens the unit menu, while a
-    /// right drag or a long right press preselects a unit order's tile for a
+    /// no edge scrolling. A quick right click is the driver's (e.g. a menu), while a
+    /// right drag or a long right press preselects a world order's tile for a
     /// separate left-click confirmation.
     Drag,
 }
@@ -696,11 +699,12 @@ impl Present {
 }
 
 impl Settings {
-    /// Where settings are kept: `$CIV3R_SETTINGS`, else
-    /// `$XDG_CONFIG_HOME/civ3r/settings.toml`, else `~/.config/civ3r/settings.toml`
-    /// (`%APPDATA%\civ3r\settings.toml` on Windows).
-    pub fn default_path() -> PathBuf {
-        if let Some(p) = std::env::var_os("CIV3R_SETTINGS") {
+    /// Where application `app`'s settings are kept: `$<env>` (the variable
+    /// named `env`), else `$XDG_CONFIG_HOME/<app>/settings.toml`, else
+    /// `~/.config/<app>/settings.toml` (`%APPDATA%\<app>\settings.toml` on
+    /// Windows).
+    pub fn default_path_for(app: &str, env: &str) -> PathBuf {
+        if let Some(p) = std::env::var_os(env) {
             return p.into();
         }
         let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -708,7 +712,7 @@ impl Settings {
             .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
             .unwrap_or_else(|| PathBuf::from("."));
-        base.join("civ3r").join("settings.toml")
+        base.join(app).join("settings.toml")
     }
 
     /// The settings at `path`; defaults if there is no file.

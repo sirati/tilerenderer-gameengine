@@ -6,7 +6,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-civ3r-sync = { path = "../civ3r-sync" }
+handoff = { path = "../handoff" }
 crossbeam-channel = "0.5"
 thiserror.workspace = true
 viewer-settings = { path = "../viewer-settings" }

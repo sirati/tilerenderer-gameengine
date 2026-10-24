@@ -1,4 +1,5 @@
-//! Optional acknowledgement to a launcher, after a complete title menu presents.
+//! Optional acknowledgement to a launcher, after a complete title menu
+//! presents: a file written (`ViewerConfig::startup_ready_file`).
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
@@ -6,11 +7,11 @@ use std::{
 
 static SENT: AtomicBool = AtomicBool::new(false);
 
-pub(crate) fn presented(scene: &scene::Scene, art_matches: bool, drawable_menu: bool) {
+pub(crate) fn presented(file: Option<&std::path::Path>, scene: &scene::Scene, art_matches: bool, drawable_menu: bool) {
     if SENT.load(Ordering::Relaxed) || !drawable_menu || !complete_menu(scene, art_matches) {
         return;
     }
-    let Some(path) = std::env::var_os("CIV3R_STARTUP_READY_FILE").map(PathBuf::from) else {
+    let Some(path) = file.map(PathBuf::from) else {
         return;
     };
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));

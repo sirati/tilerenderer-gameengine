@@ -3,7 +3,7 @@
 //! menu (orange), the loading bar (green, its hourglass slot grey), a modal
 //! popup (beige, brown border) and queued reports (light blue). With
 //! `C3R_SHOTS=dir` the pictures are written there as PPMs, before (the bar
-//! a part of the menu, as the bridge sent it until now) and after.
+//! a part of the menu, as the driver sent it until now) and after.
 //! `cargo test -p tile-viewer --test loading_bar_shots -- --ignored`
 use render_desc::{Compiled, Description, ImageLoader};
 use scene::{FreeSprite, QueuedPopup, Scene, SolidRect, View, ViewState};
@@ -26,7 +26,7 @@ fn dialog([x, y, w, h]: [i32; 4], fill: [u8; 4]) -> Vec<FreeSprite> {
 
 /// The game's 1920×1080 screen loading a game: its 1024×768 menu in the
 /// middle, the bar where the game draws it (a 200×24 bar beside the menu's
-/// entries, its hourglass slot to its left), a tall advisor report over
+/// entries, its hourglass slot to its left), a tall report screen over
 /// it, and `queued` reports the game no longer waits for.
 fn loading(split_bar: bool, queued: usize) -> Scene {
     let screen = (1920u32, 1080u32);

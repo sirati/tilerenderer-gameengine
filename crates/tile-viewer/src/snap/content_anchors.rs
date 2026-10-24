@@ -205,6 +205,7 @@ fn oversized_menu_alt_targets_stay_in_the_opening_pane_through_all_panned_corner
         layout.route(Input::MouseMove { x: middle.0, y: middle.1 });
         let mut scene = base();
         scene.interface.screen = Some("Menu".into());
+        scene.interface.screen_role = crate::screen_role_for_test("Menu");
         scene.interface.screen_view = Some(258);
         scene.views.push(ViewState {
             id: 258,

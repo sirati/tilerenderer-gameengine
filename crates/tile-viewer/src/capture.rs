@@ -4,8 +4,8 @@
 //! # Menus
 //!
 //! A menu is anything of the driver's that takes the mouse over the world:
-//! a named screen (an advisor, the city screen, the game menu, Preferences,
-//! the Civilopedia, diplomacy) or a popup (a dialog, a context menu, the
+//! a named screen (a report screen, a site screen, the game menu,
+//! Preferences, an encyclopedia, a negotiation) or a popup (a dialog, a context menu, the
 //! tile information box), as [`Layout::menu_open`] says. While one is open
 //! the mouse is never captured by the layout on its own: the menu that
 //! opens over a captured mouse lets it go and remembers the world cursor
@@ -234,10 +234,10 @@ impl Layout {
 
     /// With Drag map movement the free pointer goes anywhere: the divider
     /// holds nothing back and the system confines nothing, so it may leave
-    /// the window (but while a right-drag previews a unit's order, which
+    /// the window (but while a right-drag previews a piece's order, which
     /// still scrolls at the window's edge).
     pub(super) fn pointer_free_everywhere(&self) -> bool {
-        !self.locked && self.map_movement() == MapMovement::Drag && !self.unit_order_dragging()
+        !self.locked && self.map_movement() == MapMovement::Drag && !self.world_order_dragging()
     }
 
     /// A menu lets go of the captured mouse: captured again at the world
@@ -258,7 +258,7 @@ impl Layout {
     pub(super) fn player_capture(&mut self, into: Hit, p: (i32, i32)) -> bool {
         if self.click_popup_open() {
             self.capture_after_dismissal(into);
-            self.unit_order_events_push(scene::Input::DismissPopup);
+            self.world_order_events_push(scene::Input::DismissPopup);
             return false;
         }
         if let Some(why) = self.capture_refused(into) {

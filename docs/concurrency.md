@@ -13,8 +13,8 @@ them to the parked game thread. Rendering and the OS cursor continue. The
 receipt confirms the queued camera frame and matching input mapping, not
 physical scanout or a GPU completion fence.
 
-`crates/civ3r-sync/tests/no_locks.rs` fails the build if a lock type or lock
-crate shows up in `crates/` outside `crates/civ3r-sync/locks-allowlist.txt`.
+`crates/handoff/tests/no_locks.rs` fails the build if a lock type or lock
+crate shows up in `crates/` outside `crates/handoff/locks-allowlist.txt`.
 The allowlist is empty.
 
 ## Building blocks
@@ -22,11 +22,11 @@ The allowlist is empty.
 | What | Used for | Why it does not block |
 |---|---|---|
 | `thread_local!` `Cell`/`RefCell` | state only the game's thread touches (hooks, window procedures) | one owner, nothing shared |
-| `civ3r_sync::Latest<T>` (arc-swap) | latest value wins: one side publishes, any thread reads (camera focus, go-to path, mirrored UI view, captured units, pointer override) | readers and writers never wait; a reader keeps the `Arc` it loaded |
-| `civ3r_sync::Bounded<T>` (crossbeam, bounded) | the Alt mode recording's records, viewer thread to its writer thread (`tile_viewer::altrec`) | `push` never blocks: a full queue drops the record and counts it; the writer only polls, woken by a `Wake` |
-| `civ3r_sync::Mailbox<T>` (crossbeam, unbounded) | commands for the game's thread, drained at its safe points (camera commands, modal actions, paint rectangles, notes) | `send` never blocks; the receiver only polls, so senders stay on the lock-free path |
-| `civ3r_sync::Posted<T>` | payloads of private window messages: the publisher sends the payload and posts a token, the game's window procedure takes what was sent up to that token (world input, native sliders, preference fences) | token protocol on atomics; exactly once, in order, consecutive pointer moves merged (tests in `civ3r-sync`) |
-| `civ3r_sync::Wake` | the publisher's bell (`presenter::WAKE`): rung by the game's thread when a present changes what the window shows, by the input thread and the preview thread; the publisher waits for it between rounds (at most its 33 ms fallback tick) | `ring` is an atomic swap and, once per wake-up, `Thread::unpark` (futex / `WakeByAddressSingle`); the publisher parks between rounds; the combat barrier can park the game thread before a visible fight |
+| `handoff::Latest<T>` (arc-swap) | latest value wins: one side publishes, any thread reads (camera focus, go-to path, mirrored UI view, captured units, pointer override) | readers and writers never wait; a reader keeps the `Arc` it loaded |
+| `handoff::Bounded<T>` (crossbeam, bounded) | the Alt mode recording's records, viewer thread to its writer thread (`tile_viewer::altrec`) | `push` never blocks: a full queue drops the record and counts it; the writer only polls, woken by a `Wake` |
+| `handoff::Mailbox<T>` (crossbeam, unbounded) | commands for the game's thread, drained at its safe points (camera commands, modal actions, paint rectangles, notes) | `send` never blocks; the receiver only polls, so senders stay on the lock-free path |
+| `handoff::Posted<T>` | payloads of private window messages: the publisher sends the payload and posts a token, the game's window procedure takes what was sent up to that token (world input, native sliders, preference fences) | token protocol on atomics; exactly once, in order, consecutive pointer moves merged (tests in `handoff`) |
+| `handoff::Wake` | the publisher's bell (`presenter::WAKE`): rung by the game's thread when a present changes what the window shows, by the input thread and the preview thread; the publisher waits for it between rounds (at most its 33 ms fallback tick) | `ring` is an atomic swap and, once per wake-up, `Thread::unpark` (futex / `WakeByAddressSingle`); the publisher parks between rounds; the combat barrier can park the game thread before a visible fight |
 | tokio `mpsc` / `oneshot` / `watch` | between our own threads and tasks (game thread to preview and replay workers, log writer, runtime tasks) | unbounded `send` is a lock-free push; our receivers may block, they are ours |
 | `OnceLock` / `LazyLock`, atomics | immutable data set once, flags and counters | |
 
@@ -272,7 +272,7 @@ handle must be obtained there. The resulting `Send` surface returns to the GPU
 actor. The main thread never waits for this handshake or for a GPU operation.
 The native window and CPU cursor metadata are available before GPU initialization.
 
-Frames, art snapshots and configuration changes use `civ3r_sync::Latest`.
+Frames, art snapshots and configuration changes use `handoff::Latest`.
 The actor takes each request, releasing the slot rather than retaining the last
 world or full source atlas. App permits one frame in flight and keeps coalescing
 new driver updates while it is busy. An immutable frame contains an `Arc` world,

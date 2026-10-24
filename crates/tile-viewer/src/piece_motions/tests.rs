@@ -19,7 +19,7 @@ fn between(seed: &mut u64, (a, b): (f64, f64)) -> f64 {
 /// A walk of 64-px tiles east as the game plays it: when each slide starts
 /// (`ms` slides, then the game's own per-tile work), when its push reaches
 /// the viewer, how many tiles the path planned at each, and the publisher's
-/// rounds (each a scene with the unit's anchor as the game had it then,
+/// rounds (each a scene with the piece's anchor as the game had it then,
 /// published `publish` ms apart).
 struct Walk {
     starts: Vec<f64>,
@@ -64,7 +64,7 @@ fn walk_at(from: f64, serial: u64, tiles: usize, seed: u64, timing: &Timing) -> 
 }
 
 impl Walk {
-    /// Where the game has the unit at driver time `t` (its slide's last
+    /// Where the game has the piece at driver time `t` (its slide's last
     /// step at 8/9 of its length).
     fn game(&self, t: f64) -> f64 {
         let mut x = 0.0;
@@ -76,7 +76,7 @@ impl Walk {
         x
     }
 
-    /// The anchor the scene draws the unit at, as published at `t`: the
+    /// The anchor the scene draws the piece at, as published at `t`: the
     /// tile the game has it on (moved there at each slide's end).
     fn anchor(&self, t: f64) -> f64 {
         64.0 * self.starts.iter().filter(|&&s| s + self.ms * SLIDE_PART <= t).count() as f64
@@ -91,9 +91,9 @@ impl Walk {
         })
     }
 
-    /// The viewer's unit x at each frame from 50 ms before the walk to 1.5 s
+    /// The viewer's piece x at each frame from 50 ms before the walk to 1.5 s
     /// after: (driver time, x).
-    fn played_by(&self, motions: &mut UnitMotions, base: Instant) -> Vec<(f64, f64)> {
+    fn played_by(&self, motions: &mut PieceMotions, base: Instant) -> Vec<(f64, f64)> {
         let at = |t: f64| base + Duration::from_secs_f64((t + VIEWER_AHEAD_MS) / 1000.0);
         let mut out = Vec::new();
         let mut t = self.starts[0] - 50.0;
@@ -110,7 +110,7 @@ impl Walk {
     }
 
     fn played(&self) -> Vec<(f64, f64)> {
-        self.played_by(&mut UnitMotions::default(), Instant::now())
+        self.played_by(&mut PieceMotions::default(), Instant::now())
     }
 
     /// As played before: each tile from when its scene arrived, over its own
@@ -134,7 +134,7 @@ impl Walk {
     }
 }
 
-/// From the frame after the first push the unit moves every frame (never
+/// From the frame after the first push the piece moves every frame (never
 /// stops longer than one) until it reaches where the game ends it, never
 /// faster than [`SPRINT`] times its slide's pace (and a pixel), never back,
 /// never ahead of the game.
@@ -160,7 +160,7 @@ fn check(w: &Walk, played: &[(f64, f64)], what: &str) {
 }
 
 /// The Mac's measured walks (9-50 ms of the game's own work a tile,
-/// `civ3-bridge.log`), path known, on a viewer that saw nothing before.
+/// from the driver's log), path known, on a viewer that saw nothing before.
 #[test]
 fn a_mac_walk_plays_from_its_first_push_without_stopping_and_never_ahead() {
     for seed in 1..=60u64 {
@@ -175,7 +175,7 @@ fn a_mac_walk_plays_from_its_first_push_without_stopping_and_never_ahead() {
 fn a_harsh_walk_plays_without_stopping_and_never_ahead() {
     for seed in 1..=60u64 {
         let base = Instant::now();
-        let mut viewer = UnitMotions::default();
+        let mut viewer = PieceMotions::default();
         walk_at(1000.0, 1, 8, seed + 1000, &HARSH).played_by(&mut viewer, base);
         let w = walk_at(20_000.0, 2, 8, seed, &HARSH);
         check(&w, &w.played_by(&mut viewer, base), &format!("seed {seed}"));
@@ -227,7 +227,7 @@ fn steps_without_a_path_play_from_each_push() {
     }
 }
 
-/// The path planned 8 tiles, the game stopped after 3 (blocked): the unit
+/// The path planned 8 tiles, the game stopped after 3 (blocked): the piece
 /// stops where the game stopped, easing in, never past it.
 #[test]
 fn a_walk_that_ends_early_stops_where_the_game_stopped() {
@@ -266,7 +266,7 @@ fn a_frame_moves_the_sprite_range_and_the_cells_from_where_the_scene_has_them() 
     scene.layers = vec![scene::LayerCells { values: vec![1; 12], phases: None, offsets: Some(vec![(0, 0); 12]) }];
     scene.layers[0].offsets.as_mut().unwrap()[4 + 2] = (3, -7);
     let mut world = TileWorld::new(Grid { cols: 4, rows: 3, layout: Layout::Staggered, wrap_x: false, wrap_y: false, step: (64, 32) }, SpriteSets::default());
-    let mut spec = LayerSpec::new("unit_body", vec![tile_render::SpriteSetId::EMPTY; 2]);
+    let mut spec = LayerSpec::new("piece_body", vec![tile_render::SpriteSetId::EMPTY; 2]);
     spec.per_cell_offset = true;
     let layer = world.add_layer(spec);
     world.free = scene.sprites.iter().map(|s| tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, s.x, s.y)).collect();
@@ -280,11 +280,11 @@ fn a_frame_moves_the_sprite_range_and_the_cells_from_where_the_scene_has_them() 
 }
 
 #[test]
-fn the_marker_over_a_walking_unit_goes_with_it() {
+fn the_marker_over_a_walking_piece_goes_with_it() {
     let w = walk_at(1000.0, 1, 2, 5, &MAC);
     let base = Instant::now();
     let at = |t: f64| base + Duration::from_secs_f64((t + VIEWER_AHEAD_MS) / 1000.0);
-    let mut m = UnitMotions::default();
+    let mut m = PieceMotions::default();
     let mut scene = scene::Scene { sprites: vec![scene::FreeSprite::default()], motions: vec![scene::Motion { key: 7, sprites: (0, 1), cells: Vec::new(), anchor: (0, 0) }], ..Default::default() };
     scene.focus = Some((300, 200));
     assert_eq!(m.focus_at(&scene, 1), Some((300, 200)), "no motion of its own: the focus");
@@ -307,7 +307,7 @@ fn motion_frame_bench() {
     scene.sprites = vec![scene::FreeSprite::default(); 6000];
     let mut free: Vec<_> = scene.sprites.iter().map(|s| tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, s.x, s.y)).collect();
     let told = w.told(5000.0, at);
-    let mut m = UnitMotions::default();
+    let mut m = PieceMotions::default();
     let n = 100_000u32;
     let started = Instant::now();
     for i in 0..n {

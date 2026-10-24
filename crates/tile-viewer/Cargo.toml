@@ -8,8 +8,12 @@ version.workspace = true
 [dependencies]
 render-errors = { path = "../render-errors" }
 application-icon = { path = "../application-icon" }
-civ3r-sync = { path = "../civ3r-sync" }
+handoff = { path = "../handoff" }
 tile-render.workspace = true
+# (Not `glass`: the viewer has a module of that name, its frosted divider.)
+glass-lens = { package = "glass", path = "../glass" }
+marker = { path = "../marker" }
+viewer-spirv.workspace = true
 render-desc = { path = "../render-desc" }
 scene = { path = "../scene" }
 viewer-settings = { path = "../viewer-settings" }

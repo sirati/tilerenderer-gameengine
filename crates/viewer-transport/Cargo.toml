@@ -6,5 +6,5 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-civ3r-sync = { path = "../civ3r-sync" }
+handoff = { path = "../handoff" }
 scene = { path = "../scene" }

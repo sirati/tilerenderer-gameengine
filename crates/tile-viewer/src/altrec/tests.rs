@@ -360,7 +360,7 @@ fn the_writer_drops_and_counts_rather_than_wait() {
 fn recordings_stay_within_their_total_size() {
     let dir = temp_dir("cap");
     // Another file of the folder is never touched.
-    std::fs::write(dir.join("civ3-bridge.log"), vec![b'x'; 50_000]).unwrap();
+    std::fs::write(dir.join("driver.log"), vec![b'x'; 50_000]).unwrap();
     std::fs::write(dir.join("alt-mode-0000000001-1-000.altrec"), vec![0; 3000]).unwrap();
     let limits = Limits { part: 2000, total: 6000, queue: 1 << 16 };
     let sink = writer::start(dir.clone(), 2_000_000_000, limits).unwrap();
@@ -384,7 +384,7 @@ fn recordings_stay_within_their_total_size() {
     assert!(total <= limits.total, "{total}: {files:?}");
     assert!(files.len() >= 2, "{files:?}");
     assert!(!dir.join("alt-mode-0000000001-1-000.altrec").exists(), "the oldest went first");
-    assert_eq!(std::fs::metadata(dir.join("civ3-bridge.log")).unwrap().len(), 50_000);
+    assert_eq!(std::fs::metadata(dir.join("driver.log")).unwrap().len(), 50_000);
     // Each part stands alone: a header, the rate and targets in effect.
     for (path, _) in &files {
         let file = format::decode(&std::fs::read(path).unwrap()).unwrap();
@@ -429,7 +429,7 @@ fn a_landing_short_of_the_element_clicked_is_the_picker_getting_it_wrong() {
 }
 
 /// The live session through the writer to a file, read back as
-/// `civ3-tool altrec` reads it. (`ALTREC_SAMPLE_DIR`: the file is left
+/// the driver's altrec tool reads it. (`ALTREC_SAMPLE_DIR`: the file is left
 /// there, to try the tool on.)
 #[test]
 fn a_written_session_reads_back_and_reports() {

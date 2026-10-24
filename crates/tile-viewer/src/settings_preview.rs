@@ -189,7 +189,7 @@ impl Preview {
                 | Input::Slider { .. }
                 | Input::WorldMove { .. }
                 | Input::WorldButton { .. }
-                | Input::UnitOrder { .. }
+                | Input::WorldOrder { .. }
         );
         (consumed, result)
     }

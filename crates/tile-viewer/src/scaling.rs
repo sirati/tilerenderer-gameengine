@@ -667,10 +667,10 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     // a setup screen; not one anchored at a click): the menu keeps its own
     // fit and place, as without it; the popup goes over it at its zoom,
     // across in the middle of its region, its top `MODAL_TOP` down.
-    // A popup the driver opened at a click on its named screen (a city
-    // screen garrison unit's menu) is no modal: it stays where the driver
+    // A popup the driver opened at a click on its named screen (a site
+    // screen's stationed piece's menu) is no modal: it stays where the driver
     // put it on that screen, placed and scaled with it.
-    // (On a screen part too, an advisor: placed with that part.)
+    // (On a screen part too, a report screen: placed with that part.)
     let on_screen = parts.popup_on_screen && parts.screen.is_some();
     // (The popup placed: the dialog on top, with what is attached to it,
     // its combo box's open list: `scene::Interface::placed_popup`.)
@@ -817,13 +817,13 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let (place_id, place_camera) = Some(parts.popup_root(v.id)).filter(|&r| r != v.id && parts.is_popup_view(v.id))
             .and_then(|r| camera_of(r).map(|c| (r, c))).unwrap_or((v.id, camera));
         let piece = if on_screen && placed_popup == Some(parts.popup_root(v.id)) && parts.is_popup_view(v.id) {
-            // As the screen it was opened on: the game's place on it (an
-            // advisor's: that part's map), where the pointer made the click.
+            // As the screen it was opened on: the game's place on it (a
+            // report's: that part's map), where the pointer made the click.
             let screen = parts.screen_view.and_then(|sv| camera_of(sv).map(|c| panned(screen_piece(c, false, sv)))).unwrap_or(menu);
             let d = frame.popup_nudge;
             Affine { from: (screen.from.0 - d.0, screen.from.1 - d.1), ..screen }
         } else if parts.is_popup_view(v.id) || parts.screen_view == Some(v.id) {
-            // A popup, or a screen part (an advisor): about its middle,
+            // A popup, or a screen part (a report screen): about its middle,
             // placed as the menus are (and moved as the layout moved it),
             // kept on the canvas.
             let piece = screen_piece(place_camera, parts.is_popup_view(v.id), place_id);
@@ -850,7 +850,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
                 let piece = plan.frame_piece(a);
                 (kept(Affine { zoom: fitting(piece.zoom, Some(r)), ..piece }, r).at((r[0], r[1])), r)
             }).collect();
-            if frame.unit_orders.is_some() && !anchors.is_empty() || anchors.len() > 1 || anchors.first().is_some_and(|a| a.0.zoom != (1, 1) || a.0.from != a.0.to) {
+            if frame.order_buttons.is_some() && !anchors.is_empty() || anchors.len() > 1 || anchors.first().is_some_and(|a| a.0.zoom != (1, 1) || a.0.from != a.0.to) {
                 // The tooltip: a camera of its own, mapped as the sprite
                 // nearest to it (the control it is for) is.
                 let tip = tip_host(&v.overlay, &rect_of, &of_sprite, parts.tooltip).and_then(|host| {
@@ -917,13 +917,13 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     }
     // Place the orders after every interface piece has its final map,
     // including panels supplied in a separate view.
-    if let (Some(place), Some(orders)) = (frame.unit_orders, parts.reachable) {
+    if let (Some(place), Some(orders)) = (frame.order_buttons, parts.reachable) {
         // Where the frame draws them: at the side or corner of the screen
         // their buttons are at (as `panels` anchors a panel), at its scale.
         let side = anchor_of(orders, plan.screen);
         let at_side = plan.frame_piece(side);
         // What they keep clear of: the frame's sprites at its other sides
-        // and corners (the unit's panel, the minimap), where their panels
+        // and corners (the piece's panel, the minimap), where their panels
         // draw them (a sprite whose panel a frame put elsewhere: where its
         // own side draws it). Not what is on their own side (their
         // tooltip, the hover art of a button, a sprite the game drew there
@@ -931,7 +931,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         // those come and go, and the buttons would move (and shrink) with
         // them, and back. (Nor how a frame groups its sprites into panels:
         // a sprite between two joins them for as long as it is there.)
-        let occupied: Vec<[i32; 4]> = if matches!(place, layout::UnitOrdersPlace::In(_)) {
+        let occupied: Vec<[i32; 4]> = if matches!(place, layout::OrderButtonsPlace::In(_)) {
             panelled.iter().flat_map(|(_, i, anchors, of_sprite, _, _, sides)| {
                 scene.views[*i].overlay.iter().zip(of_sprite.iter()).filter(|&(_, &k)| k < sides.len())
                     .filter_map(|(s, &k)| rect_of(s).map(|r| (k, r))).filter(|&(_, r)| !in_tip(r) && !inside(orders, r))
@@ -941,7 +941,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             }).filter(|r| r[2] > 0 && r[3] > 0).collect()
         } else { Vec::new() };
         for (_, i, anchors, of_sprite, start, tip, _) in &mut panelled {
-            place_unit_orders(place, orders, at_side, &scene.views[*i].overlay, &rect_of, &occupied, anchors, of_sprite, tip.map(|(t, _)| t));
+            place_world_orders(place, orders, at_side, &scene.views[*i].overlay, &rect_of, &occupied, anchors, of_sprite, tip.map(|(t, _)| t));
             // (The tooltip goes with its control, wherever that went.)
             if let Some((t, host)) = *tip {
                 anchors[t].0 = anchors[of_sprite[host]].0.at((anchors[t].1[0], anchors[t].1[1]));
@@ -1153,9 +1153,9 @@ fn drawn_boxed(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: 
     Drawn { cameras, copies, present, pixel_box: k }
 }
 
-/// The unit's order buttons (the sprites inside `orders`, the rectangle of
+/// The piece's order buttons (the sprites inside `orders`, the rectangle of
 /// the game's own order buttons in the driver's pixels) placed as the
-/// layout says (`layout::UnitOrdersPlace`): panels of their own added to
+/// layout says (`layout::OrderButtonsPlace`): panels of their own added to
 /// the frame's `anchors` (each sprite's in `of_sprite`), `at_side` where
 /// the frame draws them. Split at a side by side split's gap, those left
 /// of its middle are moved left of it and the others right of it, as
@@ -1170,7 +1170,7 @@ fn drawn_boxed(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: 
 /// The tooltip (the sprites of panel `tip`, or of no panel) is none of
 /// them, wherever the game drew it: it goes with its button.
 #[allow(clippy::too_many_arguments)]
-fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], at_side: Affine, sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, occupied: &[[i32; 4]], anchors: &mut Vec<(Affine, [i32; 4])>, of_sprite: &mut [usize], tip: Option<usize>) {
+fn place_world_orders(place: layout::OrderButtonsPlace, orders: [i32; 4], at_side: Affine, sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, occupied: &[[i32; 4]], anchors: &mut Vec<(Affine, [i32; 4])>, of_sprite: &mut [usize], tip: Option<usize>) {
     let order = |i: usize| of_sprite[i] != usize::MAX && Some(of_sprite[i]) != tip;
     let members: Vec<(usize, [i32; 4])> = sprites.iter().enumerate().filter(|&(i, _)| order(i)).filter_map(|(i, s)| rect_of(s).filter(|&r| inside(orders, r)).map(|r| (i, r))).collect();
     if members.is_empty() { return; }
@@ -1194,7 +1194,7 @@ fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], at_side: 
         }
     };
     match place {
-        layout::UnitOrdersPlace::Gap((g0, g1)) => {
+        layout::OrderButtonsPlace::Gap((g0, g1)) => {
             let (left, right): (Vec<usize>, Vec<usize>) = (0..members.len()).partition(|&m| 2 * shown[m][0] + shown[m][2] < g0 + g1);
             let dl = left.iter().map(|&m| shown[m][0] + shown[m][2]).max().map_or(0, |end| (g0 - end).min(0));
             let dr = right.iter().map(|&m| shown[m][0]).min().map_or(0, |start| (g1 - start).max(0));
@@ -1204,7 +1204,7 @@ fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], at_side: 
                 }
             }
         }
-        layout::UnitOrdersPlace::In(area) => {
+        layout::OrderButtonsPlace::In(area) => {
             let map = orders_in(orders, at_side, area, occupied);
             add((0..members.len()).collect(), &|_| map, anchors);
         }
@@ -1408,7 +1408,7 @@ mod tests {
         for preferences in [false, true] {
             let mut scene = Scene {
                 screen_size: (1920, 1080),
-                interface: scene::Interface { screen: preferences.then(|| "Menu".into()), menu_fit: true,
+                interface: scene::Interface { screen: preferences.then(|| "Menu".into()), screen_role: if preferences { scene::ScreenRole::Menu } else { scene::ScreenRole::Other }, menu_fit: true,
                     screen_view: preferences.then_some(258), ..Default::default() },
                 views: vec![ViewState { id: if preferences { 258 } else { 255 }, view: View {
                     interface_only: true, menu: !preferences,
@@ -1886,6 +1886,7 @@ mod tests {
                             layout.route(Input::MouseMove { x: expected_region[0] + expected_region[2] / 2, y: expected_region[1] + expected_region[3] / 2 });
                             scene.views.push(menu);
                             scene.interface.screen = Some("Menu".into());
+                            scene.interface.screen_role = crate::screen_role_for_test("Menu");
                             scene.interface.menu_fit = !scale_menus;
                             let control = [448 + 480, 156 + 360, 64, 48];
                             scene.interactables = vec![Interactable { region: None, alt_right_click: false, id: 1, rect: control, anchor: None, kind: InteractableKind::Button }];
@@ -2117,7 +2118,7 @@ mod tests {
         assert_eq!(anchors[of[4]].1, [836, 1030, 128, 32]);
     }
 
-    /// A game's scene at 1920×1080 as the bridge sends it: the world, the
+    /// A game's scene at 1920×1080 as the driver sends it: the world, the
     /// frame (panels at three corners and the bottom middle), a menu in the
     /// middle, the roaming corner buttons and a popup.
     fn game_scene() -> (Scene, impl Fn(&FreeSprite) -> Option<[i32; 4]>) {
@@ -2154,11 +2155,11 @@ mod tests {
         (scene, rect_of)
     }
 
-    /// The screens after a game (the summary replay, demographics, the
-    /// histograph, the ranking) as the bridge gives them: a screen part of
+    /// The screens after a game (the summary replay, the scores, the
+    /// history, the ranking) as the driver gives them: a screen part of
     /// their own (`Interface::screen_view`) over the frame, with no world
     /// (the game has ended), the replay's play button an Alt target.
-    /// In-game advisors the same, over a world.
+    /// In-game report screens the same, over a world.
     fn screen_scene(world: bool, name: &str) -> (Scene, impl Fn(&FreeSprite) -> Option<[i32; 4]>) {
         use scene::{Interactable, InteractableKind, View, ViewState};
         let sprite = |x, y| FreeSprite { x, y, screen: true, after_pass: u32::MAX, ..Default::default() };
@@ -2171,7 +2172,7 @@ mod tests {
         let scene = Scene {
             views,
             shape: if world { scene::WorldShape { cols: 60, rows: 62, wrap_x: true, wrap_y: false } } else { scene::WorldShape::default() },
-            interface: scene::Interface { screen: Some(name.into()), screen_view: Some(258), ..Default::default() },
+            interface: scene::Interface { screen: Some(name.into()), screen_role: crate::screen_role_for_test(name), screen_view: Some(258), ..Default::default() },
             interactables: vec![Interactable { region: None, alt_right_click: false, id: 1, rect: [964, 548, 45, 30], anchor: None, kind: InteractableKind::Button }],
             screen_size: (1920, 1080),
             ..Default::default()
@@ -2188,7 +2189,7 @@ mod tests {
     }
 
     #[test]
-    fn the_screens_after_a_game_are_as_large_as_the_advisors_and_take_alt_input() {
+    fn the_screens_after_a_game_are_as_large_as_the_reports_and_take_alt_input() {
         use viewer_settings::{Place, ScreenPlace, Split};
         for window in [(3840, 2160), (2880, 1800), (1920, 1080)] {
             for pixel_scale in [1, 2] {
@@ -2220,12 +2221,12 @@ mod tests {
                                     .map(|(x, y)| (x + 448 - at.0, y + 156 - at.1));
                                 (body, hit, p.canvas())
                             };
-                            // The advisor floating over the world; the replay
+                            // The report floating over the world; the replay
                             // after the game: the same size and place.
-                            let (advisor, _, canvas) = shown(true, "F1", Place::Floating);
-                            for name in ["Replay", "F11", "F8", "Ranking", "Hall of Fame"] {
+                            let (report, _, canvas) = shown(true, "Report", Place::Floating);
+                            for name in ["Replay", "Scores", "History", "Ranking", "Hall of Fame"] {
                                 let (after, hit, _) = shown(false, name, Place::Floating);
-                                assert_eq!(after, advisor, "{name} {what}");
+                                assert_eq!(after, report, "{name} {what}");
                                 // (Larger than the canvas at a large base scale: panned as the menus are.)
                                 let [x, y, w, h] = after.unwrap();
                                 let fits = w <= canvas.0 as i32 && h <= canvas.1 as i32;
@@ -2361,7 +2362,7 @@ mod tests {
     #[test]
     fn clicks_on_the_frame_reach_its_pixels_at_every_pixel_scale() {
         // A vertical split in a 4K window at 200 %: the minimap (bottom-left),
-        // a top-left button and the unit panel (bottom-right) take clicks
+        // a top-left button and the piece panel (bottom-right) take clicks
         // where they are drawn, at the driver's pixels they show.
         let (scene, rect_of) = game_scene();
         let split = viewer_settings::Layout { split: viewer_settings::Split::Vertical1To1, ..Default::default() };
@@ -2383,7 +2384,7 @@ mod tests {
         }
     }
 
-    /// The unit's order buttons (eight 32-pixel buttons across the middle
+    /// The piece's order buttons (eight 32-pixel buttons across the middle
     /// of a 1920 × 1080 screen) for every split, both settings, frame
     /// scales, zoom kinds and active views: with one view (and spanning a
     /// stacked split) where the frame's scale puts them; spanning a side
@@ -2569,11 +2570,11 @@ mod tests {
         }
     }
 
-    /// The scene of the frame's panels: the unit panel (bottom right) with
-    /// its small buttons above it, the minimap (bottom left), the unit's
+    /// The scene of the frame's panels: the piece panel (bottom right) with
+    /// its small buttons above it, the minimap (bottom left), the piece's
     /// eight order buttons (`reachable`), and, if `tip`, the game's tooltip
     /// there (box and text sprites, inside `Interface::tooltip` as the
-    /// bridge reports it, or not reported: as the game draws it only).
+    /// driver reports it, or not reported: as the game draws it only).
     fn hud_with_tooltip(tip: Option<([i32; 4], bool)>) -> (Scene, impl Fn(&FreeSprite) -> Option<[i32; 4]> + Clone) {
         use scene::{View, ViewState};
         let sprite = |x, y| FreeSprite { x, y, screen: true, after_pass: u32::MAX, ..Default::default() };
@@ -2601,7 +2602,7 @@ mod tests {
         (scene, rect_of)
     }
 
-    /// The tooltip of a button the unit's orders were moved into the
+    /// The tooltip of a button the piece's orders were moved into the
     /// active view with (here one beside them, on their row, between them
     /// and the minimap): they do not make room for it (it would move with
     /// them, away from the pointer and back); it goes with its button.
@@ -2656,7 +2657,7 @@ mod tests {
     /// a row and two above the fourth, `reachable` round them all; the
     /// tooltip of one (if `tip`: its box, left of and above it, inside that
     /// rectangle's columns, and its letters, each a glyph whose em box
-    /// reaches past the box, clipped to it as the bridge sends them).
+    /// reaches past the box, clipped to it as the driver sends them).
     fn hud_with_order_tooltip(tip: Option<([i32; 4], usize)>) -> (Scene, impl Fn(&FreeSprite) -> Option<[i32; 4]> + Clone) {
         use scene::{View, ViewState};
         let sprite = |x, y| FreeSprite { x, y, screen: true, after_pass: u32::MAX, ..Default::default() };
@@ -2758,7 +2759,7 @@ mod tests {
             }
         }
     }
-    /// What a frame of the map screen has besides the unit's panel, the
+    /// What a frame of the map screen has besides the piece's panel, the
     /// minimap and the orders (`order_buttons`, `reachable` round them), as
     /// measured in a live game at 1920x1080: each a sprite (its rectangle,
     /// the driver's pixels, and clip).
@@ -2768,12 +2769,12 @@ mod tests {
         Partial(Vec<usize>),
         /// A button's pressed art, a pixel down and right.
         Pressed(usize),
-        /// A tooltip in the frame the bridge sent it in before its box: its
+        /// A tooltip in the frame the driver sent it in before its box: its
         /// letters clipped to the row of its box drawn so far (one pixel,
         /// inside the orders' rectangle), its box's top edge (beside the
         /// orders, on their row), and no `Interface::tooltip` for them.
         TooltipUnknown,
-        /// A tooltip as the bridge reports it, left of the upper buttons.
+        /// A tooltip as the driver reports it, left of the upper buttons.
         Tooltip,
         /// A line of the game's own across the bottom between the panels
         /// (joining them into one panel, wider than the canvas at ×2).
@@ -2911,12 +2912,12 @@ mod tests {
     }
 
 
-    /// The tooltip of the unit panel's small buttons (shown while one is
+    /// The tooltip of the piece panel's small buttons (shown while one is
     /// hovered or pressed, above them, reaching past the panel) changes
     /// nothing of the panel: the same place and scale, to the pixel, at
     /// every scale (its camera's origin, where its pixels round, stays).
     #[test]
-    fn the_unit_panel_does_not_move_for_its_buttons_tooltip() {
+    fn the_piece_panel_does_not_move_for_its_buttons_tooltip() {
         let panel = [[1621, 942, 294, 137], [1650, 908, 30, 28], [1690, 908, 30, 28]];
         let mut moved_unreported = 0;
         for frame_scale in [1.0, 1.1, 1.25, 1.33, 1.5, 0.75] {
@@ -3163,6 +3164,7 @@ mod tests {
                     if kind == "screen" {
                         scene.interface.screen_view = Some(v.id);
                         scene.interface.screen = Some("Preferences".into());
+                        scene.interface.screen_role = crate::screen_role_for_test("Preferences");
                     } else if kind == "popup" {
                         scene.interface.popup = Some(v.id);
                     }
@@ -3240,10 +3242,10 @@ mod tests {
         assert_eq!(layout.menu_pan.offset, (0, 0));
         assert!(!layout.menu_pan.route(&Input::MouseMove { x: 10, y: 10 }));
         // A new screen resets navigation even when its bounds match.
-        layout.menu_pan.place((Some("F1".into()), None), Some([-192, -204, 1024, 768]), (640, 360));
+        layout.menu_pan.place((Some("Report".into()), None), Some([-192, -204, 1024, 768]), (640, 360));
         layout.menu_pan.route(&Input::MouseButton { button: Button::Middle, down: true, x: 320, y: 180 });
         layout.menu_pan.route(&Input::MouseMove { x: 100, y: 100 });
-        layout.menu_pan.place((Some("F2".into()), None), Some([-192, -204, 1024, 768]), (640, 360));
+        layout.menu_pan.place((Some("Overview".into()), None), Some([-192, -204, 1024, 768]), (640, 360));
         assert_eq!(layout.menu_pan.offset, (0, 0));
         assert!(!layout.menu_pan.route(&Input::MouseMove { x: 20, y: 20 }));
         assert!(!layout.menu_pan.route(&Input::MouseButton { button: Button::Right, down: true, x: 320, y: 180 }));
@@ -3275,7 +3277,7 @@ mod tests {
             for preferences in [true, false] {
                 let base = Scene {
                     screen_size: screen,
-                    interface: scene::Interface { screen: preferences.then(|| "Menu".into()), menu_fit: true, screen_view: preferences.then_some(258), ..Default::default() },
+                    interface: scene::Interface { screen: preferences.then(|| "Menu".into()), screen_role: if preferences { scene::ScreenRole::Menu } else { scene::ScreenRole::Other }, menu_fit: true, screen_view: preferences.then_some(258), ..Default::default() },
                     views: vec![ViewState { id: if preferences { 258 } else { 255 }, view: View {
                         interface_only: true, menu: !preferences,
                         origin: if preferences { (menu[0], menu[1]) } else { (0, 0) },
@@ -3559,7 +3561,7 @@ mod tests {
                     screen_size: screen,
                     views,
                     shape: scene::WorldShape { cols: 60, rows: 62, wrap_x: true, wrap_y: false },
-                    interface: scene::Interface { screen: Some("Menu".into()), menu_fit: true, screen_view: Some(258), popup: with.then_some(257), ..Default::default() },
+                    interface: scene::Interface { screen: Some("Menu".into()), screen_role: scene::ScreenRole::Menu, menu_fit: true, screen_view: Some(258), popup: with.then_some(257), ..Default::default() },
                     interactables: vec![
                         Interactable { region: None, alt_right_click: false, id: 1, rect: control, anchor: None, kind: InteractableKind::Button },
                         Interactable { region: None, alt_right_click: false, id: 2, rect: ok, anchor: None, kind: InteractableKind::Button },

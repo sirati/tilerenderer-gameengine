@@ -447,15 +447,17 @@ impl PanelState {
 
 /// One condition of `show_if` / `enable_if`.
 #[derive(Clone, Debug, PartialEq)]
-struct Test {
-    key: String,
-    negate: bool,
+#[doc(hidden)]
+pub struct Test {
+    pub key: String,
+    pub negate: bool,
     /// `None`: whether the value is on.
-    values: Option<Vec<String>>,
+    pub values: Option<Vec<String>>,
 }
 
 impl Test {
-    fn holds(&self, values: &BTreeMap<String, Value>) -> bool {
+    #[doc(hidden)]
+    pub fn holds(&self, values: &BTreeMap<String, Value>) -> bool {
         let v = values.get(&self.key);
         let yes = match &self.values {
             None => v.is_some_and(Value::truthy),
@@ -467,7 +469,8 @@ impl Test {
 
 /// Conditions joined by `&`.
 #[derive(Clone, Debug, PartialEq)]
-struct Cond(Vec<Test>);
+#[doc(hidden)]
+pub struct Cond(pub Vec<Test>);
 
 impl Cond {
     fn parse(s: &str) -> Result<Cond, String> {
@@ -494,13 +497,15 @@ impl Cond {
         Ok(Cond(tests))
     }
 
-    fn holds(&self, values: &BTreeMap<String, Value>) -> bool {
+    #[doc(hidden)]
+    pub fn holds(&self, values: &BTreeMap<String, Value>) -> bool {
         self.0.iter().all(|t| t.holds(values))
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum ArtKind {
+#[doc(hidden)]
+pub enum ArtKind {
     None,
     Region(Region),
     Sprite(String),
@@ -508,29 +513,32 @@ enum ArtKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct Label {
-    text: String,
-    at: (i32, i32),
-    style: Option<String>,
-    align: Align,
-    valign: VAlign,
+#[doc(hidden)]
+pub struct Label {
+    pub text: String,
+    pub at: (i32, i32),
+    pub style: Option<String>,
+    pub align: Align,
+    pub valign: VAlign,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct Art {
-    kind: ArtKind,
+#[doc(hidden)]
+pub struct Art {
+    pub kind: ArtKind,
     /// Its own size, if it has one (a region's, a sprite's).
-    size: Option<(u32, u32)>,
-    slice: Option<(i32, i32)>,
-    tint: Option<[u8; 4]>,
-    border: Option<[u8; 3]>,
-    labels: Vec<Label>,
+    pub size: Option<(u32, u32)>,
+    pub slice: Option<(i32, i32)>,
+    pub tint: Option<[u8; 4]>,
+    pub border: Option<[u8; 3]>,
+    pub labels: Vec<Label>,
     /// Other art drawn over it, centred on these points (`icons`).
-    icons: Vec<(String, (i32, i32))>,
+    pub icons: Vec<(String, (i32, i32))>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Kind {
+#[doc(hidden)]
+pub enum Kind {
     Image(String),
     Text,
     Choice { control: String, value: String },
@@ -539,35 +547,37 @@ enum Kind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct Item {
-    kind: Kind,
-    at: (i32, i32),
-    size: Option<(u32, u32)>,
-    text: Option<String>,
-    tooltip: Option<String>,
-    disabled_tooltip: Option<String>,
-    tooltip_art: Option<String>,
-    tooltip_style: Option<String>,
-    disabled_over: Option<String>,
-    style: Option<String>,
-    align: Option<Align>,
-    valign: Option<VAlign>,
-    normal: Option<String>,
-    hover: Option<String>,
-    selected: Option<String>,
-    disabled: Option<String>,
-    icon: Option<String>,
-    icon_at: Option<(i32, i32)>,
-    text_at: Option<(i32, i32)>,
-    decimals: u32,
-    percent: bool,
-    value_at: Option<(i32, i32)>,
-    show_if: Option<Cond>,
-    enable_if: Option<Cond>,
+#[doc(hidden)]
+pub struct Item {
+    pub kind: Kind,
+    pub at: (i32, i32),
+    pub size: Option<(u32, u32)>,
+    pub text: Option<String>,
+    pub tooltip: Option<String>,
+    pub disabled_tooltip: Option<String>,
+    pub tooltip_art: Option<String>,
+    pub tooltip_style: Option<String>,
+    pub disabled_over: Option<String>,
+    pub style: Option<String>,
+    pub align: Option<Align>,
+    pub valign: Option<VAlign>,
+    pub normal: Option<String>,
+    pub hover: Option<String>,
+    pub selected: Option<String>,
+    pub disabled: Option<String>,
+    pub icon: Option<String>,
+    pub icon_at: Option<(i32, i32)>,
+    pub text_at: Option<(i32, i32)>,
+    pub decimals: u32,
+    pub percent: bool,
+    pub value_at: Option<(i32, i32)>,
+    pub show_if: Option<Cond>,
+    pub enable_if: Option<Cond>,
 }
 
 impl Item {
-    fn control(&self) -> Option<&str> {
+    #[doc(hidden)]
+    pub fn control(&self) -> Option<&str> {
         match &self.kind {
             Kind::Choice { control, .. } | Kind::Checkbox { control } | Kind::Slider { control, .. } => Some(control),
             Kind::Image(_) | Kind::Text => None,
@@ -581,7 +591,8 @@ pub struct Panel {
     pub name: String,
     size: (u32, u32),
     anchor: Anchor,
-    items: Vec<Item>,
+    #[doc(hidden)]
+    pub items: Vec<Item>,
     content_controls: BTreeSet<String>,
 }
 
@@ -614,9 +625,11 @@ impl Panel {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Panels {
     styles: BTreeMap<String, StyleDesc>,
-    art: BTreeMap<String, Art>,
+    #[doc(hidden)]
+    pub art: BTreeMap<String, Art>,
     /// Pictures the render description makes: art name, source, size.
-    generated: Vec<(String, String, (u32, u32))>,
+    #[doc(hidden)]
+    pub generated: Vec<(String, String, (u32, u32))>,
     panels: BTreeMap<String, Panel>,
 }
 
@@ -895,11 +908,13 @@ impl Panels {
         (area[0] + dx, area[1] + dy)
     }
 
-    fn visible(item: &Item, state: &PanelState) -> bool {
+    #[doc(hidden)]
+    pub fn visible(item: &Item, state: &PanelState) -> bool {
         item.show_if.as_ref().is_none_or(|c| c.holds(&state.values))
     }
 
-    fn enabled(item: &Item, state: &PanelState) -> bool {
+    #[doc(hidden)]
+    pub fn enabled(item: &Item, state: &PanelState) -> bool {
         item.enable_if.as_ref().is_none_or(|c| c.holds(&state.values))
     }
 
@@ -915,13 +930,15 @@ impl Panels {
     }
 
     /// Art `name` with `{…}` replaced by the values.
-    fn art_named(&self, name: &str, state: &PanelState) -> Option<&Art> {
+    #[doc(hidden)]
+    pub fn art_named(&self, name: &str, state: &PanelState) -> Option<&Art> {
         let name = substitute(name, |k| state.values.get(k).map(|v| value_text(v, 2, false)));
         self.art.get(&name)
     }
 
     /// The window rectangle (x, y, w, h) of `item`, if it covers any.
-    fn rect(&self, item: &Item, state: &PanelState, (ox, oy): (i32, i32)) -> Option<[i32; 4]> {
+    #[doc(hidden)]
+    pub fn rect(&self, item: &Item, state: &PanelState, (ox, oy): (i32, i32)) -> Option<[i32; 4]> {
         if matches!(item.kind, Kind::Text) {
             return None;
         }
@@ -951,7 +968,8 @@ impl Panels {
 
     /// The control (item index) under window point (x, y) that can be
     /// used.
-    fn hit(&self, panel: &Panel, state: &PanelState, area: [i32; 4], x: i32, y: i32) -> Option<usize> {
+    #[doc(hidden)]
+    pub fn hit(&self, panel: &Panel, state: &PanelState, area: [i32; 4], x: i32, y: i32) -> Option<usize> {
         let origin = self.origin(panel, area);
         panel.items.iter().enumerate().rev().find_map(|(n, i)| {
             let usable = i.control().is_some() && Self::visible(i, state) && Self::enabled(i, state);
@@ -1270,7 +1288,8 @@ impl Panels {
     }
 
     /// The draws of item `n` of `panel`.
-    fn draw_item(&self, panel: &Panel, state: &PanelState, area: [i32; 4], measure: &dyn Fn(&TextStyle, &str) -> TextMetrics, n: usize, item: &Item) -> Vec<Draw> {
+    #[doc(hidden)]
+    pub fn draw_item(&self, panel: &Panel, state: &PanelState, area: [i32; 4], measure: &dyn Fn(&TextStyle, &str) -> TextMetrics, n: usize, item: &Item) -> Vec<Draw> {
         let (ox, oy) = self.origin(panel, area);
         let clip = [ox, oy, ox + panel.size.0 as i32, oy + panel.size.1 as i32];
         let mut out = Vec::new();
@@ -1433,7 +1452,8 @@ impl ControlLooks {
 
 /// A stable id for `key` of panel `panel` (FNV-1a, the top two bits set:
 /// clear of a game's object addresses and of the menus' ids).
-fn id_hash(panel: &str, key: &str) -> u64 {
+#[doc(hidden)]
+pub fn id_hash(panel: &str, key: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in panel.bytes().chain([0]).chain(key.bytes()) {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
@@ -1574,14 +1594,16 @@ fn inside([x, y, w, h]: [i32; 4], px: i32, py: i32) -> bool {
 }
 
 /// Handle centre along the track. Ends are inset by half its width.
-fn slider_center(width: i32, knob: i32, t: f32) -> i32 {
+#[doc(hidden)]
+pub fn slider_center(width: i32, knob: i32, t: f32) -> i32 {
     knob / 2 + ((width - knob).max(0) as f32 * t.clamp(0.0, 1.0)).round() as i32
 }
 
 /// A ruler tick's marks on a track at `y`, `h` high: (top mark's y, bottom
 /// mark's y, their length). Both touch the inside of the track's 2-pixel
 /// frame; labelled ticks get longer marks, as whole numbers on a ruler.
-fn ruler_marks(y: i32, h: i32, labelled: bool) -> (i32, i32, i32) {
+#[doc(hidden)]
+pub fn ruler_marks(y: i32, h: i32, labelled: bool) -> (i32, i32, i32) {
     const FRAME: i32 = 2;
     let len = if labelled { 4 } else { 3 };
     (y + FRAME, y + h - FRAME - len, len)
@@ -2047,329 +2069,11 @@ mod tests {
     }
 
     #[test]
-    fn preference_rulers_follow_handle_centres_and_stay_inside_each_slider() {
-        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
-        let panel = panels.panel("preferences").unwrap();
-        let mut state = PanelState::default();
-        let area = [0, 0, 1024, 768];
-        let mut count = 0;
-        for (index, item) in panel.items.iter().enumerate() {
-            let Kind::Slider { control, min, max, knob, ticks, .. } = &item.kind else { continue };
-            count += 1;
-            assert!(!ticks.is_empty(), "{control} needs a ruler");
-            let (w, h) = item.size.unwrap();
-            let (x, y) = item.at;
-            let kw = panels.art_named(knob.as_ref().unwrap(), &state).unwrap().size.unwrap().0 as i32;
-            for &(value, label) in ticks {
-                let cx = x + slider_center(w as i32, kw, (value - min) / (max - min));
-                assert!(cx >= x + kw / 2 && cx <= x + w as i32 - kw / 2, "{control}: {value}");
-                state.values.insert(control.clone(), Value::Number(value));
-                let draws = panels.draw_item(panel, &state, area, &estimate, index, item);
-                let (top, bottom, len) = ruler_marks(y, h as i32, label);
-                for mark in [top, bottom] {
-                    assert!(draws.iter().any(|d| matches!(d, Draw::Element(Element::Fill { rect, .. })
-                        if *rect == [cx, mark, 1, len])), "{control}: tick at {value}");
-                }
-                assert!(draws.iter().any(|d| matches!(d, Draw::Element(Element::Image { at, region, .. })
-                    if region.source == "Art/SCROLL.PCX" && at.0 + kw / 2 == cx)), "{control}: handle at {value}");
-                for draw in &draws {
-                    if let Draw::Text(t) = draw {
-                        if t.style.height != 9 { continue; }
-                        let m = estimate(&t.style, &t.text);
-                        assert_eq!(t.clip, [x, y, x + w as i32, y + h as i32]);
-                        assert!(t.x >= x && t.x + m.width <= x + w as i32, "{control}: {}", t.text);
-                        assert!(t.y - m.ascent >= y && t.y + m.descent <= y + h as i32);
-                        assert!(t.text.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '×' || c == '%'));
-                    }
-                }
-            }
-        }
-        assert_eq!(count, 18);
-    }
-
-    #[test]
-    fn zoom_preferences_are_separate_and_controls_fit_without_overlap() {
-        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
-        let panel = panels.panel("preferences").unwrap();
-        let modes = ["Off", "Floating131", "Floating171", "Mouse111", "Mouse131", "Beside", "TopStrip"];
-        for content in ["World", "WorldAndMenus"] {
-            for split in ["Standard", "Vertical1To1"] {
-                for tab in ["layout", "zoom"] {
-                    for mode in modes {
-                        let mut state = PanelState::default();
-                        state.values.insert("tab".into(), Value::Text(tab.into()));
-                        state.values.insert("layout.zoom".into(), Value::Text(mode.into()));
-                        state.values.insert("layout.zoom_content".into(), Value::Text(content.into()));
-                        state.values.insert("layout.split".into(), Value::Text(split.into()));
-                        state.values.insert("layout.zoom_controls".into(), Value::On(mode != "Off"));
-                        state.values.insert("layout.zoom_lens_controls".into(), Value::On(!matches!(mode, "Off" | "TopStrip")));
-                        let looks = panels.looks(panel, &state, [0, 0, 1024, 768], &estimate);
-                        for (i, look) in looks.iter().enumerate() {
-                            let [x, y, w, h] = look.rect;
-                            assert!(x >= 49 && x+w <= 973 && y >= 40 && y+h <= 690, "{tab} {mode}: {:?}", look.rect);
-                            for other in &looks[..i] {
-                                let [a, b, c, d] = other.rect;
-                                assert!(x+w <= a || a+c <= x || y+h <= b || b+d <= y, "{tab} {mode}: {:?} overlaps {:?}", look.rect, other.rect);
-                            }
-                        }
-                        // The pictures: every placement always a target (Alt
-                        // reaches them); what it shows unless the zoom is
-                        // off; the place in a split only where it counts.
-                        let targets = |control: &str| looks.iter().filter(|l| {
-                            panel.items.iter().enumerate().any(|(n, i)| i.control() == Some(control) && id_hash(&panel.name, &n.to_string()) == l.id)
-                        }).count();
-                        if tab == "zoom" {
-                            assert_eq!(targets("layout.zoom"), modes.len());
-                            assert_eq!(targets("layout.zoom_content"), if mode == "Off" { 0 } else { 2 }, "{mode}");
-                            let placed = split != "Standard" && !matches!(mode, "Off" | "Beside");
-                            assert_eq!(targets("layout.zoom_place"), if placed { 3 } else { 0 }, "{split} {mode}");
-                            assert!(looks.iter().all(|l| l.kind == scene::InteractableKind::Button || matches!(l.kind, scene::InteractableKind::Slider { .. })));
-                        }
-                        for item in &panel.items {
-                            if item.control().is_some_and(|k| k.starts_with("layout.zoom")) {
-                                let cond = item.show_if.as_ref().unwrap();
-                                let mut layout = state.clone();
-                                layout.values.insert("tab".into(), Value::Text("layout".into()));
-                                assert!(!cond.holds(&layout.values), "zoom control on Layout");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Every placement, region and content picture is generated art of
-        // one size, with a tooltip naming it.
-        for item in panel.items.iter().filter(|i| matches!(i.control(), Some("layout.zoom" | "layout.zoom_place" | "layout.zoom_content"))) {
-            let icon = item.icon.as_ref().unwrap();
-            assert_eq!(panels.art.get(icon).and_then(|a| a.size), Some((84, 52)), "{icon}");
-            assert!(panels.generated.iter().any(|(name, source, _)| name == icon && source.starts_with("rects:84x52;")), "{icon}");
-            assert!(item.tooltip.as_ref().is_some_and(|t| !t.is_empty()), "{icon}");
-            assert_eq!(item.size, Some((104, 64)), "{icon}");
-        }
-        let note = "Rendering menus doesn't render in a higher resolution. It just shows the pixels.";
-        assert!(panel.items.iter().any(|i| i.text.as_deref() == Some(note) && i.show_if.as_ref().is_some_and(|c| c.holds(&[("tab".to_string(), Value::Text("zoom".into()))].into()))));
-        let item = panel.items.iter().find(|i| i.control() == Some("layout.zoom_magnification_step")).unwrap();
-        let Kind::Slider { tick_labels, .. } = &item.kind else { panic!("magnification slider") };
-        assert_eq!(tick_labels.as_ref().unwrap(), &["1.5×", "2×", "3×", "4×"]);
-    }
-
-    #[test]
-    fn preferences_undo_controls_fit_beside_values_and_tooltips_stay_in_the_panel() {
-        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
-        let panel = panels.panel("preferences").unwrap();
-        let area = [200, 100, 1024, 768];
-        let mut state = PanelState::default();
-        for item in &panel.items {
-            if let Kind::Slider { control, max, .. } = &item.kind {
-                state.values.insert(control.clone(), Value::Number(*max));
-                state.values.insert(format!("dialog.changed.{control}"), Value::On(true));
-            }
-        }
-        for key in ["resolution.scale_menus", "display.limit_fps", "layout.zoom_controls", "layout.zoom_lens_controls"] {
-            state.values.insert(key.into(), Value::On(true));
-        }
-        state.values.insert("layout.zoom".into(), Value::Text("Floating131".into()));
-        state.values.insert("layout.zoom_magnification_label".into(), Value::Text("4×".into()));
-        state.values.insert("layout.split".into(), Value::Text("Vertical1To1".into()));
-        let mut checked = 0;
-        let overlap = |a: [i32; 4], b: [i32; 4]| a[0] < b[0]+b[2] && b[0] < a[0]+a[2] && a[1] < b[1]+b[3] && b[1] < a[1]+a[3];
-        for tab in ["resolution", "layout", "zoom", "accessibility"] {
-            state.values.insert("tab".into(), Value::Text(tab.into()));
-            let looks = panels.looks(panel, &state, area, &estimate);
-            for (i, look) in looks.iter().enumerate() {
-                assert!(looks[..i].iter().all(|other| !overlap(look.rect, other.rect)), "{tab}: {:?} overlaps a control", look.rect);
-            }
-            let undos: Vec<_> = panel.items.iter().enumerate().filter(|(_, i)| i.control() == Some("dialog.undo") && Panels::visible(i, &state)).collect();
-            for (index, undo) in undos {
-                checked += 1;
-                let Kind::Choice { value: control, .. } = &undo.kind else { unreachable!() };
-                let rect = panels.rect(undo, &state, panels.origin(panel, area)).unwrap();
-                let (n, slider) = panel.items.iter().enumerate().find(|(_, i)| matches!(&i.kind, Kind::Slider { control: c, .. } if c == control)).unwrap();
-                for draw in panels.draw_item(panel, &state, area, &estimate, n, slider) {
-                    if let Draw::Text(t) = draw {
-                        let m = estimate(&t.style, &t.text);
-                        assert!(!overlap(rect, [t.x, t.y-m.ascent, m.width, m.ascent+m.descent]), "{control}: undo overlaps {}", t.text);
-                    }
-                }
-                state.hover = Some(index);
-                let draws = panels.draw(panel, &state, area, &estimate);
-                let look = panels.looks(panel, &state, area, &estimate).into_iter().find(|l| l.id == id_hash(&panel.name, &index.to_string())).unwrap();
-                assert!(draws.windows(look.draws.len()).any(|w| w == look.draws), "{control}: hovered control and tooltip must form one replacement range");
-                let Draw::Text(t) = draws.last().unwrap() else { panic!("tooltip must paint above all items") };
-                assert_eq!(t.text, "Undo to current state");
-                let m = estimate(&t.style, &t.text);
-                assert!(t.x >= area[0] && t.x + m.width <= area[0]+area[2]);
-                assert!(t.y-m.ascent >= area[1] && t.y+m.descent <= area[1]+area[3]);
-            }
-            state.hover = None;
-        }
-        assert_eq!(checked, 16);
-    }
-
-    #[test]
     fn ruler_steps_must_be_finite_positive_and_bounded() {
         for step in ["0", "-1", "inf", "nan", "0.00001"] {
             let text = PANELS.replace("slider = \"scale\"", &format!("slider = \"scale\"\ntick_step = {step}"));
             assert!(Panels::parse(&text).is_err(), "tick step {step}");
         }
-    }
-
-    #[test]
-    fn accessibility_controls_are_visible_hit_testable_and_fit() {
-        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
-        let p = panels.panel("preferences").unwrap();
-        let mut state = PanelState::default();
-        state.values.insert("tab".into(), Value::Text("accessibility".into()));
-        state.values.insert("accessibility.unit_rings".into(), Value::On(true));
-        state.values.insert("accessibility.active_unit_arrow".into(), Value::On(true));
-        state.values.insert("accessibility.stack_count".into(), Value::On(true));
-        for item in p.items.iter().filter(|i| i.control().is_some_and(|k| k.starts_with("accessibility."))) {
-            assert!(Panels::visible(item, &state));
-            assert!(Panels::enabled(item, &state));
-            let [x, y, w, h] = panels.rect(item, &state, (0, 0)).unwrap();
-            assert!(x >= 70 && y >= 95 && x+w <= 952 && y+h <= 655);
-            let hit = panels.hit(p, &state, [0, 0, 1024, 768], x+w/2, y+h/2);
-            assert_eq!(hit, Some(p.items.iter().position(|i| std::ptr::eq(i, item)).unwrap()));
-        }
-        let looks = panels.looks(p, &state, [0, 0, 1024, 768], &estimate);
-        for (i, a) in looks.iter().enumerate() {
-            let [x, y, w, h] = a.rect;
-            for b in &looks[..i] {
-                let [l, t, bw, bh] = b.rect;
-                assert!(x+w <= l || l+bw <= x || y+h <= t || t+bh <= y, "{:?} overlaps {:?}", a.rect, b.rect);
-            }
-        }
-        let bob = p.items.iter().find(|i| i.control() == Some("accessibility.arrow_bobbing")).unwrap();
-        state.values.insert("accessibility.active_unit_arrow".into(), Value::On(false));
-        assert!(!Panels::visible(bob, &state));
-        // The stack count's backdrop: shown, greyed out without the count.
-        let backdrop = p.items.iter().find(|i| i.control() == Some("accessibility.stack_backdrop")).unwrap();
-        state.values.insert("accessibility.stack_count".into(), Value::On(false));
-        assert!(Panels::visible(backdrop, &state) && !Panels::enabled(backdrop, &state));
-        for tab in ["civ3", "resolution", "layout", "zoom", "clean_map"] {
-            state.values.insert("tab".into(), Value::Text(tab.into()));
-            assert!(p.items.iter().filter(|i| i.control().is_some_and(|k| k.starts_with("accessibility."))).all(|i| !Panels::visible(i, &state)));
-        }
-    }
-
-    #[test]
-    fn base_ui_slider_centres_line_up_with_pixel_scale_buttons() {
-        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
-        let panel = panels.panel("preferences").unwrap();
-        let item = panel.items.iter().find(|i| i.control() == Some("resolution.base_ui_scale")).unwrap();
-        let Kind::Slider { min, max, knob, .. } = &item.kind else { panic!("base scale slider") };
-        let kw = panels.art_named(knob.as_ref().unwrap(), &PanelState::default()).unwrap().size.unwrap().0 as i32;
-        let centre = |v| item.at.0 + slider_center(item.size.unwrap().0 as i32, kw, (v - min) / (max - min));
-        for button in &panel.items {
-            let Kind::Choice { control, value } = &button.kind else { continue };
-            if control != "resolution.pixel_scale" { continue; }
-            let k = value.parse::<f32>().unwrap();
-            assert_eq!(centre(k), button.at.0 + button.size.unwrap().0 as i32 / 2);
-            if k < *max { assert_eq!(centre(k + 0.5), (centre(k) + centre(k + 1.0)) / 2); }
-        }
-    }
-
-    /// Every renderer tab of the Preferences, with its conditional
-    /// controls, undo buttons and either Base UI scale button shown: each
-    /// item (a control with its label and value, or a text) lies inside
-    /// the tab's parchment and overlaps no other item. On Accessibility
-    /// every item sits in a card with a heading, each control in the card of
-    /// the feature it belongs to, its undo button beside it.
-    #[test]
-    fn preferences_tabs_fit_without_overlaps_and_accessibility_controls_sit_in_their_cards() {
-        let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
-        let panel = panels.panel("preferences").unwrap();
-        let area = [0, 0, 1024, 768];
-        let origin = panels.origin(panel, area);
-        let mut state = PanelState::default();
-        for item in &panel.items {
-            if let Kind::Slider { control, max, .. } = &item.kind {
-                state.values.insert(control.clone(), Value::Number(*max));
-                state.values.insert(format!("dialog.changed.{control}"), Value::On(true));
-            }
-        }
-        for key in ["resolution.scale_menus", "display.limit_fps", "layout.zoom_controls", "layout.zoom_lens_controls",
-            "accessibility.unit_rings", "accessibility.active_unit_arrow", "layout.menu_follows_pointer"] {
-            state.values.insert(key.into(), Value::On(true));
-        }
-        for (key, value) in [("layout.zoom", "Floating131"), ("layout.zoom_magnification_label", "4×"), ("layout.split", "Vertical1To1"),
-            ("layout.orientation", "vertical"), ("layout.screen_place", "Floating"), ("accessibility.hud_percent", "300"), ("accessibility.arrow_percent", "300")] {
-            state.values.insert(key.into(), Value::Text(value.into()));
-        }
-        let overlap = |a: [i32; 4], b: [i32; 4]| a[0] < b[0]+b[2] && b[0] < a[0]+a[2] && a[1] < b[1]+b[3] && b[1] < a[1]+a[3];
-        let inside = |a: [i32; 4], b: [i32; 4]| a[0] >= b[0] && a[1] >= b[1] && a[0]+a[2] <= b[0]+b[2] && a[1]+a[3] <= b[1]+b[3];
-        let union = |a: [i32; 4], b: [i32; 4]| {
-            let (l, t) = (a[0].min(b[0]), a[1].min(b[1]));
-            [l, t, (a[0]+a[2]).max(b[0]+b[2]) - l, (a[1]+a[3]).max(b[1]+b[3]) - t]
-        };
-        let background = |item: &Item| matches!(&item.kind, Kind::Image(art) if art == "cover" || art == "section");
-        for previewing in [false, true] {
-            state.values.insert("dialog.previewing_base".into(), Value::On(previewing));
-            for tab in ["resolution", "layout", "zoom", "clean_map", "accessibility"] {
-                state.values.insert("tab".into(), Value::Text(tab.into()));
-                let visible: Vec<(usize, &Item)> = panel.items.iter().enumerate().filter(|(_, i)| Panels::visible(i, &state)).collect();
-                let rect_of = |n: usize, item: &Item| {
-                    let mut rect = panels.rect(item, &state, origin);
-                    for draw in panels.draw_item(panel, &state, area, &estimate, n, item) {
-                        if let Draw::Text(t) = draw {
-                            let m = estimate(&t.style, &t.text);
-                            let text = [t.x, t.y - m.ascent, m.width, m.ascent + m.descent];
-                            rect = Some(rect.map_or(text, |r| union(r, text)));
-                        }
-                    }
-                    rect.unwrap()
-                };
-                let parchment = visible.iter().find(|(_, i)| matches!(&i.kind, Kind::Image(a) if a == "cover")).map(|&(n, i)| rect_of(n, i)).unwrap();
-                let cards: Vec<[i32; 4]> = visible.iter().filter(|(_, i)| matches!(&i.kind, Kind::Image(a) if a == "section")).map(|&(n, i)| rect_of(n, i)).collect();
-                // (The tab buttons lie above the parchment.)
-                let items: Vec<(&Item, [i32; 4])> = visible.iter().filter(|(_, i)| !background(i) && !matches!(&i.kind, Kind::Choice { control, .. } if control == "tab"))
-                    .map(|&(n, i)| (i, rect_of(n, i))).collect();
-                let name = |item: &Item| item.control().map(str::to_owned).or(item.text.clone()).unwrap_or_default();
-                for (i, (item, rect)) in items.iter().enumerate() {
-                    assert!(inside(*rect, parchment), "{tab}: {} at {rect:?} leaves the panel {parchment:?}", name(item));
-                    for (other, other_rect) in &items[..i] {
-                        assert!(!overlap(*rect, *other_rect), "{tab}: {} at {rect:?} overlaps {} at {other_rect:?}", name(item), name(other));
-                    }
-                }
-                if tab != "accessibility" { continue; }
-                let card_of = |rect: [i32; 4]| {
-                    let holding: Vec<_> = cards.iter().copied().filter(|card| inside(rect, *card)).collect();
-                    assert_eq!(holding.len(), 1, "accessibility: {rect:?} in exactly one card");
-                    holding[0]
-                };
-                let heading = |card: [i32; 4]| items.iter().find(|(i, r)| i.style.as_deref() == Some("heading") && inside(*r, card)).and_then(|(i, _)| i.text.clone());
-                for (item, rect) in &items {
-                    assert!(heading(card_of(*rect)).is_some(), "accessibility: {} in a card without a heading", name(item));
-                }
-                for card in &cards {
-                    assert!(heading(*card).is_some(), "accessibility: card {card:?} without a heading");
-                }
-                let card_named = |control: &str| {
-                    let (_, rect) = items.iter().find(|(i, _)| i.control() == Some(control)).unwrap();
-                    heading(card_of(*rect)).unwrap()
-                };
-                for (control, card) in [("accessibility.active_unit_arrow", "Active unit"), ("accessibility.arrow_bobbing", "Active unit"),
-                    ("accessibility.arrow_size", "Active unit"),
-                    ("accessibility.hud_size", "Unit markers"), ("accessibility.stack_count", "Unit markers"),
-                    ("accessibility.stack_backdrop", "Unit markers"),
-                    ("accessibility.unit_rings", "Diplomacy rings"), ("accessibility.war.color", "Diplomacy rings"),
-                    ("accessibility.peace.invert", "Diplomacy rings"), ("accessibility.ring_width", "Diplomacy rings"),
-                    ("input.alt_in_menus", "Mouse (Alt mode)"), ("input.snap_updates_per_second", "Mouse (Alt mode)"),
-                    ("input.record_alt_mode", "Mouse (Alt mode)")] {
-                    assert_eq!(card_named(control), card, "{control}");
-                }
-                // Each undo button in its slider's card, on its row.
-                for (undo, rect) in items.iter().filter(|(i, _)| i.control() == Some("dialog.undo")) {
-                    let Kind::Choice { value: control, .. } = &undo.kind else { unreachable!() };
-                    let slider = items.iter().find(|(i, _)| i.control() == Some(control.as_str())).unwrap();
-                    assert_eq!(card_of(*rect), card_of(slider.1), "{control}: undo in its card");
-                    assert_eq!(rect[1], origin.1 + slider.0.at.1, "{control}: undo on the slider's row");
-                }
-            }
-        }
-        // The Alt mode settings left the Layout tab for Accessibility.
-        state.values.insert("tab".into(), Value::Text("layout".into()));
-        assert!(!panel.items.iter().any(|i| Panels::visible(i, &state) && matches!(i.control(), Some("input.alt_in_menus" | "input.snap_updates_per_second" | "input.record_alt_mode"))));
     }
 
     #[test]

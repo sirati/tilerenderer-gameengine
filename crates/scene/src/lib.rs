@@ -107,7 +107,7 @@ pub enum SpriteBlend {
     PaletteAlpha256,
 }
 
-/// A sprite not tied to a cell (units, effects, UI).
+/// A sprite not tied to a cell (pieces, effects, UI).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FreeSprite {
     /// Sprite set (animation) id, resolved from a set name by the
@@ -232,11 +232,11 @@ pub struct SpriteLifetime {
     pub duration_ms: u32,
 }
 
-/// What draws a unit that may be on a walk (see [`Walk`]): `sprites` (a
+/// What draws a piece that may be on a walk (see [`Walk`]): `sprites` (a
 /// half-open range in [`Scene::sprites`]) and `cells` (layer, column, row:
-/// the unit's cells, at the depth the driver draws it) draw unit `key` with
-/// its anchor at world pixel `anchor` (full size). While the unit's walk is
-/// played, a renderer draws them moved by where the walk has the unit then,
+/// the piece's cells, at the depth the driver draws it) draw piece `key` with
+/// its anchor at world pixel `anchor` (full size). While the piece's walk is
+/// played, a renderer draws them moved by where the walk has the piece then,
 /// less `anchor` (the cells by that added to their offsets); else where the
 /// scene has them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,10 +247,10 @@ pub struct Motion {
     pub anchor: (i32, i32),
 }
 
-/// A unit's walk from tile to tile, told the moment each tile starts (not
+/// A piece's walk from tile to tile, told the moment each tile starts (not
 /// with the scene: see [`Update::Walk`]). `serial` identifies the walk
 /// (increasing across the session); `origin` is the world pixel (full
-/// size) of the unit's anchor where it began; `tiles` are its tiles started
+/// size) of the piece's anchor where it began; `tiles` are its tiles started
 /// so far, in order; `planned` how many more the driver expects to follow
 /// (its path), 0 for a single step or the walk's last tile.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -290,11 +290,11 @@ pub struct Scene {
     /// same cells share one, and one no view differs by is not sent.
     pub slots: Vec<LayerSlot>,
     pub bindings: Vec<Binding>,
-    /// World-space sprites (units, effects), drawn in every view, in
+    /// World-space sprites (pieces, effects), drawn in every view, in
     /// drawing order (within the pass each follows).
     pub sprites: Vec<FreeSprite>,
     pub sprite_lifetimes: Vec<SpriteLifetime>,
-    /// World sprites drawing units that may be on a walk.
+    /// World sprites drawing pieces that may be on a walk.
     pub motions: Vec<Motion>,
     /// By id.
     pub views: Vec<ViewState>,
@@ -305,12 +305,12 @@ pub struct Scene {
     /// refer to; 0: whatever the renderer has.
     pub assets: u64,
     /// The world pixel the driver considers its point of interest (e.g. the
-    /// unit a player is moving), if any (in the pixels of its views, see
+    /// piece a player is moving), if any (in the pixels of its views, see
     /// [`View::downscale`]).
     pub focus: Option<(i32, i32)>,
     /// Where a marker over the point of interest goes instead of `focus`
     /// (which follows the driver's own frames): `from` (in the pixels of
-    /// `focus`) moved as the walk of unit `key` moves its sprites
+    /// `focus`) moved as the walk of piece `key` moves its sprites
     /// ([`Motion`]: from its anchor; `key` 0, or no walk: not moved).
     pub focus_motion: Option<FocusMotion>,
     /// Semantic main-camera request independent of the native rendering camera.
@@ -467,8 +467,8 @@ impl SystemCursor {
 /// Parts of the driver's interface a renderer may arrange (all in window
 /// pixels; views by id). A renderer that does not arrange anything draws
 /// every view where the driver put it, as always.
-/// The visible modal overlays in paint order, excluding the named screen.
-/// Civ III's dialog machinery permits at most four open forms.
+/// The visible modal overlays in paint order, excluding the named screen:
+/// at most four open forms.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModalStack(pub [Option<u32>; 4]);
 
@@ -477,16 +477,41 @@ impl ModalStack {
     pub fn contains(&self, id: u32) -> bool { self.iter().any(|view| view == id) }
 }
 
+/// What a named screen ([`Interface::screen`]) is, for a renderer that
+/// arranges it: the driver says so, a renderer never reads the name.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ScreenRole {
+    /// A screen of its own (a report, an overview): placed as a whole.
+    #[default]
+    Other,
+    /// The driver's menu (its title menu, its settings): a renderer keeps
+    /// the view the pointer was in when it opened as the one it belongs to,
+    /// and may let it follow the pointer between its views.
+    Menu,
+    /// The screen of a site: a place of the world with a screen of its own
+    /// that produces things (a town, a base, a star system). Its world
+    /// views (those with a viewport of their own: the site's surroundings)
+    /// are controls of the screen: placed, moved and scaled with it, every
+    /// category of the world shown in them. All of the driver's interface
+    /// views are parts of it, and its content is what its interface views
+    /// at camera (0, 0) draw.
+    Site,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Interface {
     /// The screen the interface shows, named by the driver (e.g. "F1",
-    /// "City", "Menu"); none: its usual screen over the world. A renderer
-    /// may place a named screen in one of its own views.
+    /// "Site", "Menu"); none: its usual screen over the world. A renderer
+    /// may place a named screen in one of its own views. It does not read
+    /// the name: what it arranges differently it learns from `screen_role`.
     pub screen: Option<String>,
     /// Keep the complete menu inside the visible canvas or assigned menu
     /// region, even when user menu scaling is disabled. Set for the title
     /// and Preferences using the driver's screen state, not rendered text.
     pub menu_fit: bool,
+    /// What the named screen (`screen`) is, as far as a renderer arranges
+    /// it differently.
+    pub screen_role: ScreenRole,
     /// An interface-only view holding controls that belong with whichever
     /// of the renderer's views the pointer is in (e.g. a game's menu buttons
     /// in the top-left corner, with the tooltip they show; the view's
@@ -521,11 +546,11 @@ pub struct Interface {
     /// views over the window (and map pointer input there back).
     pub screen_view: Option<u32>,
     /// The named screen's main control (x, y, w, h, in the driver's window
-    /// pixels; e.g. a city screen's production box): where a renderer that
+    /// pixels; e.g. a site screen's production box): where a renderer that
     /// lets go of a captured mouse when the screen opens puts the pointer.
     pub focus_control: Option<[i32; 4]>,
     /// A rectangle (x, y, w, h) of controls the pointer has to reach from
-    /// every view of the renderer's (e.g. the active unit's orders), while
+    /// every view of the renderer's (e.g. the selected piece's orders), while
     /// they are shown.
     pub reachable: Option<[i32; 4]>,
     /// The tooltip the driver shows (x, y, w, h), if any: drawn over
@@ -542,7 +567,7 @@ pub struct Interface {
     /// in the view the click was made in, not with the screens.
     pub popup_anchor: Option<PopupAnchor>,
     /// The open popup is one the driver opened at a click on its named
-    /// screen (`screen`; e.g. the menu of a unit in a city screen's
+    /// screen (`screen`; e.g. the menu of a piece in a site screen's
     /// garrison): it belongs where the driver put it on that screen, placed
     /// and scaled with the screen, not over it as a modal of the screen's.
     pub popup_on_screen: bool,
@@ -569,20 +594,22 @@ pub struct Interface {
     /// front of them where it cannot.
     pub loading_bar: Option<u32>,
     /// A command of the driver's waits for the player to pick a place of
-    /// the world (e.g. a unit's go-to destination, a bombard target): the
+    /// the world (e.g. a piece's go-to destination, a bombard target): the
     /// next click that matters is one on the world (a renderer may give
     /// the world the pointer for it).
     pub targeting: bool,
-    /// The command waiting for its tile is a move (a unit's or a stack's
+    /// The command waiting for its tile is a move (a piece's or a stack's
     /// go-to, whose target shows the turns it takes): a renderer may show
     /// the cursor tile by tile. Other commands (bombard, rebase, airlift,
     /// ...) keep the cursor at the pointer.
     pub snap_to_tiles: bool,
-    /// A build queue shown that the player may reorder by dragging.
-    pub build_queue: Option<BuildQueue>,
+    /// Messages of extensions of this protocol ([`Extension`]), e.g. a
+    /// game kind's list that a renderer lets the player reorder by
+    /// dragging; at most one of each kind.
+    pub extensions: Vec<Extension>,
     /// One of the driver's dialogues a player opens to get out of the game
-    /// is open (Civilization III: its game menu with Save, Load and Quit
-    /// Game, and the "really quit?" popup Escape opens on the map). While
+    /// is open (e.g. its game menu with Save, Load and Quit, or the "really
+    /// quit?" popup Escape opens on the map). While
     /// it is, a renderer holds the pointer in no way: no capture, no
     /// confinement, no walls, no warps, so it can leave the window. The
     /// driver sets it from its state in every scene, never from events.
@@ -711,7 +738,7 @@ pub struct Interactable {
     pub id: u64,
     /// In button snapping only, a left click on it reaches the driver as a
     /// right click at the same point: for elements whose only action is
-    /// on the right button (the F1 advisor's production cells). Ordinary
+    /// on the right button (a report screen's production cells). Ordinary
     /// mouse input is never changed.
     pub alt_right_click: bool,
 }
@@ -856,7 +883,7 @@ pub enum Update {
     SpriteLifetimes(Vec<SpriteLifetime>),
     /// See [`Scene::motions`] (replaced).
     Motions(Vec<Motion>),
-    /// A unit's walk as it is now (replacing any it had): kept by the
+    /// A piece's walk as it is now (replacing any it had): kept by the
     /// [`Display`], not the scene, and sent the moment a tile starts (a
     /// batch of these alone is no new scene).
     Walk(Walk),
@@ -1202,11 +1229,12 @@ pub enum Button {
     Middle,
 }
 
-/// A unit order gesture keeps the native go-to preview open until a separate
+/// A world order gesture (the selected piece, a unit, sent to a place of
+/// the world) keeps the driver's go-to preview open until a separate
 /// click confirms its destination. A driver must reject a confirmation whose
-/// tile, selected unit, or world differs from the last preview.
+/// tile, selected piece, or world differs from the last preview.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum UnitOrderAction {
+pub enum WorldOrderAction {
     Preview,
     Confirm,
     Cancel,
@@ -1343,10 +1371,11 @@ pub enum Input {
     /// does not show. A driver can update hover and targeting directly
     /// without moving its camera. Coordinates use the main world scale.
     WorldMove { x: i32, y: i32 },
-    /// Preview, confirm, or cancel a unit go-to order at a world pixel.
+    /// Preview, confirm, or cancel a go-to order of the selected piece at a
+    /// world pixel.
     /// Releasing the initiating button never confirms the order. Confirmation
     /// is valid only for the tile of the most recent preview.
-    UnitOrder { action: UnitOrderAction, x: i32, y: i32 },
+    WorldOrder { action: WorldOrderAction, x: i32, y: i32 },
     /// A button went down or up on world pixel (x, y) in a view of the
     /// renderer's own whose pointer input does not reach the driver's
     /// window (it shows what the driver's main view does not, or what the
@@ -1380,41 +1409,27 @@ pub enum Input {
     /// The renderer's user has read queued popup `serial`
     /// (`Interface::queued`): the driver stops sending it.
     CloseQueued { serial: u64 },
-    /// Move entry `from` of the build queue `Interface::build_queue` shows
-    /// (as of its `stamp`; a driver drops the edit for another) before
-    /// entry `to` (its length: to the end), or with `to` =
-    /// [`BUILD_QUEUE_CURRENT`] onto what is built now (built now instead,
-    /// what was built going to the front of the queue).
-    BuildQueue { stamp: u32, from: u8, to: u8 },
+    /// A message of an extension of this protocol (`Interface::extensions`):
+    /// the renderer's part of it sends what the driver's part reads.
+    Extension { kind: u32, data: Vec<u8> },
 }
 
-/// [`Input::BuildQueue`]'s `to` for the current build.
-pub const BUILD_QUEUE_CURRENT: u8 = u8::MAX;
-
-/// A build queue a renderer may let the player reorder by dragging
-/// ([`Input::BuildQueue`]): a city screen's queued orders where the screen
-/// lists them, and what the city builds now.
+/// What a crate that extends the protocol sends in an [`Interface`]
+/// (`Interface::extensions`) or in an [`Input::Extension`]: data this
+/// crate does not read, of a `kind` the extending crate chooses (one per
+/// message; extensions used together choose different ones, e.g. four
+/// letters of their name). A renderer without the extension ignores it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BuildQueue {
-    /// The queue as it is now (an edit names it).
-    pub stamp: u32,
-    /// What is built now (x, y, w, h), a place to drop an entry on.
-    pub current: [i32; 4],
-    /// The entries shown, in queue order.
-    pub rows: Vec<BuildQueueRow>,
+pub struct Extension {
+    pub kind: u32,
+    pub data: Vec<u8>,
 }
 
-/// An entry of a [`BuildQueue`] where it is shown.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct BuildQueueRow {
-    /// Its place in the queue (0: built next).
-    pub slot: u8,
-    /// The row (x, y, w, h) and, at its left, the handle it is dragged by:
-    /// also an interactable of its own, `grip_id` (a button), for pointing
-    /// aids.
-    pub rect: [i32; 4],
-    pub grip: [i32; 4],
-    pub grip_id: u64,
+impl Interface {
+    /// The data of the extension message `kind`, if the driver sent one.
+    pub fn extension(&self, kind: u32) -> Option<&[u8]> {
+        self.extensions.iter().find(|e| e.kind == kind).map(|e| e.data.as_slice())
+    }
 }
 
 /// How near the window's edge the pointer counts as at it ([`Input::Edge`]).
@@ -1445,11 +1460,11 @@ pub type InputSender = crossbeam_channel::Sender<Input>;
 /// [`Display::set_wake`]).
 #[derive(Clone, Default)]
 struct Waker {
-    call: std::sync::Arc<civ3r_sync::Latest<Box<dyn Fn() + Send + Sync>>>,
+    call: std::sync::Arc<handoff::Latest<Box<dyn Fn() + Send + Sync>>>,
     /// The thread waiting in [`Display::receive`], unparked by each batch.
     /// The renderer parks rather than waiting in the channel, so a send
     /// never touches the channel's waiter list (a lock).
-    parked: std::sync::Arc<civ3r_sync::Latest<std::thread::Thread>>,
+    parked: std::sync::Arc<handoff::Latest<std::thread::Thread>>,
 }
 
 impl Waker {
@@ -1560,7 +1575,7 @@ pub struct Display {
     changes_from_seq: u64,
     /// The host's status last received, and when (see [`Display::host`]).
     host: Option<(HostStatus, std::time::Instant)>,
-    /// The walk each unit was told last (see [`Update::Walk`]), with when
+    /// The walk each piece was told last (see [`Update::Walk`]), with when
     /// each of its tiles first arrived.
     walks: std::collections::HashMap<u32, (Walk, Vec<std::time::Instant>)>,
     /// The last [`Input::MouseMove`] sent (see [`Display::last_pointer_move`]).
@@ -1712,14 +1727,14 @@ impl Display {
         self.host
     }
 
-    /// The walk unit `key` was told last, and when each of its tiles first
+    /// The walk piece `key` was told last, and when each of its tiles first
     /// arrived on the renderer's clock (the driver sent it then).
     pub fn walk(&self, key: u32) -> Option<(&Walk, &[std::time::Instant])> {
         self.walks.get(&key).map(|(w, at)| (w, &at[..]))
     }
 
     fn take_walk(&mut self, walk: Walk, now: std::time::Instant) {
-        // (Walks a minute old are let go: their units stand still.)
+        // (Walks a minute old are let go: their pieces stand still.)
         self.walks.retain(|_, (_, at)| at.last().is_some_and(|t| now.saturating_duration_since(*t) < Duration::from_secs(60)));
         let entry = self.walks.entry(walk.key).or_insert_with(|| (Walk::default(), Vec::new()));
         if entry.0.serial != walk.serial {
@@ -1879,7 +1894,7 @@ mod tests {
         let (w, at) = display.walk(7).unwrap();
         assert_eq!((w.tiles.len(), at[0]), (2, first), "an earlier tile keeps its arrival");
         assert!(at[1] > first);
-        // A new walk of the unit: its own arrivals.
+        // A new walk of the piece: its own arrivals.
         driver.send(vec![Update::Walk(walk(2, vec![tile(900)]))]);
         display.receive(Duration::ZERO);
         let (w, at) = display.walk(7).unwrap();
@@ -1969,7 +1984,7 @@ mod tests {
         let (changes, scene) = display.take_changes();
         assert!(changes.slots && changes.slot_cells.is_empty() && changes.cells.is_empty() && !changes.world);
         assert_eq!((scene.slots.clone(), scene.bindings.clone(), scene.view(1).unwrap().view.binding), (s.slots.clone(), s.bindings.clone(), 1));
-        // Its city moves: only the slot's changed values travel.
+        // Its site moves: only the slot's changed values travel.
         let before = s.clone();
         s.slots[0].cells.values[2] = 2;
         s.slots[0].cells.values[0] = 1;

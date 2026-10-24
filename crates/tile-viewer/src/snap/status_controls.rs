@@ -2,7 +2,7 @@ use super::*;
 use scene::{FreeSprite, Scene, View, ViewState};
 
 #[test]
-fn status_orb_and_select_unit_targets_follow_the_drawn_panel_across_splits_and_scales() {
+fn status_orb_and_select_piece_targets_follow_the_drawn_panel_across_splits_and_scales() {
     let gui = 0x9F_DB10u64;
     let orb_id = gui << 32 | 0x3000_0000;
     let select_id = (gui + 0x274) << 32 | 0x0E00_0000;
@@ -49,11 +49,11 @@ fn status_orb_and_select_unit_targets_follow_the_drawn_panel_across_splits_and_s
                     assert!(x >= ix && x < ix + iw && y >= iy && y < iy + ih,
                         "{split:?}, pixel x{pixel_scale}, frame {frame_scale}: {input:?} vs {item:?}");
                 }
-                // Steering from the orb toward the unit's actual icon can
+                // Steering from the orb toward the piece's actual icon can
                 // reach it, even when that HUD is across the split.
                 let orb = targets.iter().find(|t| t.id == orb_id).unwrap().center();
-                let unit = targets.iter().find(|t| t.id == select_id).unwrap().center();
-                assert_eq!(targets[pick(&targets, orb, Some(orb_id), (unit.0 - orb.0, unit.1 - orb.1)).unwrap()].id, select_id);
+                let piece = targets.iter().find(|t| t.id == select_id).unwrap().center();
+                assert_eq!(targets[pick(&targets, orb, Some(orb_id), (piece.0 - orb.0, piece.1 - orb.1)).unwrap()].id, select_id);
             }
         }
     }

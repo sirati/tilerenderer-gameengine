@@ -346,7 +346,7 @@ fn a_click_clicks_the_element_snapped_to() {
 
 #[test]
 fn an_alt_left_click_on_a_right_click_only_target_is_a_right_click_there() {
-    // B (the F1 production cell) acts only on the right button.
+    // B (a report's production cell) acts only on the right button.
     let t = targets(&[button(1, [100, 100, 40, 20]), Interactable { alt_right_click: true, ..button(2, [300, 100, 40, 20]) }], IDENTITY, WINDOW);
     let mut s = Snapper::default();
     s.enter(0.0, (120.0, 110.0), &t, Rates::default());
@@ -1007,8 +1007,8 @@ fn in_the_mode_only_the_snapping_pointer_and_its_ghost_are_drawn() {
 }
 
 
-/// The driver's own pointer for an element (the game's Civilopedia book
-/// over a wonder a click opens the Civilopedia on) shows on the snapping
+/// The driver's own pointer for an element (the game's book over
+/// an entry a click opens the encyclopedia on) shows on the snapping
 /// pointer once it rests there and the driver has handled the move there,
 /// with the busy badge on it; in flight, before the driver's answer, and
 /// for a system icon the viewer has no art of, the arrow.
@@ -1133,6 +1133,7 @@ fn alt_targets_on_title_and_setup_keep_their_full_window_positions_with_saved_ga
         let mut s = scene();
         s.shape = Default::default();
         s.interface.screen = name.map(str::to_owned);
+        s.interface.screen_role = name.map_or(Default::default(), crate::screen_role_for_test);
         s.interactables = vec![button(44, [650, 400, 120, 40])];
         let mut l = Layout::default();
         l.configure("split=vertical,pane=pointer,magnifier=world,ui=pane").unwrap();

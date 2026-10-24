@@ -55,6 +55,9 @@
           export DRI_PRIME=pci-0000_72_00_0
           export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=$PWD/tools/wine-run
           export CARGO_TARGET_I686_PC_WINDOWS_GNU_RUNNER=$PWD/tools/wine-run
+          # The TrueType font the game-agnostic text tests use where there is
+          # one (here the game's Lucida Sans, which their references match).
+          export TEST_FONT=''${TEST_FONT:-''${CIV3_INSTALL:-/mnt/datasets/winvm/civ3-src/Civilization III Complete}/LSANS.TTF}
         '';
       } // pkgs.lib.optionalAttrs linux {
         # Windows targets link with mingw-w64 and need its pthreads.
