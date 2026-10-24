@@ -1,0 +1,15 @@
+[package]
+name = "marker-shaders"
+description = "rust-gpu maths of the selection marker: a bouncing gilded arrow and its ground shadow, painted at any scale (linked into viewer-shaders)"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+spirv-std = "0.11"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spirv"))'] }

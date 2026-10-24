@@ -66,6 +66,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "marker-shaders"
+version = "0.1.0"
+dependencies = [
+ "spirv-std",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -162,6 +169,8 @@ name = "viewer-shaders"
 version = "0.1.0"
 dependencies = [
  "glass-shaders",
+ "marker-shaders",
  "spirv-std",
  "tile-render-shaders",
+ "tile-render-shared",
 ]

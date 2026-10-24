@@ -49,10 +49,12 @@ use winit::window::{Fullscreen, Window, WindowId};
 /// renderer's, the glass lens's and the selection marker's shaders, one
 /// SPIR-V module), with what the renderer draws from it.
 pub const SHADERS: tile_render::Shaders = tile_render::Shaders::new(viewer_spirv::SPIRV, viewer_spirv::SPIRV_FALLBACK)
-    .with_effect(glass_lens::effect);
+    .with_effect(glass_lens::effect)
+    .with_painter(viewer_spirv::PAINTER);
 
-/// The CPU oracle of a renderer drawing with [`SHADERS`] (the glass lens's).
-pub const ORACLE: tile_render::reference::Oracle<'static> = tile_render::reference::Oracle { effect: Some(&glass_lens::ORACLE) };
+/// The CPU oracle of a renderer drawing with [`SHADERS`] (the glass lens's
+/// and the selection marker's).
+pub const ORACLE: tile_render::reference::Oracle<'static> = tile_render::reference::Oracle { effect: Some(&glass_lens::ORACLE), painter: Some(&marker::PAINTER) };
 
 #[derive(Clone, Debug)]
 pub struct ViewerConfig {
@@ -825,7 +827,7 @@ const ARROW_SHADOW_CENTRE: (i32, i32) = (8, 4);
 
 /// [`marker_sprites`] with the arrow `size` times as large as its 1:1 art.
 /// Larger, it is painted at the resolution of each view showing it
-/// (`tile_render::Shape::Arrow`) rather than scaled from its art: crisp at
+/// (`marker::arrow`) rather than scaled from its art: crisp at
 /// any world scale and in the zoom box. Its tip stays where the 1:1 arrow's
 /// is, above the unit; it bobs `size` times as far, its shadow (on the
 /// ground, as wide as it) shaped likewise.
@@ -839,9 +841,8 @@ pub fn marker_sprites_sized(compiled: &Compiled, markers: &[layout::Marker], dow
             let sprite = |shape| tile_render::PlacedSprite { category: viewer_settings::clean_map::UNITS, shape: Some(shape),
                 ..tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, x * n, y * n) };
             vec![
-                sprite(tile_render::Shape::ArrowShadow { size: sixteenths, bob, rgba: ARROW_SHADOW_RGBA,
-                    centre: ((ARROW_SHADOW_CENTRE.0 as f32 * size).round() as i32, ARROW_SHADOW_CENTRE.1) }),
-                sprite(tile_render::Shape::Arrow { size: sixteenths, tip: ARROW_TIP, bob, rgba: ARROW_RGBA }),
+                sprite(marker::shadow(sixteenths, ((ARROW_SHADOW_CENTRE.0 as f32 * size).round() as i32, ARROW_SHADOW_CENTRE.1), bob, ARROW_SHADOW_RGBA)),
+                sprite(marker::arrow(sixteenths, ARROW_TIP, bob, ARROW_RGBA)),
             ]
         }).collect();
     }
@@ -976,9 +977,9 @@ mod accessibility_arrow_tests {
     /// `sprites` alone (its shadow left out) at `zoom` around (100, 230).
     fn arrow_extent(sprites: &[tile_render::PlacedSprite], zoom: u32) -> (u32, u32, u32, u32) {
         let mut world = tile_render::TileWorld::new(tile_render::Grid { cols: 1, rows: 1, layout: tile_render::Layout::Orthogonal, step: (32, 32), wrap_x: false, wrap_y: false }, Default::default());
-        world.free = sprites.iter().filter(|s| !matches!(s.shape, Some(tile_render::Shape::ArrowShadow { .. }))).cloned().collect();
+        world.free = sprites.iter().filter(|s| !marker::is_shadow(s.shape)).cloned().collect();
         let camera = Camera { zoom: (zoom, 1), zoomed_art: true, ..Camera::new((200 * zoom, 260 * zoom)) };
-        let image = tile_render::reference::render(&world, &tile_render::AtlasBuilder::new(16).finish(), &camera, 0, [0, 0, 0, 255]);
+        let image = crate::ORACLE.render(&world, &tile_render::AtlasBuilder::new(16).finish(), &camera, 0, [0, 0, 0, 255]);
         let lit: Vec<(u32, u32)> = (0..image.height).flat_map(|y| (0..image.width).map(move |x| (x, y))).filter(|&(x, y)| image.get(x, y) != [0, 0, 0, 255]).collect();
         let xs = lit.iter().map(|p| p.0);
         let ys = lit.iter().map(|p| p.1);
@@ -1009,7 +1010,7 @@ mod accessibility_arrow_tests {
         for size in [1.5f32, 2.0, 2.5, 3.0] {
             let sprites = marker_sprites_sized(&compiled, &m, 1, Duration::ZERO, false, size);
             assert_eq!(sprites.len(), 2);
-            assert!(matches!(sprites[1].shape, Some(tile_render::Shape::Arrow { .. })), "the arrow over its shadow");
+            assert!(marker::is_arrow(sprites[1].shape), "the arrow over its shadow");
             for zoom in [1, 2, 3] {
                 let (l, t, r, b) = arrow_extent(&sprites, zoom);
                 let e = size * zoom as f32;

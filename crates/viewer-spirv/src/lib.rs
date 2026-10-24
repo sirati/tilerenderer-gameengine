@@ -15,3 +15,7 @@ pub const SPIRV: &[u8] = include_bytes!(env!("VIEWER_SPV"));
 
 /// The same module without dual-source outputs (for any other device).
 pub const SPIRV_FALLBACK: &[u8] = include_bytes!(env!("VIEWER_SPV_FALLBACK"));
+
+/// The module's painter entry point (`tile_render::Shaders::painter`): the
+/// selection marker's arrow and shadow, the tile renderer's painted shapes.
+pub const PAINTER: &str = "painted_fs";

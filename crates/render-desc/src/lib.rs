@@ -937,7 +937,7 @@ fn gilded_arrow(spec: &str) -> Result<RgbaImage, String> {
     };
     let (color, (w, h)) = shape_spec(spec, "gilded_arrow")?;
     if shift.is_some() && h <= 8 { return Err("gilded_arrow: phase art needs an eight-pixel margin".into()); }
-    // Painted at the native 33x48 size (`marker_math`), supersampled for
+    // Painted at the native 33x48 size (`marker::sample`), supersampled for
     // soft edges.
     let midtone = [color[0] as f32, color[1] as f32, color[2] as f32];
     Ok(RgbaImage::from_fn(w, h, |x, y| {
@@ -948,7 +948,7 @@ fn gilded_arrow(spec: &str) -> Result<RgbaImage, String> {
                 Some(shift) => (y as f32+(sy as f32+0.5)/4.0-4.0-shift)*48.0/(h-8) as f32,
                 None => (y as f32+(sy as f32+0.5)/4.0)*48.0/h as f32,
             };
-            let (inside, c) = marker_math::sample(px, py, midtone, false);
+            let (inside, c) = marker::sample(px, py, midtone, false);
             if !inside { continue; }
             for k in 0..3 { sum[k] += c[k]; }
             sum[3] += 1.0;
@@ -959,11 +959,6 @@ fn gilded_arrow(spec: &str) -> Result<RgbaImage, String> {
             (sum[2]/sum[3]).clamp(0.0,255.0) as u8, (sum[3]*color[3] as f32/16.0).round() as u8]
     }))
 }
-
-// (Only its 1:1 painting is used here.)
-#[allow(dead_code)]
-#[path = "../../tile-render-shaders/src/marker_math.rs"]
-mod marker_math;
 
 /// Soft elliptical ground shadow, separate from the airborne marker.
 fn marker_shadow(spec: &str) -> Result<RgbaImage, String> {

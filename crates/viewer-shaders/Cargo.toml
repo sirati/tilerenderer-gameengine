@@ -12,6 +12,9 @@ crate-type = ["dylib", "lib"]
 spirv-std = "0.11"
 tile-render-shaders = { path = "../tile-render-shaders" }
 glass-shaders = { path = "../glass-shaders" }
+marker-shaders = { path = "../marker-shaders" }
+# The tile renderer's types its painter entry point reads.
+tile-render-shared = { path = "../tile-render-shared" }
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spirv"))'] }
