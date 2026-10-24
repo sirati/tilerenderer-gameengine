@@ -5,7 +5,7 @@
 //!
 //! The viewer's thread never waits for it: pushes onto the queue drop and
 //! count when it is full; the writer polls the queue, woken early by a
-//! [`civ3r_sync::Wake`] when it fills up, and on close, which waits for
+//! [`handoff::Wake`] when it fills up, and on close, which waits for
 //! the writer at most a bounded time.
 
 use std::io::Write;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use civ3r_sync::{Bounded, Wake};
+use handoff::{Bounded, Wake};
 
 use super::Record;
 use super::format::{Encoder, Header};

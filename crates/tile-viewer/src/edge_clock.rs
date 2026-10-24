@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use civ3r_sync::Latest;
+use handoff::Latest;
 use tile_render::Present;
 
 use crate::pointer_thread::{OnTick, Tick};

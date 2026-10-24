@@ -30,7 +30,7 @@ members = [
     "crates/civ3r-viewer",
     "crates/civ3r-launcher",
     "crates/civ3r-process",
-    "crates/civ3r-sync",
+    "crates/handoff",
     "crates/inproc",
     "crates/civ3-sys",
     "crates/jgl",

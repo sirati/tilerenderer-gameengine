@@ -1055,7 +1055,7 @@ pub struct Latency {
     /// When the last sample was taken.
     pub last: Option<Instant>,
     /// Sent by the GPU's completion callbacks, whichever thread runs them.
-    pub done: std::sync::Arc<civ3r_sync::Mailbox<f64>>,
+    pub done: std::sync::Arc<handoff::Mailbox<f64>>,
 }
 
 impl std::fmt::Debug for Latency {

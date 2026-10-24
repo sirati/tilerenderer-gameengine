@@ -423,8 +423,8 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 name = "civ3-assets"
 version = "0.1.0"
 dependencies = [
- "civ3r-sync",
  "gdi-text",
+ "handoff",
  "image",
  "log",
  "render-desc",
@@ -442,9 +442,9 @@ dependencies = [
  "civ3-sys",
  "civ3-ui",
  "civ3r-native",
- "civ3r-sync",
  "env_logger",
  "gdi-text",
+ "handoff",
  "image",
  "inproc",
  "jgl",
@@ -471,8 +471,8 @@ name = "civ3-sys"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "civ3r-sync",
  "gdi-text",
+ "handoff",
  "inproc",
  "log",
  "thiserror 2.0.21",
@@ -510,8 +510,8 @@ dependencies = [
  "application-icon",
  "bytemuck",
  "civ3-assets",
- "civ3r-sync",
  "env_logger",
+ "handoff",
  "log",
  "render-desc",
  "render-errors",
@@ -530,22 +530,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "civ3r-sync"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "crossbeam-channel",
-]
-
-[[package]]
 name = "civ3r-viewer"
 version = "0.1.0"
 dependencies = [
  "application-icon",
  "civ3-assets",
- "civ3r-sync",
  "crossbeam-channel",
  "env_logger",
+ "handoff",
  "image",
  "log",
  "render-desc",
@@ -1106,6 +1098,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "handoff"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "crossbeam-channel",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1272,7 +1272,7 @@ name = "inproc"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "civ3r-sync",
+ "handoff",
  "log",
  "thiserror 2.0.21",
  "tokio",
@@ -2409,7 +2409,7 @@ dependencies = [
 name = "render-errors"
 version = "0.1.0"
 dependencies = [
- "civ3r-sync",
+ "handoff",
  "log",
 ]
 
@@ -2503,8 +2503,8 @@ dependencies = [
 name = "scene"
 version = "0.1.0"
 dependencies = [
- "civ3r-sync",
  "crossbeam-channel",
+ "handoff",
  "thiserror 2.0.21",
  "toml 0.9.12+spec-1.1.0",
  "viewer-settings",
@@ -2919,9 +2919,9 @@ name = "tile-viewer"
 version = "0.1.0"
 dependencies = [
  "application-icon",
- "civ3r-sync",
  "dispatch2",
  "function-keys",
+ "handoff",
  "log",
  "pointer-control",
  "pollster",
@@ -3183,7 +3183,7 @@ dependencies = [
 name = "viewer-transport"
 version = "0.1.0"
 dependencies = [
- "civ3r-sync",
+ "handoff",
  "scene",
 ]
 

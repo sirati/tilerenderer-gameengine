@@ -12,7 +12,7 @@
 //! pointer on a box of the last snapshot is recorded too ("gave up").
 //!
 //! The viewer's thread builds [`Record`]s ([`Recorder`]) and hands them
-//! to a writer thread through a [`civ3r_sync::Bounded`] queue: nothing on
+//! to a writer thread through a [`handoff::Bounded`] queue: nothing on
 //! the viewer's thread waits for the disk, and a record that does not fit
 //! is dropped and counted. The writer encodes them ([`format`]) into an
 //! append-only file next to the game's log, a new part every few

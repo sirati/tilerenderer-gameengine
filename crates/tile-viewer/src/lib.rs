@@ -112,12 +112,12 @@ pub struct Assets(Arc<Shared>);
 /// were made for, so those of a replaced whole are dropped as before.
 struct Shared {
     /// The latest whole description, until the viewer has uploaded it.
-    whole: civ3r_sync::Latest<Whole>,
+    whole: handoff::Latest<Whole>,
     /// Epochs handed out, and the epoch of the whole last published.
     epochs: AtomicU64,
     base: AtomicU64,
     /// Growths and reservations in the order given.
-    added: civ3r_sync::Mailbox<Added>,
+    added: handoff::Mailbox<Added>,
     /// The latest generation given (whole or grown).
     latest: AtomicU64,
     /// Highest generation committed to the drawing renderer. CPU art
@@ -150,10 +150,10 @@ impl Assets {
 
     fn with_whole(compiled: Option<Arc<Compiled>>, generation: u64) -> Self {
         let shared = Shared {
-            whole: civ3r_sync::Latest::new(),
+            whole: handoff::Latest::new(),
             epochs: AtomicU64::new(0),
             base: AtomicU64::new(0),
-            added: civ3r_sync::Mailbox::new(),
+            added: handoff::Mailbox::new(),
             latest: AtomicU64::new(0),
             uploaded: AtomicU64::new(0),
         };

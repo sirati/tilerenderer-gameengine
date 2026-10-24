@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use civ3r_sync::Mailbox;
+use handoff::Mailbox;
 
 pub const VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -288,7 +288,7 @@ struct Shared {
     /// Decoded viewer input; the reader thread is its only producer.
     input: Mailbox<scene::Input>,
     /// Rung after input arrived (see [`Client::wake_on_input`]).
-    input_wake: std::sync::OnceLock<&'static civ3r_sync::Wake>,
+    input_wake: std::sync::OnceLock<&'static handoff::Wake>,
     /// Diagnostics, about the newest `MAX_LOG` kept.
     log: Mailbox<String>,
     /// Set by the first `fail`, which alone records its error.
@@ -559,7 +559,7 @@ impl Client {
     }
 
     /// Rings `wake` whenever input arrives (the first one set stays).
-    pub fn wake_on_input(&self, wake: &'static civ3r_sync::Wake) {
+    pub fn wake_on_input(&self, wake: &'static handoff::Wake) {
         let _ = self.shared.input_wake.set(wake);
     }
 

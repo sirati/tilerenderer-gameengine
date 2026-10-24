@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{ATLAS_PART, ArtInbox, Assets, PendingArt, PendingArtPayload, PreparingArt};
-use civ3r_sync::{Latest, Mailbox, Wake};
+use handoff::{Latest, Mailbox, Wake};
 use render_desc::Compiled;
 use std::{
     cell::RefCell,

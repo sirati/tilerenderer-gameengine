@@ -1445,11 +1445,11 @@ pub type InputSender = crossbeam_channel::Sender<Input>;
 /// [`Display::set_wake`]).
 #[derive(Clone, Default)]
 struct Waker {
-    call: std::sync::Arc<civ3r_sync::Latest<Box<dyn Fn() + Send + Sync>>>,
+    call: std::sync::Arc<handoff::Latest<Box<dyn Fn() + Send + Sync>>>,
     /// The thread waiting in [`Display::receive`], unparked by each batch.
     /// The renderer parks rather than waiting in the channel, so a send
     /// never touches the channel's waiter list (a lock).
-    parked: std::sync::Arc<civ3r_sync::Latest<std::thread::Thread>>,
+    parked: std::sync::Arc<handoff::Latest<std::thread::Thread>>,
 }
 
 impl Waker {
