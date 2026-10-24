@@ -111,8 +111,8 @@ The game's thread never enters the runtime: it only sends.
   must not run on with half-installed hooks). It happens at most once per
   process, before the first frame. Afterwards every check is one atomic load.
   Restoring original drawing waits likewise for an activation in progress.
-- **Text hook install** (`trace.rs`, `inproc::loader::InstallOnce`): two
-  simultaneous loads of `jgl.dll` both return only once the import is patched.
+- **jgl text takeover** (`jgl_hooks.rs`, `inproc::loader::InstallOnce`): two
+  simultaneous loads of `jgl.dll` both return only once the slots are written.
 - **Panic logging**: the panic hook waits up to 200 ms for the log writer.
 - Inside channel implementations: waking a *parked* receiver of ours takes a
   short internal lock (tokio's parker, crossbeam's waker). Game-thread

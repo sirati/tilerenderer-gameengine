@@ -439,12 +439,15 @@ version = "0.1.0"
 dependencies = [
  "civ3-assets",
  "civ3-sys",
+ "civ3-ui",
  "civ3r-native",
  "civ3r-sync",
  "env_logger",
  "gdi-text",
  "image",
  "inproc",
+ "jgl",
+ "jgl-ffi",
  "log",
  "menu",
  "render-desc",
@@ -457,6 +460,7 @@ dependencies = [
  "viewer-settings",
  "viewer-transport",
  "wgpu",
+ "windows-sys 0.61.2",
  "wine-unixlib",
 ]
 
@@ -470,6 +474,14 @@ dependencies = [
  "inproc",
  "log",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "civ3-ui"
+version = "0.1.0"
+dependencies = [
+ "jgl",
+ "log",
 ]
 
 [[package]]
@@ -1273,6 +1285,23 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jgl"
+version = "0.1.0"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "jgl-ffi"
+version = "0.1.0"
+dependencies = [
+ "inproc",
+ "jgl",
+ "log",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "jiff"
