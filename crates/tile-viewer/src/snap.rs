@@ -58,9 +58,11 @@
 //! mode the same way: the mouse is captured again, the view and the world
 //! cursor staying put, the tile under it the command's target.
 //!
-//! **Lists.** On an entry of a list that scrolls, motion up or down that
-//! stays inside the list scrolls it instead, smoothly ([`Scroller`]: wheel
-//! notches spread out in time), the pointer staying on its entry.
+//! **Lists.** Motion only moves between elements: in a list it snaps
+//! among the entries shown and leaves the list at its edges, as anywhere
+//! else; it never scrolls the list. The wheel and a trackpad's scroll do
+//! (as wheel notches where the pointer rests; `smooth_menus` moves the
+//! list by pixels and the entries are targets where they show).
 //!
 //! **Sliders by keyboard** (in the mode or not). A slider or scroll bar is
 //! selected by a left press the driver gets on it (a click or the start of
@@ -144,13 +146,9 @@ pub const MOTION_GAIN: f64 = 0.7;
 /// an unaccelerated system pointer).
 pub const SLIDER_GAIN: f64 = 1.0;
 
-/// Wheel notches for a list's scroll are spread out with this time
-/// constant (seconds): what an update asks for is 95 % sent by the next
-/// update at 3 a second (3 time constants).
+/// The time constant (seconds) a list glides with towards where the
+/// wheel sends it (`smooth_menus::GLIDE`): 95 % of the way in 0.3 s.
 pub const SCROLL_SMOOTHING: f64 = 0.1;
-
-/// At most this many wheel notches a second (a game takes each as a step).
-pub const MAX_NOTCHES_PER_SECOND: f64 = 30.0;
 
 /// Pixels a list scrolls for one notch when neither the list nor its
 /// entries tell.
@@ -563,52 +561,6 @@ impl Flight {
     }
 }
 
-/// Wheel notches spread out in time.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-pub struct Scroller {
-    /// Notches still to send (positive: wheel up, towards the top).
-    pending: f64,
-    /// Sent in part, not yet a whole notch.
-    carry: f64,
-    since_notch: f64,
-}
-
-impl Scroller {
-    pub fn add(&mut self, notches: f64) {
-        self.pending += notches;
-    }
-
-    pub fn idle(&self) -> bool {
-        self.pending == 0.0 && self.carry == 0.0
-    }
-
-    /// `dt` seconds on: the notch to send now (+1 up, −1 down, 0 none).
-    pub fn step(&mut self, dt: f64) -> i32 {
-        self.since_notch += dt;
-        let part = self.pending * (1.0 - (-dt / SCROLL_SMOOTHING).exp());
-        self.pending -= part;
-        self.carry += part;
-        if self.pending.abs() < 0.02 {
-            self.carry += std::mem::take(&mut self.pending);
-        }
-        // The last part of a notch rounds.
-        let whole = if self.pending == 0.0 { 0.5 } else { 1.0 };
-        if self.carry.abs() >= whole && self.since_notch >= 1.0 / MAX_NOTCHES_PER_SECOND {
-            let n = self.carry.signum();
-            self.carry -= n;
-            self.since_notch = 0.0;
-            if self.pending == 0.0 && self.carry.abs() < 0.5 {
-                self.carry = 0.0;
-            }
-            return n as i32;
-        }
-        if self.pending == 0.0 && self.carry.abs() < 0.5 {
-            self.carry = 0.0;
-        }
-        0
-    }
-}
-
 /// What the snapping pointer does, in window pixels.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Action {
@@ -692,12 +644,6 @@ pub struct Snapper {
     next_ghost: f64,
     last: f64,
     rates: Rates,
-    scroll: Scroller,
-    /// Notches moved in the list not sent yet (less than half of one).
-    scroll_rest: f64,
-    /// Notches were sent: once they are all out, the driver gets the
-    /// pointer again (what is under it now shows its hover).
-    scrolled: bool,
     /// Where each button's press went, and as which button.
     pressed: [Option<(Point, Button)>; 3],
     /// The driver's element the pointer last rested on (kept across modes:
@@ -722,9 +668,6 @@ fn button_index(b: Button) -> usize {
 enum Choice {
     /// Snap to the target at this index.
     Snap(usize),
-    /// Stay, and scroll the list by this many pixels (positive: the pointer
-    /// went down the list).
-    Scroll { by: f64, step: f64 },
     Nothing,
 }
 
@@ -968,7 +911,7 @@ impl Snapper {
             if now >= self.next_ghost {
                 self.ghost = Some(match self.choose(targets) {
                     Choice::Snap(k) => targets[k].center(),
-                    Choice::Scroll { .. } | Choice::Nothing => self.flight.to,
+                    Choice::Nothing => self.flight.to,
                 });
                 self.next_ghost = (self.next_ghost + 1.0 / rates.ghost_fps).max(now);
             }
@@ -996,20 +939,6 @@ impl Snapper {
         if self.phase == Phase::Landing && self.flight.done(now) {
             self.park();
         }
-        match self.scroll.step(dt) {
-            0 => {}
-            n => {
-                log::debug!("snap: the list scrolls a notch {}", if n > 0 { "up" } else { "down" });
-                out.push(Action::Wheel { delta: n * NOTCH, at: self.flight.to });
-                self.scrolled = true;
-            }
-        }
-        if self.scrolled && self.scroll.idle() {
-            self.scrolled = false;
-            if self.flight.done(now) {
-                out.push(Action::Move(self.flight.to));
-            }
-        }
         out
     }
 
@@ -1020,7 +949,6 @@ impl Snapper {
         self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }), capture: t.is_capture(), alt_right_click: t.alt_right_click });
         let c = t.center();
         self.picked = now;
-        self.scroll_rest = 0.0;
         if c != self.flight.to || !self.flight.done(now) || self.pos != c {
             let duration = self.rates.flight();
             self.flight.retarget(c, now, duration);
@@ -1036,17 +964,8 @@ impl Snapper {
     fn choose(&self, targets: &[Target]) -> Choice {
         let from = self.flight.to;
         let m = self.moved;
-        // In a list that scrolls, motion up or down staying inside it (or
-        // within a step past its edge: from its first or last entry shown)
-        // scrolls it.
-        let list = self.snapped.and_then(|s| s.list).and_then(|id| targets.iter().find(|t| t.id == id));
-        if let Some(Target { rect, kind: TargetKind::List { step, .. }, .. }) = list {
-            let [x, y, w, h] = *rect;
-            let reach = [x, y - step, w, h + 2.0 * step];
-            if m.0.hypot(m.1) >= DEAD_ZONE && m.1.abs() >= m.0.abs() && inside(reach, (from.0 + m.0, from.1 + m.1)) {
-                return Choice::Scroll { by: m.1, step: *step };
-            }
-        }
+        // (In a list too: motion goes to the entries shown, or out of the
+        // list past its edges; only the wheel and a scroll scroll it.)
         pick(targets, from, self.snapped.map(|s| s.id), m).map_or(Choice::Nothing, Choice::Snap)
     }
 
@@ -1056,18 +975,6 @@ impl Snapper {
             Choice::Snap(k) => {
                 log::debug!("snap: motion {:?} picks {} at {:.0}° off it", self.moved, targets[k].id, degrees(self.flight.to, targets[k].center(), self.moved));
                 self.snap_to(targets, k, now);
-            }
-            Choice::Scroll { by, step } => {
-                // Moving down the list shows what is further down: the wheel
-                // turned towards the user (negative).
-                // (In whole notches, the rest kept for the next: short moves
-                // add up.)
-                self.scroll_rest += -by / step.max(1.0);
-                if self.scroll_rest.abs() >= 0.5 {
-                    let whole = self.scroll_rest.round();
-                    self.scroll_rest -= whole;
-                    self.scroll.add(whole);
-                }
             }
             Choice::Nothing => log::debug!("snap: motion {:?}: nothing within {:.0}°, stays", self.moved, CONE.to_degrees()),
         }
@@ -1181,31 +1088,27 @@ pub struct SnapInput {
     /// The attractors drawn (window pixels; whether a click captures), as
     /// of the last update: while the mode is on and the mouse is free.
     attractors: Vec<(Point, bool)>,
-    /// Lists the viewer shows scrolled away from the driver's rows
-    /// (`smooth_menus`): their rectangles and how far down the rows show.
-    list_shifts: Vec<([i32; 4], i32)>,
+    /// Lists the viewer shows scrolled away from the driver's drawing
+    /// (`smooth_menus`): their rectangles and the entries they show, where
+    /// they show them.
+    list_entries: Vec<([i32; 4], Vec<Interactable>)>,
+}
+
+/// `items` with the entries of each list in `lists` (its rectangle x, y,
+/// w, h) replaced by the entries it shows.
+fn shown_list_entries(items: &mut Vec<Interactable>, lists: &[([i32; 4], Vec<Interactable>)]) {
+    let within = |[x, y, w, h]: [i32; 4], i: &Interactable| {
+        let middle = (i.rect[0] + i.rect[2] / 2, i.rect[1] + i.rect[3] / 2);
+        middle.0 >= x && middle.0 < x + w && middle.1 >= y && middle.1 < y + h
+    };
+    items.retain(|i| i.kind != InteractableKind::ListItem || !lists.iter().any(|(r, _)| within(*r, i)));
+    for (_, entries) in lists {
+        items.extend(entries.iter().copied());
+    }
 }
 
 /// An action as the driver gets it (nothing for a point it does not take
 /// input at).
-/// Moves the entries in each of `shifts`' rectangles (x, y, w, h) down by
-/// its amount, clipped to it (an entry shown only in part is a target
-/// where it shows).
-fn shift_list_entries(items: &mut Vec<Interactable>, shifts: &[([i32; 4], i32)]) {
-    items.retain_mut(|i| {
-        if i.kind != InteractableKind::ListItem { return true }
-        let middle = (i.rect[0] + i.rect[2] / 2, i.rect[1] + i.rect[3] / 2);
-        let Some(&([x, y, w, h], dy)) = shifts.iter().find(|([x, y, w, h], _)| middle.0 >= *x && middle.0 < x + w && middle.1 >= *y && middle.1 < y + h) else { return true };
-        let (top, bottom) = ((i.rect[1] + dy).max(y), (i.rect[1] + i.rect[3] + dy).min(y + h));
-        if bottom - top < 2 || i.rect[0] >= x + w || i.rect[0] + i.rect[2] <= x { return false }
-        i.rect[1] = top;
-        i.rect[3] = bottom - top;
-        if let Some(anchor) = &mut i.anchor { anchor[1] = (anchor[1] + dy).clamp(top, bottom - 1) }
-        i.region = i.region.map(|[rx, ry, rw, rh]| [rx, ry + dy, rw, rh]);
-        true
-    });
-}
-
 fn to_input(action: Action, layout: &Layout) -> Option<Input> {
     let whole = |(x, y): Point| (x.round() as i32, y.round() as i32);
     Some(match action {
@@ -1232,19 +1135,23 @@ impl SnapInput {
         self.snapper.holds_pointer()
     }
 
-    /// Lists the viewer shows scrolled by `shifts` (rectangle, rows moved
-    /// down) from where the driver has their rows: their entries are
-    /// targets where they show.
-    pub fn set_list_shifts(&mut self, shifts: Vec<([i32; 4], i32)>) {
-        self.list_shifts = shifts;
+    /// Lists the viewer shows away from the driver's drawing
+    /// (`smooth_menus::SmoothMenus::shown_entries`): their entries are
+    /// targets where they show, every one shown.
+    pub fn set_list_entries(&mut self, lists: Vec<([i32; 4], Vec<Interactable>)>) {
+        self.list_entries = lists;
     }
 
     /// [`SnapInput::targets`] with the lists' entries where they show.
     fn shown_targets(&self, scene: &scene::Scene, layout: &Layout) -> Vec<Target> {
-        if self.list_shifts.is_empty() { return Self::targets(scene, layout) }
+        Self::targets_of(&self.shown_interactables(scene), layout)
+    }
+
+    /// The scene's interactables, list entries where they show.
+    pub fn shown_interactables(&self, scene: &scene::Scene) -> Vec<Interactable> {
         let mut shown = scene.interactables.clone();
-        shift_list_entries(&mut shown, &self.list_shifts);
-        Self::targets_of(&shown, layout)
+        if !self.list_entries.is_empty() { shown_list_entries(&mut shown, &self.list_entries) }
+        shown
     }
 
     /// The targets in `scene` as `layout` shows them, and the view a click
@@ -1377,9 +1284,8 @@ impl SnapInput {
         let mut out = if action == SliderAction::Commit { self.slider_preview() } else { vec![] };
         if let Some(edit) = self.slider.take() {
             out.push(Input::Slider { id: edit.id, action, value: edit.value.round() as i32 });
-            // Editing motion never becomes a delayed navigation or list scroll.
+            // Editing motion never becomes a delayed navigation.
             self.snapper.moved = (0.0, 0.0);
-            self.snapper.scroll = Scroller::default();
         }
         out
     }

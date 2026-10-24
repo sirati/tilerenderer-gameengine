@@ -512,80 +512,55 @@ fn the_nearest_is_the_one_under_the_point_else_the_closest_edge() {
 
 // --- lists ---
 
+/// Wheel actions among `actions`.
+fn wheels(actions: &[(f64, Action)]) -> usize {
+    actions.iter().filter(|(_, a)| matches!(a, Action::Wheel { .. })).count()
+}
+
 #[test]
-fn moving_down_the_list_scrolls_it_smoothly_and_the_pointer_stays() {
+fn moving_down_a_list_snaps_to_the_entries_below_and_never_scrolls_it() {
     let t = with_list();
     let mut s = Snapper::default();
     s.enter(0.0, (600.0, 150.0), &t, Rates::default());
     assert_eq!(s.target(), Some((600.0, 150.0)));
-    // 60 px down in a tenth of a second.
     let actions = run(&mut s, &t, 0.0, 1.5, (0.0, 5.0), |t| t < 0.1);
-    let wheel: Vec<(f64, i32)> = actions
-        .iter()
-        .filter_map(|(t, a)| match a {
-            Action::Wheel { delta, at } => {
-                assert_eq!(*at, (600.0, 150.0));
-                Some((*t, *delta))
-            }
-            _ => None,
-        })
-        .collect();
-    // Down the list: wheel notches towards the user, one per 20 px.
-    assert_eq!(wheel.len(), 3, "{wheel:?}");
-    assert!(wheel.iter().all(|w| w.1 == -120));
-    assert!(wheel.windows(2).all(|w| w[1].0 - w[0].0 >= 1.0 / MAX_NOTCHES_PER_SECOND - 1e-9));
-    assert!(wheel.last().unwrap().0 - wheel[0].0 > 0.05);
-    assert_eq!(s.pointer(), Some((600.0, 150.0)));
-    // Once scrolled, the driver gets the pointer (the hover of what is
-    // under it now).
-    let after = moves(&actions).into_iter().filter(|m| m.0 >= wheel.last().unwrap().0).collect::<Vec<_>>();
-    assert_eq!(after.iter().map(|m| m.1).collect::<Vec<_>>(), [(600.0, 150.0)]);
+    assert_eq!(wheels(&actions), 0, "{actions:?}");
+    let (x, y) = s.target().unwrap();
+    assert_eq!(x, 600.0);
+    assert!(y > 150.0 && y < 400.0, "an entry further down: {y}");
+    let actions = run(&mut s, &t, 1.5, 3.0, (0.0, -5.0), |t| t < 1.6);
+    assert_eq!(wheels(&actions), 0);
+    assert!(s.target().unwrap().1 < y, "and back up");
 }
 
 #[test]
-fn moving_up_the_list_scrolls_it_up() {
-    let t = with_list();
-    let mut s = Snapper::default();
-    s.enter(0.0, (600.0, 350.0), &t, Rates::default());
-    let actions = run(&mut s, &t, 0.0, 1.5, (0.0, -2.0), |t| t < 0.1);
-    let deltas: Vec<i32> = actions.iter().filter_map(|(_, a)| if let Action::Wheel { delta, .. } = a { Some(*delta) } else { None }).collect();
-    assert!(!deltas.is_empty() && deltas.iter().all(|&d| d == 120), "{deltas:?}");
-}
-
-#[test]
-fn short_moves_down_a_list_add_up_to_notches() {
-    // Entries 42 high (a notch each); nudges of 24 px, half a second apart.
-    let mut items = vec![list(10, [500, 100, 200, 252], 0)];
-    items.extend((0..6).map(|k| item(100 + k, [500, 100 + 42 * k as i32, 200, 42])));
-    let t = targets(&items, IDENTITY, WINDOW);
-    let mut s = Snapper::default();
-    s.enter(0.0, (600.0, 163.0), &t, Rates::default());
-    let mut actions = Vec::new();
-    for k in 0..4 {
-        let t0 = 0.5 * k as f64;
-        actions.extend(run(&mut s, &t, t0, t0 + 0.5, (0.0, 8.0), |t| t < t0 + 3.0 * TICK + 1e-9));
-    }
-    actions.extend(run(&mut s, &t, 2.0, 3.0, (0.0, 0.0), |_| false));
-    let notches = actions.iter().filter(|(_, a)| matches!(a, Action::Wheel { delta: -120, .. })).count();
-    assert!(notches >= 2, "{actions:?}");
-    assert_eq!(s.target(), Some((600.0, 163.0)));
-}
-
-#[test]
-fn from_the_first_entry_shown_moving_up_scrolls_and_a_long_move_leaves() {
-    // A header button just above the list.
-    let mut items = vec![list(10, [500, 100, 200, 300], 0), at(5, 600, 80)];
+fn past_the_list_edges_motion_leaves_the_list_instead_of_scrolling_it() {
+    // A header button above the list and one below it; the list shows
+    // 15 entries of 20 px from y 100.
+    let mut items = vec![list(10, [500, 100, 200, 300], 0), at(5, 600, 80), at(6, 600, 430)];
     items.extend((0..15).map(|k| item(100 + k, [500, 100 + 20 * k as i32, 200, 20])));
     let t = targets(&items, IDENTITY, WINDOW);
     let mut s = Snapper::default();
     s.enter(0.0, (600.0, 110.0), &t, Rates::default());
     let actions = run(&mut s, &t, 0.0, 1.0, (0.0, -5.0), |t| t < 0.03);
-    assert!(actions.iter().any(|(_, a)| matches!(a, Action::Wheel { delta: 120, .. })), "{actions:?}");
-    assert_eq!(s.target(), Some((600.0, 110.0)));
-    // A long move up in one go: the header.
-    s.motion(px((0.0, -60.0)));
-    run(&mut s, &t, 1.0, 1.1, (0.0, 0.0), |_| false);
-    assert_eq!(s.target(), Some((600.0, 80.0)));
+    assert_eq!(wheels(&actions), 0, "{actions:?}");
+    assert_eq!(s.target(), Some((600.0, 80.0)), "the header");
+    let mut s = Snapper::default();
+    s.enter(0.0, (600.0, 390.0), &t, Rates::default());
+    let actions = run(&mut s, &t, 0.0, 1.0, (0.0, 5.0), |t| t < 0.03);
+    assert_eq!(wheels(&actions), 0, "{actions:?}");
+    assert_eq!(s.target(), Some((600.0, 430.0)), "the button below");
+}
+
+#[test]
+fn the_wheel_scrolls_the_list_where_the_pointer_rests() {
+    let t = with_list();
+    let mut s = Snapper::default();
+    s.enter(0.0, (600.0, 150.0), &t, Rates::default());
+    run(&mut s, &t, 0.0, 1.0, (0.0, 0.0), |_| false);
+    let at = s.pointer().unwrap();
+    assert_eq!(s.wheel(-120), Some(vec![Action::Wheel { delta: -120, at }]));
+    assert_eq!(s.wheel(120), Some(vec![Action::Wheel { delta: 120, at }]));
 }
 
 #[test]
@@ -595,7 +570,7 @@ fn moving_sideways_out_of_the_list_leaves_it() {
     s.enter(0.0, (600.0, 150.0), &t, Rates::default());
     let actions = run(&mut s, &t, 0.0, 0.4, (4.0, 0.0), |t| t < 0.05);
     assert_eq!(s.target(), Some((850.0, 210.0)));
-    assert!(actions.iter().all(|(_, a)| !matches!(a, Action::Wheel { .. })));
+    assert_eq!(wheels(&actions), 0);
 }
 
 #[test]
@@ -608,49 +583,18 @@ fn the_entry_under_the_pointer_is_snapped_to_after_the_list_scrolled() {
     s.tick(2.0 * TICK, &scrolled, Rates::default());
     assert_eq!(s.target(), Some((600.0, 150.0)));
     assert_eq!(s.target_id(), Some(1102));
-    let actions = run(&mut s, &scrolled, 2.0 * TICK, 1.5, (0.0, 2.0), |t| t < 0.1);
-    assert!(actions.iter().any(|(_, a)| matches!(a, Action::Wheel { .. })));
 }
 
 #[test]
-fn a_list_without_entries_is_snapped_to_and_scrolled_at_its_middle() {
+fn a_list_without_entries_is_snapped_to_at_its_middle_and_the_wheel_scrolls_it() {
     let t = targets(&[list(1, [100, 100, 200, 400], 10)], IDENTITY, WINDOW);
     let mut s = Snapper::default();
     s.enter(0.0, (0.0, 0.0), &t, Rates::default());
     assert_eq!(s.target(), Some((200.0, 300.0)));
     run(&mut s, &t, 0.0, 2.0, (0.0, 0.0), |_| false);
     let actions = run(&mut s, &t, 2.0, 3.5, (0.0, 2.0), |t| t < 2.1);
-    assert!(actions.iter().any(|(_, a)| matches!(a, Action::Wheel { delta: -120, at: (200.0, 300.0) })));
-}
-
-#[test]
-fn scrolling_sends_whole_notches_rounded_and_spaced() {
-    let total = |notches: f64| {
-        let mut s = Scroller::default();
-        s.add(notches);
-        let (mut sum, mut sent, mut t) = (0, Vec::new(), 0.0);
-        for _ in 0..200 {
-            t += TICK;
-            let n = s.step(TICK);
-            if n != 0 {
-                sum += n;
-                sent.push(t);
-            }
-        }
-        assert!(s.idle());
-        assert!(sent.windows(2).all(|w| w[1] - w[0] >= 1.0 / MAX_NOTCHES_PER_SECOND - 1e-9));
-        (sum, sent)
-    };
-    assert_eq!(total(3.0).0, 3);
-    assert_eq!(total(-5.0).0, -5);
-    assert_eq!(total(0.4).0, 0);
-    assert_eq!(total(-0.6).0, -1);
-    assert_eq!(total(2.5).0, 3);
-    let (_, sent) = total(4.0);
-    assert!(sent[2] < 0.34, "{sent:?}");
-    let (sum, sent) = total(20.0);
-    assert_eq!(sum, 20);
-    assert!(*sent.last().unwrap() >= 19.0 / MAX_NOTCHES_PER_SECOND);
+    assert_eq!(wheels(&actions), 0, "motion does not scroll it");
+    assert_eq!(s.wheel(-120), Some(vec![Action::Wheel { delta: -120, at: (200.0, 300.0) }]));
 }
 
 // --- with the layout ---
@@ -1260,4 +1204,23 @@ fn alt_wheel_after_menu_replacement_uses_the_current_target_before_tick() {
 /// Mouse counts that move the pointer by `p` window pixels.
 fn px(p: Point) -> Point {
     (p.0 / MOTION_GAIN, p.1 / MOTION_GAIN)
+}
+
+#[test]
+fn lists_shown_scrolled_are_targets_where_their_rows_show() {
+    let mut s = scene();
+    s.interactables.push(list(10, [500, 100, 200, 60], 20));
+    s.interactables.extend((0..3).map(|k| item(100 + k, [500, 100 + 20 * k as i32, 200, 20])));
+    let mut snap = SnapInput::default();
+    assert_eq!(snap.shown_interactables(&s), s.interactables, "the driver's own where nothing is shown otherwise");
+    // Shown 9 pixels down the list: the first row in part, a fourth one
+    // from an earlier drawing at the bottom.
+    let shown: Vec<Interactable> = [(100, 100, 11), (101, 111, 20), (102, 131, 20), (103, 151, 9)].into_iter()
+        .map(|(id, y, h)| Interactable { anchor: Some([560, y + h / 2]), ..item(id, [500, y, 200, h]) }).collect();
+    snap.set_list_entries(vec![([500, 100, 200, 60], shown.clone())]);
+    let got = snap.shown_interactables(&s);
+    let entries: Vec<&Interactable> = got.iter().filter(|i| i.kind == InteractableKind::ListItem).collect();
+    assert_eq!(entries.len(), 4);
+    assert!(shown.iter().all(|e| entries.contains(&e)));
+    assert!(got.iter().any(|i| i.id == 10) && got.iter().any(|i| i.id == 1), "the list and the other buttons stay");
 }

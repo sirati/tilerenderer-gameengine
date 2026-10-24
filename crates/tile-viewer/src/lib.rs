@@ -3001,7 +3001,14 @@ impl App {
         // (Lists scrolled by the viewer: scroll input moves them, pointer
         // input goes to the row shown, `smooth_menus`.)
         let moves = matches!(input, Input::MouseMove { .. });
+        let press = match input { Input::MouseButton { down: true, x, y, .. } => Some((x, y)), _ => None };
+        if let Some(q) = press { self.layout.press_sent(q); }
         let routed = self.menu_scroll.route(input, self.snap.snap_mode_active());
+        // A press the list took to another row's place in the driver: a
+        // popup it opens at that click is placed at the pointer all the same.
+        if let (Some(from), Some(&Input::MouseButton { down: true, x, y, .. })) = (press, routed.iter().rev().find(|i| matches!(i, Input::MouseButton { .. }))) {
+            if from != (x, y) { self.layout.press_delivered(from, (x, y)); }
+        }
         if moves && routed.is_empty() {
             self.feedback.pointer_gone(now);
         }
@@ -3993,7 +4000,7 @@ impl App {
         for input in self.menu_scroll.take_inputs() {
             frame_input(&mut self.preparing_inputs, &self.display, input);
         }
-        self.snap.set_list_shifts(self.menu_scroll.shifts());
+        self.snap.set_list_entries(self.menu_scroll.shown_entries());
         // The build queue's handles, and a row being dragged (on the
         // drawing as it is now, from the driver's: rebuilt every frame).
         if scene.interface.build_queue.is_some() {
