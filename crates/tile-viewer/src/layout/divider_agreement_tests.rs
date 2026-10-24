@@ -223,8 +223,85 @@ fn the_drawn_dividers_are_where_the_pointer_is_held_hit_and_scrolled_stacked() {
     agree(S::Horizontal1To1);
 }
 
-// (As the code stood before the single divider geometry.)
-fn glass_dividers_setting(_: &mut Settings, _: bool) {}
-fn drawn_dividers(_: &Layout, f: &Frame) -> Vec<[i32; 4]> {
-    f.divider.iter().map(|d| d.1).chain(f.separators.iter().map(|s| s.1)).collect()
+fn glass_dividers_setting(s: &mut Settings, glass: bool) {
+    s.glass_dividers = glass;
+}
+
+/// The pixels the frame draws as dividers: the frosted strips, the strip's
+/// separator, or the glass bars where they are shown (their lens within
+/// their clip, in the window).
+fn drawn_dividers(l: &Layout, f: &Frame) -> Vec<[i32; 4]> {
+    let window = [0, 0, l.window.0 as i32, l.window.1 as i32];
+    let glass = f.glass_dividers.iter().map(|&(at, _)| {
+        let c = f.cameras[at as usize];
+        let [x0, y0, x1, y1] = c.target_clip.unwrap();
+        let r = [c.origin.0.max(x0).max(0), c.origin.1.max(y0).max(0), 0, 0];
+        let right = (c.origin.0 + c.viewport.0 as i32).min(x1).min(window[2]);
+        let bottom = (c.origin.1 + c.viewport.1 as i32).min(y1).min(window[3]);
+        [r[0], r[1], (right - r[0]).max(0), (bottom - r[1]).max(0)]
+    });
+    f.divider.iter().map(|d| d.1).chain(f.separators.iter().map(|s| s.1)).chain(glass).collect()
+}
+
+/// With glass dividers every segment is a glass bar exactly as thick as its
+/// wall, round (its radius half that) and showing that round end only
+/// where the divider stops in the open: at the window's edge it runs on
+/// past it, against another divider it runs on under it and is cut off at
+/// its side.
+#[test]
+fn glass_bars_are_as_thick_as_their_walls_and_round_only_at_free_ends() {
+    let (mut free, mut edge, mut junction) = (0, 0, 0);
+    for split in [S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
+        for c in cases(split, true) {
+            let (l, f) = layout_of(&c);
+            let window = (l.window.0 as i32, l.window.1 as i32);
+            let dividers = l.dividers();
+            assert_eq!(f.glass_dividers.len(), dividers.segments.len(), "{c:?}");
+            for &(at, s) in &f.glass_dividers {
+                let camera = f.cameras[at as usize];
+                let lens = camera.lens.unwrap_or_else(|| panic!("{c:?}: no lens"));
+                let t = s.band.thickness();
+                assert_eq!(t, l.divider_thickness(), "{c:?}");
+                assert!(lens.glass && lens.radius == t as f32 / 2.0 && lens.rim == t as f32 / 2.0, "{c:?}: {lens:?}");
+                // Across: exactly the wall.
+                let (across, along) = if s.band.vertical { ((camera.origin.0, camera.viewport.0), (camera.origin.1, camera.viewport.1)) } else { ((camera.origin.1, camera.viewport.1), (camera.origin.0, camera.viewport.0)) };
+                assert_eq!((across.0, across.0 + across.1 as i32), s.band.across, "{c:?}");
+                let (a0, a1) = (along.0, along.0 + along.1 as i32);
+                let clip = camera.target_clip.unwrap();
+                let (c0, c1) = if s.band.vertical { (clip[1], clip[3]) } else { (clip[0], clip[2]) };
+                let extent = if s.band.vertical { window.1 } else { window.0 };
+                for (k, end) in s.ends.iter().enumerate() {
+                    let (lens_end, clip_end, at) = if k == 0 { (a0, c0, s.along.0) } else { (a1, c1, s.along.1) };
+                    let outward = |v: i32| if k == 0 { at - v } else { v - at };
+                    match end {
+                        DividerEnd::Free => {
+                            // The round cap inside the segment, shown.
+                            free += 1;
+                            assert_eq!(lens_end, at, "{c:?}: free end {k} of {s:?}");
+                            assert!(outward(clip_end) > 0, "{c:?}: its halo shows");
+                            assert!(at > 0 && at < extent, "{c:?}");
+                        }
+                        DividerEnd::Edge => {
+                            // The cap past the window's edge.
+                            edge += 1;
+                            assert!(at <= 0 || at >= extent, "{c:?}");
+                            assert!(outward(lens_end) >= t, "{c:?}: edge end {k} of {s:?}: {lens_end}");
+                        }
+                        DividerEnd::Junction => {
+                            // The cap under the other divider, cut off at its side.
+                            junction += 1;
+                            assert!(outward(lens_end) * 2 >= t, "{c:?}: junction end {k} of {s:?}");
+                            assert_eq!(clip_end, at, "{c:?}: junction end {k} of {s:?}");
+                            let other = if s.band.kind == DividerKind::Split { dividers.strip } else { dividers.split }.unwrap();
+                            assert!(at == other.across.0 || at == other.across.1, "{c:?}");
+                        }
+                    }
+                }
+            }
+            // The ones others end against go over them.
+            let firsts: Vec<bool> = f.glass_dividers.iter().map(|(_, s)| s.ends.contains(&DividerEnd::Junction)).collect();
+            assert!(firsts.windows(2).all(|w| w[0] || !w[1]), "{c:?}: {firsts:?}");
+        }
+    }
+    assert!(free > 100 && edge > 100 && junction > 10, "{free} {edge} {junction}");
 }

@@ -21,7 +21,7 @@
 //! there to show as open).
 
 use tile_render::Camera;
-use super::{world_at_floor, Axis, DividerKind, Hit, Layout};
+use super::{world_at_floor, Axis, DividerKind, Dividers, Hit, Layout};
 
 /// The shade of one column (side by side) or row (stacked) of the glass.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -75,6 +75,34 @@ impl Layout {
                 None => Camera { zoom: (2, 1), origin: at, cells: false, ..Camera::new(size) },
             };
             out.push((rect, camera));
+        }
+        out
+    }
+
+    /// What lies under the zoom strip's divider with glass dividers: the
+    /// pictures of the panes below it going on up into it (to the middle of
+    /// the split's gap), so the glass has the world to bend.
+    pub(super) fn strip_band_under(&self, dividers: &Dividers) -> Vec<Camera> {
+        let Some(band) = dividers.strip else { return vec![] };
+        let [bx, by, bw, bh] = band.rect();
+        let mut out = Vec::new();
+        for hit in [Hit::Main, Hit::Pane] {
+            let Some((_, c)) = self.shown.iter().find(|(h, c)| *h == hit && Some(hit) != self.fit.map(|f| f.hit) && !c.stacked) else { continue };
+            // (Each pane's picture on to the middle of a side by side
+            // split's gap, as under the gap: no hole where the dividers meet.)
+            let (mut l, mut r) = (c.origin.0, c.origin.0 + c.viewport.0 as i32);
+            if let Some(split) = dividers.split.filter(|s| s.vertical) {
+                let middle = (split.across.0 + split.across.1) / 2;
+                if r == split.across.0 { r = middle; }
+                if l == split.across.1 { l = middle; }
+            }
+            let (x0, x1) = (bx.max(l), (bx + bw).min(r));
+            if x1 <= x0 || bh <= 0 {
+                continue;
+            }
+            let at = (x0, by);
+            let (x, y) = world_at_floor(c, at);
+            out.push(Camera { x, y, origin: at, viewport: ((x1 - x0) as u32, bh as u32), ..*c });
         }
         out
     }

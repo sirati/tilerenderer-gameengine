@@ -615,6 +615,9 @@ pub struct Frame {
     /// going on there) to draw it in, its rectangle (x, y, w, h), whether
     /// the split is side by side, and its shade (`crate::glass_sprite`).
     pub divider: Vec<(u32, [i32; 4], bool, Shade)>,
+    /// With glass dividers: the camera of each glass bar (its lens) and the
+    /// divider segment it draws (`dividers`), in drawing order.
+    pub glass_dividers: Vec<(u32, DividerSegment)>,
     /// Where the cursor drawn in a view the pointer is not in (the world
     /// cursor mirrored there) goes in the drawing order: before this camera,
     /// the first of the driver's interface over the world views, so that
@@ -736,6 +739,8 @@ pub struct Layout {
     pub zoom_mouse_below: u32,
     pub zoom_rounded: bool,
     pub zoom_glass: bool,
+    /// The dividers drawn as glass bars (`dividers`).
+    pub glass_dividers: bool,
     pub separator_width: u32,
     /// Physical window pixels per composition pixel.
     pub window_pixel_scale: f64,
@@ -1026,6 +1031,7 @@ impl Default for Layout {
             zoom_mouse_below: 200,
             zoom_rounded: true,
             zoom_glass: true,
+            glass_dividers: false,
             separator_width: 4,
             window_pixel_scale: 1.0,
             zoom_box_zoom: None,
@@ -1513,6 +1519,7 @@ impl Layout {
         self.zoom_mouse_below = thousandths(s.zoom_mouse_below, viewer_settings::controls::ZOOM_MOUSE_BELOW_RANGE.max);
         self.zoom_rounded = s.zoom_rounded;
         self.zoom_glass = s.zoom_glass;
+        self.glass_dividers = s.glass_dividers;
         self.separator_width = s.separator_width.clamp(1, 16);
         self.screen_place = s.screen_place;
         self.menu_follows_pointer = s.menu_follows_pointer;
@@ -2923,6 +2930,13 @@ impl Layout {
             push(&mut frame, camera);
             self.shown.push((Hit::Pane, camera));
         }
+        // Whether the zoom box or strip is shown this frame (the strip's
+        // divider with it, `Layout::dividers`).
+        let fit_rect = fit.map(|f| if f.hit == Hit::Main { main_rect } else { pane_rect.unwrap_or(main_rect) });
+        self.move_zoom_box(dt);
+        self.move_zoom_mouse(dt);
+        let magnifier = magnifier.filter(|m| m.place == ZoomPlace::Beside || (self.world_shown && !fit_rect.is_some_and(|f| overlap(f, self.magnifier_geometry(m).0))));
+        self.magnifier_shown = magnifier.is_some();
         // Each pane's picture goes on under its half of the gap; the glass
         // over it where the divider is shown (`glass`).
         let mut halves = Vec::new();
@@ -2932,9 +2946,31 @@ impl Layout {
             }
             halves.push((rect, push(&mut frame, camera)));
         }
-        for (rect, vertical, shade) in self.glass_strips() {
-            if let Some(&(_, index)) = halves.iter().find(|(h, _)| inside(*h, (rect[0], rect[1]))) {
-                frame.divider.push((index, rect, vertical, shade));
+        if !self.glass_dividers {
+            for (rect, vertical, shade) in self.glass_strips() {
+                if let Some(&(_, index)) = halves.iter().find(|(h, _)| inside(*h, (rect[0], rect[1]))) {
+                    frame.divider.push((index, rect, vertical, shade));
+                }
+            }
+        } else {
+            // Glass bars: the panes' pictures go on under the strip's
+            // divider too, and each segment is a lens of glass over what
+            // lies under it (`dividers::GlassBar`).
+            let dividers = self.dividers();
+            for camera in self.strip_band_under(&dividers) {
+                if take(1) {
+                    push(&mut frame, camera);
+                }
+            }
+            for (segment, bar) in dividers.glass_order() {
+                if !take(1) {
+                    break;
+                }
+                let [x, y, w, h] = bar.rect;
+                let lens = tile_render::Lens { radius: bar.radius, rim: bar.rim, glass: true };
+                let camera = Camera { origin: (x, y), cells: false, lens: Some(lens), target_clip: Some(bar.clip), ..Camera::new((w.max(1) as u32, h.max(1) as u32)) };
+                let at = push(&mut frame, camera);
+                frame.glass_dividers.push((at, segment));
             }
         }
         for (k, inset) in self.insets.iter().enumerate().take(insets) {
@@ -2949,17 +2985,12 @@ impl Layout {
         // and under the driver's interface (whose menus stay usable); not
         // over a screen fitted into a pane. The magnifier beside the
         // pointer is on top.
-        let fit_rect = fit.map(|f| if f.hit == Hit::Main { main_rect } else { pane_rect.unwrap_or(main_rect) });
-        self.move_zoom_box(dt);
-        self.move_zoom_mouse(dt);
-        let magnifier = magnifier.filter(|m| m.place == ZoomPlace::Beside || (self.world_shown && !fit_rect.is_some_and(|f| overlap(f, self.magnifier_geometry(m).0))));
-        self.magnifier_shown = magnifier.is_some();
         let zoom_box = magnifier.filter(|m| m.place != ZoomPlace::Beside && m.mode == MagnifierMode::World);
         if let Some(m) = zoom_box {
             let (rect, _) = self.magnifier_geometry(&m);
             let lens = self.zoom_lens(&m, rect);
             // (A strip: its divider below it, as `Layout::dividers` has it.)
-            let dividers = if lens.is_none() { self.dividers() } else { Dividers::default() };
+            let dividers = if lens.is_none() && !self.glass_dividers { self.dividers() } else { Dividers::default() };
             if let Some(band) = dividers.strip {
                 let [x, y, w, h] = band.rect();
                 let border = Camera { origin: (x, y), cells: false, ..Camera::new((w.max(1) as u32, h.max(1) as u32)) };

@@ -7,7 +7,8 @@
 //! consumer reads that one value:
 //!
 //! - drawing: the frosted strips over the split's gap and the strip's
-//!   plain separator;
+//!   plain separator, or the glass bars ([`Segment::glass`], with
+//!   glass dividers);
 //! - the pointer: the walls the system holds it out of
 //!   ([`Dividers::walls`], [`Layout::pointer_walls`]), the walls the
 //!   layout holds it back at ([`Dividers::holds`], `Layout::constrain`),
@@ -86,6 +87,23 @@ impl Band {
     }
 }
 
+/// How a segment is drawn as a glass bar (a `tile_render::Lens`): the
+/// lens's rectangle (the segment's, run on past the window's edge and
+/// into a divider it meets, so that only its free ends show their round
+/// caps), its corner radius and rim (half the thickness: a rounded rod),
+/// and whether it goes over the others (a divider others end against).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct GlassBar {
+    pub rect: [i32; 4],
+    /// Where it is drawn (x0, y0, x1, y1; `Camera::target_clip`): the
+    /// segment and the glass's faint halo around it, but not on into a
+    /// divider it meets (that one's side closes it off cleanly).
+    pub clip: [i32; 4],
+    pub radius: f32,
+    pub rim: f32,
+    pub on_top: bool,
+}
+
 /// A drawn stretch of a divider.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
@@ -106,6 +124,28 @@ impl Segment {
     pub fn contains(&self, p: (i32, i32)) -> bool {
         let (c, a) = self.band.local(p);
         c >= self.band.across.0 && c < self.band.across.1 && a >= self.along.0 && a < self.along.1
+    }
+
+    /// The glass bar drawing it, exactly as thick as the segment (its
+    /// wall); `junction`: the thickness of a divider it meets.
+    pub fn glass(&self, junction: i32) -> GlassBar {
+        let t = self.band.thickness();
+        let run = |end: End| match end {
+            // (Its round cap beyond the window.)
+            End::Edge => t,
+            // (Its round cap under the middle of the divider it meets,
+            // which is drawn over it.)
+            End::Junction => (junction + 1) / 2,
+            End::Free => 0,
+        };
+        let along = (self.along.0 - run(self.ends[0]), self.along.1 + run(self.ends[1]));
+        // (The halo: `tile_render::Lens`, 0.28 of the rim.)
+        let halo = (t as f32 / 2.0 * 0.28).ceil() as i32 + 1;
+        let shown = |at: i32, end: End, out: i32| if end == End::Junction { at } else { at + out };
+        let (a0, a1) = (shown(self.along.0, self.ends[0], -halo - run(self.ends[0])), shown(self.along.1, self.ends[1], halo + run(self.ends[1])));
+        let [x, y, w, h] = self.band.rect_of((a0, a1));
+        let clip = if self.band.vertical { [x - halo, y, x + w + halo, y + h] } else { [x, y - halo, x + w, y + h + halo] };
+        GlassBar { rect: self.band.rect_of(along), clip, radius: t as f32 / 2.0, rim: t as f32 / 2.0, on_top: !self.ends.contains(&End::Junction) }
     }
 
 }
@@ -158,6 +198,18 @@ impl Dividers {
         self.handles.iter().any(|r| super::inside(*r, p))
     }
 
+    /// The segments with their glass bars in drawing order: those ending
+    /// against another divider first, the ones they end against over them.
+    pub fn glass_order(&self) -> Vec<(Segment, GlassBar)> {
+        let meeting = |kind: Kind| match kind {
+            Kind::Split => self.strip.map_or(0, |b| b.thickness()),
+            Kind::Strip => self.split.map_or(0, |b| b.thickness()),
+        };
+        let mut out: Vec<_> = self.segments.iter().map(|s| (*s, s.glass(meeting(s.band.kind)))).collect();
+        out.sort_by_key(|(_, g)| g.on_top);
+        out
+    }
+
     /// The stretches along the split's divider where it is not drawn (the
     /// pointer passes there).
     pub fn split_openings(&self) -> Vec<(i32, i32)> {
@@ -184,10 +236,11 @@ fn carve(band: Band, openings: &[(i32, i32)], wall: bool, ends: [End; 2]) -> Vec
 
 impl Layout {
     /// How thick the dividers are (canvas pixels): the separator width in
-    /// window pixels, at
+    /// window pixels (at least [`GLASS_WIDTH`] with glass dividers), at
     /// least one pixel.
     pub(crate) fn divider_thickness(&self) -> i32 {
         let width = self.separator_width.clamp(1, 16);
+        let width = if self.glass_dividers { width.max(GLASS_WIDTH) } else { width };
         (f64::from(width) / self.window_pixel_scale.max(1.0)).round().max(1.0) as i32
     }
 
@@ -279,3 +332,7 @@ impl Layout {
     }
 }
 
+
+/// The glass dividers' least thickness, window pixels: enough for the
+/// glass to read as a rod, little enough not to take much room.
+pub const GLASS_WIDTH: u32 = 16;

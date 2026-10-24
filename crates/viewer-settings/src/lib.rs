@@ -385,6 +385,10 @@ pub struct Layout {
     pub zoom_rounded: bool,
     /// Shade the zoom lens rim as polished glass.
     pub zoom_glass: bool,
+    /// Draw every divider (the split's, the zoom strip's) as a bar of the
+    /// zoom's glass, with round ends where it stops. It is then at least
+    /// 16 window pixels thick (the pointer's wall with it).
+    pub glass_dividers: bool,
     /// Where the zoom box goes in a vertical split (else unused).
     pub zoom_place: Place,
     pub zoom: Zoom,
@@ -449,6 +453,7 @@ impl Default for Layout {
             separator_width: 4,
             zoom_rounded: true,
             zoom_glass: true,
+            glass_dividers: false,
             zoom_place: Place::Floating,
             zoom: Zoom::Off,
             zoom_content: ZoomContent::World,
@@ -1084,5 +1089,22 @@ mod zoom_content_migration_tests {
         assert!(!saved.contains("menu_zoom"), "{saved}");
         assert!(saved.contains("zoom = \"Beside\"") && saved.contains("zoom_content = \"WorldAndMenus\""), "{saved}");
         assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), s);
+    }
+}
+
+#[cfg(test)]
+mod glass_dividers_tests {
+    use super::*;
+    use controls::ControlValue;
+
+    #[test]
+    fn glass_dividers_are_off_by_default_and_round_trip() {
+        let mut settings: Settings = toml::from_str("[layout]\nsplit = 'Vertical1To1'").unwrap();
+        assert!(!settings.layout.glass_dividers);
+        assert_eq!(settings.control("layout.glass_dividers"), Some(ControlValue::On(false)));
+        assert!(!settings.set_control("layout.glass_dividers", &ControlValue::Number(1.0)));
+        assert!(settings.set_control("layout.glass_dividers", &ControlValue::On(true)));
+        assert!(settings.layout.glass_dividers);
+        assert_eq!(toml::from_str::<Settings>(&toml::to_string(&settings).unwrap()).unwrap(), settings);
     }
 }
