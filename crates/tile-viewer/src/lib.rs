@@ -2919,7 +2919,9 @@ impl App {
     fn sync_function_keys(&mut self) {
         let window_active = self.pointer_presentation.active() && self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus());
         let input = &self.settings.input;
-        self.function_keys.set(function_keys::Want { capture: input.capture_function_keys, media_keys: input.media_keys_as_function_keys, window_active });
+        let want = function_keys::Want { capture: input.capture_function_keys, media_keys: input.media_keys_as_function_keys, window_active };
+        self.input.set_top_row_keys(want.capture && want.media_keys);
+        self.function_keys.set(want);
     }
 
     fn configure_timing(&mut self) {

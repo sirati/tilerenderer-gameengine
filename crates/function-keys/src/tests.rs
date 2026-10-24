@@ -281,3 +281,35 @@ fn file_journal_round_trip() {
     assert!(!path.exists());
     std::fs::remove_dir(&dir).unwrap();
 }
+
+#[test]
+fn media_mode_pauses_the_shortcuts_on_mission_control_spotlight_dictation_and_do_not_disturb() {
+    // As on an Apple silicon MacBook (macOS 26): the system shortcuts bound
+    // to the top row's own key codes, with the Fn flag the system gives them.
+    let fake = Fake::macos();
+    {
+        let mut w = fake.0.borrow_mut();
+        let mut add = |id: u32, key: u16, modifiers: u32| {
+            w.hotkeys.insert(id, (HotKey { id, key_code: key, modifiers }, true));
+        };
+        add(108, 0xA0, FN); // Mission Control
+        add(110, 0xA0, FN | COMMAND);
+        add(173, 0x83, FN); // Launchpad
+        add(186, 0xB0, FN); // Dictation
+        add(187, 0xB1, FN); // Spotlight
+        add(188, 0xCF, FN); // Dictation (the usage's code)
+        add(189, 0xB2, FN); // Do Not Disturb
+        add(190, 0xB3, FN); // a code the tables do not know: left alone
+    }
+    let mut c = capture(&fake);
+    c.set(PLAIN);
+    assert_eq!(fake.off(), vec![7, 36, 37, 59]);
+    c.set(MEDIA);
+    assert_eq!(fake.off(), vec![7, 32, 36, 37, 59, 108, 110, 173, 186, 187, 188, 189]);
+    assert_eq!(fake.journal(), Some(vec![7, 32, 36, 37, 108, 110, 173, 186, 187, 188, 189]));
+    // Cmd+Tab and Spotlight's Cmd+Space stay on.
+    assert!(fake.on(1) && fake.on(64) && fake.on(190));
+    c.set(None);
+    assert_eq!(fake.off(), vec![59]);
+    assert_eq!(fake.journal(), None);
+}
