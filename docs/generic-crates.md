@@ -11,7 +11,9 @@ too. `crates/tile-viewer/tests/generic_crates.rs` checks this.
 | Crate | Why it is generic |
 | --- | --- |
 | `tile-render`, `tile-render-shared`, `tile-render-shaders` | renders tiles, nothing else |
-| `glass-shaders`, `marker-shaders`, `viewer-shaders` | the viewer's glass slab, its selection marker, and the one SPIR-V module that links all three shader libraries |
+| `glass`, `glass-shared`, `glass-shaders` | the glass lens (rounded slab with a halo) over views and screen copies: host passes and CPU oracle, shared parameters, shader library |
+| `marker`, `marker-shaders` | the selection marker (bouncing arrow and ground shadow): CPU oracle and art, shader maths |
+| `viewer-shaders`, `viewer-spirv` | the viewer's one SPIR-V module: `viewer-shaders` links the three `no_std` shader libraries, `viewer-spirv`'s build script compiles it once per build; `tile-viewer` draws with it, `tile-render` takes the module from outside (its own GPU tests use the same module, as a dev-dependency) |
 | `scene` | the driver-renderer protocol: snapshots, input, extension payloads |
 | `render-desc` | TOML render descriptions compiled into atlases and layers |
 | `menu` | TOML menus drawn as free sprites, with hit testing |
@@ -57,6 +59,10 @@ What the generic crates knew of Civ III before this pass, and where it went:
   names spoke of Civ III terrain, cities and `civ3_bridge`.
 - **render-desc**: a Civ III palette comment, `civ` palette fixtures, a font
   test reading a Civ III installation.
+- **tile-render-shared** also named Civ III's thirteen Clean Map categories
+  (`CATEGORY_CITIES`, `CATEGORY_UNITS`, ...): now it only reserves the top
+  four category bits (`CATEGORY_RESERVED`); the driver's categories are its
+  own (`viewer_settings::clean_map`).
 - **menu**: six tests parsed `assets/civ3/preferences.toml`; fixture names
   (`Art/Advisors`, "unit picture", "Explosion Palette").
 - **viewer-settings**: the `civ3r` settings folder and `CIV3R_SETTINGS`, a
