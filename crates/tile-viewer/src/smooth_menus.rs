@@ -142,6 +142,7 @@ struct Seen {
     wheel: Rect,
     step: i32,
     bar: Option<Bar>,
+    bar_art: BarArt,
 }
 
 impl Picture {
@@ -184,8 +185,19 @@ impl Picture {
                     }
                 }
             }
+            let bar = bar_of(scene, bounds(list.rect));
+            // (The bar's track, to show where the thumb moved away from.)
+            let bar_art = bar.map(|b| {
+                let thumb = thumb_sprites(&b, &cameras, free, rect_of);
+                let region = [b.rect[0], b.span.0, b.rect[2], b.span.1];
+                let extent = thumb.iter().filter_map(|&k| rect_of(&free[k]).map(bounds)).fold(None, |a: Option<(i32, i32)>, r| Some(a.map_or((r[1], r[3]), |(t, b)| (t.min(r[1]), b.max(r[3])))));
+                let track = free.iter().enumerate().filter(|(k, s)| !thumb.contains(k) && s.screen && !s.except_view && s.view.is_some_and(|v| cameras.contains(&v)))
+                    .filter(|(_, s)| rect_of(s).map(bounds).is_some_and(|r| intersect(r, region).is_some()))
+                    .filter_map(|(_, s)| clipped(*s, region)).collect();
+                BarArt { track, thumb: extent }
+            }).unwrap_or_default();
             let picture = Picture { id: list.id, rect, rows, sprites, extents, cameras };
-            Some(Seen { picture, wheel: bounds(list.rect), step, bar: bar_of(scene, bounds(list.rect)) })
+            Some(Seen { picture, wheel: bounds(list.rect), step, bar, bar_art })
         }).collect()
     }
 
@@ -250,7 +262,17 @@ impl Picture {
 /// A drawing of the driver's kept: the list's content offset (pixels) it
 /// shows.
 #[derive(Clone, Debug)]
-struct Drawing { scroll: i64, picture: Picture }
+struct Drawing {
+    scroll: i64,
+    picture: Picture,
+    /// Its bar's art between the arrows but the thumb (`BarArt`).
+    bar: BarArt,
+}
+
+/// A bar's art in one drawing: its track's sprites (the thumb's left out)
+/// and where its thumb was (top, bottom).
+#[derive(Clone, Debug, Default)]
+struct BarArt { track: Vec<PlacedSprite>, thumb: Option<(i32, i32)> }
 
 /// Where a list settles from `pos` (content pixels) on items `step` apart
 /// from `origin`, having moved last in direction `dir` (+1 down, −1 up, 0
@@ -324,7 +346,7 @@ impl List {
         let p = &seen.picture;
         let mut list = List {
             id: p.id, rect: p.rect, wheel: seen.wheel, step: i64::from(seen.step.max(1)), cameras: p.cameras.clone(),
-            drawings: vec![Drawing { scroll: 0, picture: p.clone() }], drawn: 0, expected: 0, notched: (f64::NEG_INFINITY, 0),
+            drawings: vec![Drawing { scroll: 0, picture: p.clone(), bar: seen.bar_art.clone() }], drawn: 0, expected: 0, notched: (f64::NEG_INFINITY, 0),
             pos: 0.0, target: 0.0, shown: 0, input_at: f64::NEG_INFINITY, dir: 0.0, settled: true, glide: true,
             top: None, bottom: None, held: 0, highlight: None, entries: vec![],
             bar: None, samples: vec![], thumb: None, gesture: None, slider_from: None,
@@ -445,7 +467,7 @@ impl List {
         self.drawn = scroll;
         self.wheel = seen.wheel;
         self.drawings.retain(|d| d.scroll != scroll);
-        self.drawings.push(Drawing { scroll, picture: picture.clone() });
+        self.drawings.push(Drawing { scroll, picture: picture.clone(), bar: seen.bar_art.clone() });
         if self.drawings.len() > MAX_DRAWINGS { self.drawings.remove(0); }
         if self.drawn != self.expected && now - self.notched.0 >= SETTLE {
             // The driver did not go where it was sent (an end of a list
@@ -695,8 +717,10 @@ impl SmoothMenus {
         }
         self.lists = lists;
         let mut patches: Vec<(Rect, Vec<u32>, Vec<PlacedSprite>)> = Vec::new();
-        // The bars' thumbs moved with their lists: (sprite, how far, clip).
+        // The bars' thumbs moved with their lists: (sprite, how far, clip);
+        // the track where the game's thumb was, from an earlier drawing.
         let mut thumbs: Vec<(usize, i32, Rect)> = Vec::new();
+        let mut tracks: Vec<PlacedSprite> = Vec::new();
         for l in &mut self.lists {
             l.advance(now, dt, snap);
             if l.held == 0 {
@@ -720,6 +744,18 @@ impl SmoothMenus {
                 let extent = found.iter().filter_map(|&k| rect_of(&free[k]).map(bounds)).fold(None, |a: Option<(i32, i32)>, r| Some(a.map_or((r[1], r[3]), |(t, b)| (t.min(r[1]), b.max(r[3])))));
                 l.thumb = extent.map(|(t, b)| (t + dy, b + dy));
                 if dy != 0 { thumbs.extend(found.into_iter().map(|k| (k, dy, clip))); }
+                // (The game draws its track around its thumb: where the thumb
+                // was, the track as a drawing with the thumb elsewhere has it.)
+                if let Some((top, bottom)) = extent.filter(|_| dy != 0) {
+                    let (st, sb) = (top + dy, bottom + dy);
+                    let holes = [(top, bottom.min(st)), (top.max(sb), bottom)];
+                    for (ht, hb) in holes.into_iter().filter(|(t, b)| b > t) {
+                        let art = l.drawings.iter().rev().skip(1).find(|d| d.bar.thumb.is_some_and(|(t, b)| b <= ht || t >= hb) && !d.bar.track.is_empty());
+                        for s in art.map(|d| d.bar.track.as_slice()).unwrap_or_default() {
+                            if let Some(s) = clipped(*s, [bar.rect[0], ht, bar.rect[2], hb]) { tracks.push(s) }
+                        }
+                    }
+                }
             }
             if l.shown == l.drawn { continue }
             let mut shown = l.compose(l.shown);
@@ -732,7 +768,7 @@ impl SmoothMenus {
             }
             patches.push((l.rect, l.cameras.clone(), shown.sprites));
         }
-        if patches.is_empty() && thumbs.is_empty() { return None }
+        if patches.is_empty() && thumbs.is_empty() && tracks.is_empty() { return None }
         self.patched = true;
         let mut result = free.to_vec();
         for (k, dy, clip) in thumbs {
@@ -740,6 +776,7 @@ impl SmoothMenus {
             s.y += dy;
             s.clip = intersect(s.clip.map_or(clip, |c| shifted(c, dy)), clip).or(Some([clip[0], clip[1], clip[0], clip[1]]));
         }
+        result.extend(tracks);
         for (rect, cameras, shown) in patches {
             let mut outside = Vec::new();
             for s in result {

@@ -46,13 +46,15 @@ struct Sim {
     snap: bool,
     shown: Vec<PlacedSprite>,
     notches: Vec<i32>,
-    /// The list has the game's scroll bar ([`with_bar`]).
+    /// The list has the game's scroll bar ([`with_bar`]), its track drawn
+    /// around its thumb if `segmented`.
     bar: bool,
+    segmented: bool,
 }
 
 impl Sim {
     fn new(count: u64, snap: bool) -> Self {
-        let mut sim = Sim { state: SmoothMenus::default(), first: 1, count, now: 0.0, snap, shown: vec![], notches: vec![], bar: false };
+        let mut sim = Sim { state: SmoothMenus::default(), first: 1, count, now: 0.0, snap, shown: vec![], notches: vec![], bar: false, segmented: false };
         sim.frame();
         sim
     }
@@ -68,7 +70,7 @@ impl Sim {
     }
 
     fn frame(&mut self) {
-        let (scene, free, spans) = if self.bar { with_bar(self.first, self.count) } else { frame(self.first, self.count) };
+        let (scene, free, spans) = if self.bar { with_bar(self.first, self.count, self.segmented) } else { frame(self.first, self.count) };
         self.shown = self.state.draw(&scene, &free, &spans, self.now, true, self.snap, 1, None, rect).unwrap_or(free);
         let out = self.state.take_inputs();
         self.apply(out);
@@ -408,7 +410,7 @@ fn thumb_top(value: i32) -> i32 { 23 + (f64::from(value) * 34.0 / 1e6).round() a
 
 /// [`frame`] with the game's scroll bar at the right: arrows (buttons)
 /// 10..18 and 62..70, the track 18..62 drawn whole, a 10 px thumb.
-fn with_bar(first: u64, count: u64) -> (Scene, Vec<PlacedSprite>, Vec<Span>) {
+fn with_bar(first: u64, count: u64, segmented: bool) -> (Scene, Vec<PlacedSprite>, Vec<Span>) {
     let (mut scene, mut free, _) = frame(first, count);
     let value = bar_value(first, count);
     let button = |id, y| Interactable { region: None, alt_right_click: false, anchor: None, id, rect: [96, y, 14, 8], kind: InteractableKind::Button };
@@ -417,7 +419,13 @@ fn with_bar(first: u64, count: u64) -> (Scene, Vec<PlacedSprite>, Vec<Span>) {
         button(501, 10), button(502, 62),
     ]);
     let ty = thumb_top(value);
-    free.push(PlacedSprite { screen: true, view: Some(0), clip: Some([96, 18, 110, 62]), ..PlacedSprite::new(SpriteSetId::from_raw(900), 96, 18) });
+    let track = |clip| PlacedSprite { screen: true, view: Some(0), clip: Some(clip), ..PlacedSprite::new(SpriteSetId::from_raw(900), 96, 18) };
+    if segmented {
+        // (As the game: the track above and below the thumb, none under it.)
+        free.extend([track([96, 18, 110, ty]), track([96, ty + 10, 110, 62])].into_iter().filter(|s| s.clip.is_some_and(|c| c[3] > c[1])));
+    } else {
+        free.push(track([96, 18, 110, 62]));
+    }
     free.push(PlacedSprite { screen: true, view: Some(0), clip: Some([96, ty, 110, ty + 10]), ..PlacedSprite::new(SpriteSetId::from_raw(THUMB), 96, ty) });
     let spans = vec![Span { view: 7, start: 0, len: free.len(), cameras: vec![0; free.len()] }];
     (scene, free, spans)
@@ -531,4 +539,25 @@ fn before_the_bars_scale_is_known_its_presses_are_the_games() {
     let mut sim = sim_with_bar(true);
     let arrow = Input::MouseButton { button: Button::Left, down: true, x: 103, y: 65 };
     assert_eq!(sim.route(arrow.clone()), vec![arrow]);
+}
+
+#[test]
+fn where_the_games_thumb_was_its_track_shows() {
+    let mut sim = Sim::new(20, true);
+    (sim.bar, sim.segmented) = (true, true);
+    sim.frames(2);
+    sim.wheel(1);
+    sim.frames(40);
+    sim.wheel(-1);
+    sim.frames(40);
+    sim.wheel(4);
+    let mut moved = 0;
+    for _ in 0..60 {
+        sim.frame();
+        if shown_thumb(&sim) != thumb_top(bar_value(sim.first, 20)) { moved += 1 }
+        for y in 18..62 {
+            assert!(matches!(pixel(&sim.shown, (100, y)), Some(900 | 901)), "a hole in the bar at {y}, list at {}", sim.shown());
+        }
+    }
+    assert!(moved >= 5, "the thumb was shown away from the game's: {moved}");
 }
