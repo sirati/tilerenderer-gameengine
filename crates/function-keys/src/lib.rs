@@ -20,13 +20,13 @@
 //!   (minimised, another Space), the session goes away, the setting is
 //!   turned off, the viewer ends, or [`Controller`] is dropped;
 //! * a journal left behind by a process that could not (a crash, a kill) is
-//!   replayed by the next [`Controller`] and by [`Recovery`], which the
-//!   launcher holds around the game's process: it restores them as soon as
+//!   replayed by the next [`Controller`] and by [`replay`], which the
+//!   launcher calls whenever it starts (also a start it refuses) and once
 //!   the game is gone, however it ended.
 //!
 //! Only shortcuts that were on are paused, so only those are turned on
 //! again. The state machine is [`Capture`], over a [`Backend`] (the system)
-//! and a [`Journal`]; elsewhere than macOS [`Controller`] and [`Recovery`]
+//! and a [`Journal`]; elsewhere than macOS [`Controller`] and [`replay`]
 //! do nothing.
 
 #![forbid(unsafe_code)]
@@ -273,7 +273,7 @@ impl Want {
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{Controller, Recovery};
+pub use macos::{Controller, replay};
 
 #[cfg(not(target_os = "macos"))]
 mod elsewhere {
@@ -292,16 +292,12 @@ mod elsewhere {
     }
 
     /// Nothing to restore here.
-    pub struct Recovery;
-
-    impl Recovery {
-        pub fn new(_journal: PathBuf) -> Recovery {
-            Recovery
-        }
+    pub fn replay(_journal: &std::path::Path) -> usize {
+        0
     }
 }
 #[cfg(not(target_os = "macos"))]
-pub use elsewhere::{Controller, Recovery};
+pub use elsewhere::{Controller, replay};
 
 #[cfg(test)]
 mod tests;

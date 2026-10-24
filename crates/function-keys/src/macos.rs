@@ -2,7 +2,7 @@
 //! (`function_keys_macos`), the session's state, the journal file.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use function_keys_macos::{MediaKeys, SymbolicHotKeys, SystemWatch};
@@ -103,31 +103,16 @@ impl Controller {
     }
 }
 
-/// Held by the launcher around the game's process: turns on again what a
-/// run left paused, when made (a crashed earlier run) and when dropped
-/// (once the game is gone).
-pub struct Recovery(PathBuf);
-
-impl Recovery {
-    pub fn new(journal: PathBuf) -> Recovery {
-        let recovery = Recovery(journal);
-        recovery.run();
-        recovery
+/// Turns on again the shortcuts the journal at `journal` holds (a run that
+/// paused them ended before it turned them on); how many. The launcher
+/// calls it when it starts and once the game is gone.
+pub fn replay(journal: &Path) -> usize {
+    let mut journal = FileJournal(journal.to_path_buf());
+    if crate::Journal::read(&journal).is_empty() {
+        return 0;
     }
-
-    fn run(&self) {
-        let mut journal = FileJournal(self.0.clone());
-        if crate::Journal::read(&journal).is_empty() {
-            return;
-        }
-        if let Some(mut system) = system() {
-            crate::recover(&mut system, &mut journal);
-        }
-    }
-}
-
-impl Drop for Recovery {
-    fn drop(&mut self) {
-        self.run();
+    match system() {
+        Some(mut system) => crate::recover(&mut system, &mut journal),
+        None => 0,
     }
 }
