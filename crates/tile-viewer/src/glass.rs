@@ -19,9 +19,13 @@
 //! pictures alone), all of it while the mouse is captured, and all of it
 //! with Drag map movement, where the pointer passes it everywhere (nothing
 //! there to show as open).
+//!
+//! With glass dividers there are no halves and no frost: one view's picture
+//! goes on under the whole of each divider (`Dividers::under`), and the
+//! glass bars bend that one picture.
 
 use tile_render::Camera;
-use super::{world_at_floor, Axis, DividerKind, Dividers, Hit, Layout};
+use super::{world_at_floor, Axis, DividerKind, Dividers, Hit, Layout, Side};
 
 /// The shade of one column (side by side) or row (stacked) of the glass.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -53,58 +57,43 @@ impl Layout {
     /// the background where the pane shows no world).
     pub(super) fn gap_halves(&self) -> Vec<([i32; 4], Camera)> {
         let (Some(((g0, g1), (s0, s1))), Some(split)) = (self.gap(), self.split) else { return vec![] };
-        let fitted = self.fit.map(|f| f.hit);
         let half = (g1 - g0) / 2;
         let mut out = Vec::new();
-        for (hit, from, to) in [(Hit::Main, g0, g0 + half), (Hit::Pane, g0 + half, g1)] {
+        for (side, from, to) in [(Side::A, g0, g0 + half), (Side::B, g0 + half, g1)] {
             if to <= from || s1 <= s0 {
                 continue;
             }
-            let (at, size) = match split.axis {
-                Axis::Vertical => ((from, s0), ((to - from) as u32, (s1 - s0) as u32)),
-                Axis::Horizontal => ((s0, from), ((s1 - s0) as u32, (to - from) as u32)),
+            let rect = match split.axis {
+                Axis::Vertical => [from, s0, to - from, s1 - s0],
+                Axis::Horizontal => [s0, from, s1 - s0, to - from],
             };
-            let rect = [at.0, at.1, size.0 as i32, size.1 as i32];
-            let world = self.shown.iter().find(|(h, c)| *h == hit && Some(hit) != fitted && !c.stacked);
-            let camera = match world {
-                Some((_, c)) => {
-                    let (x, y) = world_at_floor(c, at);
-                    Camera { x, y, origin: at, viewport: size, ..*c }
-                }
-                // (A zoomed view of nothing: the background colour.)
-                None => Camera { zoom: (2, 1), origin: at, cells: false, ..Camera::new(size) },
-            };
-            out.push((rect, camera));
+            out.push((rect, self.picture_over(Some(side), rect)));
         }
         out
     }
 
-    /// What lies under the zoom strip's divider with glass dividers: the
-    /// pictures of the panes below it going on up into it (to the middle of
-    /// the split's gap), so the glass has the world to bend.
-    pub(super) fn strip_band_under(&self, dividers: &Dividers) -> Vec<Camera> {
-        let Some(band) = dividers.strip else { return vec![] };
-        let [bx, by, bw, bh] = band.rect();
-        let mut out = Vec::new();
-        for hit in [Hit::Main, Hit::Pane] {
-            let Some((_, c)) = self.shown.iter().find(|(h, c)| *h == hit && Some(hit) != self.fit.map(|f| f.hit) && !c.stacked) else { continue };
-            // (Each pane's picture on to the middle of a side by side
-            // split's gap, as under the gap: no hole where the dividers meet.)
-            let (mut l, mut r) = (c.origin.0, c.origin.0 + c.viewport.0 as i32);
-            if let Some(split) = dividers.split.filter(|s| s.vertical) {
-                let middle = (split.across.0 + split.across.1) / 2;
-                if r == split.across.0 { r = middle; }
-                if l == split.across.1 { l = middle; }
+    /// What lies under the glass dividers (`Dividers::under`, which view's
+    /// picture goes on where): a camera for each stretch.
+    pub(super) fn under_glass_cameras(&self, dividers: &Dividers) -> Vec<Camera> {
+        dividers.under.iter().filter(|u| u.rect[2] > 0 && u.rect[3] > 0).map(|u| self.picture_over(u.side, u.rect)).collect()
+    }
+
+    /// A camera drawing `side`'s picture going on over window rectangle
+    /// `rect`, as its view draws it (a block of the background where the
+    /// side shows no world, or none is given).
+    fn picture_over(&self, side: Option<Side>, rect: [i32; 4]) -> Camera {
+        let fitted = self.fit.map(|f| f.hit);
+        let hit = side.map(|s| if s == Side::A { Hit::Main } else { Hit::Pane }).filter(|h| Some(*h) != fitted);
+        let at = (rect[0], rect[1]);
+        let size = (rect[2].max(1) as u32, rect[3].max(1) as u32);
+        match hit.and_then(|hit| self.shown.iter().find(|(h, c)| *h == hit && !c.stacked)) {
+            Some((_, c)) => {
+                let (x, y) = world_at_floor(c, at);
+                Camera { x, y, origin: at, viewport: size, ..*c }
             }
-            let (x0, x1) = (bx.max(l), (bx + bw).min(r));
-            if x1 <= x0 || bh <= 0 {
-                continue;
-            }
-            let at = (x0, by);
-            let (x, y) = world_at_floor(c, at);
-            out.push(Camera { x, y, origin: at, viewport: ((x1 - x0) as u32, bh as u32), ..*c });
+            // (A zoomed view of nothing: the background colour.)
+            None => Camera { zoom: (2, 1), origin: at, cells: false, ..Camera::new(size) },
         }
-        out
     }
 
     /// The glass's strips: each a window rectangle one pixel across the

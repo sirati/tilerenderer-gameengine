@@ -2960,30 +2960,31 @@ impl Layout {
         self.move_zoom_mouse(dt);
         let magnifier = magnifier.filter(|m| m.place == ZoomPlace::Beside || (self.world_shown && !fit_rect.is_some_and(|f| overlap(f, self.magnifier_geometry(m).0))));
         self.magnifier_shown = magnifier.is_some();
-        // Each pane's picture goes on under its half of the gap; the glass
-        // over it where the divider is shown (`glass`).
-        let mut halves = Vec::new();
-        for (rect, camera) in self.gap_halves() {
-            if !take(1) {
-                break;
-            }
-            halves.push((rect, push(&mut frame, camera)));
-        }
         if !self.glass_dividers {
+            // Each pane's picture goes on under its half of the gap; the
+            // frosted glass over it where the divider is shown (`glass`).
+            let mut halves = Vec::new();
+            for (rect, camera) in self.gap_halves() {
+                if !take(1) {
+                    break;
+                }
+                halves.push((rect, push(&mut frame, camera)));
+            }
             for (rect, vertical, shade) in self.glass_strips() {
                 if let Some(&(_, index)) = halves.iter().find(|(h, _)| inside(*h, (rect[0], rect[1]))) {
                     frame.divider.push((index, rect, vertical, shade));
                 }
             }
         } else {
-            // Glass bars: the panes' pictures go on under the strip's
-            // divider too, and each segment is a lens of glass over what
-            // lies under it (`dividers::GlassBar`).
+            // Glass bars: one view's picture goes on under each divider
+            // (`dividers::UnderGlass`), and each segment is a lens of glass
+            // over it (`dividers::GlassBar`).
             let dividers = self.dividers();
-            for camera in self.strip_band_under(&dividers) {
-                if take(1) {
-                    push(&mut frame, camera);
+            for camera in self.under_glass_cameras(&dividers) {
+                if !take(1) {
+                    break;
                 }
+                push(&mut frame, camera);
             }
             for (segment, bar) in dividers.glass_order() {
                 if !take(1) {

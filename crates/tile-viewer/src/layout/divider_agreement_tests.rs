@@ -305,3 +305,166 @@ fn glass_bars_are_as_thick_as_their_walls_and_round_only_at_free_ends() {
     }
     assert!(free > 100 && edge > 100 && junction > 10, "{free} {edge} {junction}");
 }
+
+/// With glass dividers one view's picture goes on under each glass bar
+/// (`Dividers::under`, from `Layout::dividers`), and only drawing goes on
+/// there: every pixel a bar bends (its lens in the window, run on under
+/// the divider it meets too) lies under exactly one stretch, of a view
+/// showing the world (no background); the split's under one view (no seam
+/// in it), the strip's changing view only under the split's bar, at its
+/// far side; the frame draws exactly those stretches, with the pictures of
+/// their views, and no gap halves. The views' rectangles and the sides
+/// stay out of the gap (the walls: `agree`, with glass too).
+#[test]
+fn under_the_glass_one_views_picture_goes_on_and_only_the_drawing_extends() {
+    let mut checked = (0, 0);
+    for split in [S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
+        for c in cases(split, true) {
+            let (l, f) = layout_of(&c);
+            let dividers = l.dividers();
+            let window = [0, 0, l.window.0 as i32, l.window.1 as i32];
+            let under = &dividers.under;
+            assert_eq!(under.iter().filter(|u| u.kind == DividerKind::Split).count(), usize::from(dividers.split.is_some()), "{c:?}");
+            assert_eq!(under.is_empty(), dividers.split.is_none() && dividers.strip.is_none(), "{c:?}");
+            // Each stretch lies in its divider's band.
+            for u in under {
+                let band = if u.kind == DividerKind::Split { dividers.split } else { dividers.strip }.unwrap();
+                let [bx, by, bw, bh] = band.rect();
+                let [x, y, w, h] = u.rect;
+                assert!(x >= bx && y >= by && x + w <= bx + bw && y + h <= by + bh && w > 0 && h > 0, "{c:?}: {u:?} in {band:?}");
+                assert!(u.side.is_some(), "{c:?}: {u:?} the background under the glass");
+            }
+            let split_side = under.iter().find(|u| u.kind == DividerKind::Split).and_then(|u| u.side);
+            assert!(split_side.is_none() || split_side == Some(Side::A), "{c:?}: the first view under the split's divider");
+            // What each bar bends: exactly one stretch's view under every
+            // pixel of its lens in the window.
+            for (_, bar) in dividers.glass_order() {
+                let [x, y, w, h] = bar.rect;
+                let (x0, y0) = (x.max(0), y.max(0));
+                let (x1, y1) = ((x + w).min(window[2]), (y + h).min(window[3]));
+                for py in (y0..y1).step_by(3) {
+                    for px in (x0..x1).step_by(3) {
+                        let at: Vec<_> = under.iter().filter(|u| inside(u.rect, (px, py))).collect();
+                        assert_eq!(at.len(), 1, "{c:?}: {:?} under ({px}, {py}) of {bar:?}", at);
+                        checked.0 += 1;
+                    }
+                }
+            }
+            // The strip's stretches change view only at the split's far side.
+            let strip: Vec<_> = under.iter().filter(|u| u.kind == DividerKind::Strip).collect();
+            for pair in strip.windows(2) {
+                assert_ne!(pair[0].side, pair[1].side, "{c:?}: merged");
+                let at = pair[1].rect[0];
+                assert_eq!(Some(at), dividers.split.filter(|s| s.vertical).map(|s| s.across.1), "{c:?}: {strip:?}");
+            }
+            // Drawn: one camera for each stretch, its view's picture going on.
+            for u in under {
+                let view = l.shown.iter().find(|(h, c)| *h == if u.side == Some(Side::A) { Hit::Main } else { Hit::Pane } && !c.stacked).unwrap().1;
+                let (x, y) = world_at_floor(&view, (u.rect[0], u.rect[1]));
+                let drawn = f.cameras.iter().filter(|cam| rect_of(cam) == u.rect && cam.lens.is_none()).collect::<Vec<_>>();
+                assert!(drawn.iter().any(|cam| (cam.x, cam.y, cam.zoom, cam.cells) == (x, y, view.zoom, true)), "{c:?}: {u:?} not drawn as its view: {drawn:?}");
+                checked.1 += 1;
+            }
+            assert!(f.divider.is_empty(), "{c:?}: no frost");
+            if let Some(((g0, g1), (s0, s1))) = l.gap() {
+                let half = (g1 - g0) / 2;
+                let vertical = dividers.split.unwrap().vertical;
+                let a_half = if vertical { [g0, s0, half, s1 - s0] } else { [s0, g0, s1 - s0, half] };
+                assert!(!f.cameras.iter().any(|cam| rect_of(cam) == a_half && half > 0), "{c:?}: no gap halves");
+                // Only drawing: the views' rectangles, the walls and the sides
+                // are as without glass under it.
+                let (a, b) = l.panes();
+                for (hit, pane) in [(Hit::Main, a), (Hit::Pane, b.unwrap())] {
+                    let Some((_, view)) = l.shown.iter().find(|(h, _)| *h == hit) else { continue };
+                    let r = rect_of(view);
+                    let (c0, c1) = if vertical { (r[0], r[0] + r[2]) } else { (r[1], r[1] + r[3]) };
+                    assert!(c1 <= g0 || c0 >= g1, "{c:?}: {hit:?} at {r:?} reaches into the gap ({pane:?})");
+                }
+                for along in [(s0 + s1) / 2, s0 + 1, s1 - 2] {
+                    for v in [g0, (g0 + g1) / 2, g1 - 1] {
+                        let p = if vertical { (v, along) } else { (along, v) };
+                        assert_eq!(l.side_of(p), None, "{c:?}: {p:?} in the gap");
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked.0 > 10_000 && checked.1 > 1000, "{checked:?}");
+}
+
+/// Without glass dividers nothing goes on under them but the gap halves.
+#[test]
+fn without_glass_dividers_nothing_goes_on_under_them() {
+    for split in [S::Vertical1To1, S::Horizontal1To1] {
+        for c in cases(split, false).into_iter().step_by(7) {
+            let (l, _) = layout_of(&c);
+            assert!(l.dividers().under.is_empty(), "{c:?}");
+        }
+    }
+}
+
+/// The pictures under the glass, drawn (the CPU reference renderer): each
+/// stretch shows exactly what its view would show there if the view went
+/// on that far, continuing the view's own picture without a seam, and no
+/// background anywhere under the bars.
+#[test]
+fn the_picture_under_the_glass_continues_its_views_picture() {
+    use tile_render::{AtlasBuilder, Grid, LayerSpec, RgbaImage, SpriteSets, TileWorld};
+    const CLEAR: [u8; 4] = [255, 0, 255, 255];
+    let mut atlas = AtlasBuilder::new(256);
+    let tiles: Vec<_> = (0..5u32).map(|k| atlas.add(&RgbaImage::from_fn(8, 8, |x, y| [(40 * k + 8 * x) as u8, (30 + 20 * y + 7 * k) as u8, (200 - 30 * k) as u8, 255]), (0, 0)).unwrap()).collect();
+    let atlas = atlas.finish();
+    let mut sets = SpriteSets::default();
+    let tiles: Vec<_> = tiles.into_iter().map(|t| sets.single(t)).collect();
+    let grid = Grid { cols: 256, rows: 256, layout: tile_render::Layout::Orthogonal, wrap_x: true, wrap_y: true, step: (8, 8) };
+    let mut world = TileWorld::new(grid, sets);
+    let layer = world.add_layer(LayerSpec::new("ground", tiles));
+    for y in 0..grid.rows { for x in 0..grid.cols { world.set(layer, x, y, (x * 3 + y * 7 + x * y) % 5); } }
+    // (Each into its own picture, from its top-left.)
+    let render = |c: &Camera| tile_render::reference::render(&world, &atlas, &Camera { origin: (0, 0), ..*c }, 0, CLEAR);
+    let mut checked = 0;
+    for split in [S::Vertical1To1, S::Horizontal1To1] {
+        for zoom in [Zoom::Off, Zoom::TopStrip] {
+            for (width, pixel_scale) in [(4, 1.0), (13, 1.0), (4, 2.0)] {
+                let c = Case { canvas: (480, 360), split, width, pixel_scale, zoom, place: Place::Floating, orders: false, across: false,
+                    movement: MapMovement::EdgeScroll, ui: 1, glass: true };
+                let (l, f) = layout_of(&c);
+                let dividers = l.dividers();
+                assert!(!dividers.under.is_empty(), "{c:?}");
+                for u in &dividers.under {
+                    let hit = if u.side == Some(Side::A) { Hit::Main } else { Hit::Pane };
+                    let view = l.shown.iter().find(|(h, _)| *h == hit).unwrap().1;
+                    let drawn = *f.cameras.iter().find(|cam| rect_of(cam) == u.rect && cam.lens.is_none()).unwrap_or_else(|| panic!("{c:?}: {u:?} not drawn"));
+                    // The view going on as far as the stretch.
+                    let (v, r) = (rect_of(&view), u.rect);
+                    let (x0, y0) = (v[0].min(r[0]), v[1].min(r[1]));
+                    let (x1, y1) = ((v[0] + v[2]).max(r[0] + r[2]), (v[1] + v[3]).max(r[1] + r[3]));
+                    let (x, y) = world_at_floor(&view, (x0, y0));
+                    let whole = Camera { x, y, origin: (x0, y0), viewport: ((x1 - x0) as u32, (y1 - y0) as u32), ..view };
+                    let (whole, under, own) = (render(&whole), render(&drawn), render(&view));
+                    for py in r[1]..r[1] + r[3] {
+                        for px in r[0]..r[0] + r[2] {
+                            let got = under.get((px - r[0]) as u32, (py - r[1]) as u32);
+                            assert_ne!(got, CLEAR, "{c:?}: the background under the glass at ({px}, {py})");
+                            assert_eq!(got, whole.get((px - x0) as u32, (py - y0) as u32), "{c:?}: {u:?} at ({px}, {py})");
+                            checked += 1;
+                        }
+                    }
+                    // The view's own picture is that picture too (no seam
+                    // where it meets the stretch).
+                    for py in v[1]..v[1] + v[3] {
+                        for px in [v[0], v[0] + v[2] - 1] {
+                            assert_eq!(own.get((px - v[0]) as u32, (py - v[1]) as u32), whole.get((px - x0) as u32, (py - y0) as u32), "{c:?}: {hit:?} at ({px}, {py})");
+                        }
+                    }
+                    for px in v[0]..v[0] + v[2] {
+                        for py in [v[1], v[1] + v[3] - 1] {
+                            assert_eq!(own.get((px - v[0]) as u32, (py - v[1]) as u32), whole.get((px - x0) as u32, (py - y0) as u32), "{c:?}: {hit:?} at ({px}, {py})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 10_000, "{checked}");
+}
