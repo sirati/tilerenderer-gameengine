@@ -80,7 +80,7 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 43] = [
+pub const KEYS: [&str; 44] = [
     "resolution.pixel_scale",
     "resolution.base_ui_scale",
     "resolution.scale_menus",
@@ -124,6 +124,7 @@ pub const KEYS: [&str; 43] = [
     "display.limit_fps",
     "display.fps_limit",
     "display.cursor_size",
+    "display.windowed",
 ];
 
 /// The range of number control `key`, if it is one.
@@ -292,6 +293,7 @@ impl Settings {
             "display.fps_limit" => Some(ControlValue::Number(FPS_LIMIT_RANGE.snap(if self.display.max_fps > 0 { self.display.max_fps } else { self.display.fps_limit } as f32))),
             "display.show_fps" => Some(ControlValue::On(self.display.show_fps)),
             "display.fps_detailed" => Some(ControlValue::On(self.display.fps_detailed)),
+            "display.windowed" => Some(ControlValue::On(self.display.windowed)),
             "display.cursor_size" => Some(ControlValue::Choice(match self.display.cursor_size {
                 crate::Display::SYSTEM_CURSOR_SIZE => "system".into(),
                 n => n.to_string(),
@@ -501,6 +503,13 @@ impl Settings {
                     ControlValue::Number(n) => {
                         d.fps_limit = FPS_LIMIT_RANGE.snap(*n) as u32;
                         if d.max_fps > 0 { d.max_fps = d.fps_limit; }
+                        true
+                    }
+                    _ => false,
+                },
+                "display.windowed" => match value {
+                    ControlValue::On(on) => {
+                        d.windowed = *on;
                         true
                     }
                     _ => false,

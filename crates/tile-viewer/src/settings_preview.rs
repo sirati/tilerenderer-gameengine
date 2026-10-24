@@ -1,23 +1,34 @@
-//! Viewer-clock confirmation for temporary render multipliers.
-use scene::{Input, SettingsPreview};
+//! Viewer-clock confirmation for settings that can leave the game unusable
+//! (`scene::SettingsPreview`): the pixel scale, a previewed menu size, the
+//! window mode. Keep or Revert; nobody answering reverts by itself.
+use scene::{Input, PreviewValue, SettingsPreview};
 use std::{
     collections::BTreeSet,
     time::{Duration, Instant},
 };
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the confirmation waits before it reverts by itself.
+pub const TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Default)]
 pub struct Preview {
     active: Option<(SettingsPreview, Instant)>,
-    settled: Option<((u64, u64), u32)>,
+    settled: Option<((u64, u64), PreviewValue)>,
     keys: BTreeSet<u32>,
     press: Option<bool>,
     /// The countdown last drawn (`Preview::drew`).
     drawn: Option<u64>,
+    /// The desktop's scale (window pixels per logical pixel; 0: 1): the
+    /// confirmation's size follows it ([`Dialog::of`]).
+    desktop_scale: f64,
 }
 impl Preview {
     pub fn active(&self) -> bool {
         self.active.is_some()
+    }
+    /// The desktop's scale the confirmation is sized for (the window's
+    /// scale factor).
+    pub fn set_desktop_scale(&mut self, scale: f64) {
+        self.desktop_scale = scale;
     }
     pub fn seed_held_keys(&mut self, keys: impl IntoIterator<Item = u32>) {
         self.keys
@@ -40,38 +51,36 @@ impl Preview {
         self.active = Some((lease, now + TIMEOUT));
         self.press = None;
     }
+    /// The settings the driver sent, with what this confirmation decided
+    /// before the driver heard of it (or a newer change still asked about).
     pub fn project(
         &mut self,
         lease: Option<SettingsPreview>,
         settings: &mut viewer_settings::Settings,
     ) {
         if lease.is_none() {
-            if let Some((_, scale)) = &mut self.settled {
-                *scale = settings.resolution.pixel_scale;
+            if let Some((_, value)) = &mut self.settled {
+                *value = value.of(settings);
             }
         }
         if let Some(lease) = lease {
             if let Some((active, _)) = self.active {
                 if (lease.session, lease.id) < (active.session, active.id) {
-                    settings.resolution.pixel_scale = active.pixel_scale;
+                    active.value.apply(settings);
                     return;
                 }
             }
-            if let Some((seen, scale)) = self.settled {
+            if let Some((seen, value)) = self.settled {
                 if (lease.session, lease.id) <= seen {
-                    settings.resolution.pixel_scale = scale;
+                    value.apply(settings);
                 }
             }
         }
     }
-    pub fn resolve(&mut self, keep: bool) -> Option<(Input, u32)> {
+    pub fn resolve(&mut self, keep: bool) -> Option<(Input, PreviewValue)> {
         let (lease, _) = self.active.take()?;
-        let scale = if keep {
-            lease.pixel_scale
-        } else {
-            lease.previous_pixel_scale
-        };
-        self.settled = Some(((lease.session, lease.id), scale));
+        let value = if keep { lease.value } else { lease.previous };
+        self.settled = Some(((lease.session, lease.id), value));
         self.press = None;
         Some((
             Input::SettingsPreviewDecision {
@@ -79,10 +88,10 @@ impl Preview {
                 id: lease.id,
                 keep,
             },
-            scale,
+            value,
         ))
     }
-    pub fn tick(&mut self, now: Instant) -> Option<(Input, u32)> {
+    pub fn tick(&mut self, now: Instant) -> Option<(Input, PreviewValue)> {
         if self.active.is_some_and(|(_, deadline)| now >= deadline) {
             self.resolve(false)
         } else {
@@ -116,7 +125,7 @@ impl Preview {
         input: &Input,
         pointer: (i32, i32),
         window: (u32, u32),
-    ) -> (bool, Option<(Input, u32)>) {
+    ) -> (bool, Option<(Input, PreviewValue)>) {
         if let Input::Key { vk, down, .. } | Input::WorldKey { vk, down, .. } = input {
             // Modifiers retain their paired releases in the native dialog.
             if matches!(*vk, 16..=18) {
@@ -151,7 +160,8 @@ impl Preview {
                 down,
                 ..
             } => {
-                let hit = buttons(window)
+                let hit = Dialog::of(window, self.desktop_scale)
+                    .buttons()
                     .into_iter()
                     .enumerate()
                     .find(|(_, r)| contains(*r, pointer))
@@ -188,31 +198,67 @@ fn contains([x, y, w, h]: [i32; 4], (px, py): (i32, i32)) -> bool {
     px >= x && py >= y && px < x + w && py < y + h
 }
 
-fn panel(window: (u32, u32)) -> [i32; 4] {
-    let (ww, wh) = (
-        window.0.max(1).min(i32::MAX as u32) as i32,
-        window.1.max(1).min(i32::MAX as u32) as i32,
-    );
-    let margin = if ww >= 32 && wh >= 32 { 8 } else { 0 };
-    let (w, h) = ((ww - 2 * margin).min(420), (wh - 2 * margin).min(160));
-    [(ww - w) / 2, (wh - h) / 2, w, h]
+/// The confirmation's design size, in logical pixels at 1×.
+pub const DESIGN: (i32, i32) = (420, 160);
+/// How much larger than [`DESIGN`] it is drawn, in logical pixels (times
+/// the desktop's scale in window pixels), where the window has room.
+pub const TARGET_SCALE: f64 = 2.0;
+
+/// Where the confirmation is in a window: its size never follows the
+/// settings it asks about (the pixel, menu or base UI scale), only the
+/// window and the desktop's scale.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Dialog {
+    /// Its panel, in window pixels.
+    pub rect: [i32; 4],
+    /// Window pixels per design pixel.
+    pub scale: f64,
 }
-fn buttons(window: (u32, u32)) -> [[i32; 4]; 2] {
-    let [x, y, w, h] = panel(window);
-    [
-        [
-            x + w * 17 / 100,
+
+impl Dialog {
+    /// [`DESIGN`] times [`TARGET_SCALE`] times the desktop's scale
+    /// (`desktop_scale`, window pixels per logical pixel; 0 or less: 1),
+    /// centred; in a window too small for that, as large as the window
+    /// allows at the same aspect ratio: its whole width or its whole height,
+    /// whichever runs out first.
+    pub fn of(window: (u32, u32), desktop_scale: f64) -> Dialog {
+        let (ww, wh) = (
+            window.0.clamp(1, i32::MAX as u32) as i32,
+            window.1.clamp(1, i32::MAX as u32) as i32,
+        );
+        let desktop = if desktop_scale.is_finite() && desktop_scale > 0.0 { desktop_scale } else { 1.0 };
+        let target = TARGET_SCALE * desktop;
+        let fit = (ww as f64 / DESIGN.0 as f64).min(wh as f64 / DESIGN.1 as f64);
+        let scale = target.min(fit);
+        let w = ((DESIGN.0 as f64 * scale).round() as i32).clamp(1, ww);
+        let h = ((DESIGN.1 as f64 * scale).round() as i32).clamp(1, wh);
+        Dialog { rect: [(ww - w) / 2, (wh - h) / 2, w, h], scale }
+    }
+
+    /// Keep and Revert, in window pixels.
+    pub fn buttons(&self) -> [[i32; 4]; 2] {
+        let [x, y, w, h] = self.rect;
+        [17, 55].map(|left| [
+            x + w * left / 100,
             y + h * 65 / 100,
             (w * 29 / 100).max(1),
             (h * 23 / 100).max(1),
-        ],
-        [
-            x + w * 55 / 100,
-            y + h * 65 / 100,
-            (w * 29 / 100).max(1),
-            (h * 23 / 100).max(1),
-        ],
-    ]
+        ])
+    }
+
+    /// The light frame around the panel, in window pixels.
+    fn frame(&self) -> i32 {
+        (2.0 * self.scale).round().max(1.0) as i32
+    }
+
+    /// The window pixels it draws (its panel and frame, within `window`).
+    pub fn drawn_rect(&self, window: (u32, u32)) -> [i32; 4] {
+        let [x, y, w, h] = self.rect;
+        let frame = self.frame();
+        let (x0, y0) = ((x - frame).max(0), (y - frame).max(0));
+        let (x1, y1) = ((x + w + frame).min(window.0 as i32), (y + h + frame).min(window.1 as i32));
+        [x0, y0, x1 - x0, y1 - y0]
+    }
 }
 
 /// The confirmation over a frame shown as `present` says: drawn onto the
@@ -222,28 +268,24 @@ fn buttons(window: (u32, u32)) -> [[i32; 4]; 2] {
 pub fn compose_presented(
     compiled: &render_desc::Compiled,
     present: tile_render::Present,
+    desktop_scale: f64,
     seconds: u64,
     view: u32,
 ) -> (tile_render::Camera, Vec<tile_render::PlacedSprite>) {
-    let (camera, sprites) = compose(compiled, present.target, seconds, view);
+    let (camera, sprites) = compose(compiled, present.target, desktop_scale, seconds, view);
     (tile_render::Camera { on_target: true, ..camera }, sprites)
 }
 
 /// The window pixels the confirmation draws (its panel and frame): all a
 /// frame showing it costs more.
-pub fn drawn_rect(window: (u32, u32)) -> [i32; 4] {
-    let [x, y, w, h] = panel(window);
-    let (x0, y0) = ((x - FRAME).max(0), (y - FRAME).max(0));
-    let (x1, y1) = ((x + w + FRAME).min(window.0 as i32), (y + h + FRAME).min(window.1 as i32));
-    [x0, y0, x1 - x0, y1 - y0]
+pub fn drawn_rect(window: (u32, u32), desktop_scale: f64) -> [i32; 4] {
+    Dialog::of(window, desktop_scale).drawn_rect(window)
 }
-
-/// The panel's frame, in window pixels (where the window has room).
-const FRAME: i32 = 2;
 
 pub fn compose(
     compiled: &render_desc::Compiled,
     window: (u32, u32),
+    desktop_scale: f64,
     seconds: u64,
     view: u32,
 ) -> (tile_render::Camera, Vec<tile_render::PlacedSprite>) {
@@ -259,20 +301,23 @@ pub fn compose(
         }),
         ..PlacedSprite::new(tile_render::SpriteSetId::EMPTY, x, y)
     };
+    let dialog = Dialog::of(window, desktop_scale);
     // No dimming of the whole window: shading every window pixel cost a
     // full frame's GPU time (some 2.6 ms at 3258×1904). A light frame
     // sets the panel off instead.
-    out.push(solid(drawn_rect(window), [150, 150, 160, 255]));
-    let rect = panel(window);
-    let [x, y, w, h] = rect;
-    out.push(solid(rect, [40, 40, 45, 255]));
-    let buttons = buttons(window);
+    out.push(solid(dialog.drawn_rect(window), [150, 150, 160, 255]));
+    let [x, y, w, h] = dialog.rect;
+    out.push(solid(dialog.rect, [40, 40, 45, 255]));
+    let buttons = dialog.buttons();
     for button in buttons {
         out.push(solid(button, [85, 85, 95, 255]));
     }
     let required = "Do you want to keep this? Reverting in 0123456789 seconds Keep Revert";
     if let Some((font, face)) = crate::host_status::face_for(compiled, required) {
-        let pad = (w / 14).min(30);
+        let pad = (w / 14).min((30.0 * dialog.scale).round() as i32);
+        // 18 design pixels (12% of its height), smaller where the text
+        // would not fit.
+        let size = ((18.0 * dialog.scale).round() as i32).min(h * 12 / 100).max(1);
         for (text, area, baseline) in [
             (
                 "Do you want to keep this?".to_owned(),
@@ -293,7 +338,7 @@ pub fn compose(
                     .map(|ch| face.advance(ch).unwrap_or(0) * px / em)
                     .sum::<i32>()
             };
-            let mut px = (h * 12 / 100).clamp(1, 18);
+            let mut px = size;
             while px > 1 && width(px) > area[2] {
                 px -= 1;
             }
@@ -337,8 +382,8 @@ mod tests {
         SettingsPreview {
             session: 1,
             id,
-            pixel_scale: 3,
-            previous_pixel_scale: 1,
+            value: PreviewValue::PixelScale(3),
+            previous: PreviewValue::PixelScale(1),
         }
     }
     #[test]
@@ -352,10 +397,10 @@ mod tests {
         for keep in [false, true] {
             let lease = lease(if keep { 2 } else { 1 });
             preview.observe(Some(lease), Instant::now());
-            settings.resolution.pixel_scale = lease.pixel_scale;
+            lease.value.apply(&mut settings);
             let (_, scale) = preview.resolve(keep).unwrap();
             preview.project(Some(lease), &mut settings);
-            assert_eq!(settings.resolution, viewer_settings::Resolution { pixel_scale: scale, ..original.clone() });
+            assert_eq!(settings.resolution, viewer_settings::Resolution { pixel_scale: match scale { PreviewValue::PixelScale(n) => n, _ => unreachable!() }, ..original.clone() });
         }
     }
 
@@ -366,7 +411,7 @@ mod tests {
         p.observe(Some(lease(1)), now);
         p.observe(Some(lease(1)), now + Duration::from_secs(9));
         assert_eq!(p.seconds(now + Duration::from_secs(9)), Some(1));
-        assert_eq!(p.tick(now + TIMEOUT).unwrap().1, 1);
+        assert_eq!(p.tick(now + TIMEOUT).unwrap().1, PreviewValue::PixelScale(1));
         p.observe(Some(lease(1)), now + TIMEOUT);
         assert!(!p.active());
         let mut settings = viewer_settings::Settings::default();
@@ -399,7 +444,7 @@ mod tests {
         };
         let (used, result) = p.input(&key(true), (0, 0), (1000, 800));
         assert!(used);
-        assert_eq!(result.unwrap().1, 3);
+        assert_eq!(result.unwrap().1, PreviewValue::PixelScale(3));
         assert!(p.input(&key(true), (0, 0), (1000, 800)).0);
         assert!(p.input(&key(false), (0, 0), (1000, 800)).0);
         assert!(!p.input(&key(true), (0, 0), (1000, 800)).0);
@@ -415,11 +460,11 @@ mod transaction_tests {
         let lease = SettingsPreview {
             session: 5,
             id: 1,
-            pixel_scale: 4,
-            previous_pixel_scale: 2,
+            value: PreviewValue::PixelScale(4),
+            previous: PreviewValue::PixelScale(2),
         };
         p.observe(Some(lease), Instant::now());
-        assert_eq!(p.resolve(true).unwrap().1, 4);
+        assert_eq!(p.resolve(true).unwrap().1, PreviewValue::PixelScale(4));
         p.observe(None, Instant::now());
         let mut authoritative = viewer_settings::Settings::default();
         authoritative.resolution.pixel_scale = 2;
@@ -431,19 +476,19 @@ mod transaction_tests {
         let lease = SettingsPreview {
             session: 5,
             id: 1,
-            pixel_scale: 4,
-            previous_pixel_scale: 2,
+            value: PreviewValue::PixelScale(4),
+            previous: PreviewValue::PixelScale(2),
         };
         for scale in [1, 2, 4, 6] {
             let mut p = Preview::default();
             p.observe(
                 Some(SettingsPreview {
-                    pixel_scale: scale,
+                    value: PreviewValue::PixelScale(scale),
                     ..lease
                 }),
                 Instant::now(),
             );
-            let [x, y, _, _] = buttons((1200, 900))[1];
+            let [x, y, _, _] = Dialog::of((1200, 900), 1.0).buttons()[1];
             let mouse = |down| Input::MouseButton {
                 button: scene::Button::Left,
                 down,
@@ -456,7 +501,7 @@ mod transaction_tests {
                     .1
                     .unwrap()
                     .1,
-                2
+                PreviewValue::PixelScale(2)
             );
         }
         let mut p = Preview::default();
@@ -474,7 +519,7 @@ mod transaction_tests {
             .1
             .unwrap()
             .1,
-            2
+            PreviewValue::PixelScale(2)
         );
         assert!(
             p.input(
@@ -500,12 +545,12 @@ mod stale_tests {
         let old = SettingsPreview {
             session: 10,
             id: 1,
-            pixel_scale: 3,
-            previous_pixel_scale: 1,
+            value: PreviewValue::PixelScale(3),
+            previous: PreviewValue::PixelScale(1),
         };
         let next = SettingsPreview {
             id: 2,
-            pixel_scale: 4,
+            value: PreviewValue::PixelScale(4),
             ..old
         };
         let mut p = Preview::default();
@@ -514,14 +559,14 @@ mod stale_tests {
         p.observe(Some(next), t);
         p.observe(Some(old), t);
         let mut source = viewer_settings::Settings::default();
-        source.resolution.pixel_scale = old.pixel_scale;
+        source.resolution.pixel_scale = 3;
         p.project(Some(old), &mut source);
         assert_eq!(source.resolution.pixel_scale, 4);
         p.resolve(true);
         p.observe(None, t);
         source.resolution.pixel_scale = 2;
         p.project(None, &mut source);
-        source.resolution.pixel_scale = old.pixel_scale;
+        source.resolution.pixel_scale = 3;
         p.project(Some(old), &mut source);
         assert_eq!(source.resolution.pixel_scale, 2);
     }
@@ -554,8 +599,8 @@ mod app_tests {
         let lease = SettingsPreview {
             session: 1,
             id: 1,
-            pixel_scale: 4,
-            previous_pixel_scale: 2,
+            value: PreviewValue::PixelScale(4),
+            previous: PreviewValue::PixelScale(2),
         };
         app.settings_preview.observe(Some(lease), t);
         let mut candidate = app.settings.clone();
@@ -626,7 +671,7 @@ mod review_tests {
                     // the window after it, in its pixels.
                     let drawn = crate::scaling::drawn(&[camera], &[], source, |_| zoomed_art);
                     assert_eq!(drawn.present, source);
-                    let (modal, commands) = compose_presented(&compiled, drawn.present, 10, 1);
+                    let (modal, commands) = compose_presented(&compiled, drawn.present, 1.0, 10, 1);
                     assert_eq!(
                         (modal.on_target, modal.cells, modal.zoom, modal.viewport, modal.origin, modal.screen_shift),
                         (true, false, (1, 1), window, (0, 0), (0, 0))
@@ -649,8 +694,8 @@ mod review_tests {
                             Some(SettingsPreview {
                                 session: 1,
                                 id: 1,
-                                pixel_scale: n,
-                                previous_pixel_scale: 1,
+                                value: PreviewValue::PixelScale(n),
+                                previous: PreviewValue::PixelScale(1),
                             }),
                             Instant::now(),
                         );
@@ -694,7 +739,7 @@ mod review_tests {
                 )),
             ),
         );
-        let (_, commands) = compose(&c, (240, 100), 10, 0);
+        let (_, commands) = compose(&c, (240, 100), 1.0, 10, 0);
         let text: Vec<_> = commands.iter().filter_map(|s| s.text).collect();
         assert!(!text.is_empty());
         assert!(text.iter().all(|g| g.font != 0));
@@ -712,8 +757,8 @@ mod review_tests {
             Some(SettingsPreview {
                 session: 1,
                 id: 1,
-                pixel_scale: 3,
-                previous_pixel_scale: 1,
+                value: PreviewValue::PixelScale(3),
+                previous: PreviewValue::PixelScale(1),
             }),
             Instant::now(),
         );
@@ -738,7 +783,7 @@ mod review_tests {
         let start = Instant::now();
         let mut p = Preview::default();
         assert!(!p.needs_frame(start));
-        p.observe(Some(SettingsPreview { session: 1, id: 1, pixel_scale: 6, previous_pixel_scale: 1 }), start);
+        p.observe(Some(SettingsPreview { session: 1, id: 1, value: PreviewValue::PixelScale(6), previous: PreviewValue::PixelScale(1) }), start);
         assert!(p.needs_frame(start), "it appears");
         p.drew(p.seconds(start));
         assert_eq!(p.seconds(start), Some(10));
@@ -762,5 +807,104 @@ mod review_tests {
         assert!(p.needs_frame(start + TIMEOUT), "it goes");
         p.drew(None);
         assert!(!p.needs_frame(start + TIMEOUT));
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    /// Twice its design size in logical pixels where the window has room;
+    /// in a smaller window as large as it fits, its whole width or its
+    /// whole height, at the same aspect ratio.
+    #[test]
+    fn the_dialog_is_twice_its_design_or_fills_the_window_by_width_or_height() {
+        let ratio = |d: Dialog| d.rect[2] as f64 / d.rect[3] as f64;
+        let design = DESIGN.0 as f64 / DESIGN.1 as f64;
+        // Room: 840×320 logical pixels, centred, at any desktop scale.
+        for (window, desktop) in [((1920, 1080), 1.0), ((3258, 1904), 2.0), ((2560, 1440), 1.5)] {
+            let d = Dialog::of(window, desktop);
+            let (w, h) = ((840.0 * desktop).round() as i32, (320.0 * desktop).round() as i32);
+            assert_eq!(d.rect, [(window.0 as i32 - w) / 2, (window.1 as i32 - h) / 2, w, h], "{window:?} at {desktop}");
+            assert_eq!(d.scale, 2.0 * desktop);
+        }
+        // Too narrow: the whole width.
+        let d = Dialog::of((640, 480), 1.0);
+        assert_eq!((d.rect[0], d.rect[2]), (0, 640));
+        assert!(d.rect[3] < 480 && (ratio(d) - design).abs() < 0.02);
+        // Too low: the whole height.
+        let d = Dialog::of((1600, 240), 1.0);
+        assert_eq!((d.rect[1], d.rect[3]), (0, 240));
+        assert!(d.rect[2] < 1600 && (ratio(d) - design).abs() < 0.02);
+        // A HiDPI window too small for its target: limited the same way.
+        let d = Dialog::of((1280, 800), 2.0);
+        assert_eq!((d.rect[0], d.rect[2]), (0, 1280));
+        // Its buttons stay inside it, and clickable.
+        for window in [(1920, 1080), (640, 480), (1600, 240), (100, 60)] {
+            let d = Dialog::of(window, 1.0);
+            for [x, y, w, h] in d.buttons() {
+                assert!(w > 0 && h > 0 && x >= d.rect[0] && y >= d.rect[1]);
+                assert!(x + w <= d.rect[0] + d.rect[2] && y + h <= d.rect[1] + d.rect[3]);
+            }
+            let [x, y, w, h] = d.drawn_rect(window);
+            assert!(x >= 0 && y >= 0 && x + w <= window.0 as i32 && y + h <= window.1 as i32);
+        }
+    }
+
+    /// The window mode and the menu size revert on the viewer's clock like
+    /// the pixel scale: the settings it shows go back before the driver
+    /// hears, and stay so until the driver's settings agree.
+    #[test]
+    fn timeout_reverts_the_window_mode_and_the_menu_size() {
+        let t = Instant::now();
+        for (value, previous) in [
+            (PreviewValue::Windowed(true), PreviewValue::Windowed(false)),
+            (PreviewValue::menus(true, 40.0), PreviewValue::menus(false, 100.0)),
+        ] {
+            let mut p = Preview::default();
+            let lease = SettingsPreview { session: 2, id: 7, value, previous };
+            p.observe(Some(lease), t);
+            assert_eq!(p.tick(t + TIMEOUT - Duration::from_millis(1)), None);
+            let (input, reverted) = p.tick(t + TIMEOUT).unwrap();
+            assert_eq!(input, Input::SettingsPreviewDecision { session: 2, id: 7, keep: false });
+            assert_eq!(reverted, previous);
+            // The driver still sends the previewed value: shown reverted.
+            let mut settings = viewer_settings::Settings::default();
+            value.apply(&mut settings);
+            p.project(Some(lease), &mut settings);
+            assert_eq!(previous.of(&settings), previous);
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_mode_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, Arc};
+    struct NoImages;
+    impl render_desc::ImageLoader for NoImages {
+        fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> {
+            Err("no images".into())
+        }
+    }
+
+    /// The viewer follows the window mode its driver's settings ask for,
+    /// and goes back to the previous one when the confirmation times out.
+    #[test]
+    fn expiry_switches_the_window_mode_back() {
+        let compiled = render_desc::Description::parse("grid={layout='orthogonal',step=[8,8]}").unwrap().compile(&NoImages, 16).unwrap();
+        let (driver, display) = scene::connect();
+        let config = crate::ViewerConfig { fullscreen: true, ..Default::default() };
+        let mut app = crate::new_app(config, crate::Assets::new(Arc::new(compiled)), display, Arc::new(AtomicBool::new(false)));
+        let t = Instant::now();
+        let lease = SettingsPreview { session: 1, id: 1, value: PreviewValue::Windowed(true), previous: PreviewValue::Windowed(false) };
+        app.settings_preview.observe(Some(lease), t);
+        app.follow_window_mode(true);
+        assert!(!app.config.fullscreen, "windowed while asking");
+        let expired = app.settings_preview.tick(t + TIMEOUT);
+        app.resolve_settings_preview(expired);
+        assert!(app.config.fullscreen, "fullscreen again");
+        assert!(!app.settings.display.windowed);
+        assert_eq!(driver.take_input(), vec![Input::SettingsPreviewDecision { session: 1, id: 1, keep: false }]);
     }
 }

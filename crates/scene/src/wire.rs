@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, BuildQueue, BuildQueueRow, Button, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 60;
+pub const VERSION: u32 = 61;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -76,6 +76,30 @@ impl<'a> Reader<'a> {
         }
         Ok(n)
     }
+}
+
+/// A [`crate::PreviewValue`]: its kind, then one u32 and a bool.
+fn preview_value(w: &mut Writer, value: crate::PreviewValue) {
+    use crate::PreviewValue::*;
+    let (kind, n, on) = match value {
+        PixelScale(scale) => (0, scale, false),
+        Menus { scale, percent_bits } => (1, percent_bits, scale),
+        Windowed(on) => (2, 0, on),
+    };
+    w.u8(kind);
+    w.u32(n);
+    w.bool(on);
+}
+
+fn read_preview_value(r: &mut Reader) -> Result<crate::PreviewValue, WireError> {
+    use crate::PreviewValue::*;
+    let (kind, n, on) = (r.u8()?, r.u32()?, r.bool()?);
+    Ok(match kind {
+        0 => PixelScale(n),
+        1 => Menus { scale: on, percent_bits: n },
+        2 => Windowed(on),
+        t => return Err(WireError::Tag(t)),
+    })
 }
 
 impl Writer {
@@ -531,7 +555,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.bool(p.is_some());
                 if let Some(p) = p {
                     for n in [p.session, p.id] { w.u32(n as u32); w.u32((n >> 32) as u32); }
-                    w.u32(p.pixel_scale); w.u32(p.previous_pixel_scale);
+                    for v in [p.value, p.previous] { preview_value(&mut w, v); }
                 }
             }
             Update::Settings(s) => {
@@ -1004,7 +1028,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 Some(crate::SettingsPreview {
                     session: r.u32()? as u64 | (r.u32()? as u64) << 32,
                     id: r.u32()? as u64 | (r.u32()? as u64) << 32,
-                    pixel_scale: r.u32()?, previous_pixel_scale: r.u32()?,
+                    value: read_preview_value(&mut r)?, previous: read_preview_value(&mut r)?,
                 })
             } else { None }),
             23 => Update::Host(crate::HostStatus { stale_ms: r.u32()?, serial: r.u32()?, render_errors: r.u32()? }),
@@ -1550,7 +1574,8 @@ mod tests {
         updates.push(Update::Cursor(Cursor::System(SystemCursor::ResizeNesw)));
         updates.push(Update::Cursor(Cursor::Default));
         updates.push(Update::Host(crate::HostStatus { stale_ms: 3_250, serial: 77, render_errors: 9 }));
-        updates.push(Update::SettingsPreview(Some(crate::SettingsPreview { session: 0x1_0000_0001, id: 0x2_0000_0002, pixel_scale: 3, previous_pixel_scale: 1 })));
+        updates.push(Update::SettingsPreview(Some(crate::SettingsPreview { session: 0x1_0000_0001, id: 0x2_0000_0002, value: crate::PreviewValue::menus(true, 62.5), previous: crate::PreviewValue::PixelScale(1) })));
+        updates.push(Update::SettingsPreview(Some(crate::SettingsPreview { session: 3, id: 4, value: crate::PreviewValue::Windowed(true), previous: crate::PreviewValue::Windowed(false) })));
         updates.push(Update::SettingsPreview(None));
         assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
         let mut got = Scene::default();
