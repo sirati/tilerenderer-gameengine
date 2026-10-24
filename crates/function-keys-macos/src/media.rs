@@ -1,6 +1,6 @@
-//! The top-row media keys as F1-F12: an event tap in the login session
-//! that, while it is on, rewrites them on their way to the application in
-//! front.
+//! The top-row media keys as F1-F12: an event tap where events enter the
+//! window server from the HID system ([`keys::tap::HID`]) that, while it
+//! is on, rewrites them before the system or any application sees them.
 //!
 //! * Brightness, keyboard light, media and volume keys arrive as
 //!   system-defined events (`NX_SYSDEFINED`, subtype 8). Each is replaced
@@ -8,8 +8,15 @@
 //!   ([`crate::keys::MediaKey::as_function`]); the system never sees it,
 //!   so the volume or brightness does not change.
 //! * Mission Control, Spotlight, Dictation, Do Not Disturb (and Launchpad)
-//!   arrive as key events of their own codes; their code is replaced with
-//!   their function key's ([`crate::keys::top_row_as_function`]).
+//!   arrive as key events of their own codes; each is replaced with a key
+//!   press or release of its function key
+//!   ([`crate::keys::top_row_as_function`]). A tap in the session does not
+//!   get these: on an Apple silicon MacBook they went past one to the
+//!   window in front with their own codes, unchanged, so the tap sits at
+//!   the HID level (in the session only if the system refuses that).
+//!
+//! Each top-row key the tap rewrites, and each special key it does not
+//! know, is logged once (`function keys: tap: ...`).
 //!
 //! A tap that changes events needs the Accessibility permission (System
 //! Settings > Privacy & Security > Accessibility), granted to the
@@ -22,12 +29,13 @@
 //! ends with the process.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use objc2_app_kit::NSEvent;
 use objc2_core_graphics::CGEvent;
 
 use crate::keys;
+use crate::keys::tap::{self, Seen};
 
 type CFTypeRef = *const c_void;
 type CFMachPortRef = *mut c_void;
@@ -69,12 +77,8 @@ unsafe extern "C" {
     static kAXTrustedCheckOptionPrompt: CFTypeRef;
 }
 
-const SESSION_EVENT_TAP: u32 = 1;
 const HEAD_INSERT_EVENT_TAP: u32 = 0;
 const TAP_OPTION_DEFAULT: u32 = 0;
-const KEY_DOWN: u32 = 10;
-const KEY_UP: u32 = 11;
-const SYSTEM_DEFINED: u32 = 14;
 const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
 const TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 const KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
@@ -103,6 +107,17 @@ impl std::fmt::Display for MediaKeysError {
 struct Shared {
     on: AtomicBool,
     port: AtomicPtr<c_void>,
+    /// Key codes (0..256) and media key types (256..512) already logged.
+    logged: [AtomicU64; 8],
+}
+
+impl Shared {
+    /// Whether `index` is logged for the first time now.
+    fn first(&self, index: usize) -> bool {
+        let Some(word) = self.logged.get(index / 64) else { return false };
+        let bit = 1u64 << (index % 64);
+        word.fetch_or(bit, Ordering::Relaxed) & bit == 0
+    }
 }
 
 /// The tap, made the first time it is turned on. Main thread only.
@@ -120,7 +135,8 @@ impl Default for MediaKeys {
 
 impl MediaKeys {
     pub fn new() -> MediaKeys {
-        MediaKeys { shared: Box::new(Shared { on: AtomicBool::new(false), port: AtomicPtr::new(std::ptr::null_mut()) }), port: std::ptr::null_mut(), source: std::ptr::null_mut() }
+        let shared = Shared { on: AtomicBool::new(false), port: AtomicPtr::new(std::ptr::null_mut()), logged: Default::default() };
+        MediaKeys { shared: Box::new(shared), port: std::ptr::null_mut(), source: std::ptr::null_mut() }
     }
 
     /// Whether the tap is on.
@@ -145,15 +161,22 @@ impl MediaKeys {
         if !trusted() {
             return Err(MediaKeysError::NotTrusted);
         }
-        let events = (1u64 << KEY_DOWN) | (1u64 << KEY_UP) | (1u64 << SYSTEM_DEFINED);
         let info = &*self.shared as *const Shared as *mut c_void;
-        // SAFETY: `info` is the boxed `Shared`, which outlives the tap
-        // (`Drop` invalidates the tap first); the callback has the tap
-        // callback's signature.
-        let port = unsafe { CGEventTapCreate(SESSION_EVENT_TAP, HEAD_INSERT_EVENT_TAP, TAP_OPTION_DEFAULT, events, tap, info) };
-        if port.is_null() {
-            return Err(MediaKeysError::Refused);
-        }
+        let port = tap::LOCATIONS.iter().find_map(|&location| {
+            // SAFETY: `info` is the boxed `Shared`, which outlives the tap
+            // (`Drop` invalidates the tap first); the callback has the tap
+            // callback's signature.
+            let port = unsafe { CGEventTapCreate(location, HEAD_INSERT_EVENT_TAP, TAP_OPTION_DEFAULT, tap::EVENTS, tap_callback, info) };
+            let place = if location == tap::HID { "the HID level" } else { "the login session" };
+            if port.is_null() {
+                log::warn!("function keys: the system refused an event tap at {place}");
+                None
+            } else {
+                log::info!("function keys: event tap at {place}");
+                Some(port)
+            }
+        });
+        let Some(port) = port else { return Err(MediaKeysError::Refused) };
         // SAFETY: a live tap; the default allocator.
         let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0) };
         if source.is_null() {
@@ -220,7 +243,7 @@ fn trusted() -> bool {
 
 /// The tap: rewrites the top row's keys while on, lets everything else by.
 /// Runs on the main run loop; must not panic (it is called from C).
-extern "C" fn tap(_proxy: *mut c_void, kind: u32, event: CGEventRef, info: *mut c_void) -> CGEventRef {
+extern "C" fn tap_callback(_proxy: *mut c_void, kind: u32, event: CGEventRef, info: *mut c_void) -> CGEventRef {
     // SAFETY: `info` is the `Shared` the tap was made with (`create`).
     let shared = unsafe { &*(info as *const Shared) };
     let on = shared.on.load(Ordering::Relaxed);
@@ -235,46 +258,64 @@ extern "C" fn tap(_proxy: *mut c_void, kind: u32, event: CGEventRef, info: *mut 
     if !on || event.is_null() {
         return event;
     }
-    match kind {
-        KEY_DOWN | KEY_UP => {
+    let seen = match kind {
+        tap::KEY_DOWN | tap::KEY_UP => {
             // SAFETY: a live keyboard event handed to the tap.
-            let code = unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE) };
-            if let Some(function) = u16::try_from(code).ok().and_then(keys::top_row_as_function) {
-                // SAFETY: as above; the tap may change the event it passes on.
-                unsafe { CGEventSetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE, i64::from(function)) };
+            let (code, repeat) = unsafe { (CGEventGetIntegerValueField(event, KEYBOARD_EVENT_KEYCODE), CGEventGetIntegerValueField(event, KEYBOARD_EVENT_AUTOREPEAT)) };
+            match u16::try_from(code) {
+                Ok(code) => Seen::Key { code, down: kind == tap::KEY_DOWN, repeat: repeat != 0 },
+                Err(_) => Seen::Other,
             }
-            event
         }
-        SYSTEM_DEFINED => {
-            let Some((function, key)) = media_key(event) else { return event };
-            // SAFETY: no event source; a key code and a direction.
-            let replacement = unsafe { CGEventCreateKeyboardEvent(std::ptr::null_mut(), function, key.down) };
-            if replacement.is_null() {
-                return event;
+        tap::SYSTEM_DEFINED => media_key(event).map_or(Seen::Other, Seen::Media),
+        _ => Seen::Other,
+    };
+    let Some(replace) = tap::rewrite(seen) else {
+        if let Some(what) = tap::unknown(seen) {
+            if shared.first(log_index(seen)) {
+                log::info!("function keys: tap: {what} is no top-row key it knows; passed on");
             }
-            // SAFETY: two live events. The replacement is handed back to the
-            // system, which releases it (with the original) once delivered.
-            unsafe {
-                CGEventSetFlags(replacement, CGEventGetFlags(event) & u64::from(keys::MODIFIERS));
-                if key.repeat {
-                    CGEventSetIntegerValueField(replacement, KEYBOARD_EVENT_AUTOREPEAT, 1);
-                }
-            }
-            replacement
         }
-        _ => event,
+        return event;
+    };
+    if let Seen::Key { code, .. } = seen {
+        if shared.first(log_index(seen)) {
+            log::info!("function keys: tap: top-row key code {code:#04x} becomes {}", keys::describe(replace.key_code, 0));
+        }
+    }
+    // SAFETY: no event source; a key code and a direction.
+    let replacement = unsafe { CGEventCreateKeyboardEvent(std::ptr::null_mut(), replace.key_code, replace.down) };
+    if replacement.is_null() {
+        return event;
+    }
+    // SAFETY: two live events. The replacement is handed back to the
+    // system, which releases it (with the original) once delivered.
+    unsafe {
+        CGEventSetFlags(replacement, CGEventGetFlags(event) & u64::from(keys::MODIFIERS));
+        if replace.repeat {
+            CGEventSetIntegerValueField(replacement, KEYBOARD_EVENT_AUTOREPEAT, 1);
+        }
+    }
+    replacement
+}
+
+/// Where `seen` is noted as logged (`Shared::logged`).
+fn log_index(seen: Seen) -> usize {
+    match seen {
+        Seen::Key { code, .. } => usize::from(code).min(255),
+        Seen::Media(key) => 256 + (key.key as usize).min(255),
+        Seen::Other => 511,
     }
 }
 
-/// The function key a system-defined event's media key stands on.
-fn media_key(event: CGEventRef) -> Option<(u16, keys::MediaKey)> {
+/// The media key of a system-defined event, if it is one.
+fn media_key(event: CGEventRef) -> Option<keys::MediaKey> {
     objc2::rc::autoreleasepool(|_| {
         // SAFETY: a live CGEvent (a CF object of that type) for the call.
         let event = NSEvent::eventWithCGEvent(unsafe { &*(event as *const CGEvent) })?;
         if event.subtype().0 != keys::AUX_CONTROL_BUTTONS {
             return None;
         }
-        let key = keys::MediaKey::from_data1(event.data1())?;
-        Some((key.as_function()?, key))
+        keys::MediaKey::from_data1(event.data1())
     })
 }
