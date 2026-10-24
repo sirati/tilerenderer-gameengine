@@ -4,6 +4,8 @@ use tile_render::SpriteSetId;
 
 const ROW: i32 = 20;
 const FRAME: f64 = 1.0 / 60.0;
+/// Where each row's name ends (its entry's anchor, as the bridge sets it).
+const TEXT_END: i32 = 52;
 
 /// The driver's list: `count` rows of 20 pixels, three shown from `first`
 /// (1-based ids, sprite set = row id) in [10, 10, 100, 60].
@@ -16,7 +18,7 @@ fn frame(first: u64, count: u64) -> (Scene, Vec<PlacedSprite>, Vec<Span>) {
         let id = first + k;
         if id > count { break }
         let y = 10 + k as i32 * ROW;
-        scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None, id, rect: [10, y, 100, ROW], kind: InteractableKind::ListItem });
+        scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: Some([TEXT_END, y + ROW / 2]), id, rect: [10, y, 100, ROW], kind: InteractableKind::ListItem });
         free.push(PlacedSprite { screen: true, view: Some(0), clip: Some([10, 10, 110, 70]), ..PlacedSprite::new(SpriteSetId::from_raw(id as u32), 10, y) });
     }
     let spans = vec![Span { view: 7, start: 0, len: free.len(), cameras: vec![0; free.len()] }];
@@ -177,7 +179,74 @@ fn without_snapping_a_list_rests_between_items() {
     assert_eq!(pixel(&sim.shown, (20, 15)), Some(1));
     assert_eq!(pixel(&sim.shown, (20, 25)), Some(2));
     assert_eq!(pixel(&sim.shown, (20, 62)), Some(4));
-    assert_eq!(sim.state.shifts(), vec![([10, 10, 100, 60], -9)], "the button snapping's targets follow the rows shown");
+    let entries = &sim.state.shown_entries()[0];
+    assert_eq!(entries.0, [10, 10, 100, 60]);
+    assert_eq!(entries.1.iter().map(|e| (e.id, e.rect[1], e.rect[3])).collect::<Vec<_>>(), [(1, 10, 11), (2, 21, 20), (3, 41, 20), (4, 61, 9)],
+        "every row shown is a target where it shows, the one the driver does not hold too");
+}
+
+/// Row `id`'s rectangle (x, y, w, h) as shown at content offset `p`,
+/// clipped to the list.
+fn shown_row(id: u64, p: i64) -> Option<[i32; 4]> {
+    let top = 10 + (id as i32 - 1) * ROW - p as i32;
+    let (t, b) = (top.max(10), (top + ROW).min(70));
+    (b - t >= 2).then_some([10, t, 100, b - t])
+}
+
+fn check_targets(sim: &Sim) {
+    let p = sim.shown();
+    let entries: Vec<Interactable> = sim.state.shown_entries().into_iter().flat_map(|(_, e)| e).collect();
+    if p == sim.state.lists[0].drawn {
+        assert!(entries.is_empty(), "the driver's own entries are the targets at {p}");
+        return;
+    }
+    let want: Vec<(u64, [i32; 4])> = (1..=20).filter_map(|id| shown_row(id, p).map(|r| (id, r))).collect();
+    assert_eq!(entries.iter().map(|e| (e.id, e.rect)).collect::<Vec<_>>(), want, "targets as shown at {p}");
+    for e in &entries {
+        let [x, y, w, h] = e.rect;
+        let [ax, ay] = e.anchor.unwrap();
+        assert_eq!(ax, TEXT_END, "at the end of the row's name");
+        assert!(ax >= x && ax < x + w && ay >= y && ay < y + h, "inside its row {e:?}");
+        if h == ROW { assert_eq!(ay, y + ROW / 2, "in the middle of the row") }
+    }
+}
+
+#[test]
+fn at_every_offset_each_row_shown_is_an_alt_target_where_it_shows() {
+    let mut sim = Sim::new(20, false);
+    let mut offsets = std::collections::BTreeSet::new();
+    for _ in 0..4 {
+        sim.wheel(1);
+        for _ in 0..40 {
+            sim.frame();
+            offsets.insert(sim.shown());
+            check_targets(&sim);
+        }
+    }
+    for px in [3, 7, 5, 11, 2] {
+        trackpad(&mut sim, px);
+        for _ in 0..30 {
+            sim.frame();
+            offsets.insert(sim.shown());
+            check_targets(&sim);
+        }
+    }
+    assert!(offsets.iter().filter(|p| *p % i64::from(ROW) != 0).count() >= 15, "many offsets between items: {offsets:?}");
+}
+
+#[test]
+fn in_alt_mode_the_wheel_scrolls_and_the_targets_follow() {
+    let mut sim = Sim::new(20, true);
+    assert!(sim.state.route(Input::Wheel { delta: -NOTCH, x: 20, y: 30 }, true).is_empty());
+    let mut between = false;
+    for _ in 0..60 {
+        sim.frame();
+        between |= sim.shown() % i64::from(ROW) != 0;
+        check_targets(&sim);
+    }
+    assert!(between);
+    assert_eq!(sim.pos(), ROW as f64);
+    assert_eq!(sim.first, 2);
 }
 
 #[test]

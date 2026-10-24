@@ -20,7 +20,7 @@
 //! driver's pointer highlight is moved to the row under the pointer
 //! ([`highlight`]).
 
-use scene::{Button, Input, InteractableKind, Scene};
+use scene::{Button, Input, Interactable, InteractableKind, Scene};
 use tile_render::PlacedSprite;
 
 use crate::looks::Span;
@@ -93,8 +93,10 @@ fn bar_value(scene: &Scene, wheel: Rect) -> Option<i32> {
     })
 }
 
+/// A row: the driver's entry (`item`, as that drawing had it) and its
+/// rectangle.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Row { id: u64, rect: Rect }
+struct Row { id: u64, rect: Rect, item: Interactable }
 
 #[derive(Clone, Debug)]
 struct Picture {
@@ -135,7 +137,7 @@ impl Picture {
                             InteractableKind::List { scroll, .. } if inside(bounds(scroll), center) => Some((candidate.id, i64::from(scroll[2]) * i64::from(scroll[3]))),
                             _ => None,
                         }).min_by_key(|(_, area)| *area).is_some_and(|(id, _)| id == list.id)
-                }).map(|row| Row { id: row.id, rect: bounds(row.rect) }).collect();
+                }).map(|row| Row { id: row.id, rect: bounds(row.rect), item: row.clone() }).collect();
             // ListItem hit areas can cover only a row's name. The native
             // scroll rectangle covers every column, including nonclickable
             // statistics and cells represented as buttons.
@@ -209,7 +211,11 @@ impl Picture {
         for row in &self.rows {
             let rect = shifted(row.rect, dy);
             if intersect(rect, clip).is_some() && !out.rows.iter().any(|r| r.id == row.id) {
-                out.rows.push(Row { id: row.id, rect });
+                let mut item = row.item.clone();
+                item.rect[1] += dy;
+                if let Some(anchor) = &mut item.anchor { anchor[1] += dy }
+                if let Some(region) = &mut item.region { region[1] += dy }
+                out.rows.push(Row { id: row.id, rect, item });
             }
         }
     }
@@ -271,6 +277,9 @@ struct List {
     /// Buttons pressed on it, held: the driver's position stays.
     held: u8,
     highlight: Option<Highlight>,
+    /// The driver's entries where the last frame showed them, if it showed
+    /// the list away from the driver's drawing.
+    entries: Vec<Interactable>,
 }
 
 impl List {
@@ -280,7 +289,7 @@ impl List {
             id: p.id, rect: p.rect, wheel: seen.wheel, step: i64::from(seen.step.max(1)), cameras: p.cameras.clone(),
             drawings: vec![Drawing { scroll: 0, picture: p.clone() }], drawn: 0, expected: 0, notched: (f64::NEG_INFINITY, 0),
             pos: 0.0, target: 0.0, shown: 0, input_at: f64::NEG_INFINITY, dir: 0.0, settled: true, glide: true,
-            top: None, bottom: None, held: 0, highlight: None,
+            top: None, bottom: None, held: 0, highlight: None, entries: vec![],
         };
         list.ends(seen.bar);
         list
@@ -525,12 +534,14 @@ impl SmoothMenus {
     /// later input.
     pub fn take_inputs(&mut self) -> Vec<Input> { std::mem::take(&mut self.out) }
 
-    /// For each list that does not show where the driver's scene has its
-    /// rows: its rectangle (driver pixels, x, y, w, h) and how far down
-    /// its rows show (the button snapping's targets follow).
-    pub fn shifts(&self) -> Vec<([i32; 4], i32)> {
+    /// For each list shown away from the driver's drawing: its rectangle
+    /// (driver pixels, x, y, w, h) and every entry it shows, where it shows
+    /// it (clipped to the list; its anchor kept in its row): those the
+    /// driver holds and those drawn from its earlier drawings alike. The
+    /// button snapping's targets are these.
+    pub fn shown_entries(&self) -> Vec<([i32; 4], Vec<Interactable>)> {
         self.lists.iter().filter(|l| l.shown != l.drawn)
-            .map(|l| ([l.rect[0], l.rect[1], l.rect[2] - l.rect[0], l.rect[3] - l.rect[1]], (l.drawn - l.shown) as i32)).collect()
+            .map(|l| ([l.rect[0], l.rect[1], l.rect[2] - l.rect[0], l.rect[3] - l.rect[1]], l.entries.clone())).collect()
     }
 
     /// Draws the current free sprites with each list at its own position.
@@ -570,8 +581,10 @@ impl SmoothMenus {
                 self.out.extend(l.notches_to(to, now));
             }
             l.shown = l.pos.round() as i64;
+            l.entries.clear();
             if l.shown == l.drawn { continue }
             let mut shown = l.compose(l.shown);
+            l.entries = shown_entries(&shown);
             // The driver's highlight on the row under the pointer.
             if let (Some(h), Some(p)) = (&l.highlight, pointer) {
                 if let Some(row) = shown.row_at(p).map(|r| r.id) {
@@ -696,6 +709,24 @@ impl SmoothMenus {
         self.hover = Some((x, y));
         PointerRefresh::Move { x, y }
     }
+}
+
+/// A composed picture's entries, each clipped to the list (an anchor kept
+/// inside what shows of its row); none shown less than 2 pixels.
+fn shown_entries(picture: &Picture) -> Vec<Interactable> {
+    let r = picture.rect;
+    let mut out = picture.rows.iter().filter_map(|row| {
+        let mut item = row.item.clone();
+        let (top, bottom) = (item.rect[1].max(r[1]), (item.rect[1] + item.rect[3]).min(r[3]));
+        if bottom - top < 2 { return None }
+        item.rect[1] = top;
+        item.rect[3] = bottom - top;
+        if let Some(anchor) = &mut item.anchor { anchor[1] = anchor[1].clamp(top, bottom - 1) }
+        Some(item)
+    }).collect::<Vec<_>>();
+    // (In the order they show, top to bottom.)
+    out.sort_by_key(|i| (i.rect[1], i.rect[0]));
+    out
 }
 
 fn button_index(button: Button) -> u8 {

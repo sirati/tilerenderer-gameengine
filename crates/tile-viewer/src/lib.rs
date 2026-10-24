@@ -3866,7 +3866,7 @@ impl App {
         for input in self.menu_scroll.take_inputs() {
             frame_input(&mut self.preparing_inputs, &self.display, input);
         }
-        self.snap.set_list_shifts(self.menu_scroll.shifts());
+        self.snap.set_list_entries(self.menu_scroll.shown_entries());
         // The build queue's handles, and a row being dragged (on the
         // drawing as it is now, from the driver's: rebuilt every frame).
         if scene.interface.build_queue.is_some() {
