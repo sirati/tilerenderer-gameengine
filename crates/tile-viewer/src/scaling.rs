@@ -447,6 +447,12 @@ impl ShownPiece {
         if x >= mx && y >= my && x < mx + mw && y < my + mh { (if mx > 0 { mx - 1 } else { mx + mw }, y) } else { (x, y) }
     }
 
+    /// Where the piece's map draws driver rectangle `r` (its window's
+    /// pixels), whether the piece is all of it or not.
+    pub fn drawn_at(&self, r: [i32; 4]) -> [i32; 4] {
+        self.piece.drawn([r[0] + self.shift.0, r[1] + self.shift.1, r[2], r[3]])
+    }
+
     /// The driver's pixel for canvas pixel `p` on the piece.
     pub fn to_driver(&self, p: (i32, i32)) -> (i32, i32) {
         let (x, y) = self.piece.invert(p);
@@ -610,7 +616,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     // sprite its panel.
     let mut pieces: Vec<Option<Affine>> = vec![None; frame.cameras.len()];
     let mut clips: Vec<Option<[i32; 4]>> = vec![None; frame.cameras.len()];
-    let mut panelled: Vec<(usize, usize, Vec<(Affine, [i32; 4])>, Vec<usize>, usize, Option<(usize, usize)>)> = Vec::new();
+    let mut panelled: Vec<(usize, usize, Vec<(Affine, [i32; 4])>, Vec<usize>, usize, Option<(usize, usize)>, Vec<(u8, u8)>)> = Vec::new();
     // (A sprite of the driver's tooltip: inside its rectangle.)
     let in_tip = |r: [i32; 4]| parts.tooltip.is_some_and(|t| r[0] >= t[0] && r[1] >= t[1] && r[0] + r[2] <= t[0] + t[2] && r[1] + r[3] <= t[1] + t[3]);
     // What takes the pointer: per rectangle (the driver's pixels) its map
@@ -838,6 +844,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             // camera's origin, where its pixels round) must not.
             let tip_sprites: Vec<usize> = v.overlay.iter().enumerate().filter(|(_, s)| rect_of(s).is_some_and(in_tip)).map(|(k, _)| k).collect();
             let (anchors, mut of_sprite) = panels(plan.screen, &v.overlay, &rect_of, &|k| tip_sprites.contains(&k));
+            let sides: Vec<(u8, u8)> = anchors.iter().map(|a| a.0).collect();
             // (Each no larger than the canvas.)
             let mut anchors: Vec<(Affine, [i32; 4])> = anchors.into_iter().map(|(a, r)| {
                 let piece = plan.frame_piece(a);
@@ -856,7 +863,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
                 for (s, &k) in v.overlay.iter().zip(&of_sprite) {
                     shown.extend(rect_of(s).map(|r| (anchors[k].0, r, (0, 0), None)));
                 }
-                panelled.push((c, i, anchors, of_sprite, start, tip));
+                panelled.push((c, i, anchors, of_sprite, start, tip, sides));
                 continue;
             }
             Affine::IDENTITY
@@ -911,16 +918,30 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     // Place the orders after every interface piece has its final map,
     // including panels supplied in a separate view.
     if let (Some(place), Some(orders)) = (frame.unit_orders, parts.reachable) {
-        let occupied: Vec<([i32; 4], [i32; 4])> = if matches!(place, layout::UnitOrdersPlace::In(_)) {
-            shown.iter().map(|(piece, r, d, clip)| {
-                let rect = piece.drawn(*r);
-                ([r[0] - d.0, r[1] - d.1, r[2], r[3]], clip.map_or(rect, |clip| intersection(rect, clip)))
-            // (Nothing makes room for the tooltip: the buttons would move
-            // away from their own.)
-            }).filter(|(d, r)| r[2] > 0 && r[3] > 0 && !in_tip(*d)).collect()
+        // Where the frame draws them: at the side or corner of the screen
+        // their buttons are at (as `panels` anchors a panel), at its scale.
+        let side = anchor_of(orders, plan.screen);
+        let at_side = plan.frame_piece(side);
+        // What they keep clear of: the frame's sprites at its other sides
+        // and corners (the unit's panel, the minimap), where their panels
+        // draw them (a sprite whose panel a frame put elsewhere: where its
+        // own side draws it). Not what is on their own side (their
+        // tooltip, the hover art of a button, a sprite the game drew there
+        // for a frame), nor popups, screens or reports over the views:
+        // those come and go, and the buttons would move (and shrink) with
+        // them, and back. (Nor how a frame groups its sprites into panels:
+        // a sprite between two joins them for as long as it is there.)
+        let occupied: Vec<[i32; 4]> = if matches!(place, layout::UnitOrdersPlace::In(_)) {
+            panelled.iter().flat_map(|(_, i, anchors, of_sprite, _, _, sides)| {
+                scene.views[*i].overlay.iter().zip(of_sprite.iter()).filter(|&(_, &k)| k < sides.len())
+                    .filter_map(|(s, &k)| rect_of(s).map(|r| (k, r))).filter(|&(_, r)| !in_tip(r) && !inside(orders, r))
+                    .map(|(k, r)| (k, anchor_of(r, plan.screen), r)).filter(|&(_, at, _)| at != side)
+                    // (Where its panel draws it, if that is at its own side.)
+                    .map(|(k, at, r)| if sides[k] == at { anchors[k].0 } else { plan.frame_piece(at).at((r[0], r[1])) }.drawn(r))
+            }).filter(|r| r[2] > 0 && r[3] > 0).collect()
         } else { Vec::new() };
-        for (_, i, anchors, of_sprite, start, tip) in &mut panelled {
-            place_unit_orders(place, orders, &scene.views[*i].overlay, &rect_of, &occupied, anchors, of_sprite, tip.map(|(t, _)| t));
+        for (_, i, anchors, of_sprite, start, tip, _) in &mut panelled {
+            place_unit_orders(place, orders, at_side, &scene.views[*i].overlay, &rect_of, &occupied, anchors, of_sprite, tip.map(|(t, _)| t));
             // (The tooltip goes with its control, wherever that went.)
             if let Some((t, host)) = *tip {
                 anchors[t].0 = anchors[of_sprite[host]].0.at((anchors[t].1[0], anchors[t].1[1]));
@@ -951,7 +972,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         // renderer's fallback once, rather than on every rendered frame.
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| log::warn!("viewer: the frame and panels need {required} views, limit {}: panels drawn as one (not repeated)", tile_render::MAX_VIEWS));
-        for (c, i, anchors, _, _, _) in panelled.drain(..) {
+        for (c, i, anchors, ..) in panelled.drain(..) {
             shown.retain(|(p, _, _, _)| !anchors.iter().any(|a| a.0 == *p));
             shown.extend(scene.views[i].overlay.iter().filter_map(&rect_of).map(|r| (Affine::IDENTITY, r, (0, 0), None)));
             pieces[c] = Some(Affine::IDENTITY);
@@ -976,7 +997,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         }
         index[k] = cameras.len() as u32;
         match (panelled.iter().find(|p| p.0 == k), pieces[k]) {
-            (Some((_, i, anchors, of_sprite, _, _)), _) => {
+            (Some((_, i, anchors, of_sprite, ..)), _) => {
                 // Each panel's part of the driver's screen, at its place.
                 let first = cameras.len() as u32;
                 for (piece, [x, y, w, h]) in anchors {
@@ -1132,37 +1153,43 @@ fn drawn_boxed(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: 
     Drawn { cameras, copies, present, pixel_box: k }
 }
 
-/// The unit's order buttons (the sprites inside `orders`, the driver's
-/// pixels) placed as the layout says (`layout::UnitOrdersPlace`): panels of
-/// their own added to the frame's `anchors` (each sprite's in
-/// `of_sprite`). Split at a side by side split's gap, those left of its
-/// middle are moved left of it and the others right of it, as little as
-/// that takes; or all of them go into the active view's area, as large as
-/// they are elsewhere where that fits it, centred in the widest free
-/// span along their row, at the same height where that is inside it.
+/// The unit's order buttons (the sprites inside `orders`, the rectangle of
+/// the game's own order buttons in the driver's pixels) placed as the
+/// layout says (`layout::UnitOrdersPlace`): panels of their own added to
+/// the frame's `anchors` (each sprite's in `of_sprite`), `at_side` where
+/// the frame draws them. Split at a side by side split's gap, those left
+/// of its middle are moved left of it and the others right of it, as
+/// little as that takes; or all of them go into the active view's area,
+/// as large as they are elsewhere where that fits it, centred in the
+/// widest span along their row clear of `occupied` (canvas pixels), at the
+/// same height where that is inside it.
+/// In the active view, their place and scale come from `orders` alone (the
+/// buttons the game laid out), never from the sprites a frame has inside
+/// it: a button not drawn yet, its hover art, a tooltip or anything else
+/// the game drew there for a frame moves and scales nothing.
 /// The tooltip (the sprites of panel `tip`, or of no panel) is none of
-/// them, wherever the game drew it: it goes with its button, and its size
-/// moves nothing.
-fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, occupied: &[([i32; 4], [i32; 4])], anchors: &mut Vec<(Affine, [i32; 4])>, of_sprite: &mut [usize], tip: Option<usize>) {
-    let within = |r: &[i32; 4]| r[2] > 0 && r[3] > 0 && r[0] >= orders[0] && r[1] >= orders[1] && r[0] + r[2] <= orders[0] + orders[2] && r[1] + r[3] <= orders[1] + orders[3];
+/// them, wherever the game drew it: it goes with its button.
+#[allow(clippy::too_many_arguments)]
+fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], at_side: Affine, sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, occupied: &[[i32; 4]], anchors: &mut Vec<(Affine, [i32; 4])>, of_sprite: &mut [usize], tip: Option<usize>) {
     let order = |i: usize| of_sprite[i] != usize::MAX && Some(of_sprite[i]) != tip;
-    let members: Vec<(usize, [i32; 4])> = sprites.iter().enumerate().filter(|&(i, _)| order(i)).filter_map(|(i, s)| rect_of(s).filter(within).map(|r| (i, r))).collect();
+    let members: Vec<(usize, [i32; 4])> = sprites.iter().enumerate().filter(|&(i, _)| order(i)).filter_map(|(i, s)| rect_of(s).filter(|&r| inside(orders, r)).map(|r| (i, r))).collect();
     if members.is_empty() { return; }
+    // (Where their panels draw them.)
     let shown: Vec<[i32; 4]> = members.iter().map(|&(i, r)| anchors[of_sprite[i]].0.rect(r)).collect();
-    let zoom_before = anchors[of_sprite[members[0].0]].0.zoom;
     // A group of them (indices into `members`) as one panel more, its map
-    // from the driver's pixels made from the one of its panel so far.
+    // from the driver's pixels made from the one of its panel so far. Its
+    // camera is the orders' rectangle, whichever of them a frame has: the
+    // renderer rounds a camera's pixels from its origin, so that is where
+    // each button's pixels round, always the same.
     let mut add = |group: Vec<usize>, map: &dyn Fn(Affine) -> Affine, anchors: &mut Vec<(Affine, [i32; 4])>| {
         let mut bases: Vec<usize> = group.iter().map(|&m| of_sprite[members[m].0]).collect();
         bases.sort_unstable();
         bases.dedup();
         for k in bases {
-            let part: Vec<usize> = group.iter().copied().filter(|&m| of_sprite[members[m].0] == k).collect();
-            let Some(r) = bounding(&part.iter().map(|&m| members[m].1).collect::<Vec<_>>()) else { continue };
             let at = anchors.len();
-            anchors.push((map(anchors[k].0).at((r[0], r[1])), r));
-            for m in part {
-                of_sprite[members[m].0] = at;
+            anchors.push((map(anchors[k].0).at((orders[0], orders[1])), orders));
+            for &m in &group {
+                if of_sprite[members[m].0] == k { of_sprite[members[m].0] = at; }
             }
         }
     };
@@ -1178,25 +1205,51 @@ fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], sprites: 
             }
         }
         layout::UnitOrdersPlace::In(area) => {
-            let (Some(drawn), Some(driver)) = (bounding(&shown), bounding(&members.iter().map(|m| m.1).collect::<Vec<_>>())) else { return };
-            let zoom = fit_at_most(zoom_before, Some(driver), (area[2].max(1) as u32, area[3].max(1) as u32));
-            let h = (driver[3] as u64 * zoom.0 as u64).div_ceil(zoom.1 as u64) as i32;
-            let y = drawn[1].clamp(area[1], (area[1] + area[3] - h).max(area[1]));
-            let mut spans = vec![(area[0], area[0] + area[2])];
-            for (_, r) in occupied.iter().filter(|(d, r)| !within(d) && r[1] < y + h && y < r[1] + r[3]) {
-                spans = spans.into_iter().flat_map(|(a, b)| {
-                    [(a, b.min(r[0])), (a.max(r[0] + r[2]), b)].into_iter().filter(|(a, b)| b > a)
-                }).collect();
-            }
-            // With no clear span left, retain the whole-view fallback.
-            let (a, b) = spans.into_iter().max_by_key(|(a, b)| b - a).unwrap_or((area[0], area[0] + area[2]));
-            let zoom = fit_at_most(zoom, Some(driver), ((b - a).max(1) as u32, area[3].max(1) as u32));
-            let w = (driver[2] as u64 * zoom.0 as u64).div_ceil(zoom.1 as u64) as i32;
-            let x = a + (b - a - w).max(0) / 2;
-            let map = Affine { from: (driver[0], driver[1]), to: (x, y), zoom };
+            let map = orders_in(orders, at_side, area, occupied);
             add((0..members.len()).collect(), &|_| map, anchors);
         }
     }
+}
+
+/// The map of the orders' rectangle `orders` (the driver's pixels) into
+/// the active view's `area` (canvas pixels): at the frame's scale (that of
+/// `at_side`, where the frame draws them), smaller where they do not fit;
+/// as high as the frame draws them where that is inside the area; centred
+/// in the widest span of their row clear of `occupied`, smaller where they
+/// fit there only so.
+fn orders_in(orders: [i32; 4], at_side: Affine, area: [i32; 4], occupied: &[[i32; 4]]) -> Affine {
+    let drawn = at_side.rect(orders);
+    let zoom = fit_at_most(at_side.zoom, Some(orders), (area[2].max(1) as u32, area[3].max(1) as u32));
+    let h = (orders[3] as u64 * zoom.0 as u64).div_ceil(zoom.1 as u64) as i32;
+    let y = drawn[1].clamp(area[1], (area[1] + area[3] - h).max(area[1]));
+    let mut spans = vec![(area[0], area[0] + area[2])];
+    for r in occupied.iter().filter(|r| r[1] < y + h && y < r[1] + r[3]) {
+        spans = spans.into_iter().flat_map(|(a, b)| {
+            [(a, b.min(r[0])), (a.max(r[0] + r[2]), b)].into_iter().filter(|(a, b)| b > a)
+        }).collect();
+    }
+    // With no clear span left, retain the whole-view fallback.
+    let (a, b) = spans.into_iter().max_by_key(|(a, b)| b - a).unwrap_or((area[0], area[0] + area[2]));
+    let zoom = fit_at_most(zoom, Some(orders), ((b - a).max(1) as u32, area[3].max(1) as u32));
+    let w = (orders[2] as u64 * zoom.0 as u64).div_ceil(zoom.1 as u64) as i32;
+    let x = a + (b - a - w).max(0) / 2;
+    Affine { from: (orders[0], orders[1]), to: (x, y), zoom }
+}
+
+/// Whether rectangle `r` (not empty) lies inside `outer`.
+fn inside(outer: [i32; 4], r: [i32; 4]) -> bool {
+    r[2] > 0 && r[3] > 0 && r[0] >= outer[0] && r[1] >= outer[1] && r[0] + r[2] <= outer[0] + outer[2] && r[1] + r[3] <= outer[1] + outer[3]
+}
+
+/// The side or corner of `screen` a panel at `r` keeps to (each way 0: the
+/// start, 1: the middle, 2: the end): the one its middle is in (thirds).
+fn anchor_of(r: [i32; 4], screen: (u32, u32)) -> (u8, u8) {
+    let third = |v: i32, size: u32| match v as i64 * 3 / size.max(1) as i64 {
+        ..=0 => 0,
+        1 => 1,
+        _ => 2,
+    };
+    (third(r[0] + r[2] / 2, screen.0), third(r[1] + r[3] / 2, screen.1))
 }
 
 /// The smallest rectangle holding `rects`.
@@ -1244,18 +1297,10 @@ fn panels(screen: (u32, u32), sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSpr
         let k = root(&mut parent, i);
         panel_rects.entry(k).or_default().push(*r);
     }
-    let third = |v: i32, size: u32| match v as i64 * 3 / size.max(1) as i64 {
-        ..=0 => 0,
-        1 => 1,
-        _ => 2,
-    };
     // Per panel: its anchor.
-    let anchor_of: std::collections::BTreeMap<usize, (u8, u8)> = panel_rects
+    let anchor: std::collections::BTreeMap<usize, (u8, u8)> = panel_rects
         .iter()
-        .map(|(&k, rs)| {
-            let b = bounding(rs).unwrap_or_default();
-            (k, (third(b[0] + b[2] / 2, screen.0), third(b[1] + b[3] / 2, screen.1)))
-        })
+        .map(|(&k, rs)| (k, anchor_of(bounding(rs).unwrap_or_default(), screen)))
         .collect();
     let mut anchors: Vec<((u8, u8), Vec<[i32; 4]>)> = Vec::new();
     let mut of_sprite = Vec::with_capacity(rects.len());
@@ -1264,7 +1309,7 @@ fn panels(screen: (u32, u32), sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSpr
             of_sprite.push(usize::MAX);
             continue;
         }
-        let a = anchor_of[&root(&mut parent, i)];
+        let a = anchor[&root(&mut parent, i)];
         let k = match anchors.iter().position(|(x, _)| *x == a) {
             Some(k) => k,
             None => {
@@ -2686,6 +2731,158 @@ mod tests {
             }
         }
     }
+    /// What a frame of the map screen has besides the unit's panel, the
+    /// minimap and the orders (`order_buttons`, `reachable` round them), as
+    /// measured in a live game at 1920x1080: each a sprite (its rectangle,
+    /// the driver's pixels, and clip).
+    #[derive(Clone, Debug)]
+    enum Passing {
+        /// The game redraws its order panel: only these buttons so far.
+        Partial(Vec<usize>),
+        /// A button's pressed art, a pixel down and right.
+        Pressed(usize),
+        /// A tooltip in the frame the bridge sent it in before its box: its
+        /// letters clipped to the row of its box drawn so far (one pixel,
+        /// inside the orders' rectangle), its box's top edge (beside the
+        /// orders, on their row), and no `Interface::tooltip` for them.
+        TooltipUnknown,
+        /// A tooltip as the bridge reports it, left of the upper buttons.
+        Tooltip,
+        /// A line of the game's own across the bottom between the panels
+        /// (joining them into one panel, wider than the canvas at ×2).
+        WideLine,
+        /// A popup over the world, on the buttons' row.
+        Popup,
+        /// A report queued at the top right.
+        Queued,
+    }
+
+    fn hud_passing(passing: Option<&Passing>) -> (Scene, impl Fn(&FreeSprite) -> Option<[i32; 4]> + Clone) {
+        use scene::{View, ViewState};
+        let sprite = |x, y| FreeSprite { x, y, screen: true, after_pass: u32::MAX, ..Default::default() };
+        let mut overlay = vec![sprite(5, 949), sprite(1621, 942)];
+        let mut rects: Vec<[i32; 4]> = vec![[5, 949, 280, 130], [1621, 942, 294, 137]];
+        let buttons = order_buttons();
+        let drawn: Vec<usize> = match passing { Some(Passing::Partial(k)) => k.clone(), _ => (0..buttons.len()).collect() };
+        for k in drawn {
+            let b = if matches!(passing, Some(Passing::Pressed(p)) if *p == k) { [buttons[k][0] + 1, buttons[k][1] + 1, 31, 31] } else { buttons[k] };
+            // (Pressed art: another sprite; told apart by its clip here.)
+            overlay.push(FreeSprite { clip: (b != buttons[k]).then_some([0, 0, 1920, 1080]), ..sprite(b[0], b[1]) });
+            rects.push(b);
+        }
+        let mut extra = |r: [i32; 4], clip: Option<[i32; 4]>| {
+            overlay.push(FreeSprite { clip, ..sprite(r[0], r[1]) });
+            rects.push(r);
+        };
+        let mut tooltip = None;
+        let (mut popup, mut queued) = (None, None);
+        match passing {
+            Some(Passing::TooltipUnknown) => {
+                let clip = Some([700, 966, 1100, 967]);
+                for k in 0..12 { extra([840 + 7 * k, 966, 7, 1], clip); }
+                for k in 0..6 { extra([700 + 16 * k, 966, 16, 1], clip); }
+            }
+            Some(Passing::Tooltip) => {
+                let t = [850, 1000, 78, 15];
+                extra(t, None);
+                for k in 0..10 { extra([t[0] + 4 + 7 * k, t[1] + 1, 7, 13], Some([t[0], t[1], t[0] + t[2], t[1] + t[3]])); }
+                tooltip = Some(t);
+            }
+            Some(Passing::WideLine) => extra([280, 1066, 1345, 4], None),
+            Some(Passing::Popup) => popup = Some(ViewState { id: 300, view: View { interface_only: true, origin: (560, 900), viewport: (800, 170), ..Default::default() }, overlay: vec![sprite(560, 900)] }),
+            Some(Passing::Queued) => queued = Some(ViewState { id: 301, view: View { interface_only: true, origin: (1500, 20), viewport: (400, 300), ..Default::default() }, overlay: vec![sprite(1500, 20)] }),
+            _ => {}
+        }
+        let world = View { camera_x: 1000, camera_y: 500, zoom: (1, 1), ..Default::default() };
+        let mut views = vec![
+            ViewState { id: 0, view: world, overlay: vec![] },
+            ViewState { id: 254, view: View { interface_only: true, ..Default::default() }, overlay: overlay.clone() },
+        ];
+        let mut interface = scene::Interface { reachable: Some([836, 966, 256, 96]), tooltip, ..Default::default() };
+        if let Some(p) = popup {
+            interface.popup = Some(p.id);
+            overlay.push(p.overlay[0]);
+            rects.push([560, 900, 800, 170]);
+            views.push(p);
+        }
+        if let Some(q) = queued {
+            interface.queued = vec![scene::QueuedPopup { view: q.id, serial: 1, button: None }];
+            overlay.push(q.overlay[0]);
+            rects.push([1500, 20, 400, 300]);
+            views.push(q);
+        }
+        let scene = Scene {
+            views,
+            shape: scene::WorldShape { cols: 60, rows: 62, wrap_x: true, wrap_y: false },
+            interface,
+            screen_size: (1920, 1080),
+            ..Default::default()
+        };
+        let rect_of = move |s: &FreeSprite| overlay.iter().position(|o| (o.x, o.y, o.clip) == (s.x, s.y, s.clip)).map(|k| rects[k]);
+        (scene, rect_of)
+    }
+
+    /// A sequence of frames of the map screen with the orders in the
+    /// active view, each with something else for a frame or two (a redraw
+    /// of the order panel in progress, a pressed button, a tooltip known
+    /// or not yet, a line of the game's across the panels, a popup on
+    /// their row, a queued report), between frames of the orders alone:
+    /// every button drawn is drawn where and as large as without it, to
+    /// the pixel, at every frame and pixel scale, in either view.
+    #[test]
+    fn the_unit_buttons_keep_place_and_scale_whatever_else_a_frame_has() {
+        use viewer_settings::{Split, UnitButtons};
+        let buttons = order_buttons();
+        let passing = [
+            Passing::Partial(vec![0, 1, 2, 3, 4]),
+            Passing::Partial(vec![3, 4, 5, 6, 7, 8, 9]),
+            Passing::Partial(vec![8, 9]),
+            Passing::Pressed(0),
+            Passing::Pressed(7),
+            Passing::TooltipUnknown,
+            Passing::Tooltip,
+            Passing::WideLine,
+            Passing::Popup,
+            Passing::Queued,
+        ];
+        for side in [layout::Side::A, layout::Side::B] {
+            for frame_scale in [1.0, 1.5, 2.0] {
+                for pixel_scale in [1, 2] {
+                    let p = fixed_plan((1920 * pixel_scale, 1080 * pixel_scale), (1920, 1080), (pixel_scale, 1.0, frame_scale, 1.0));
+                    let mut l = layout::Layout::default();
+                    l.apply_settings(&viewer_settings::Layout { split: Split::Vertical1To1, unit_buttons: UnitButtons::ActiveView, ..Default::default() });
+                    l.driver_screen = Some(p.screen);
+                    let (calm, _) = hud_passing(None);
+                    l.frame(&calm, (1920, 1080), (0, 0, 0, 0), vec![], None);
+                    let area = l.view_area(side);
+                    l.route(scene::Input::MouseMove { x: area[0] + area[2] / 2, y: area[1] + area[3] / 2 });
+                    // Each button as shown: its rectangle and its map's scale.
+                    let mut frame = |passing: Option<&Passing>| {
+                        let (scene, rect_of) = hud_passing(passing);
+                        let mut f = l.frame(&scene, (1920, 1080), (0, 0, 0, 0), vec![], None);
+                        let shown = arrange(&p, &scene, &mut f, &rect_of).shown.unwrap();
+                        l.set_interface_shown(Some(shown.clone()));
+                        buttons.iter().map(|b| shown.iter().find(|s| s.driver == *b).map(|s| (s.rect, s.piece.zoom))).collect::<Vec<_>>()
+                    };
+                    for _ in 0..2 { frame(None); }
+                    let settled = frame(None);
+                    assert!(settled.iter().all(Option::is_some), "{side:?} ×{frame_scale} ×{pixel_scale}: all shown");
+                    for passing in &passing {
+                        let what = format!("{side:?}, frame ×{frame_scale}, ×{pixel_scale}, {passing:?}");
+                        for k in 0..2 {
+                            for (b, (now, then)) in buttons.iter().zip(frame(Some(passing)).iter().zip(&settled)) {
+                                if let Some(now) = now {
+                                    assert_eq!(Some(now), then.as_ref(), "{what}, frame {k}: button {b:?}");
+                                }
+                            }
+                        }
+                        assert_eq!(frame(None), settled, "{what}: after it");
+                    }
+                }
+            }
+        }
+    }
+
 
     /// The tooltip of the unit panel's small buttons (shown while one is
     /// hovered or pressed, above them, reaching past the panel) changes
