@@ -6,7 +6,7 @@
 //!
 //! Every arranged view follows something ([`Follow`]): what the driver's
 //! main view shows, the driver's point of interest (`Scene::focus`, e.g. the
-//! active unit), the world cursor, or nothing (moved by hand). The world
+//! selected piece), the world cursor, or nothing (moved by hand). The world
 //! cursor is the pointer's world pixel; a view following it keeps it in its
 //! middle (but not past an edge of the world that does not wrap). Clicking
 //! into such a view captures the mouse: its movement then moves the world
@@ -75,7 +75,7 @@
 //!   5% to 15%, default 5%) of the region's height further down, whatever
 //!   the pointer does in there, and back once it leaves; or it holds the
 //!   pointer out with `zoom_box_block_pointer`. Boxes do not
-//!   dodge the views' own interface (corner buttons, unit orders): they
+//!   dodge the views' own interface (corner buttons, world orders): they
 //!   lie under it, and it keeps its clicks. Every zoom magnifies
 //!   `zoom_magnification` (1.5×, 2×, 3×, 4×; default 2×) on top of how
 //!   large the view under it shows the world (world scale, the view's own
@@ -112,7 +112,7 @@
 //! The divider is a band of frosted glass (`glass`). While the mouse is not
 //! captured it is a wall except in its middle third (no glass there) and
 //! along the rows of the driver's always reachable controls
-//! (`Interface::reachable`, e.g. the unit's orders) and of its interface,
+//! (`Interface::reachable`, e.g. the piece's orders) and of its interface,
 //! where they are drawn over it (moved into the active view, the orders
 //! are clear of it and it runs on); with Drag map movement nowhere (`capture`). The pointer
 //! pushed against it stays in its view (the
@@ -157,8 +157,8 @@ mod detached_popups;
 #[path = "queued_popups.rs"]
 mod queued_popups;
 #[cfg(test)]
-#[path = "city_screen_tests.rs"]
-mod city_screen_tests;
+#[path = "site_screen_tests.rs"]
+mod site_screen_tests;
 #[cfg(test)]
 #[path = "cursor_screen_tests.rs"]
 mod cursor_screen_tests;
@@ -293,7 +293,7 @@ pub enum Follow {
     /// What the driver's main view shows.
     #[default]
     Driver,
-    /// The driver's point of interest (`Scene::focus`, e.g. the active unit).
+    /// The driver's point of interest (`Scene::focus`, e.g. the selected piece).
     Focus,
     /// The world cursor, in the middle.
     Pointer,
@@ -609,7 +609,7 @@ pub struct Frame {
     /// the hint in their place) shows in ([`Layout::view_area`], canvas
     /// pixels): scaled no larger than fits it and kept inside it.
     pub view_ui_region: Option<[i32; 4]>,
-    /// Where the unit's order buttons (`scene::Interface::reachable`) go
+    /// Where the piece's order buttons (`scene::Interface::reachable`) go
     /// with two views (`scaling::arrange` moves their sprites).
     pub order_buttons: Option<OrderButtonsPlace>,
     pub copies: Vec<ScreenCopy>,
@@ -636,7 +636,7 @@ pub struct Frame {
     pub cursor_slots: Vec<u32>,
 }
 
-/// Where the unit's order buttons go while there are two views
+/// Where the piece's order buttons go while there are two views
 /// ([`UnitButtons`]), in canvas pixels.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OrderButtonsPlace {
@@ -775,7 +775,7 @@ pub struct Layout {
     pub smooth: bool,
     /// What the views follow (from the settings).
     pub roles: Roles,
-    /// Where the unit's order buttons go with two views
+    /// Where the piece's order buttons go with two views
     /// ([`Frame::order_buttons`]).
     pub unit_buttons: UnitButtons,
     /// Where every screen and popup goes (from the settings; click-anchored
@@ -847,7 +847,7 @@ pub struct Layout {
     /// The driver's anchor for the open popup as last taken in.
     popup_anchor_seen: Option<scene::PopupAnchor>,
     /// The world click the last anchored popup belonged to, and when that
-    /// popup closed: a popup an entry of it opens (a city menu's "Terrain
+    /// popup closed: a popup an entry of it opens (a site menu's "Terrain
     /// details") belongs to the same click, however long ago it was made.
     chain_press: Option<(WorldPress, f64)>,
     /// Buttons whose press only dismissed a popup anchored at a world click
@@ -910,8 +910,8 @@ pub struct Layout {
     /// Last semantic camera request consumed from a driver that parks its
     /// physical camera. Equal positions can still be distinct requests.
     camera_focus_serial: Option<u64>,
-    /// A semantic camera request wins over the active unit only until that
-    /// unit focus changes. Driver-following A always uses the request.
+    /// A semantic camera request wins over the selected piece only until that
+    /// piece focus changes. Driver-following A always uses the request.
     semantic_focus_active: bool,
     focus_at_camera_request: Option<(i32, i32)>,
     focus_at_camera_request_rest: (f64, f64),
@@ -977,7 +977,7 @@ pub struct Layout {
     shown: Vec<(Hit, Camera)>,
     interface: Vec<[i32; 4]>,
     /// From the last frame: the rectangles of the driver's other world views
-    /// (e.g. a city screen's map) over the window, how many insets were
+    /// (e.g. a site screen's map) over the window, how many insets were
     /// drawn, and how many of the viewer's views were left out.
     driver_rects: Vec<[i32; 4]>,
     insets_shown: usize,
@@ -1571,7 +1571,7 @@ impl Layout {
     }
 
     /// What a screen opening (`opens`) or closing does: an opening
-    /// cancels a pending unit order, and lets go of a captured mouse, the
+    /// cancels a pending world order, and lets go of a captured mouse, the
     /// pointer on the screen's main control (the next frame, once it is
     /// placed); captured again once no menu is open (`settle_capture`).
     fn screen_changes(&mut self, opens: bool) {
@@ -1852,7 +1852,7 @@ impl Layout {
 
     /// The part of the driver's window a named screen actually occupies.
     /// A screen part gives its own bounds. Screens containing a world view
-    /// of their own, such as City, use their interface and that view together.
+    /// of their own, such as a site screen, use their interface and that view together.
     /// `ui=pane` deliberately keeps the whole driver's window.
     fn fitted_source(&self, scene: &Scene, base: &[Camera], screen_part: Option<usize>, popup: Option<usize>) -> [i32; 4] {
         let (w, h) = self.driver_screen();
@@ -2053,7 +2053,7 @@ impl Layout {
         }
     }
 
-    /// Where the unit's order buttons go (none: where the driver put them,
+    /// Where the piece's order buttons go (none: where the driver put them,
     /// as with one view): split at a side by side split's gap, or inside
     /// the active view's area (`UnitButtons`).
     fn order_buttons_place(&self) -> Option<OrderButtonsPlace> {
@@ -2065,7 +2065,7 @@ impl Layout {
         }
     }
 
-    /// The unit's order buttons (`scene::Interface::reachable`) where they
+    /// The piece's order buttons (`scene::Interface::reachable`) where they
     /// are drawn (canvas pixels): their pieces as shown, the scale of the
     /// game's frame and the place `order_buttons_place` gave them applied
     /// (none: the viewer shows the interface, but none of them); where the
@@ -2248,7 +2248,7 @@ impl Layout {
         // margin).
         let width = |region: [i32; 4], n: u32| (region[2] as i64 * n.max(1) as i64 / (n.max(1) as i64 + 2)) as i32;
         // A box does not dodge the views' own interface (the corner's
-        // buttons, the unit's orders): it lies under it, which stays drawn
+        // buttons, the piece's orders): it lies under it, which stays drawn
         // on top and takes its clicks (`Layout::hit`).
         match m.place {
             ZoomPlace::Beside => {}
@@ -2651,9 +2651,9 @@ impl Layout {
                 self.resume_game_focus();
             }
         } else if self.semantic_focus_active && scene.focus != self.focus_at_camera_request {
-            // Selecting or moving a unit may not move the parked native
+            // Selecting or moving a piece may not move the parked native
             // camera. Resume Focus mode without reviving an older AI focus
-            // if the selected unit later returns to the request's baseline.
+            // if the selected piece later returns to the request's baseline.
             self.semantic_focus_active = false;
         }
         if let Some(b) = bounds {
@@ -2674,7 +2674,7 @@ impl Layout {
         }
         // The main pane following the driver shows the middle of the
         // driver's view in its own middle (a split or a zoom strip crops it
-        // round its middle): what the driver centres on (the active unit,
+        // round its middle): what the driver centres on (the selected piece,
         // a popup's subject, a place looked at) is in the middle of A.
         let main_driver = semantic_main.or(driver);
         let (cursor, focus) = (self.cursor, scene.focus);
@@ -2786,18 +2786,18 @@ impl Layout {
         // A modal popup over the menu (`over_menu`) keeps out of the screen
         // fitted into a pane: that screen's fit stays as without it, the
         // popup goes over it in that pane (`scaling::MODAL_TOP`).
-        // (Not one the driver opened at a click on its screen, e.g. a city
-        // screen garrison unit's menu: that one stays at the click, with the
+        // (Not one the driver opened at a click on its screen, e.g. a site
+        // screen's stationed piece's menu: that one stays at the click, with the
         // screen.)
-        // (A screen part too: an advisor's menu opened at a click on its
-        // table, e.g. the domestic advisor's production menu.)
+        // (A screen part too: a report screen's menu opened at a click on
+        // its table, e.g. a production menu opened from a row.)
         let on_screen = parts.popup_on_screen && parts.screen.is_some();
         let modal = popup.filter(|_| over_menu && self.anchored.is_none() && !on_screen);
         if std::mem::take(&mut self.popup_opened_now) {
             // Placed with its screen: where the click was made. The game
-            // may have it in its screen part's own pixels (the domestic
-            // advisor's production menu: its corner the click less the
-            // advisor's place); whichever reading puts its corner nearer the
+            // may have it in its screen part's own pixels (a report's
+            // production menu: its corner the click less the report's
+            // place); whichever reading puts its corner nearer the
             // click the game got is the one, and it stays on the screen.
             self.popup_nudge = match (on_screen, popup.map(|i| rect_of(&base[i])), self.last_press.filter(|&(_, _, t)| self.clock - t < 2.0)) {
                 (true, Some([x, y, w, h]), Some((_, q, _))) => {
@@ -2827,7 +2827,7 @@ impl Layout {
         // picture. A named panel instead gets its own group over the normal
         // world panes, with its one-pixel lines kept.
         // (Its head: the main view, else the first filling the window, e.g.
-        // the game's view hidden by a city screen.)
+        // the game's view hidden by a site screen.)
         let head = main.or_else(|| scene.views.iter().position(|v| v.view.viewport.0 == 0 || v.view.viewport.1 == 0)).or((!scene.views.is_empty()).then_some(0));
         let placement = fit_target.filter(|_| head.is_some()).and_then(|hit| {
             let rect = if hit == Hit::Main { main_rect } else { pane_rect? };
@@ -3111,7 +3111,7 @@ impl Layout {
             };
             let at = push(&mut frame, head);
             frame.placed.push(at);
-            // Internal world views, such as the City's surroundings, go
+            // Internal world views, such as the site screen's surroundings, go
             // under the panel's art, while both world panes stay independent.
             let mut named = named;
             // (A popup's attached combo box list over it.)
@@ -3204,7 +3204,7 @@ impl Layout {
             }).collect()
         } else { Vec::new() };
         for (index, camera) in frame.cameras.iter_mut().enumerate().filter(|(_, c)| c.cells) {
-            // The City's internal map is a UI control whether its panel
+            // The Site's internal map is a UI control whether its panel
             // floats or is assigned to a pane. Preserve workers and yields
             // without exempting either world pane or the world magnifier.
             if camera.stacked || site_controls.contains(&(index as u32)) { camera.hidden_categories = 0; continue; }
@@ -4165,7 +4165,7 @@ impl Layout {
     }
 
     /// The player asked the driver to centre on its point of interest (the
-    /// game's C: centre on the active unit), `focus` (a world pixel): the
+    /// game's C: centre on the selected piece), `focus` (a world pixel): the
     /// view following the world cursor centres on it too (the world cursor
     /// goes there), and the views following the driver or the focus that
     /// were moved by hand follow it again. Not while a popup or a named
@@ -5426,7 +5426,7 @@ mod tests {
 
     #[test]
     fn focus_pane_and_mouse_locked_pane() {
-        // The left half shows the active unit, the right one keeps the
+        // The left half shows the selected piece, the right one keeps the
         // world cursor in its middle.
         let mut l = Layout::default();
         l.configure("split=vertical,main=focus,pane=pointer").unwrap();
@@ -5918,22 +5918,22 @@ mod tests {
         assert_ne!(l.hit((r[0] + 5, r[1] + 5)), Hit::Inset(k));
     }
 
-    /// The city screen open (as the bridge shows it): the game's view hidden
-    /// (interface only), the city's surroundings in a view of their own
+    /// The site screen open (as the driver shows it): the game's view hidden
+    /// (interface only), the site's surroundings in a view of their own
     /// within the right half, the interface over all.
-    fn city_screen() -> Scene {
+    fn site_screen() -> Scene {
         let game = View { camera_x: 1000, camera_y: 500, interface_only: true, ..Default::default() };
-        let city = View { camera_x: 1964, camera_y: 748, viewport: (300, 200), origin: (450, 150), ..Default::default() };
+        let site = View { camera_x: 1964, camera_y: 748, viewport: (300, 200), origin: (450, 150), ..Default::default() };
         let ui = View { interface_only: true, ..Default::default() };
         Scene {
-            views: vec![ViewState { id: 0, view: game, overlay: vec![] }, ViewState { id: 1, view: city, overlay: vec![] }, ViewState { id: 255, view: ui, overlay: vec![] }],
+            views: vec![ViewState { id: 0, view: game, overlay: vec![] }, ViewState { id: 1, view: site, overlay: vec![] }, ViewState { id: 255, view: ui, overlay: vec![] }],
             shape: scene().shape,
             ..Default::default()
         }
     }
 
     #[test]
-    fn city_screen_controls_keep_detail_when_clean_map_filters_world_panes() {
+    fn site_screen_controls_keep_detail_when_clean_map_filters_world_panes() {
         use viewer_settings::clean_map::{ALL, CITIES, Mode, UNITS, View as Detail, YIELDS};
         for split in [S::Standard, S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
             for place in [Place::Floating, Place::LeftOrBottom, Place::RightOrTop] {
@@ -5946,16 +5946,16 @@ mod tests {
                         l.clean_map.a = Detail { mode: Mode::Custom, hidden: UNITS };
                         l.clean_map.b = Detail { mode: Mode::Custom, hidden: YIELDS };
                         l.clean_map.zoom = Detail { mode: Mode::Custom, hidden: CITIES };
-                        let mut city = city_screen();
-                        city.shape = scene().shape;
-                        city.interface.screen = Some("Site".into());
-                        city.interface.screen_role = crate::screen_role_for_test("Site");
-                        city.views[0].view.hidden_categories = ALL;
-                        city.views[0].view.downscale = downscale;
-                        city.views[1].view.downscale = downscale;
-                        let f = l.frame(&city, (800, 600), (0, 0, 0, 0), vec![[0, 0, 800, 150], [0, 350, 800, 250]], BOUNDS);
+                        let mut site = site_screen();
+                        site.shape = scene().shape;
+                        site.interface.screen = Some("Site".into());
+                        site.interface.screen_role = crate::screen_role_for_test("Site");
+                        site.views[0].view.hidden_categories = ALL;
+                        site.views[0].view.downscale = downscale;
+                        site.views[1].view.downscale = downscale;
+                        let f = l.frame(&site, (800, 600), (0, 0, 0, 0), vec![[0, 0, 800, 150], [0, 350, 800, 250]], BOUNDS);
                         let internal = f.cameras[f.view_cameras[1].unwrap() as usize];
-                        assert_eq!(internal.hidden_categories, 0, "City control keeps workers and yields: {split:?}, {place:?}, {zoom:?}, downscale{downscale}");
+                        assert_eq!(internal.hidden_categories, 0, "site control keeps workers and yields: {split:?}, {place:?}, {zoom:?}, downscale{downscale}");
                         for (hit, expected) in [(Hit::Main, UNITS), (Hit::Pane, YIELDS), (Hit::Magnifier, CITIES)] {
                             if let Some((_, shown)) = l.shown.iter().find(|(h, _)| *h == hit) {
                                 let camera = f.cameras.iter().find(|c| c.cells && !c.stacked && c.origin == shown.origin && c.viewport == shown.viewport).unwrap();
@@ -5969,18 +5969,18 @@ mod tests {
     }
 
     #[test]
-    fn a_city_screens_map_stays_over_the_pane() {
-        // With a split and the interface over the window, the city screen's
+    fn a_site_screens_map_stays_over_the_pane() {
+        // With a split and the interface over the window, the site screen's
         // map keeps its camera, over the pane, and takes its clicks itself.
         let mut l = Layout::default();
         l.configure("split=vertical,pane=free").unwrap();
         let interface = vec![[0, 0, 800, 150], [0, 350, 800, 250]];
         l.frame(&scene(), (800, 600), (0, 0, 0, 0), interface.clone(), BOUNDS);
-        let f = l.frame(&city_screen(), (800, 600), (0, 0, 0, 0), interface, BOUNDS);
-        let city = f.view_cameras[1].unwrap() as usize;
+        let f = l.frame(&site_screen(), (800, 600), (0, 0, 0, 0), interface, BOUNDS);
+        let site = f.view_cameras[1].unwrap() as usize;
         let pane = f.cameras.iter().position(|c| c.origin == (404, 0)).unwrap();
-        assert!(city > pane, "{:?}", f.cameras);
-        assert_eq!((f.cameras[city].x, f.cameras[city].y, f.cameras[city].origin), (1964, 748, (450, 150)));
+        assert!(site > pane, "{:?}", f.cameras);
+        assert_eq!((f.cameras[site].x, f.cameras[site].y, f.cameras[site].origin), (1964, 748, (450, 150)));
         assert_eq!(f.view_cameras[2], Some(f.cameras.len() as u32 - 1));
         assert_eq!(click(&mut l, (600, 250))[0], Input::MouseButton { button: Button::Left, down: true, x: 600, y: 250 });
         // Beside it the pane still shows the world.
@@ -5988,13 +5988,13 @@ mod tests {
     }
 
     #[test]
-    fn a_city_screen_fits_into_the_main_pane() {
-        // ui=pane: the whole city screen (its map too) at half size in the
+    fn a_site_screen_fits_into_the_main_pane() {
+        // ui=pane: the whole site screen (its map too) at half size in the
         // left half, its one-pixel lines kept; clicks go to its window pixel.
         let mut l = Layout::default();
         l.configure("split=vertical,ui=pane").unwrap();
-        l.frame(&city_screen(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        let f = l.frame(&city_screen(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        l.frame(&site_screen(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let f = l.frame(&site_screen(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!((f.cameras[0].zoom, f.cameras[0].origin, f.cameras[0].cells), ((1, 2), (0, 0), false));
         assert!(f.cameras[1..3].iter().all(|c| c.stacked && c.hairline));
         assert_eq!(f.view_cameras, [Some(0), Some(1), Some(2)]);
@@ -6331,7 +6331,7 @@ mod tests {
         }));
         assert_eq!((l.main_view.follow, l.split.unwrap().view.follow), (Follow::Focus, Follow::Pointer));
         assert!(l.smooth);
-        // A follows the active unit (scene focus (3000, 2000)).
+        // A follows the selected piece (scene focus (3000, 2000)).
         let f = frame(&mut l, vec![]);
         let (sw, sh) = f.cameras[0].world_size();
         assert_eq!((f.cameras[0].x + sw as i32 / 2, f.cameras[0].y + sh as i32 / 2), (3000, 2000));
@@ -6345,7 +6345,7 @@ mod tests {
         assert!(!l.locked);
         assert_eq!(l.take_grab(), Some(false));
         assert_eq!(l.split.unwrap().view.center, center);
-        // One view following the unit.
+        // One view following the piece.
         let one = arranged(&settings(|s| s.roles = Roles::UnitMouse));
         assert_eq!((one.main_view.follow, one.split), (Follow::Focus, None));
     }
@@ -6922,8 +6922,8 @@ mod tests {
         let mut l = arranged(&settings(|s| (s.split, s.zoom, s.zoom_place) = (S::Vertical1To1, Zoom::Floating131, Place::RightOrTop)));
         l.screen_place = ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating };
         let mut s = scene();
-        s.interface.screen = Some("F1".into());
-        s.interface.screen_role = crate::screen_role_for_test("F1");
+        s.interface.screen = Some("Report".into());
+        s.interface.screen_role = crate::screen_role_for_test("Report");
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         let boxed = f.cameras.iter().position(|c| c.cells && c.zoom == (2, 1) && c.origin == (483, 15)).unwrap();
         assert!(f.placed.iter().all(|&at| at as usize > boxed), "{:?}", f.cameras);
@@ -7055,7 +7055,7 @@ mod tests {
 
     #[test]
     fn a_screen_over_the_window_goes_below_the_zoom_strip_where_there_is_room() {
-        let mut s = with_screen("F1");
+        let mut s = with_screen("Report");
         let part = scene::ViewState { id: 258, view: scene::View { interface_only: true, origin: (100, 100), viewport: (600, 400), ..Default::default() }, overlay: vec![] };
         s.views.push(part);
         s.interface.screen_view = Some(258);
@@ -7081,7 +7081,7 @@ mod tests {
 
     #[test]
     fn a_screen_goes_below_a_floating_zoom_box_its_height_and_clicks_with_it() {
-        let mut s = with_screen("F1");
+        let mut s = with_screen("Report");
         let part = scene::ViewState { id: 258, view: scene::View { interface_only: true, origin: (420, 150), viewport: (300, 200), ..Default::default() }, overlay: vec![] };
         s.views.push(part);
         s.interface.screen_view = Some(258);
@@ -7144,7 +7144,7 @@ mod tests {
         };
         // Only the named interface is placed in A or B. Their world cameras
         // stay independent beneath it.
-        let (fit, f) = fitted(&s, "F1");
+        let (fit, f) = fitted(&s, "Report");
         assert_eq!(fit, Some(Fit { hit: Hit::Main, source: [0, 0, 800, 600], origin: (0, 0), zoom: (1, 2) }));
         let a = camera_at(&f, (0, 0));
         let b = camera_at(&f, (404, 0));
@@ -7153,7 +7153,7 @@ mod tests {
         assert!(f.placed.iter().all(|&i| !f.cameras[i as usize].cells));
         // One setting for every screen the driver names (Menu included while
         // the place is not floating).
-        for kind in ["F1", "F7", "Site", "Palace", "Spy", "Help", "Menu", "Diplomacy"] {
+        for kind in ["Report", "Records", "Site", "Gallery", "Intel", "Help", "Menu", "Talks"] {
             assert_eq!(fitted(&s, kind).0.map(|f| f.hit), Some(Hit::Main), "{kind}");
         }
         let right = Settings { screen_place: place(Place::RightOrTop, Place::Floating), ..s.clone() };
@@ -7166,12 +7166,12 @@ mod tests {
         assert_eq!(fitted(&floating, "Site").0, None);
         // The horizontal split uses the other orientation's place.
         let h = Settings { split: S::Horizontal1To1, ..s.clone() };
-        assert_eq!(fitted(&h, "F1").0.map(|f| f.hit), Some(Hit::Main));
+        assert_eq!(fitted(&h, "Report").0.map(|f| f.hit), Some(Hit::Main));
         assert_eq!(fitted(&h, "Site").0.map(|f| f.hit), Some(Hit::Main));
         let h = Settings { split: S::Horizontal1To1, screen_place: place(Place::Floating, Place::LeftOrBottom), ..s.clone() };
-        assert_eq!(fitted(&h, "F5").0.map(|f| f.hit), Some(Hit::Pane));
+        assert_eq!(fitted(&h, "Census").0.map(|f| f.hit), Some(Hit::Pane));
         let one = Settings { split: S::Standard, ..s };
-        assert_eq!(fitted(&one, "F1").0, None);
+        assert_eq!(fitted(&one, "Report").0, None);
     }
 
     #[test]
@@ -7181,7 +7181,7 @@ mod tests {
         let mut l = Layout::default();
         l.apply_settings(&s);
         let before = l.frame(&scene(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        let f = l.frame(&with_screen("F4"), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let f = l.frame(&with_screen("Ledger"), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!(camera_at(&before, (0, 0)), camera_at(&f, (0, 0)));
         assert_eq!(camera_at(&before, (404, 0)), camera_at(&f, (404, 0)));
         assert_eq!(click(&mut l, (503, 100))[0], Input::MouseButton { button: Button::Left, down: true, x: 200, y: 202 });
@@ -7208,7 +7208,7 @@ mod tests {
         let mut l = Layout::default();
         l.apply_settings(&s);
         let plan = crate::scaling::plan((800, 600), (800, 600), &Resolution::default());
-        let menu = with_screen("F4");
+        let menu = with_screen("Ledger");
         l.frame(&scene(), plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
         let mut f = l.frame(&menu, plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
         crate::scaling::arrange_panned(&plan, &menu, &mut f, &mut l.menu_pan, |_| Some([0, 0, 800, 600]));
@@ -7438,7 +7438,7 @@ mod tests {
     }
 
     #[test]
-    fn a_menu_over_city_moves_only_the_active_menu_panel() {
+    fn a_menu_over_site_moves_only_the_active_menu_panel() {
         let mut settings = settings(|s| s.split = S::Vertical1To1);
         settings.menu_follows_pointer = false;
         settings.screen_place = ScreenPlace { vertical: Place::RightOrTop, horizontal: Place::Floating };
@@ -7446,7 +7446,7 @@ mod tests {
         l.apply_settings(&settings);
         l.driver_screen = Some((1920, 1080));
         let before = l.frame(&scene(), (1280, 720), (0, 0, 0, 0), vec![], BOUNDS);
-        let mut s = city_screen();
+        let mut s = site_screen();
         s.shape = scene().shape;
         s.views[2].view.menu = true;
         s.interface.screen = Some("Menu".into());
@@ -7454,7 +7454,7 @@ mod tests {
         s.interface.screen_view = Some(258);
         s.views.push(ViewState { id: 258, view: View { interface_only: true, origin: (448, 156), viewport: (1024, 768), ..Default::default() }, overlay: vec![] });
         let f = l.frame(&s, (1280, 720), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(f.view_cameras[1], None, "the underlying City's map is not part of Preferences");
+        assert_eq!(f.view_cameras[1], None, "the underlying Site's map is not part of Preferences");
         assert_eq!(f.view_cameras[2], None, "an inactive menu is not copied into the active panel");
         assert!(f.placed.iter().all(|&i| !f.cameras[i as usize].cells));
         assert_eq!(l.placed_screen.unwrap().source, [448, 156, 1024, 768]);
@@ -7463,14 +7463,14 @@ mod tests {
     }
 
     #[test]
-    fn a_mouse_view_menu_over_city_moves_only_the_active_ui_at_requested_scale() {
+    fn a_mouse_view_menu_over_site_moves_only_the_active_ui_at_requested_scale() {
         let mut l = Layout::default();
         l.apply_settings(&settings(|s| s.split = S::Vertical1To1));
         l.driver_screen = Some((1920, 1080));
         l.set_walls(Walls::Open);
         l.frame(&scene(), (1280, 720), (0, 0, 0, 0), vec![], BOUNDS);
         mv(&mut l, (960, 360));
-        let mut s = city_screen();
+        let mut s = site_screen();
         s.shape = scene().shape;
         s.views[2].view.menu = true;
         s.interface.screen = Some("Menu".into());
@@ -7478,8 +7478,8 @@ mod tests {
         s.interface.screen_view = Some(258);
         s.views.push(ViewState { id: 258, view: View { interface_only: true, origin: (448, 156), viewport: (1024, 768), ..Default::default() }, overlay: vec![scene::FreeSprite::default()] });
         let mut f = l.frame(&s, (1280, 720), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(f.view_cameras[1], None, "Preferences does not copy the underlying City's map");
-        assert_eq!(f.view_cameras[2], None, "the underlying City UI does not join Preferences");
+        assert_eq!(f.view_cameras[1], None, "Preferences does not copy the underlying Site's map");
+        assert_eq!(f.view_cameras[2], None, "the underlying site screen's UI does not join Preferences");
         assert_eq!(f.menu_region, l.panes().1);
         assert_eq!(l.shown.iter().filter(|(hit, _)| matches!(hit, Hit::Main | Hit::Pane)).count(), 2);
         assert!(f.placed.is_empty());
@@ -7496,16 +7496,16 @@ mod tests {
     }
 
     #[test]
-    fn placed_menu_pixels_preserve_both_maps_and_citys_internal_map() {
+    fn placed_menu_pixels_preserve_both_maps_and_the_sites_internal_map() {
         use tile_render::{AtlasBuilder, Grid, LayerSpec, PlacedSprite, RgbaImage, SpriteSets, TileWorld};
         const GREEN: [u8; 4] = [20, 180, 40, 255];
         const RED: [u8; 4] = [220, 30, 40, 255];
         const BLUE: [u8; 4] = [30, 50, 220, 255];
-        for city in [false, true] {
+        for site in [false, true] {
             let mut atlas = AtlasBuilder::new(64);
             let green = atlas.add(&RgbaImage::from_fn(8, 8, |_, _| GREEN), (0, 0)).unwrap();
             let panel = atlas.add(&RgbaImage::from_fn(32, 24, |x, y| {
-                let clear = if city { (4..20).contains(&y) } else { x < 4 && y < 4 };
+                let clear = if site { (4..20).contains(&y) } else { x < 4 && y < 4 };
                 if clear { [0; 4] } else { RED }
             }), (0, 0)).unwrap();
             let blue = atlas.add(&RgbaImage::from_fn(32, 16, |_, _| BLUE), (0, 0)).unwrap();
@@ -7514,7 +7514,7 @@ mod tests {
             let (green, panel, blue) = (sets.single(green), sets.single(panel), sets.single(blue));
             let mut world = TileWorld::new(Grid { cols: 512, rows: 512, layout: tile_render::Layout::Orthogonal, wrap_x: false, wrap_y: false, step: (8, 8) }, sets);
             world.add_layer(LayerSpec::new("ground", vec![green]));
-            let name = if city { "Site" } else { "F1" };
+            let name = if site { "Site" } else { "Report" };
             let mut settings = settings(|s| s.split = S::Vertical1To1);
             settings.screen_place = ScreenPlace { vertical: Place::LeftOrBottom, horizontal: Place::Floating };
             let mut l = Layout::default();
@@ -7523,7 +7523,7 @@ mod tests {
             let mut s = scene();
             s.interface.screen = Some(name.into());
             s.interface.screen_role = crate::screen_role_for_test(name);
-            if city {
+            if site {
                 s.views[0].view.interface_only = true;
                 s.views.push(ViewState { id: 1, view: View { camera_x: 1024, camera_y: 522, origin: (24, 22), viewport: (32, 16), ..Default::default() }, overlay: vec![] });
             } else {
@@ -7531,10 +7531,10 @@ mod tests {
                 s.views.push(ViewState { id: 258, view: View { interface_only: true, origin: (24, 18), viewport: (32, 24), ..Default::default() }, overlay: vec![] });
             }
             let f = l.frame(&s, (80, 60), (0, 0, 0, 0), vec![[24, 18, 32, 24]], BOUNDS);
-            let panel_view = f.view_cameras[if city { 1 } else { 2 }].unwrap();
+            let panel_view = f.view_cameras[if site { 1 } else { 2 }].unwrap();
             world.free.push(PlacedSprite { screen: true, view: Some(panel_view), clip: Some([24, 18, 56, 42]), ..PlacedSprite::new(panel, 24, 18) });
-            if city {
-                // The City's own map view goes under its transparent band.
+            if site {
+                // The Site's own map view goes under its transparent band.
                 world.free.insert(0, PlacedSprite { screen: true, view: f.view_cameras[2], ..PlacedSprite::new(blue, 24, 22) });
             }
             let image = tile_render::reference::render_views(&world, &atlas, &f.cameras, (80, 60), 0, [0, 0, 0, 255]);
@@ -7543,8 +7543,8 @@ mod tests {
             assert_eq!(image.get(0, 14), GREEN, "{name}: A remains visible above the panel");
             assert_eq!(image.get(50, 20), GREEN, "{name}: B contains its own world instead of the panel at its old coordinates");
             assert_eq!(image.get(79, 59), GREEN, "{name}: B remains visible outside the panel");
-            if city {
-                assert_eq!(image.get(10, 24), BLUE, "City map is transformed with the panel");
+            if site {
+                assert_eq!(image.get(10, 24), BLUE, "site map is transformed with the panel");
             } else {
                 assert_eq!(image.get(0, 15), GREEN, "the UI group preserves transparent menu pixels");
             }
@@ -7552,14 +7552,14 @@ mod tests {
     }
 
     #[test]
-    fn named_city_and_advisor_panels_fill_their_pane_without_the_driver_margins() {
+    fn named_site_and_report_panels_fill_their_pane_without_the_driver_margins() {
         use viewer_settings::Resolution;
         const SOURCE: [i32; 4] = [448, 156, 1024, 768];
         for pixel_scale in [1, 3, 6] {
             for split in [S::Vertical1To1, S::Vertical2To1, S::Horizontal1To1] {
                 for place in [Place::LeftOrBottom, Place::RightOrTop] {
-                    for city in [false, true] {
-                        let name = if city { "Site" } else { "F1" };
+                    for site in [false, true] {
+                        let name = if site { "Site" } else { "Report" };
                         let mut settings = settings(|s| s.split = split);
                         settings.screen_place = ScreenPlace { vertical: place, horizontal: place };
                         let mut plan = crate::scaling::plan((3840, 2160), (1920, 1080), &Resolution { pixel_scale, ..Default::default() });
@@ -7570,14 +7570,14 @@ mod tests {
                         let mut s = scene();
                         s.interface.screen = Some(name.into());
                         s.interface.screen_role = crate::screen_role_for_test(name);
-                        let interface = if city {
+                        let interface = if site {
                             s.views[0].view.interface_only = true;
                             s.views.push(ViewState { id: 1, view: View { camera_x: 1448, camera_y: 748, origin: (448, 248), viewport: (1024, 416), ..Default::default() }, overlay: vec![] });
                             vec![[448, 156, 1024, 92], [448, 664, 1024, 260]]
                         } else {
                             s.interface.screen_view = Some(258);
                             s.views.push(ViewState { id: 258, view: View { interface_only: true, origin: (448, 156), viewport: (1024, 768), ..Default::default() }, overlay: vec![] });
-                            // The original HUD exists outside the advisor's part.
+                            // The original HUD exists outside the report's part.
                             vec![[0, 0, 160, 54], [0, 900, 400, 180]]
                         };
                         let before = l.frame(&scene(), plan.canvas(), (0, 0, 0, 0), vec![], BOUNDS);
@@ -7595,8 +7595,8 @@ mod tests {
                         for origin in [(a[0], a[1]), (b.unwrap()[0], b.unwrap()[1])] {
                             assert_eq!(camera_at(&before, origin), camera_at(&f, origin), "{name} preserves the world camera at {origin:?}");
                         }
-                        assert_eq!(f.placed.iter().filter(|&&i| f.cameras[i as usize].cells).count(), usize::from(city));
-                        if city {
+                        assert_eq!(f.placed.iter().filter(|&&i| f.cameras[i as usize].cells).count(), usize::from(site));
+                        if site {
                             let map = f.cameras[f.view_cameras[2].unwrap() as usize];
                             assert_eq!((map.origin, map.viewport, map.screen_shift), ((0, 92), (1024, 416), (-448, -156)));
                         }
@@ -7949,7 +7949,7 @@ mod tests {
     fn the_walls_the_system_holds_the_pointer_out_of_are_the_gaps_closed_stretches() {
         let mut l = split_1to1();
         assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 200], [400, 400, 4, 200]]));
-        // Always reachable unit controls drawn over the divider open it
+        // Always reachable piece controls drawn over the divider open it
         // along exactly their rows, also where only part of them is over it.
         l.reachable = Some([398, 100, 20, 30]);
         assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 100], [400, 130, 4, 70], [400, 400, 4, 200]]));
@@ -8126,7 +8126,7 @@ mod tests {
     }
 
     #[test]
-    fn pushing_against_the_divider_from_a_view_following_the_unit_holds_it_until_the_unit_moves() {
+    fn pushing_against_the_divider_from_a_view_following_the_piece_holds_it_until_the_piece_moves() {
         let mut l = arranged(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse)));
         frame(&mut l, vec![]);
         mv(&mut l, (100, 100));
@@ -8139,7 +8139,7 @@ mod tests {
         mv(&mut l, (300, 100));
         frame(&mut l, vec![]);
         assert_eq!(l.main_view.center, (3030, 2000));
-        // The unit moves on: A follows it again.
+        // The piece moves on: A follows it again.
         let mut s = scene();
         s.focus = Some((3200, 2100));
         l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
@@ -8339,7 +8339,7 @@ mod tests {
     #[test]
     fn beside_a_screen_the_world_takes_world_input_and_the_screen_its_own() {
         for (place, screen_at, world_at) in [(Place::LeftOrBottom, (200, 150), (600, 300)), (Place::RightOrTop, (600, 150), (200, 300))] {
-            for kind in ["F1", "Site", "Civilopedia"] {
+            for kind in ["Report", "Site", "Encyclopedia"] {
                 let mut l = screen_layout(place, Roles::Free, false);
                 let s = screen_with_hint(kind);
                 l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
@@ -8371,7 +8371,7 @@ mod tests {
             (Place::LeftOrBottom, false, (600, 300), (412, 8)),
             (Place::LeftOrBottom, true, (600, 300), (412, 8)),
         ] {
-            for kind in ["F1", "Site"] {
+            for kind in ["Report", "Site"] {
                 let what = format!("{place:?}, ui in pane {ui_in_pane}, {kind}");
                 let mut l = screen_layout(place, Roles::UnitMouse, ui_in_pane);
                 let s = screen_with_hint(kind);
@@ -8483,7 +8483,7 @@ mod tests {
         assert!(l.captured());
         let cursor = l.cursor;
         let _ = l.take_grab();
-        // The city screen over the window, its production box at 500, 400.
+        // The site screen over the window, its production box at 500, 400.
         let mut s = with_screen("Site");
         s.interface.focus_control = Some([480, 380, 40, 40]);
         l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
@@ -8833,7 +8833,7 @@ mod tests {
     fn the_world_cursor_is_drawn_in_both_views_and_stays_in_bs_middle() {
         let mut l = arranged(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse)));
         click(&mut l, (600, 300));
-        // Move the cursor next to the unit A follows: A shows it too.
+        // Move the cursor next to the piece A follows: A shows it too.
         l.cursor = (3000, 2000);
         let f = frame(&mut l, vec![]);
         assert!(f.markers.contains(&Marker::Cursor((3000, 2000))));
@@ -9078,7 +9078,7 @@ mod tests {
             match mode {
                 0 => l.released(),
                 1 => { l.frame(&with_parts(Some(300)), (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
-                _ => { l.frame(&with_screen("F1"), (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+                _ => { l.frame(&with_screen("Report"), (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
             }
             assert!(!l.captured());
             assert_eq!(l.pointer_bounds(), None);
@@ -9622,10 +9622,10 @@ mod tests {
     }
 
     #[test]
-    fn terrain_details_from_a_city_menu_open_at_the_menus_tile_however_long_it_was_open() {
-        // The city's menu opened at a right click, read for five seconds;
+    fn terrain_details_from_a_site_menu_open_at_the_menus_tile_however_long_it_was_open() {
+        // The site's menu opened at a right click, read for five seconds;
         // its "Terrain details" opens the tile box the driver anchors at the
-        // city's tile: there, in the view the menu was opened in (whether
+        // site's tile: there, in the view the menu was opened in (whether
         // the menu closed a frame before or the box took its place).
         for side in [Side::A, Side::B] {
             for zoom in [ONE, ONE - 2, ONE + 2] {
@@ -9644,17 +9644,17 @@ mod tests {
                     let menu = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, (120, 90));
                     for _ in 0..250 { l.advance(std::time::Duration::from_millis(20)); l.frame(&menu, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
                     if gap { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
-                    let city = (w.0 - 50, w.1 - 20);
-                    let tile_box = with_anchored_popup(scene::PopupAnchor { world: city, offset: (0, 0), world_scaled: true }, (256, 173));
+                    let site = (w.0 - 50, w.1 - 20);
+                    let tile_box = with_anchored_popup(scene::PopupAnchor { world: site, offset: (0, 0), world_scaled: true }, (256, 173));
                     let f = l.frame(&tile_box, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
                     let (corner, _) = f.popup_at.unwrap_or_else(|| panic!("{what}: not at the menu's tile"));
-                    assert_eq!(corner, shown_at(&camera_at(&f, (pane[0], pane[1])), city, p, (8000, 0)), "{what}");
+                    assert_eq!(corner, shown_at(&camera_at(&f, (pane[0], pane[1])), site, p, (8000, 0)), "{what}");
                 }
             }
         }
     }
 
-    /// The domestic advisor's production menu, opened by a right click on
+    /// A report screen's production menu, opened by a right click on
     /// a row of a list shown scrolled by pixels: the driver got the click
     /// at the row's place in its list (`smooth_menus`), and anchored its
     /// menu there; the menu goes to the pointer, as without the scrolling.
@@ -9928,7 +9928,7 @@ mod tests {
 
     #[test]
     fn other_menus_and_popups_hold_and_capture_as_before() {
-        for other in [with_screen("F1"), with_screen("Menu"), with_parts(Some(300))] {
+        for other in [with_screen("Report"), with_screen("Menu"), with_parts(Some(300))] {
             let mut l = split_free();
             l.frame(&other, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
             assert!(!l.releases_pointer());

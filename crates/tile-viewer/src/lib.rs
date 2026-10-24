@@ -4,7 +4,7 @@
 //! Nothing here knows which game it is showing.
 
 mod sprite_lifetimes;
-mod unit_motions;
+mod piece_motions;
 mod scene_prefix;
 mod scene_snapshot;
 mod ui_submission;
@@ -69,13 +69,15 @@ pub struct ViewerConfig {
     /// `viewer_settings::Input::record_alt_mode` is on (`altrec`): the
     /// folder of the driver's log. None: not recorded.
     pub recording_dir: Option<std::path::PathBuf>,
+    /// Where the user's settings are kept (`viewer_settings::Settings::load`).
+    pub settings_path: std::path::PathBuf,
     /// Behaviour plugged in by crates built on the viewer (`extension`).
     pub extensions: extension::Extensions,
 }
 
 impl Default for ViewerConfig {
     fn default() -> Self {
-        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None, extensions: extension::Extensions::default() }
+        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None, settings_path: viewer_settings::Settings::default_path_for("tile-viewer", "TILE_VIEWER_SETTINGS"), extensions: extension::Extensions::default() }
     }
 }
 
@@ -619,7 +621,7 @@ pub fn scene_cells_changed(compiled: &Compiled, scene: &Scene, world: &mut TileW
 }
 
 /// Moves what `motion` names in `scene` by `by` (world pixels, full size),
-/// as the viewer moves a unit along its walk (`unit_motions`): for
+/// as the viewer moves a piece along its walk (`piece_motions`): for
 /// comparing pictures of a walk.
 pub fn move_motion(scene: &mut Scene, motion: &scene::Motion, by: (i32, i32)) {
     for s in scene.sprites.iter_mut().take(motion.sprites.1 as usize).skip(motion.sprites.0 as usize) {
@@ -805,12 +807,12 @@ pub fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale
     marker_sprites_sized(compiled, markers, downscale, time, bobbing, 1.0)
 }
 
-/// The colour of the arrow's metal (as `civ3.toml`'s `viewer_arrow`) and of
+/// The colour of the arrow's metal (as the game description's `viewer_arrow`) and of
 /// its shadow at rest.
 const ARROW_RGBA: [u8; 4] = [232, 183, 87, 255];
 const ARROW_SHADOW_RGBA: [u8; 4] = [32, 23, 14, 255];
 /// The arrow's tip above the point it marks, and its shadow's centre from
-/// it, in full-size world pixels (as `civ3.toml` places the 1:1 art).
+/// it, in full-size world pixels (as the game description places the 1:1 art).
 const ARROW_TIP: (i32, i32) = (0, -68);
 const ARROW_SHADOW_CENTRE: (i32, i32) = (8, 4);
 
@@ -818,7 +820,7 @@ const ARROW_SHADOW_CENTRE: (i32, i32) = (8, 4);
 /// Larger, it is painted at the resolution of each view showing it
 /// (`tile_render::Shape::Arrow`) rather than scaled from its art: crisp at
 /// any world scale and in the zoom box. Its tip stays where the 1:1 arrow's
-/// is, above the unit; it bobs `size` times as far, its shadow (on the
+/// is, above the piece; it bobs `size` times as far, its shadow (on the
 /// ground, as wide as it) shaped likewise.
 pub fn marker_sprites_sized(compiled: &Compiled, markers: &[layout::Marker], downscale: u32, time: Duration, bobbing: bool, size: f32) -> Vec<tile_render::PlacedSprite> {
     if size > 1.0 {
@@ -1007,7 +1009,7 @@ mod accessibility_arrow_tests {
                 assert!(b.abs_diff(tip * zoom) <= 1 + zoom, "{size}x at {zoom}x: tip at {b}, not {}", tip * zoom);
                 assert!(((b - t) as f32 - 41.0 * e).abs() <= 2.0 + e, "{size}x at {zoom}x: {} high", b - t);
                 assert!(((r - l) as f32 - 26.0 * e).abs() <= 2.0 + e, "{size}x at {zoom}x: {} wide", r - l);
-                assert!((((l + r) as f32 / 2.0) - 100.0 * zoom as f32 - 0.25 * e).abs() <= 1.0 + e / 2.0, "{size}x at {zoom}x: centred over the unit");
+                assert!((((l + r) as f32 / 2.0) - 100.0 * zoom as f32 - 0.25 * e).abs() <= 1.0 + e / 2.0, "{size}x at {zoom}x: centred over the piece");
             }
             // Bobbing `size` times as far, its shadow on the ground.
             let (low, high) = (Duration::from_millis(325), Duration::from_millis(975));
@@ -1423,6 +1425,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
     let whole = whole.expect("a new description");
     let native_thread_init = config.native_thread_init;
     let running_extensions = config.extensions.build();
+    let settings_path = config.settings_path.clone();
     let mut app = App {
         stop,
         config,
@@ -1435,7 +1438,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         shown_scene: Arc::new(Scene::default()),
         camera_arrival_reported: None,
         sprite_lifetimes: sprite_lifetimes::SpriteLifetimes::default(),
-        unit_motions: unit_motions::UnitMotions::default(),
+        piece_motions: piece_motions::PieceMotions::default(),
         pending_scene: None,
         future_metadata: None,
         drawable_scene: None,
@@ -1518,12 +1521,12 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         spans: Vec::new(),
         look_scene: Arc::new(looks::LookScene::default()),
         menu_scroll: smooth_menus::SmoothMenus::default(),
-        function_keys: function_keys::Controller::new(function_keys::journal_path(&viewer_settings::Settings::default_path())),
+        function_keys: function_keys::Controller::new(function_keys::journal_path(&settings_path)),
         extensions: running_extensions,
         host_closed: false,
     };
     // The arrangement to start with: the user's settings.
-    app.set_settings(load_settings());
+    app.set_settings(load_settings(&settings_path));
     app
 }
 
@@ -1634,10 +1637,9 @@ mod host_app {
     }
 }
 
-/// The settings saved at `viewer_settings::Settings::default_path()`; the
+/// The settings saved at `path` (`ViewerConfig::settings_path`); the
 /// defaults if there are none or they do not load (logged).
-fn load_settings() -> viewer_settings::Settings {
-    let path = viewer_settings::Settings::default_path();
+fn load_settings(path: &std::path::Path) -> viewer_settings::Settings {
     viewer_settings::Settings::load(&path).unwrap_or_else(|e| {
         log::warn!("viewer settings: {e}; using the defaults");
         viewer_settings::Settings::default()
@@ -1694,7 +1696,7 @@ struct App {
     shown_scene: Arc<Scene>,
     camera_arrival_reported: Option<u64>,
     sprite_lifetimes: sprite_lifetimes::SpriteLifetimes,
-    unit_motions: unit_motions::UnitMotions,
+    piece_motions: piece_motions::PieceMotions,
     /// One immutable future snapshot prevents later optional art generations
     /// from moving the adoption target. Display keeps coalescing newer work.
     pending_scene: Option<PendingScene>,
@@ -1764,7 +1766,7 @@ struct App {
     drawn_at: Option<std::time::Instant>,
     error: Option<ViewerError>,
     /// The viewer's own settings (resolution, layout, input): read from
-    /// `viewer_settings::Settings::default_path()` at start, replaced by those
+    /// `ViewerConfig::settings_path` at start, replaced by those
     /// the driver sends (`scene::Update::Settings`; the driver keeps and saves
     /// them, e.g. edited on its preferences screen).
     settings: viewer_settings::Settings,
@@ -4077,24 +4079,24 @@ impl App {
                 }
             }
         }
-        // Units sliding to the next tile (`unit_motions`), where this
+        // Pieces sliding to the next tile (`piece_motions`), where this
         // frame's time has them: the driver tells each slide once.
-        if let Some(offsets) = self.unit_motions.offsets(scene, started, full || cells_changed || free_changed || looks_changed, |key| self.display.walk(key)) {
+        if let Some(offsets) = self.piece_motions.offsets(scene, started, full || cells_changed || free_changed || looks_changed, |key| self.display.walk(key)) {
             if !offsets.is_empty() {
-                unit_motions::apply(Arc::make_mut(self.world.as_mut().expect("built above")), scene, &offsets);
+                piece_motions::apply(Arc::make_mut(self.world.as_mut().expect("built above")), scene, &offsets);
                 looks_changed = true;
                 // (A frame-timing trace of the slides: `TILE_VIEWER_MOTION_TRACE=1`.)
                 static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| profile::env_on("TILE_VIEWER_MOTION_TRACE"));
                 if *TRACE {
-                    // Each moved unit: its key and where it is drawn (anchor + offset).
-                    let at: Vec<_> = scene.motions.iter().filter_map(|m| self.unit_motions.moved(m.key).map(|o| (m.key, m.anchor.0 + o.0, m.anchor.1 + o.1))).collect();
-                    log::info!("viewer: motion at {:.1} ms (scene {}): units at {at:?}", started.duration_since(self.started).as_secs_f64() * 1000.0, scene.seq);
+                    // Each moved piece: its key and where it is drawn (anchor + offset).
+                    let at: Vec<_> = scene.motions.iter().filter_map(|m| self.piece_motions.moved(m.key).map(|o| (m.key, m.anchor.0 + o.0, m.anchor.1 + o.1))).collect();
+                    log::info!("viewer: motion at {:.1} ms (scene {}): pieces at {at:?}", started.duration_since(self.started).as_secs_f64() * 1000.0, scene.seq);
                 }
             }
         }
         // The viewer's markers on top of the world, for this frame only.
-        // (The arrow over a unit on its way goes with it, on the same clock.)
-        let focus = self.unit_motions.focus_at(scene, world_downscale(scene));
+        // (The arrow over a piece on its way goes with it, on the same clock.)
+        let focus = self.piece_motions.focus_at(scene, world_downscale(scene));
         for m in &mut arranged.markers {
             if let (layout::Marker::Focus(at), Some(f)) = (m, focus) { *at = f; }
         }

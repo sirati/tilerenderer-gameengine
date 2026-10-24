@@ -2,7 +2,7 @@ use super::*;
 use scene::{FreeSprite, Scene, View, ViewState};
 
 #[test]
-fn city_worked_tile_alt_target_clicks_the_same_native_tile_across_splits_and_scales() {
+fn site_worked_tile_alt_target_clicks_the_same_native_tile_across_splits_and_scales() {
     let item = Interactable { region: None, alt_right_click: false, rect: [1056, 460, 64, 32], anchor: Some([1088, 476]),
         kind: InteractableKind::Button, id: 0x740C34_0F000002 };
     let scene = Scene {
@@ -42,8 +42,8 @@ fn city_worked_tile_alt_target_clicks_the_same_native_tile_across_splits_and_sca
                 let input = to_input(action, &layout).unwrap();
                 let Input::MouseButton { button: Button::Left, down: true, x, y } = input else { panic!("worked tile became a world-camera action: {input:?}") };
                 assert!((x - 1088).abs() <= 1 && (y - 476).abs() <= 1,
-                    "{split:?}, pixels {pixel_scale}, frame {frame_scale}: native city point {:?}", (x, y));
-                // Bridge's city camera inverse restores native game camera
+                    "{split:?}, pixels {pixel_scale}, frame {frame_scale}: native site point {:?}", (x, y));
+                // The driver's site camera inverse restores native game camera
                 // coordinates: tile(12,10) centre is (832,352) at camera0.
                 assert!((x - 256 - 832).abs() <= 1 && (y - 124 - 352).abs() <= 1);
             }

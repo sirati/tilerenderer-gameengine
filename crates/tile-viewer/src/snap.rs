@@ -332,7 +332,7 @@ pub fn targets(items: &[Interactable], mapping: ((i32, i32), (u32, u32)), window
 /// [`targets`] with each rectangle placed by `map` (driver's pixels to the
 /// window's).
 pub fn targets_mapped(items: &[Interactable], map: impl Fn([i32; 4]) -> [f64; 4], window: (u32, u32)) -> Vec<Target> {
-    // (A unit's size as shown: for the guessed scroll step.)
+    // (A piece's size as shown: for the guessed scroll step.)
     let scale = map([0, 0, 1000, 1000])[3] / 1000.0;
     let on_screen = |[x, y, w, h]: [f64; 4]| w > 0.0 && h > 0.0 && x + w > 0.0 && y + h > 0.0 && x < window.0 as f64 && y < window.1 as f64;
     let mut out: Vec<Target> = items
@@ -1657,8 +1657,8 @@ impl SnapInput {
                 }
             }
         }
-        // The game's C (centre on the active unit), going to the driver:
-        // the view following the world cursor centres on the unit too.
+        // The game's C (centre on the selected piece), going to the driver:
+        // the view following the world cursor centres on the piece too.
         let centre = matches!(input, Input::Key { vk: VK_C, down: true, .. }) && !self.ctrl && !self.alt;
         let out = match input {
             // (Held, it repeats.)
@@ -1952,7 +1952,7 @@ impl SnapInput {
     /// rests on one of its elements and the driver has handled the move
     /// there, so that it tells
     /// what a click does as the driver's pointer would (the game's
-    /// Civilopedia book over an entry a click opens the Civilopedia on);
+    /// book over an entry a click opens the encyclopedia on);
     /// else, and for a system icon the viewer has no art of, the driver's
     /// arrow (else the viewer's own pointer). In flight, and at rest until
     /// the driver has handled the move there, it is the arrow: the driver's
@@ -2058,8 +2058,8 @@ mod menus;
 mod cursor_size;
 
 #[cfg(test)]
-#[path = "snap/city_work.rs"]
-mod city_work;
+#[path = "snap/site_work.rs"]
+mod site_work;
 
 #[cfg(test)]
 #[path = "snap/regions.rs"]

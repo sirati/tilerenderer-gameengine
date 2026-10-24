@@ -1,11 +1,11 @@
-//! Units on their walks (`scene::Walk`), moved on the viewer's own clock at
+//! Pieces on their walks (`scene::Walk`), moved on the viewer's own clock at
 //! its frame rate.
 //!
-//! The driver tells a unit's walk the moment each tile starts, straight to
+//! The driver tells a piece's walk the moment each tile starts, straight to
 //! the viewer and not with its next scene: the tiles started so far (when,
 //! which way, how long at least) and how many more its path plans. The
-//! scene draws the unit as free sprites at an anchor (`scene::Motion`); the
-//! viewer moves them to where the walk has the unit now.
+//! scene draws the piece as free sprites at an anchor (`scene::Motion`); the
+//! viewer moves them to where the walk has the piece now.
 //!
 //! A tile plays from when the game started it (on the driver's clock,
 //! mapped through the earliest arrival seen: never ahead of the game).
@@ -23,7 +23,7 @@ use std::time::Instant;
 /// How much faster than its slide a tile may be played to catch up.
 pub(crate) const SPRINT: f64 = 1.3;
 /// A tile is never shorter than the game's own slide: its last step comes
-/// at 8/9 of the slide's length (`civ3_sys::unit_slide`).
+/// at 8/9 of the slide's length (as the driver plays slides).
 const SLIDE_PART: f64 = 8.0 / 9.0;
 /// A tile whose next start is not known yet is aimed at this much more
 /// than the walk's tiles have been taking.
@@ -63,7 +63,7 @@ impl Seg {
     }
 }
 
-/// A unit's walk as the viewer plays it.
+/// A piece's walk as the viewer plays it.
 #[derive(Debug)]
 struct Play {
     serial: u64,
@@ -78,12 +78,12 @@ struct Play {
     along: f64,
     /// Played to its end, and since when (driver ms).
     finished: Option<f64>,
-    /// No longer applied (the scene has the unit at its end, or long after).
+    /// No longer applied (the scene has the piece at its end, or long after).
     done: bool,
 }
 
 #[derive(Default)]
-pub(crate) struct UnitMotions {
+pub(crate) struct PieceMotions {
     /// Recent `arrival - start_ms` (viewer ms minus driver ms).
     samples: VecDeque<f64>,
     /// Recent times from one walk tile's start to the next's, by slide
@@ -93,7 +93,7 @@ pub(crate) struct UnitMotions {
     /// The tiles' arrivals counted into `samples`, per walk: (serial, count).
     counted: HashMap<u32, (u64, usize)>,
     epoch: Option<Instant>,
-    /// The offset of each moving unit's sprites this frame, by key.
+    /// The offset of each moving piece's sprites this frame, by key.
     moved: HashMap<u32, (i32, i32)>,
     /// The offsets applied last: (sprite range, offset).
     applied: Vec<((u32, u32), (i32, i32))>,
@@ -112,7 +112,7 @@ fn point(walk: &scene::Walk, along: f64) -> (i32, i32) {
     (x.round() as i32, y.round() as i32)
 }
 
-impl UnitMotions {
+impl PieceMotions {
     fn ms(&mut self, at: Instant) -> f64 {
         let epoch = *self.epoch.get_or_insert(at);
         if at >= epoch { at.duration_since(epoch).as_secs_f64() * 1000.0 } else { -(epoch.duration_since(at).as_secs_f64() * 1000.0) }
@@ -136,20 +136,20 @@ impl UnitMotions {
         }
     }
 
-    /// Plays the walk of `key` at driver time `t`: where it has the unit, if
+    /// Plays the walk of `key` at driver time `t`: where it has the piece, if
     /// it is still played.
     fn play(&mut self, key: u32, walk: &scene::Walk, t: f64) -> Option<(i32, i32)> {
         if walk.tiles.is_empty() {
             return None;
         }
         if self.plays.get(&key).is_none_or(|p| p.serial != walk.serial) {
-            // (A walk long over, met again when its unit is drawn to be
+            // (A walk long over, met again when its piece is drawn to be
             // moved again, is not played again.)
             let last = walk.tiles[walk.tiles.len() - 1];
             if t > last.start_ms as f64 + f64::from(last.ms) + STALE_MS {
                 return None;
             }
-            // From the game's start, or from now if the unit was not drawn
+            // From the game's start, or from now if the piece was not drawn
             // to be moved before (its first tile then trails a little).
             let first = walk.tiles[0].start_ms as f64;
             let t0 = first.max(t - 17.0);
@@ -203,7 +203,7 @@ impl UnitMotions {
     /// its offset, after the ranges moved last frame that no longer move,
     /// at (0, 0) (back where the scene has them). `None` when that is what
     /// was applied last and `rebuilt` (the world's sprites made again from
-    /// the scene's) is false. `walk` gives a unit's walk and when each of
+    /// the scene's) is false. `walk` gives a piece's walk and when each of
     /// its tiles arrived (`scene::Display::walk`).
     pub(crate) fn offsets<'w>(&mut self, scene: &scene::Scene, now: Instant, rebuilt: bool, walk: impl Fn(u32) -> Option<(&'w scene::Walk, &'w [Instant])>) -> Option<Moves> {
         let offsets = self.positions(scene, now, walk);
@@ -259,7 +259,7 @@ impl UnitMotions {
             let offset = match at {
                 Some(p) => {
                     let play = self.plays.get_mut(&m.key).expect("played above");
-                    // Over once the scene has the unit where the walk ended
+                    // Over once the scene has the piece where the walk ended
                     // (or a while after: it moved on by other means).
                     if play.finished.is_some_and(|f| p == m.anchor || t > f + 2000.0) {
                         play.done = true;
@@ -276,13 +276,13 @@ impl UnitMotions {
         out
     }
 
-    /// The offset unit `key`'s sprites were moved by this frame, if any.
+    /// The offset piece `key`'s sprites were moved by this frame, if any.
     pub(crate) fn moved(&self, key: u32) -> Option<(i32, i32)> {
         self.moved.get(&key).copied()
     }
 
     /// Where a marker over the scene's point of interest goes
-    /// (`scene::Scene::focus_motion`): moved as its unit's sprites were
+    /// (`scene::Scene::focus_motion`): moved as its piece's sprites were
     /// this frame, in the pixels of views showing the world `downscale`
     /// times smaller (the focus's); else the focus.
     pub(crate) fn focus_at(&self, scene: &scene::Scene, downscale: u32) -> Option<(i32, i32)> {
