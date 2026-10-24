@@ -7,6 +7,8 @@ use crate::controls::{ControlValue, Range};
 pub struct Accessibility {
     pub active_unit_arrow: bool,
     pub arrow_bobbing: bool,
+    /// The arrow's size: an index into [`ARROW_SCALES`].
+    pub arrow_size: usize,
     pub unit_rings: bool,
     pub war: RingColor,
     pub allied: RingColor,
@@ -28,13 +30,14 @@ impl Default for RingColor {
 }
 impl Default for Accessibility {
     fn default() -> Self {
-        Self { active_unit_arrow: false, arrow_bobbing: true, unit_rings: false,
+        Self { active_unit_arrow: false, arrow_bobbing: true, arrow_size: 0, unit_rings: false,
             war: RingColor::default(), allied: RingColor { color: [0, 64, 255], invert: false },
             peace: RingColor { color: [64, 240, 96], invert: false }, ring_width: 2, hud_size: 0, stack_count: false }
     }
 }
 
 pub const HUD_SCALES: [f32; 4] = [1.0, 1.5, 2.0, 3.0];
+pub const ARROW_SCALES: [f32; 5] = [1.0, 1.5, 2.0, 2.5, 3.0];
 /// The compact palette shown beside each diplomatic relation.
 pub const PALETTE: [[u8; 3]; 16] = [
     [255, 0, 0], [240, 112, 24], [248, 208, 32], [64, 240, 96],
@@ -42,8 +45,8 @@ pub const PALETTE: [[u8; 3]; 16] = [
     [200, 48, 160], [248, 144, 176], [144, 80, 40], [192, 168, 104],
     [255, 255, 255], [176, 176, 176], [80, 80, 80], [0, 0, 0],
 ];
-pub const KEYS: [&str; 12] = [
-    "accessibility.active_unit_arrow", "accessibility.arrow_bobbing", "accessibility.unit_rings",
+pub const KEYS: [&str; 13] = [
+    "accessibility.active_unit_arrow", "accessibility.arrow_bobbing", "accessibility.arrow_size", "accessibility.unit_rings",
     "accessibility.war.color", "accessibility.war.invert", "accessibility.allied.color", "accessibility.allied.invert",
     "accessibility.peace.color", "accessibility.peace.invert", "accessibility.ring_width", "accessibility.hud_size", "accessibility.stack_count",
 ];
@@ -51,17 +54,20 @@ pub fn range(key: &str) -> Option<Range> {
     match key {
         "accessibility.ring_width" => Some(Range { min: 1.0, max: 6.0, step: 1.0 }),
         "accessibility.hud_size" => Some(Range { min: 0.0, max: 3.0, step: 1.0 }),
+        "accessibility.arrow_size" => Some(Range { min: 0.0, max: 4.0, step: 1.0 }),
         _ => None,
     }
 }
 impl Accessibility {
     pub fn hud_scale(&self) -> f32 { HUD_SCALES[self.hud_size.min(3)] }
+    pub fn arrow_scale(&self) -> f32 { ARROW_SCALES[self.arrow_size.min(4)] }
     pub fn control(&self, key: &str) -> Option<ControlValue> {
         use ControlValue::*;
         Some(match key.strip_prefix("accessibility.")? {
             "active_unit_arrow" => On(self.active_unit_arrow), "arrow_bobbing" => On(self.arrow_bobbing),
             "unit_rings" => On(self.unit_rings), "stack_count" => On(self.stack_count),
             "ring_width" => Number(self.ring_width.clamp(1, 6) as f32), "hud_size" => Number(self.hud_size.min(3) as f32),
+            "arrow_size" => Number(self.arrow_size.min(4) as f32),
             relation => {
                 let (name, field) = relation.split_once('.')?;
                 let ring = match name { "war" => &self.war, "allied" => &self.allied, "peace" => &self.peace, _ => return None };
@@ -82,6 +88,7 @@ impl Accessibility {
             (Some("stack_count"), On(v)) => self.stack_count = *v,
             (Some("ring_width"), Number(v)) => self.ring_width = range(key).unwrap().snap(*v) as u32,
             (Some("hud_size"), Number(v)) => self.hud_size = range(key).unwrap().snap(*v) as usize,
+            (Some("arrow_size"), Number(v)) => self.arrow_size = range(key).unwrap().snap(*v) as usize,
             (Some(relation), value) => {
                 let Some((name, field)) = relation.split_once('.') else { return false };
                 let ring = match name { "war" => &mut self.war, "allied" => &mut self.allied, "peace" => &mut self.peace, _ => return false };
@@ -120,5 +127,8 @@ mod tests {
         assert!(!s.set_control("accessibility.war.color", &ControlValue::Choice("invalid".into())));
         s.set_control("accessibility.hud_size", &ControlValue::Number(f32::NAN));
         assert_eq!(s.accessibility.hud_scale(), 1.0);
+        assert_eq!((s.accessibility.arrow_size, s.accessibility.arrow_scale()), (3, 2.5), "the arrow's size by its slider's steps");
+        assert!(s.set_control("accessibility.arrow_size", &ControlValue::Number(9.0)));
+        assert_eq!(s.accessibility.arrow_scale(), 3.0);
     }
 }

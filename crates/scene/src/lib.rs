@@ -284,6 +284,11 @@ pub struct Scene {
     /// unit a player is moving), if any (in the pixels of its views, see
     /// [`View::downscale`]).
     pub focus: Option<(i32, i32)>,
+    /// Where a marker over the point of interest goes instead of `focus`
+    /// (which follows the driver's own frames): from `from` (in the pixels
+    /// of `focus`) along the motion `serial` while the scene has it (a unit
+    /// on its way, [`Motion::serial`]); else at `from` (one held there).
+    pub focus_motion: Option<FocusMotion>,
     /// Semantic main-camera request independent of the native rendering camera.
     /// A new serial repeats a request even when its destination is unchanged.
     /// None retains the driver-camera behavior of older drivers.
@@ -323,6 +328,13 @@ pub struct Scene {
     /// pointer asks for them, rather than wait for the driver's interface to
     /// draw them.
     pub looks: Vec<Looks>,
+}
+
+/// The point of interest on its way (see [`Scene::focus_motion`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FocusMotion {
+    pub serial: u64,
+    pub from: (i32, i32),
 }
 
 /// An explicit request to focus the primary renderer view.
@@ -777,6 +789,8 @@ pub enum Update {
     /// Sprite pixels to write into the atlas.
     Patches(Vec<Patch>),
     Tick(u32),
+    /// See [`Scene::focus_motion`].
+    FocusMotion(Option<FocusMotion>),
     /// The point of interest moved (see [`Scene::focus`]).
     Focus(Option<(i32, i32)>),
     /// See [`Scene::camera_focus`].
@@ -934,6 +948,7 @@ impl Scene {
             }
             Update::Tick(tick) => self.tick = tick,
             Update::Focus(focus) => self.focus = focus,
+            Update::FocusMotion(m) => self.focus_motion = m,
             Update::CameraFocus(focus) => self.camera_focus = focus,
             Update::CameraArrival(arrival) => self.camera_arrival = arrival,
             Update::MapWheelStep(step) => self.map_wheel_step = step,
@@ -1053,6 +1068,9 @@ impl Scene {
         }
         if self.minimap != old.minimap {
             out.push(Update::Minimap(self.minimap));
+        }
+        if self.focus_motion != old.focus_motion {
+            out.push(Update::FocusMotion(self.focus_motion));
         }
         if self.focus != old.focus {
             out.push(Update::Focus(self.focus));

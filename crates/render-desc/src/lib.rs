@@ -914,27 +914,9 @@ fn gilded_arrow(spec: &str) -> Result<RgbaImage, String> {
     };
     let (color, (w, h)) = shape_spec(spec, "gilded_arrow")?;
     if shift.is_some() && h <= 8 { return Err("gilded_arrow: phase art needs an eight-pixel margin".into()); }
-    // Slightly unequal shoulders and a tapered, chamfered shaft. Coordinates
-    // are painted at the native 33x48 size, then supersampled for soft edges.
-    let points = [(13.0, 3.0), (21.0, 3.6), (23.0, 5.5), (22.0, 23.0),
-        (29.5, 23.8), (29.0, 27.0), (16.0, 44.0), (3.5, 26.0),
-        (4.0, 23.0), (11.5, 23.4), (11.0, 5.0)];
-    let surface = |x: f32, y: f32| {
-        let mut inside = false;
-        let (mut distance, mut light) = (f32::MAX, 0.0);
-        for (a, b) in points.iter().zip(points.iter().cycle().skip(1)).take(points.len()) {
-            if (a.1 > y) != (b.1 > y) && x < (b.0-a.0)*(y-a.1)/(b.1-a.1)+a.0 { inside = !inside; }
-            let (dx, dy) = (b.0-a.0, b.1-a.1);
-            let t = ((x-a.0)*dx+(y-a.1)*dy)/(dx*dx+dy*dy);
-            let t = t.clamp(0.0, 1.0);
-            let d = ((x-a.0-t*dx).powi(2)+(y-a.1-t*dy).powi(2)).sqrt();
-            if d < distance {
-                distance = d;
-                light = (dx-dy)/(dx*dx+dy*dy).sqrt() * 0.707;
-            }
-        }
-        (inside, distance, light)
-    };
+    // Painted at the native 33x48 size (`marker_math`), supersampled for
+    // soft edges.
+    let midtone = [color[0] as f32, color[1] as f32, color[2] as f32];
     Ok(RgbaImage::from_fn(w, h, |x, y| {
         let mut sum = [0.0; 4];
         for sy in 0..4 { for sx in 0..4 {
@@ -943,25 +925,9 @@ fn gilded_arrow(spec: &str) -> Result<RgbaImage, String> {
                 Some(shift) => (y as f32+(sy as f32+0.5)/4.0-4.0-shift)*48.0/(h-8) as f32,
                 None => (y as f32+(sy as f32+0.5)/4.0)*48.0/h as f32,
             };
-            let (inside, edge, light) = surface(px, py);
+            let (inside, c) = marker_math::sample(px, py, midtone, false);
             if !inside { continue; }
-            let (gx, gy) = (px.floor() as i32, py.floor() as i32);
-            let grain = (gx*37+gy*61+gx*gy*7).rem_euclid(17) as f32/16.0-0.5;
-            let mottle = (px*0.77+py*0.32).sin()*(py*0.63-px*0.21).sin();
-            let worn_edge = 0.95+grain*0.30+(py*1.7).sin()*0.12;
-            // Broad directional bevel, brown crevices and a rounded central
-            // ridge. The metal has patches of tarnish rather than a flat fill.
-            let bevel = ((3.8-edge)/2.8).clamp(0.0, 1.0);
-            let ridge = (-((px-16.0)/3.7).powi(2)).exp()*0.17;
-            let shade = 0.76+ridge+0.08*(py*0.16).cos()+mottle*0.055+grain*0.045;
-            for c in 0..3 {
-                let body = color[c] as f32*shade;
-                let rim = if light > 0.0 { [255.0, 239.0, 167.0][c] } else { [96.0, 53.0, 22.0][c] };
-                let metal = body+(rim-body)*bevel*light.abs().sqrt();
-                let ink = [55.0, 34.0, 19.0][c]+mottle*7.0;
-                let t = ((edge-worn_edge)*2.2).clamp(0.0, 1.0);
-                sum[c] += ink+(metal-ink)*t;
-            }
+            for k in 0..3 { sum[k] += c[k]; }
             sum[3] += 1.0;
         }}
         if sum[3] == 0.0 { return [0; 4]; }
@@ -970,6 +936,11 @@ fn gilded_arrow(spec: &str) -> Result<RgbaImage, String> {
             (sum[2]/sum[3]).clamp(0.0,255.0) as u8, (sum[3]*color[3] as f32/16.0).round() as u8]
     }))
 }
+
+// (Only its 1:1 painting is used here.)
+#[allow(dead_code)]
+#[path = "../../tile-render-shaders/src/marker_math.rs"]
+mod marker_math;
 
 /// Soft elliptical ground shadow, separate from the airborne marker.
 fn marker_shadow(spec: &str) -> Result<RgbaImage, String> {

@@ -776,6 +776,40 @@ pub const ARROW_SHADOW: &str = "Viewer@arrow_shadow";
 /// the pixels of views showing the world `downscale` times smaller; world
 /// sprites are placed at full size.
 pub fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale: u32, time: Duration, bobbing: bool) -> Vec<tile_render::PlacedSprite> {
+    marker_sprites_sized(compiled, markers, downscale, time, bobbing, 1.0)
+}
+
+/// The colour of the arrow's metal (as `civ3.toml`'s `viewer_arrow`) and of
+/// its shadow at rest.
+const ARROW_RGBA: [u8; 4] = [232, 183, 87, 255];
+const ARROW_SHADOW_RGBA: [u8; 4] = [32, 23, 14, 255];
+/// The arrow's tip above the point it marks, and its shadow's centre from
+/// it, in full-size world pixels (as `civ3.toml` places the 1:1 art).
+const ARROW_TIP: (i32, i32) = (0, -68);
+const ARROW_SHADOW_CENTRE: (i32, i32) = (8, 4);
+
+/// [`marker_sprites`] with the arrow `size` times as large as its 1:1 art.
+/// Larger, it is painted at the resolution of each view showing it
+/// (`tile_render::Shape::Arrow`) rather than scaled from its art: crisp at
+/// any world scale and in the zoom box. Its tip stays where the 1:1 arrow's
+/// is, above the unit; it bobs `size` times as far, its shadow (on the
+/// ground, as wide as it) shaped likewise.
+pub fn marker_sprites_sized(compiled: &Compiled, markers: &[layout::Marker], downscale: u32, time: Duration, bobbing: bool, size: f32) -> Vec<tile_render::PlacedSprite> {
+    if size > 1.0 {
+        return markers.iter().flat_map(|m| {
+            let layout::Marker::Focus((x, y)) = *m else { return Vec::new() };
+            let n = downscale.max(1) as i32;
+            let bob = if bobbing { (arrow_bob_offset(time) * size * 64.0).round() as i32 } else { 0 };
+            let sixteenths = (size * 16.0).round() as u32;
+            let sprite = |shape| tile_render::PlacedSprite { category: viewer_settings::clean_map::UNITS, shape: Some(shape),
+                ..tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, x * n, y * n) };
+            vec![
+                sprite(tile_render::Shape::ArrowShadow { size: sixteenths, bob, rgba: ARROW_SHADOW_RGBA,
+                    centre: ((ARROW_SHADOW_CENTRE.0 as f32 * size).round() as i32, ARROW_SHADOW_CENTRE.1) }),
+                sprite(tile_render::Shape::Arrow { size: sixteenths, tip: ARROW_TIP, bob, rgba: ARROW_RGBA }),
+            ]
+        }).collect();
+    }
     markers
         .iter()
         .flat_map(|m| {
@@ -813,6 +847,12 @@ pub fn arrow_bob_offset(time: Duration) -> f32 {
 /// Only animate when at least one world camera can show the marker. Static
 /// markers stay identical, allowing the renderer to reuse its last picture.
 pub fn arrow_bobbing_visible(bobbing: bool, markers: &[layout::Marker], cameras: &[Camera], downscale: u32) -> bool {
+    arrow_bobbing_visible_sized(bobbing, markers, cameras, downscale, 1.0)
+}
+
+/// [`arrow_bobbing_visible`] for an arrow `size` times as large.
+pub fn arrow_bobbing_visible_sized(bobbing: bool, markers: &[layout::Marker], cameras: &[Camera], downscale: u32, size: f32) -> bool {
+    let size = f64::from(size.max(1.0));
     bobbing && markers.iter().any(|m| {
         let layout::Marker::Focus((x, y)) = *m else { return false };
         let n = downscale.max(1) as f64;
@@ -820,8 +860,10 @@ pub fn arrow_bobbing_visible(bobbing: bool, markers: &[layout::Marker], cameras:
             if !c.cells || c.hidden_categories & viewer_settings::clean_map::UNITS != 0 { return false; }
             let d = c.downscale.max(1) as f64;
             let z = c.zoom.0 as f64 / c.zoom.1.max(1) as f64;
-            let (left, top) = (((x as f64*n - 16.0)/d - c.x as f64)*z, ((y as f64*n - 115.0)/d - c.y as f64)*z);
-            left < c.viewport.0 as f64 && top < c.viewport.1 as f64 && left + 33.0*z/d > 0.0 && top + 54.0*z/d > 0.0
+            // (The 1:1 arrow from 115 above the point, its bob included,
+            // grown about its tip 68 above it.)
+            let (left, top) = (((x as f64*n - 16.0*size)/d - c.x as f64)*z, ((y as f64*n - 68.0 - 47.0*size)/d - c.y as f64)*z);
+            left < c.viewport.0 as f64 && top < c.viewport.1 as f64 && left + 33.0*size*z/d > 0.0 && top + 54.0*size*z/d > 0.0
         })
     })
 }
@@ -894,6 +936,63 @@ mod accessibility_arrow_tests {
         check(&mut renderer, a, true, &[]);
         check(&mut renderer, b, true, &[]);
         assert!(renderer.reused());
+    }
+    /// The opaque extent (left, top, right, bottom) of the arrow drawn by
+    /// `sprites` alone (its shadow left out) at `zoom` around (100, 230).
+    fn arrow_extent(sprites: &[tile_render::PlacedSprite], zoom: u32) -> (u32, u32, u32, u32) {
+        let mut world = tile_render::TileWorld::new(tile_render::Grid { cols: 1, rows: 1, layout: tile_render::Layout::Orthogonal, step: (32, 32), wrap_x: false, wrap_y: false }, Default::default());
+        world.free = sprites.iter().filter(|s| !matches!(s.shape, Some(tile_render::Shape::ArrowShadow { .. }))).cloned().collect();
+        let camera = Camera { zoom: (zoom, 1), zoomed_art: true, ..Camera::new((200 * zoom, 260 * zoom)) };
+        let image = tile_render::reference::render(&world, &tile_render::AtlasBuilder::new(16).finish(), &camera, 0, [0, 0, 0, 255]);
+        let lit: Vec<(u32, u32)> = (0..image.height).flat_map(|y| (0..image.width).map(move |x| (x, y))).filter(|&(x, y)| image.get(x, y) != [0, 0, 0, 255]).collect();
+        let xs = lit.iter().map(|p| p.0);
+        let ys = lit.iter().map(|p| p.1);
+        (xs.clone().min().unwrap(), ys.clone().min().unwrap(), xs.max().unwrap() + 1, ys.max().unwrap() + 1)
+    }
+
+    #[test]
+    fn larger_arrows_grow_up_from_the_same_tip_at_the_views_resolution() {
+        struct NoFiles;
+        impl render_desc::ImageLoader for NoFiles {
+            fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> { unreachable!() }
+        }
+        let desc = "grid = { layout = \"orthogonal\", step = [32,32] }\n[images.arrow]\nsource = \"gilded_arrow:232,183,87,255:33x48\"\n[sheets.arrow]\nimage = \"arrow\"\ncell = [33,48]\ngrid = [1,1]\nanchor = [-16,-112]\ngroup = \"Viewer@arrow\"\n";
+        let compiled = render_desc::Description::parse(desc).unwrap().compile(&NoFiles, 128).unwrap();
+        let m = [layout::Marker::Focus((100, 230))];
+        // 1×: today's sprites, whatever else.
+        for (t, bobbing) in [(Duration::ZERO, false), (Duration::from_millis(325), true)] {
+            assert_eq!(marker_sprites_sized(&compiled, &m, 1, t, bobbing, 1.0), marker_sprites(&compiled, &m, 1, t, bobbing));
+            assert!(marker_sprites_sized(&compiled, &m, 1, t, bobbing, 1.0).iter().all(|s| s.shape.is_none()));
+        }
+        // Larger: painted shapes; the tip where the 1:1 arrow's is, at
+        // every world scale; as wide and high as the art times the size.
+        let mut world = compiled.world(1, 1, false, false);
+        world.free = marker_sprites(&compiled, &m, 1, Duration::ZERO, false);
+        let one = tile_render::reference::render(&world, &compiled.atlas, &Camera::new((200, 260)), 0, [0, 0, 0, 255]);
+        let tip = (0..260).rev().find(|&y| (0..200).any(|x| one.get(x, y) != [0, 0, 0, 255])).unwrap() + 1;
+        assert_eq!(tip, 230 - 68, "the 1:1 art's tip");
+        for size in [1.5f32, 2.0, 2.5, 3.0] {
+            let sprites = marker_sprites_sized(&compiled, &m, 1, Duration::ZERO, false, size);
+            assert_eq!(sprites.len(), 2);
+            assert!(matches!(sprites[1].shape, Some(tile_render::Shape::Arrow { .. })), "the arrow over its shadow");
+            for zoom in [1, 2, 3] {
+                let (l, t, r, b) = arrow_extent(&sprites, zoom);
+                let e = size * zoom as f32;
+                assert!(b.abs_diff(tip * zoom) <= 1 + zoom, "{size}x at {zoom}x: tip at {b}, not {}", tip * zoom);
+                assert!(((b - t) as f32 - 41.0 * e).abs() <= 2.0 + e, "{size}x at {zoom}x: {} high", b - t);
+                assert!(((r - l) as f32 - 26.0 * e).abs() <= 2.0 + e, "{size}x at {zoom}x: {} wide", r - l);
+                assert!((((l + r) as f32 / 2.0) - 100.0 * zoom as f32 - 0.25 * e).abs() <= 1.0 + e / 2.0, "{size}x at {zoom}x: centred over the unit");
+            }
+            // Bobbing `size` times as far, its shadow on the ground.
+            let (low, high) = (Duration::from_millis(325), Duration::from_millis(975));
+            let (a, b) = (marker_sprites_sized(&compiled, &m, 1, low, true, size), marker_sprites_sized(&compiled, &m, 1, high, true, size));
+            let (ba, bb) = (arrow_extent(&a, 2).3 as f32, arrow_extent(&b, 2).3 as f32);
+            assert!((ba - bb - 12.0 * size).abs() <= 2.0, "{size}x: bobs {} of {}", ba - bb, 12.0 * size);
+            assert_eq!((a[0].x, a[0].y), (b[0].x, b[0].y));
+            assert!(arrow_bobbing_visible_sized(true, &m, &[Camera::new((320, 240))], 1, size));
+        }
+        // Reduced views: from the same full-size point.
+        assert_eq!(marker_sprites_sized(&compiled, &m, 2, Duration::ZERO, false, 2.0)[1].y, 460);
     }
 }
 
@@ -3542,7 +3641,7 @@ impl App {
         let future_layout = metadata.map(|m| m.layout.clone());
         let scene = self.shown_scene.as_ref();
         let layout_compiled = future_layout.as_deref().unwrap_or(&self.compiled);
-        let arranged = {
+        let mut arranged = {
             let now = std::time::Instant::now();
             if let Some(at) = self.drawn_at.replace(now) {
                 self.layout.advance(now - at);
@@ -3695,8 +3794,14 @@ impl App {
             }
         }
         // The viewer's markers on top of the world, for this frame only.
-        let bobbing = arrow_bobbing_visible(self.settings.accessibility.arrow_bobbing, &arranged.markers, &arranged.cameras, world_downscale(scene));
-        let mut markers = marker_sprites(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed(), bobbing);
+        // (The arrow over a unit on its way goes with it, on the same clock.)
+        let focus = self.unit_motions.focus_at(scene, started, world_downscale(scene));
+        for m in &mut arranged.markers {
+            if let (layout::Marker::Focus(at), Some(f)) = (m, focus) { *at = f; }
+        }
+        let arrow_size = self.settings.accessibility.arrow_scale();
+        let bobbing = arrow_bobbing_visible_sized(self.settings.accessibility.arrow_bobbing, &arranged.markers, &arranged.cameras, world_downscale(scene), arrow_size);
+        let mut markers = marker_sprites_sized(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed(), bobbing, arrow_size);
         markers.extend(glass_sprites(&self.compiled, &arranged.divider));
         markers.extend(separator_sprites(&arranged.separators));
         // The cursor where the viewer draws it, in a camera of its own on

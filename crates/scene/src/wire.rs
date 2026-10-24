@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, Button, DetachedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 56;
+pub const VERSION: u32 = 57;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -447,6 +447,15 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
+            Update::FocusMotion(m) => {
+                w.u8(30);
+                w.bool(m.is_some());
+                let m = m.unwrap_or_default();
+                w.u32(m.serial as u32);
+                w.u32((m.serial >> 32) as u32);
+                w.i32(m.from.0);
+                w.i32(m.from.1);
+            }
             Update::CameraArrival(arrival) => {
                 w.u8(25);
                 w.bool(arrival.is_some());
@@ -745,6 +754,12 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let some = r.bool()?;
                 let p = (r.i32()?, r.i32()?);
                 Update::Focus(some.then_some(p))
+            }
+            30 => {
+                let some = r.bool()?;
+                let serial = r.u32()? as u64 | (r.u32()? as u64) << 32;
+                let from = (r.i32()?, r.i32()?);
+                Update::FocusMotion(some.then_some(crate::FocusMotion { serial, from }))
             }
             18 => {
                 let some = r.bool()?;
@@ -1342,6 +1357,7 @@ mod tests {
         s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, blend: crate::SpriteBlend::Alpha, tint: 0, zoom_art: 0, zoom: (0, 0), zoom_offset: (0, 0), clip: Some([1, -2, 300, 40]), not_in_view: None, glyph: None, solid: None, output_rect: None, palette: 0, category: 0x789 });
         s.patches.push(Patch { sprite: "Screen@x/0".into(), width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
         s.focus = Some((-64, 96));
+        s.focus_motion = Some(crate::FocusMotion { serial: 1 << 40 | 3, from: (-32, 80) });
         s.camera_focus = Some(CameraFocus { serial: 0x1_0000_0002, center: (-4096, 1234) });
         s.assets = 3;
         s.zooms = vec![(3, 2)];
