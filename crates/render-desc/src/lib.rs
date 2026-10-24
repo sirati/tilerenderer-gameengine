@@ -670,8 +670,8 @@ pub struct SheetDesc {
     /// every side, its anchor moves accordingly.
     pub outline: Option<OutlineDesc>,
     /// Each cell resampled to this size, nearest pixel (e.g. a game's icon
-    /// fitted into a smaller picture); after `outline`. Colour images only
-    /// (`indexed = false`).
+    /// fitted into a smaller picture); after `outline`. A resized or
+    /// outlined cell of an indexed image is cut in colours.
     pub resize: Option<[u32; 2]>,
     /// Explicit source increments for a legacy16.16 nearest sampler.
     /// Used only with `resize`; each output pixel samples floor(i*step/65536)
@@ -1662,12 +1662,12 @@ impl Description {
         if exceeds(sheet.origin) || sheet.scaled_origin.is_some_and(exceeds) {
             return Err(err(format!("{cols}×{rows} cells of {cw}×{ch} exceed the {iw}×{ih} image")));
         }
-        if matches!(all, Some(Frames::Indexed { .. })) && sheet.outline.is_some() {
-            return Err(err("an indexed image cannot be outlined".into()));
-        }
-        if matches!(all, Some(Frames::Indexed { .. })) && sheet.resize.is_some() {
-            return Err(err("an indexed image cannot be resized (indexed = false)".into()));
-        }
+        // Outlines and resizes make new colours: an indexed image's cells are
+        // cut in colours for them (each index as its palette draws it), the
+        // image's other sheets stay indexed. (Not an error: a layout-only
+        // compile cannot tell, and a renderer refusing what the tables
+        // accepted waits for that art forever.)
+        let in_colours = sheet.outline.is_some() || sheet.resize.is_some();
         if sheet.resize.is_some_and(|[w, h]| w == 0 || h == 0) {
             return Err(err("resized to nothing".into()));
         }
@@ -1706,6 +1706,7 @@ impl Description {
         let mut cut = |x: u32, y: u32| -> Result<(Option<Cut>, [u32; 4]), DescError> {
             let image = all.filter(|_| pixels).map(|f| match f {
                 Frames::Rgba(frames) => Ok(Cut::Rgba(shape(frames[frame].crop(x, y, cw, ch)))),
+                Frames::Indexed { .. } if in_colours => Ok(Cut::Rgba(shape(RgbaImage::from_fn(cw, ch, |i, j| f.pixel(frame, x + i, y + j))))),
                 Frames::Indexed { frames, rows } => {
                     let key = (source.to_owned(), frame, [x, y, cw, ch], None);
                     let image = shared.entry(key.clone()).or_insert_with(|| std::sync::Arc::new(frames[frame].pixels.crop(x, y, cw, ch))).clone();
@@ -1718,6 +1719,7 @@ impl Description {
             }).transpose()?;
             let sample_box = match all_blank {
                 Some(Frames::Rgba(blank)) => opaque_box(&shape(blank[frame].crop(x, y, cw, ch))).unwrap_or_default(),
+                Some(f @ Frames::Indexed { .. }) if in_colours => opaque_box(&shape(RgbaImage::from_fn(cw, ch, |i, j| f.pixel(frame, x + i, y + j)))).unwrap_or_default(),
                 Some(Frames::Indexed { frames, rows }) => {
                     let f = &frames[frame];
                     let row = &rows[frame];
@@ -2109,16 +2111,35 @@ impl Description {
                 *len = (*len).max(sheet.first_index + cols * rows * sheet.index_stride);
                 continue;
             }
+            // A sheet whose pixels cannot be made (its file unreadable, say)
+            // keeps the sprites a compile without pixels gives it, clear and
+            // unavailable: a pixel compile has the same tables as one without
+            // whatever the pixels are, so the side drawing never refuses (or
+            // numbers differently) art the other side took. (Not kept for
+            // the next compile, which tries again.)
+            let mut slice = |pixels: bool| self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared, &identity(&sheet.image, false));
+            let mut clear = false;
+            let mut made = |cached: Option<&std::sync::Arc<Sliced>>| -> Result<std::sync::Arc<Sliced>, DescError> {
+                if let Some(s) = cached { return Ok(s.clone()); }
+                match slice(pixels) {
+                    Ok(s) => Ok(std::sync::Arc::new(s)),
+                    // (A compile given up stops here, see `StopWhen`.)
+                    Err(e) if pixels && !e.to_string().contains(CANCELLED) => {
+                        let tables = slice(false)?;
+                        log::error!("sheet {sheet_name}: {e}: its {} sprites are left clear", tables.sprites.len());
+                        clear = true;
+                        Ok(std::sync::Arc::new(tables))
+                    }
+                    Err(e) => Err(e),
+                }
+            };
             let sliced = match cache.as_deref_mut() {
                 Some(cache) => {
-                    let sliced = match cache.sheets.as_ref().and_then(|c| c.get(&key)) {
-                        Some(s) => s.clone(),
-                        None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared, &identity(&sheet.image, false))?),
-                    };
-                    kept.insert(key, sliced.clone());
+                    let sliced = made(cache.sheets.as_ref().and_then(|c| c.get(&key)))?;
+                    if !clear { kept.insert(key, sliced.clone()); }
                     sliced
                 }
-                None => std::sync::Arc::new(self.slice(sheet_name, sheet, pixels, &mut frames, &mut sizes, &mut shared, &identity(&sheet.image, false))?),
+                None => made(None)?,
             };
             let remap = self.remap(&sheet.image);
             for (k, s) in sliced.sprites.iter().enumerate() {
@@ -2127,7 +2148,9 @@ impl Description {
                 if existing(&name).is_some() {
                     continue;
                 }
-                let id = placer.add(&name, s.image.as_ref(), s.size, s.anchor, scaling, s.sample_box, remap, known)?;
+                let blank = clear.then(|| Cut::Rgba(RgbaImage::new(s.size.0, s.size.1)));
+                let id = placer.add(&name, blank.as_ref().or(s.image.as_ref()), s.size, s.anchor, scaling, s.sample_box, remap, known)?;
+                if clear { placer.unavailable.insert(id.0); }
                 let desc = placer.sprite_mut(id);
                 desc.sampling = sheet.sampling.flag();
                 desc.sampling_origin_x = s.sample_origin[0];
@@ -2148,7 +2171,10 @@ impl Description {
         for (id, sliced, k, scaling, remap) in twins {
             let s = &sliced.sprites[k];
             let Some((image, sample_box)) = &s.scaled else { continue };
-            let twin = placer.add("(a zoomed-out twin)", image.as_ref(), s.size, s.anchor, scaling, *sample_box, remap, known)?;
+            // (A clear sheet's twins clear too, see above.)
+            let blank = (image.is_none() && placer.pixels).then(|| Cut::Rgba(RgbaImage::new(s.size.0, s.size.1)));
+            let twin = placer.add("(a zoomed-out twin)", blank.as_ref().or(image.as_ref()), s.size, s.anchor, scaling, *sample_box, remap, known)?;
+            if blank.is_some() { placer.unavailable.insert(twin.0); }
             placer.sprite_mut(id).downscaled = twin.0 + 1;
         }
         if let Some(cache) = cache {
@@ -3023,6 +3049,79 @@ mod tests {
         }
     }
 
+    /// A resized or outlined sheet of an indexed image (the F7 screen's
+    /// scaled pictures, `menu::screen` `screen_resized_region_*`) is cut in
+    /// colours, in a whole compile and a growth alike, as the layout-only
+    /// compile of the bridge accepts it; the image's plain sheet stays
+    /// indexed. (A growth refused here left the viewer waiting for that art
+    /// forever: its scenes, the game's close of F7 and a popup with them,
+    /// were never shown.)
+    #[test]
+    fn resized_and_outlined_sheets_of_indexed_art_are_cut_in_colours() {
+        let base = "grid = { layout = 'orthogonal', step = [8, 4] }\n[images.body]\nsource = 'a.flc'\n[sheets.body]\nimage = 'body'\ncell = [8, 4]\n";
+        let addition = "[images.again]\nsource = 'a.flc'\n[sheets.small]\nimage = 'again'\ncell = [8, 4]\nresize = [4, 2]\nresize_step = [131072, 131072]\n[sheets.ring]\nimage = 'again'\ncell = [8, 4]\noutline = { width = 1, color = [1, 2, 3, 255] }\n";
+        let check = |c: &Compiled, pixels: bool| {
+            let sprite = |n: &str| c.atlas.sprites[c.sprite(n).unwrap().0 as usize];
+            assert_eq!((sprite("small/0").width, sprite("small/0").height), (4, 2));
+            assert_eq!((sprite("ring/0").width, sprite("ring/0").height), (10, 6));
+            if pixels {
+                assert_ne!(sprite("body/0").palette, 0, "the plain sheet stays indexed");
+                assert_eq!((sprite("small/0").palette, sprite("ring/0").palette), (0, 0));
+                // Every other index of every other row: indices 0 (clear), 2, 4, 6 in grey.
+                let row = [[0; 4], [2, 2, 2, 255], [4, 4, 4, 255], [6, 6, 6, 255]];
+                assert_eq!(sprite_pixels(c, "small/0"), [row, row].concat());
+            }
+        };
+        let whole = Description::parse(&format!("{base}{addition}")).unwrap();
+        check(&whole.compile(&Indexed, 64).unwrap(), true);
+        check(&whole.compile_layout(&Indexed, 64).unwrap(), false);
+        for pixels in [true, false] {
+            let (mut compiled, mut growing) = Description::parse(base).unwrap().compile_growing(&Indexed, 64, pixels).unwrap();
+            let growth = growing.grow(&compiled, addition, &Indexed).unwrap();
+            compiled.apply(&growth);
+            check(&compiled, pixels);
+        }
+    }
+
+    /// A sheet whose pixels cannot be made, though its sizes can (the side
+    /// without pixels took it): the pixel compile and growth keep its
+    /// sprites, same names, ids and sizes, clear and unavailable, and the
+    /// other sheets' art; the error is logged, nothing refused.
+    #[test]
+    fn a_sheet_whose_pixels_fail_keeps_the_tables_of_a_compile_without_them() {
+        struct Unreadable;
+        impl ImageLoader for Unreadable {
+            fn load(&self, source: &str, _: &toml::Table) -> Result<Vec<RgbaImage>, String> {
+                if source == "broken.pcx" { return Err("broken.pcx: truncated".into()); }
+                Ok(vec![RgbaImage::from_fn(16, 8, |x, y| [x as u8, y as u8, 7, 255])])
+            }
+            fn sizes(&self, _: &str, _: &toml::Table) -> Result<Vec<(u32, u32)>, String> {
+                Ok(vec![(16, 8)])
+            }
+        }
+        let base = "grid = { layout = 'orthogonal', step = [8, 8] }\n[images.good]\nsource = 'good.pcx'\n[sheets.good]\nimage = 'good'\ncell = [8, 8]\n";
+        let addition = "[images.bad]\nsource = 'broken.pcx'\n[sheets.bad]\nimage = 'bad'\ncell = [8, 8]\nscaled_origin = [0, 0]\n[images.more]\nsource = 'more.pcx'\n[sheets.more]\nimage = 'more'\ncell = [16, 8]\n";
+        let tables = |c: &Compiled| (c.sprite_names.clone(), c.atlas.sprites.iter().map(|s| (s.width, s.height, s.anchor_x, s.anchor_y, s.downscaled)).collect::<Vec<_>>());
+        let check = |c: &Compiled| {
+            for n in ["bad/0", "bad/1"] { assert!(!c.sprite_available(c.sprite(n).unwrap()), "{n}"); }
+            for n in ["good/0", "more/0"] { assert!(c.sprite_available(c.sprite(n).unwrap()), "{n}"); }
+            assert_eq!(sprite_pixels(c, "bad/1"), vec![[0; 4]; 64]);
+            assert_eq!(sprite_pixels(c, "more/0")[17], [1, 1, 7, 255]);
+        };
+        let whole = Description::parse(&format!("{base}{addition}")).unwrap();
+        let drawn = whole.compile(&Unreadable, 64).unwrap();
+        check(&drawn);
+        assert_eq!(tables(&drawn), tables(&whole.compile_layout(&Unreadable, 64).unwrap()));
+        let grown = [true, false].map(|pixels| {
+            let (mut compiled, mut growing) = Description::parse(base).unwrap().compile_growing(&Unreadable, 64, pixels).unwrap();
+            let growth = growing.grow(&compiled, addition, &Unreadable).unwrap();
+            compiled.apply(&growth);
+            compiled
+        });
+        check(&grown[0]);
+        assert_eq!(tables(&grown[0]), tables(&grown[1]));
+    }
+
     #[test]
     fn indexed_images_share_their_pixels_and_pick_named_palettes() {
         let text = r#"
@@ -3412,7 +3511,10 @@ mod tests {
         }
         assert_eq!(pixels[256], [0, 255, 17, 0]);
         let remapped = source.replace("source = 'full'", "source = 'full'\nremap = [0, 256]");
-        assert!(Description::parse(&remapped).unwrap().compile(&MaskedIndexed, 512).err().unwrap().to_string().contains("no safe transparent index"));
+        // (No safe transparent index: the sheet's art is left out, clear,
+        // its tables as without pixels.)
+        let left_out = Description::parse(&remapped).unwrap().compile(&MaskedIndexed, 512).unwrap();
+        assert!(!left_out.sprite_available(left_out.sprite("keep/0").unwrap()));
     }
 
     #[test]
@@ -4055,9 +4157,10 @@ mod tests {
         let got: Vec<(u8, u8)> = (0..3).flat_map(|y| (0..4).map(move |x| (x, y))).map(|(x, y)| page.get(s.atlas_x + x, s.atlas_y + y)).map(|p| (p[0], p[1])).collect();
         let want: Vec<(u8, u8)> = [2, 4, 5].iter().flat_map(|&y| [9, 11, 13, 15].map(|x| (x, y))).collect();
         assert_eq!(got, want);
-        // Not of indexed art.
+        // Of indexed art, in colours.
         let indexed = text.replace("source = \"a\"", "source = \"a.flc\"").replace("origin = [8, 2]", "origin = [0, 0]");
-        assert!(Description::parse(&indexed).unwrap().compile(&Indexed, 256).is_err());
+        let c = Description::parse(&indexed).unwrap().compile(&Indexed, 256).unwrap();
+        assert_eq!(c.atlas.sprites[c.sprite("icon/0").unwrap().0 as usize].palette, 0);
     }
 
     #[test]
