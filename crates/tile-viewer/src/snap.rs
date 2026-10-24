@@ -142,6 +142,35 @@ pub const ATTRACTION: f64 = 0.25;
 /// the screen to a far element.
 pub const MOTION_GAIN: f64 = 0.7;
 
+/// The values picking and the flight's timing go by: the constants above
+/// ([`Tuning::default`]), which the viewer always uses. A replay of a
+/// recording (`crate::altrec`) tries others.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Tuning {
+    /// [`CONE`] (radians).
+    pub cone: f64,
+    /// [`DEAD_ZONE`] (pixels).
+    pub dead_zone: f64,
+    /// [`IDLE_RESET`] (seconds).
+    pub idle_reset: f64,
+    /// [`ANGLE_WEIGHT`].
+    pub angle_weight: f64,
+    /// [`DISTANCE_WEIGHT`].
+    pub distance_weight: f64,
+    /// [`ATTRACTION`].
+    pub attraction: f64,
+    /// [`MOTION_GAIN`] (window pixels per raw count).
+    pub motion_gain: f64,
+    /// [`FLIGHT`] (update intervals).
+    pub flight: f64,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self { cone: CONE, dead_zone: DEAD_ZONE, idle_reset: IDLE_RESET, angle_weight: ANGLE_WEIGHT, distance_weight: DISTANCE_WEIGHT, attraction: ATTRACTION, motion_gain: MOTION_GAIN, flight: FLIGHT }
+    }
+}
+
 /// Track pixels per raw mouse count while an Alt-mode slider is edited (as
 /// an unaccelerated system pointer).
 pub const SLIDER_GAIN: f64 = 1.0;
@@ -447,8 +476,14 @@ pub fn nearest(targets: &[Target], p: Point) -> Option<usize> {
 /// the motion leads, so all of it draws the pointer. Of those the motion
 /// leads into alike, the one whose pointer spot is nearest.
 pub fn pick(targets: &[Target], from: Point, current: Option<u64>, moved: Point) -> Option<usize> {
+    pick_tuned(&Tuning::default(), targets, from, current, moved)
+}
+
+/// [`pick`] with the weights, cone and dead zone of `tuning` (a replay
+/// trying other values; [`Tuning::default`] is [`pick`]).
+pub fn pick_tuned(tuning: &Tuning, targets: &[Target], from: Point, current: Option<u64>, moved: Point) -> Option<usize> {
     let reach = moved.0.hypot(moved.1);
-    if reach < DEAD_ZONE {
+    if reach < tuning.dead_zone {
         return None;
     }
     let dir = (moved.0 / reach, moved.1 / reach);
@@ -466,14 +501,14 @@ pub fn pick(targets: &[Target], from: Point, current: Option<u64>, moved: Point)
                 return None;
             }
             let angle = ((d.0 * dir.0 + d.1 * dir.1) / dist).clamp(-1.0, 1.0).acos();
-            if angle > CONE + 1e-9 {
+            if angle > tuning.cone + 1e-9 {
                 return None;
             }
             // (The capture view's middle draws the pointer from afar: it
             // counts as near as the edge of its disc of attraction.)
-            let near = if t.is_capture() { (dist - ATTRACTION * t.rect[2].min(t.rect[3])).max(0.0) } else { dist };
-            let off = (near - reach).abs() + DISTANCE_WEIGHT * near + 1.0;
-            Some((k, off * (1.0 + ANGLE_WEIGHT * (angle / CONE).powi(2)), (spot.0 - aim.0).hypot(spot.1 - aim.1)))
+            let near = if t.is_capture() { (dist - tuning.attraction * t.rect[2].min(t.rect[3])).max(0.0) } else { dist };
+            let off = (near - reach).abs() + tuning.distance_weight * near + 1.0;
+            Some((k, off * (1.0 + tuning.angle_weight * (angle / tuning.cone).powi(2)), (spot.0 - aim.0).hypot(spot.1 - aim.1)))
         })
         .min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
         .map(|(k, _, _)| k)
@@ -653,6 +688,9 @@ pub struct Snapper {
     parked: Option<Point>,
     /// When the element now snapped to was picked (for the log).
     picked: f64,
+    /// What it picks and times its flights by (the constants, but in a
+    /// replay).
+    tuning: Tuning,
 }
 
 fn button_index(b: Button) -> usize {
@@ -727,12 +765,69 @@ impl Snapper {
         self.parked.take()
     }
 
+    /// A snapper that picks and times its flights by `tuning` (a replay;
+    /// the viewer's is [`Snapper::default`], the constants).
+    pub fn with_tuning(tuning: Tuning) -> Self {
+        Self { tuning, ..Self::default() }
+    }
+
+    /// The id of the element snapped to, while the mode is on or not.
+    pub fn snapped_id(&self) -> Option<u64> {
+        self.snapped.map(|s| s.id)
+    }
+
+    /// The flight landed (or a click put the pointer on its element).
+    pub fn arrived(&self) -> bool {
+        self.arrived
+    }
+
+    /// Where the motion picks from, and how far the mouse moved since the
+    /// last update (pixels).
+    pub fn motion_state(&self) -> (Point, Point) {
+        (self.flight.to, self.moved)
+    }
+
+    /// The pointer stops on the element it heads for, there at once (an
+    /// Alt-mode slider edit starts: motion edits the slider meanwhile).
+    pub fn hold(&mut self) {
+        let at = self.flight.to;
+        self.flight = Flight::rest(at);
+        self.pos = at;
+        self.arrived = true;
+        self.ghost = Some(at);
+        self.moved = (0.0, 0.0);
+        if let Some(s) = self.snapped {
+            self.rested = Some(s.id);
+        }
+    }
+
+    /// The motion since the last update is forgotten.
+    pub fn forget_motion(&mut self) {
+        self.moved = (0.0, 0.0);
+    }
+
+    /// Time `now` passes without a step (while a slider is edited).
+    pub fn pause(&mut self, now: f64) {
+        self.last = now;
+    }
+
+    /// Keeps the target on its element as the targets change (as a step
+    /// does first).
+    pub fn follow(&mut self, targets: &[Target], now: f64) {
+        self.track(targets, now);
+    }
+
+    /// How long a flight lasts (seconds).
+    fn flight_time(&self) -> f64 {
+        self.tuning.flight / self.rates.updates_per_second
+    }
+
     /// Turns the mode on at time `now`, the pointer at `at`: it goes on
     /// from the element it last rested on if that is still there (from
     /// there), else it flies to the one nearest `at` at once (the capture
     /// view if there is no other).
     pub fn enter(&mut self, now: f64, at: Point, targets: &[Target], rates: Rates) {
-        *self = Self { pressed: self.pressed, rested: self.rested, ..Self::default() };
+        *self = Self { pressed: self.pressed, rested: self.rested, tuning: self.tuning, ..Self::default() };
         self.phase = Phase::Snapping;
         self.rates = rates;
         self.last = now;
@@ -823,7 +918,7 @@ impl Snapper {
     pub fn motion(&mut self, d: Point) -> bool {
         match self.phase {
             Phase::Snapping => {
-                self.moved = (self.moved.0 + d.0 * MOTION_GAIN, self.moved.1 + d.1 * MOTION_GAIN);
+                self.moved = (self.moved.0 + d.0 * self.tuning.motion_gain, self.moved.1 + d.1 * self.tuning.motion_gain);
                 self.moving = true;
                 true
             }
@@ -903,14 +998,14 @@ impl Snapper {
         } else {
             self.idle += dt;
             // (A move on, beyond a nudge, waits for the next update.)
-            if self.idle > IDLE_RESET && self.moved.0.hypot(self.moved.1) < 2.0 * DEAD_ZONE {
+            if self.idle > self.tuning.idle_reset && self.moved.0.hypot(self.moved.1) < 2.0 * self.tuning.dead_zone {
                 self.moved = (0.0, 0.0);
             }
         }
         self.track(targets, now);
         if self.snapping() {
             let reach = self.moved.0.hypot(self.moved.1);
-            if now >= self.next_update && reach >= DEAD_ZONE {
+            if now >= self.next_update && reach >= self.tuning.dead_zone {
                 self.update(targets, now);
                 self.moved = (0.0, 0.0);
                 self.next_update = now + 1.0 / rates.updates_per_second;
@@ -957,7 +1052,7 @@ impl Snapper {
         let c = t.center();
         self.picked = now;
         if c != self.flight.to || !self.flight.done(now) || self.pos != c {
-            let duration = self.rates.flight();
+            let duration = self.flight_time();
             self.flight.retarget(c, now, duration);
             self.arrived = false;
             log::debug!("snap: at {now:.3} s picked {} ({:?}) at {c:?} from {:?}, lands at {:.3} s", t.id, t.kind, self.pos, now + duration);
@@ -973,7 +1068,7 @@ impl Snapper {
         let m = self.moved;
         // (In a list too: motion goes to the entries shown, or out of the
         // list past its edges; only the wheel and a scroll scroll it.)
-        pick(targets, from, self.snapped.map(|s| s.id), m).map_or(Choice::Nothing, Choice::Snap)
+        pick_tuned(&self.tuning, targets, from, self.snapped.map(|s| s.id), m).map_or(Choice::Nothing, Choice::Snap)
     }
 
     /// An update: the motion picks the next element.
@@ -1014,7 +1109,7 @@ impl Snapper {
             Some(x) => {
                 let c = x.center();
                 if c != t {
-                    self.flight.retarget(c, now, self.rates.flight());
+                    self.flight.retarget(c, now, self.flight_time());
                     self.arrived = false;
                 }
             }
@@ -1099,6 +1194,11 @@ pub struct SnapInput {
     /// (`smooth_menus`): their rectangles and the entries they show, where
     /// they show them.
     list_entries: Vec<([i32; 4], Vec<Interactable>)>,
+    /// Records the mode's interactions (`crate::altrec`), while set.
+    recorder: Option<Box<crate::altrec::Recorder>>,
+    /// The time of the last input or tick (seconds; for records of calls
+    /// that do not tell it).
+    clock: f64,
 }
 
 /// `items` with the entries of each list in `lists` (its rectangle x, y,
@@ -1111,6 +1211,18 @@ fn shown_list_entries(items: &mut Vec<Interactable>, lists: &[([i32; 4], Vec<Int
     items.retain(|i| i.kind != InteractableKind::ListItem || !lists.iter().any(|(r, _)| within(*r, i)));
     for (_, entries) in lists {
         items.extend(entries.iter().copied());
+    }
+}
+
+/// Why the mode was turned off, from what the log says.
+fn reason_of(why: &str) -> crate::altrec::Reason {
+    use crate::altrec::Reason;
+    match why {
+        "Alt" => Reason::Alt,
+        "Esc" => Reason::Esc,
+        "Ctrl" => Reason::Ctrl,
+        "the menus closed" => Reason::MenusClosed,
+        _ => Reason::Unknown,
     }
 }
 
@@ -1140,6 +1252,59 @@ impl SnapInput {
     /// pointer while it lands too).
     pub fn active(&self) -> bool {
         self.snapper.holds_pointer()
+    }
+
+    /// Records the mode's interactions with `recorder` (`crate::altrec`),
+    /// or no longer (the recording closed).
+    pub fn set_recorder(&mut self, recorder: Option<crate::altrec::Recorder>) {
+        self.recorder = recorder.map(Box::new);
+    }
+
+    pub fn recorder(&self) -> Option<&crate::altrec::Recorder> {
+        self.recorder.as_deref()
+    }
+
+    /// Closes the recording, waiting for its writer a bounded time (the
+    /// viewer closing).
+    pub fn finish_recording(&mut self) {
+        if let Some(mut r) = self.recorder.take() {
+            r.finish();
+        }
+    }
+
+    /// The mode ends (`change`, for `reason`): recorded while it held the
+    /// pointer.
+    fn note_off(&mut self, change: crate::altrec::ModeChange, reason: crate::altrec::Reason) {
+        if let Some(r) = self.recorder.as_mut().filter(|_| self.snapper.holds_pointer()) {
+            r.mode_off(self.clock, change, reason);
+        }
+    }
+
+    /// A mouse button at window pixel `at`: in the mode, what it does and
+    /// the element snapped to; after it, a press on an element whose box
+    /// was one of the mode's (`Recorder::click_after`).
+    fn record_click(&mut self, now: f64, button: Button, down: bool, at: Point, targets: &[Target]) {
+        use crate::altrec::ClickUse;
+        let Some(r) = self.recorder.as_mut() else { return };
+        if !self.snapper.holds_pointer() {
+            if down {
+                // (What the driver hit-tests: no list, no view.)
+                let hit = targets.iter().find(|t| !matches!(t.kind, TargetKind::List { .. } | TargetKind::Capture { .. }) && inside(t.rect, at));
+                r.click_after(now, button, at, hit.map(|t| t.rect));
+            }
+            return;
+        }
+        let used = if !down && self.swallowed_buttons[button_index(button)] {
+            ClickUse::Swallowed
+        } else if down && self.slider.is_some() {
+            ClickUse::SliderEnd
+        } else if down && button == Button::Left && self.snapper.snapping() && targets.iter().any(|t| Some(t.id) == self.snapper.target_id() && matches!(t.kind, TargetKind::Slider { .. })) {
+            ClickUse::SliderBegin
+        } else {
+            ClickUse::Pointer
+        };
+        r.observe(now, targets);
+        r.click(now, button, down, used, self.snapper.snapped_id());
     }
 
     /// Lists the viewer shows away from the driver's drawing
@@ -1226,6 +1391,7 @@ impl SnapInput {
         for a in actions {
             match a {
                 Action::Capture(p) => {
+                    self.note_off(crate::altrec::ModeChange::Stop, crate::altrec::Reason::Attractor);
                     self.snapper.stop();
                     let p = (p.0.round() as i32, p.1.round() as i32);
                     layout.attractor_clicked(p);
@@ -1271,12 +1437,16 @@ impl SnapInput {
     }
 
     /// Turns the mode on.
-    fn enter(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
+    fn enter(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates, why: crate::altrec::Reason) -> Vec<Input> {
         let at = self.snapper.pointer().unwrap_or_else(|| {
             let (x, y) = layout.pointer_in_window();
             (x as f64, y as f64)
         });
-        self.snapper.enter(now, at, &self.shown_targets(scene, layout), rates);
+        let targets = self.shown_targets(scene, layout);
+        if let Some(r) = &mut self.recorder {
+            r.mode_on(now, why, at, &targets, rates.updates_per_second);
+        }
+        self.snapper.enter(now, at, &targets, rates);
         log::debug!("viewer: button snapping on (the mouse {})", if layout.captured() { "captured" } else { "free" });
         self.sync(layout)
     }
@@ -1292,7 +1462,7 @@ impl SnapInput {
         if let Some(edit) = self.slider.take() {
             out.push(Input::Slider { id: edit.id, action, value: edit.value.round() as i32 });
             // Editing motion never becomes a delayed navigation.
-            self.snapper.moved = (0.0, 0.0);
+            self.snapper.forget_motion();
         }
         out
     }
@@ -1312,13 +1482,8 @@ impl SnapInput {
 
     fn begin_slider(&mut self, target: Target) -> Vec<Input> {
         let TargetKind::Slider { track, value } = target.kind else { return vec![] };
-        let at = self.snapper.flight.to;
-        self.snapper.flight = Flight::rest(at);
-        self.snapper.pos = at;
-        self.snapper.arrived = true;
+        self.snapper.hold();
         self.snapper.rested = Some(target.id);
-        self.snapper.ghost = Some(at);
-        self.snapper.moved = (0.0, 0.0);
         self.slider = Some(SliderEdit { id: target.id, track, value: value.clamp(0, 1_000_000) as f64, dirty: false, resync: None });
         self.selected = Some(target.id);
         vec![Input::Slider { id: target.id, action: SliderAction::Begin, value }]
@@ -1329,6 +1494,7 @@ impl SnapInput {
         if !self.snapper.snapping() {
             return vec![];
         }
+        self.note_off(crate::altrec::ModeChange::Land, reason_of(why));
         let mut out = self.end_slider(SliderAction::Cancel);
         let actions = self.snapper.leave();
         log::debug!("viewer: button snapping off ({why})");
@@ -1442,6 +1608,7 @@ impl SnapInput {
 
     /// A window input at time `now`: what goes to the driver.
     pub fn route(&mut self, input: Input, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
+        self.clock = now;
         if let Input::Key { vk: VK_SHIFT, down, .. } = input {
             self.shift = down;
         }
@@ -1471,7 +1638,8 @@ impl SnapInput {
         if self.snapper.holds_pointer() && matches!(input, Input::MouseButton { down: true, .. } | Input::Wheel { .. }) {
             self.snapper.track(&targets, now);
         }
-        if let Input::MouseButton { button, down, .. } = input {
+        if let Input::MouseButton { button, down, x, y } = input {
+            self.record_click(now, button, down, (x as f64, y as f64), &targets);
             let b = button_index(button);
             if !down && std::mem::take(&mut self.swallowed_buttons[b]) {
                 return before;
@@ -1519,7 +1687,7 @@ impl SnapInput {
                     return before;
                 }
                 self.alt_entered = true;
-                self.enter(layout, scene, now, rates)
+                self.enter(layout, scene, now, rates, crate::altrec::Reason::Alt)
             }
             Input::Key { vk: VK_MENU, down: false, .. } => {
                 self.alt = false;
@@ -1557,6 +1725,7 @@ impl SnapInput {
                 let mut out = Vec::new();
                 if std::mem::take(&mut self.alt_entered) && self.snapper.snapping() {
                     before.extend(self.end_slider(SliderAction::Cancel));
+                    self.note_off(crate::altrec::ModeChange::Stop, crate::altrec::Reason::Shortcut);
                     self.snapper.stop();
                     log::debug!("viewer: Alt with a key: a shortcut, no button snapping");
                     out.extend(self.sync(layout));
@@ -1610,6 +1779,12 @@ impl SnapInput {
     /// Raw mouse motion: `None` if it is the layout's (as without
     /// snapping), else what goes to the driver.
     pub fn motion(&mut self, d: (f64, f64)) -> Option<Vec<Input>> {
+        self.motion_at(d, self.clock)
+    }
+
+    /// [`SnapInput::motion`] at time `now` (for the recording).
+    pub fn motion_at(&mut self, d: (f64, f64), now: f64) -> Option<Vec<Input>> {
+        self.clock = now;
         if let Some(edit) = &mut self.slider {
             let vertical = edit.track[3] > edit.track[2];
             let (motion, span) = if vertical { (d.1, edit.track[3]) } else { (d.0, edit.track[2]) };
@@ -1620,11 +1795,19 @@ impl SnapInput {
             }
             return Some(vec![]);
         }
-        self.snapper.motion(d).then(Vec::new)
+        let (at, id) = (self.snapper.pointer(), self.snapper.snapped_id());
+        let took = self.snapper.motion(d);
+        if took {
+            if let Some(r) = &mut self.recorder {
+                r.motion(now, d, || (at.unwrap_or_default(), id));
+            }
+        }
+        took.then(Vec::new)
     }
 
     /// Time `now`: the pointer moves on; what goes to the driver.
     pub fn tick(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
+        self.clock = now;
         let mut out = self.menu_mode(layout, scene, now, rates);
         out.extend(self.tick_mode(layout, scene, now, rates));
         // (Drawn while the mode is on and the mouse free.)
@@ -1683,7 +1866,7 @@ impl SnapInput {
         if self.alt_in_menus && !self.by_menu && !self.menu_declined && !self.snapper.snapping() && !self.alt && self.shown_targets(scene, layout).iter().any(|t| !t.is_capture()) {
             self.by_menu = true;
             log::debug!("snap: a menu is open: button snapping on by itself");
-            return self.enter(layout, scene, now, rates);
+            return self.enter(layout, scene, now, rates, crate::altrec::Reason::MenuOpened);
         }
         vec![]
     }
@@ -1701,11 +1884,19 @@ impl SnapInput {
         self.validate_selection(&targets);
         self.shown = self.keyboard_slider(&targets);
         if self.slider.is_some() {
-            self.snapper.last = now;
+            self.snapper.pause(now);
             out.extend(self.slider_preview());
             return out;
         }
+        let arrived = self.snapper.arrived();
+        if let Some(r) = self.recorder.as_mut().filter(|_| self.snapper.holds_pointer()) {
+            r.rate(now, rates.updates_per_second);
+            r.observe(now, &targets);
+        }
         let actions = self.snapper.tick(now, &targets, rates);
+        if let Some(r) = self.recorder.as_mut().filter(|_| !arrived && self.snapper.arrived() && self.snapper.snapped_id().is_some()) {
+            r.pointer(now, crate::altrec::PointerKind::Rest, self.snapper.flight.to, self.snapper.snapped_id());
+        }
         out.extend(self.perform(actions, layout));
         self.shown = self.keyboard_slider(&targets);
         out
@@ -1719,6 +1910,7 @@ impl SnapInput {
     /// held is let go on the element it went to.
     fn capture_for_target(&mut self, layout: &mut Layout) -> Vec<Input> {
         let mut out = self.end_slider(SliderAction::Cancel);
+        self.note_off(crate::altrec::ModeChange::Stop, crate::altrec::Reason::WorldTarget);
         self.snapper.stop();
         let target = layout.capture_for_target();
         log::debug!("snap: a command waits for a place of the world: off, {}", if target.is_some() { "the mouse captured again" } else { "no view to capture the mouse in" });
@@ -1730,6 +1922,7 @@ impl SnapInput {
     /// The window lost the keyboard: no key is held any more, the mode ends.
     pub fn focus_lost(&mut self, layout: &mut Layout) -> Vec<Input> {
         let mut out = self.end_slider(SliderAction::Cancel);
+        self.note_off(crate::altrec::ModeChange::Stop, crate::altrec::Reason::FocusLost);
         self.snapper.stop();
         if self.alt_sent {
             out.extend(layout.route(Input::Key { vk: VK_MENU, down: false, text: None }));
