@@ -1,8 +1,9 @@
 //! Right-button unit orders in the map-drag mouse mode (the Civ6 movement
-//! style). A right drag preselects a destination: the driver arms its
+//! style). A right drag, or the right button held still for
+//! [`LONG_PRESS_SECONDS`], preselects a destination: the driver arms its
 //! go-to there and draws the route, but only a later left click on that
-//! tile may commit the order. A short right click is the game's own right
-//! click (its menu, the tile box).
+//! tile may commit the order. Only a quick right click (released sooner,
+//! not dragged) is the game's own right click (its menu, the tile box).
 //!
 //! A preselected destination stays until the driver's command stops
 //! waiting for it, or until one of these:
@@ -25,6 +26,11 @@ use viewer_settings::MapMovement;
 
 use super::{Layout, VK_ESCAPE, pan::past_threshold};
 
+/// How long the right button held on the world without moving takes to
+/// preselect a destination as a drag does. A shorter press, not dragged,
+/// is the game's right click.
+pub(super) const LONG_PRESS_SECONDS: f64 = 0.35;
+
 #[derive(Clone, Copy, Debug)]
 struct Point {
     /// Stable screen-pixel coordinates for the drag threshold. Captured
@@ -38,8 +44,12 @@ struct Point {
 struct Press {
     point: Point,
     window: (i32, i32),
-    /// A drag (never the game's right click).
+    /// A drag or a long press (never the game's right click).
     dragging: bool,
+    /// When it was made (`Layout::clock`, and the wall clock: frames may
+    /// pause while nothing moves).
+    clock: f64,
+    made: std::time::Instant,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -55,6 +65,13 @@ pub(super) struct UnitOrders {
     eat_escape_up: bool,
     replaying: bool,
     queued: Vec<Input>,
+}
+
+impl Press {
+    /// Held for a long press by `clock` (`Layout::clock`) or by the wall clock.
+    fn held_long(&self, clock: f64) -> bool {
+        clock - self.clock >= LONG_PRESS_SECONDS || self.made.elapsed().as_secs_f64() >= LONG_PRESS_SECONDS
+    }
 }
 
 fn order(action: UnitOrderAction, (x, y): (i32, i32)) -> Input {
@@ -177,10 +194,22 @@ impl Layout {
         self.unit_orders.right.is_some_and(|press| press.dragging)
     }
 
-    /// Each frame: a preselection ends once the
+    /// Each frame, after its clock moved on: a right press held long enough
+    /// preselects where the pointer is, and a preselection ends once the
     /// driver's command no longer waits for its tile (`targeting`:
     /// `scene::Interface::targeting`), e.g. after another unit command.
     pub(super) fn unit_orders_frame(&mut self, targeting: bool) {
+        if let Some(press) = self.unit_orders.right
+            && !press.dragging
+            && press.held_long(self.clock)
+        {
+            let at = self.order_point(self.pointer).map_or(press.point.world, |point| point.world);
+            let state = &mut self.unit_orders;
+            state.right = Some(Press { dragging: true, ..press });
+            state.destination = Some(at);
+            state.queued.push(order(UnitOrderAction::Preview, at));
+            log::info!("viewer: a long right press preselects a destination");
+        }
         let state = &mut self.unit_orders;
         if state.destination.is_none() || state.right.is_some() {
             return;
@@ -238,7 +267,7 @@ impl Layout {
             if std::mem::take(eat) { return Some(vec![]); }
             if button == Button::Right {
                 let press = self.unit_orders.right.take()?;
-                let long = press.dragging;
+                let long = press.dragging || press.held_long(self.clock);
                 match self.order_point(p) {
                     // Over the interface: the destination as it was.
                     None => return Some(vec![]),
@@ -253,7 +282,7 @@ impl Layout {
                     }
                     Some(_) => {}
                 }
-                // A short right click is the game's ordinary context menu.
+                // A quick right click is the game's ordinary context menu.
                 // Replay through its existing screen/world coordinate path.
                 self.unit_orders.replaying = true;
                 let mut out = self.button(button, true, press.window);
@@ -292,7 +321,7 @@ impl Layout {
                 // A new gesture stops a coasting map just like a normal
                 // press, while leaving the map's left/middle drags intact.
                 let _ = self.pan_button(button, true, p);
-                self.unit_orders.right = Some(Press { point, window: p, dragging: false });
+                self.unit_orders.right = Some(Press { point, window: p, dragging: false, clock: self.clock, made: std::time::Instant::now() });
                 return Some(vec![]);
             }
         }
@@ -309,7 +338,7 @@ impl Layout {
         };
         match button {
             Button::Left => {
-                self.unit_orders.confirm = Some(Press { point, window: p, dragging: false });
+                self.unit_orders.confirm = Some(Press { point, window: p, dragging: false, clock: self.clock, made: std::time::Instant::now() });
                 self.unit_orders.eat_left_up = false;
                 // The map may still be dragged from here (`pan`), keeping
                 // the destination; a click confirms.
@@ -469,6 +498,13 @@ mod tests {
     fn confirms(out: &[Input]) -> bool {
         out.iter().any(|i| matches!(i, Input::UnitOrder { action: UnitOrderAction::Confirm, .. }))
     }
+    /// Frames for `ms` milliseconds (each frame steps at most 0.1 s).
+    fn hold(l: &mut Layout, ms: u64) {
+        for _ in 0..ms / 50 {
+            l.advance(std::time::Duration::from_millis(50));
+            frame(l, &scene(), vec![]);
+        }
+    }
 
     #[test]
     fn dragging_the_map_from_the_world_keeps_the_destination() {
@@ -573,6 +609,67 @@ mod tests {
         // (Into the interface before the drag threshold.)
         assert_eq!(mv(&mut l, (100, 302)), []);
         assert_eq!(button(&mut l, Button::Right, false, (100, 302)), []);
+    }
+
+    #[test]
+    fn a_long_right_press_preselects_where_it_is_held() {
+        let mut l = layout();
+        mv(&mut l, (170, 190));
+        assert_eq!(button(&mut l, Button::Right, true, (170, 190)), []);
+        let held = l.world_under((170, 190)).unwrap();
+        // Shorter than the long press: nothing yet.
+        hold(&mut l, 300);
+        assert!(l.take_unit_order_events().is_empty());
+        hold(&mut l, 100);
+        assert_eq!(l.take_unit_order_events(), [order(UnitOrderAction::Preview, held)]);
+        // Released where it was held: the menu stays shut, the preselection
+        // waits for its confirmation.
+        assert_eq!(button(&mut l, Button::Right, false, (170, 190)), []);
+        assert_eq!(l.unit_orders.destination, Some(held));
+        button(&mut l, Button::Left, true, (170, 190));
+        assert_eq!(button(&mut l, Button::Left, false, (170, 190)), [order(UnitOrderAction::Confirm, held)]);
+    }
+
+    #[test]
+    fn a_long_press_released_before_a_frame_still_preselects() {
+        let mut l = layout();
+        mv(&mut l, (170, 190));
+        button(&mut l, Button::Right, true, (170, 190));
+        l.clock += LONG_PRESS_SECONDS;
+        let held = l.world_under((170, 190)).unwrap();
+        assert_eq!(button(&mut l, Button::Right, false, (170, 190)), [order(UnitOrderAction::Preview, held)]);
+    }
+
+    #[test]
+    fn a_quick_right_click_still_opens_the_games_menu() {
+        let mut l = layout();
+        mv(&mut l, (170, 190));
+        button(&mut l, Button::Right, true, (170, 190));
+        hold(&mut l, 150);
+        assert!(l.take_unit_order_events().is_empty());
+        let out = button(&mut l, Button::Right, false, (171, 190));
+        assert!(matches!(out[..], [Input::MouseButton { button: Button::Right, down: true, .. }, Input::MouseButton { button: Button::Right, down: false, .. }]), "{out:?}");
+        assert!(l.unit_orders.destination.is_none());
+    }
+
+    #[test]
+    fn a_release_after_a_drag_or_long_press_never_reaches_the_game() {
+        // (Whatever is on the tile, a city or a unit: the viewer sends the
+        // game no right button, so it opens no menu there.)
+        for long in [false, true] {
+            let mut l = layout();
+            mv(&mut l, (100, 100));
+            button(&mut l, Button::Right, true, (100, 100));
+            let mut out = if long {
+                hold(&mut l, 400);
+                l.take_unit_order_events()
+            } else {
+                [mv(&mut l, (170, 190)), mv(&mut l, (100, 101))].concat()
+            };
+            out.extend(button(&mut l, Button::Right, false, (100, 101)));
+            assert!(!to_driver(&out), "long {long}: {out:?}");
+            assert!(l.unit_orders.destination.is_some(), "long {long}");
+        }
     }
 
     #[test]
