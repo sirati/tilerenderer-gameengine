@@ -4344,6 +4344,9 @@ impl App {
                 gpu.window.set_visible(false);
             }
             self.function_keys.release();
+            // (The host may end the process on the Quit: the recording is
+            // written out first, waited for 100 ms at most.)
+            self.close_recording();
             self.display.send_input(Input::Quit);
         }
         true
