@@ -485,6 +485,7 @@ version = "0.1.0"
 dependencies = [
  "jgl",
  "log",
+ "menu",
  "scene",
  "tile-game",
  "tile-viewer",

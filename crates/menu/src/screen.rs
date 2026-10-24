@@ -631,7 +631,7 @@ mod tests {
     #[test]
     fn art_lists_round_trip() {
         let mut art = ScreenArt::default();
-        art.regions.insert(Region { source: "Art/Advisors/a b.pcx".into(), rect: [1, -2, 30, 40], keyed: true, mask: None, palette: None });
+        art.regions.insert(Region { source: "Art/Reports/a b.pcx".into(), rect: [1, -2, 30, 40], keyed: true, mask: None, palette: None });
         art.regions.insert(Region {
             source: "Art/x.pcx".into(),
             rect: [0, 0, 5, 5],
@@ -767,9 +767,9 @@ mod tests {
 
     #[test]
     fn resized_palette_alpha_rules_round_trip_and_keep_native_samples_and_typed_mode() {
-        let region = Region { source: "unit picture.pcx".into(), rect: [8, 4, 9, 5], keyed: true, mask: None, palette: None };
+        let region = Region { source: "piece picture.pcx".into(), rect: [8, 4, 9, 5], keyed: true, mask: None, palette: None };
         let resize = Some(IndexedResize { size: (5, 3), sample_step: [117964, 109226] });
-        let smoke = Indices { frame: Some(0), transparent: (0..=255).collect(), resize, palette_alpha: Some(PaletteAlpha { source: "Art/Explosion Palette.pcx".into(), first: 224, count: 16, skip: [0, 0, 255] }), ..Default::default() };
+        let smoke = Indices { frame: Some(0), transparent: (0..=255).collect(), resize, palette_alpha: Some(PaletteAlpha { source: "Art/Smoke Palette.pcx".into(), first: 224, count: 16, skip: [0, 0, 255] }), ..Default::default() };
         let shades = Indices { shade: vec![(249, 10)], resize, ..Default::default() };
         let elements = [Element::Indexed { region: region.clone(), indices: smoke.clone(), at: (2, 3), clip: [4, 3, 7, 6] }, Element::Indexed { region, indices: shades, at: (9, 3), clip: [9, 3, 14, 6] }];
         let mut art = ScreenArt::default();
@@ -781,7 +781,7 @@ mod tests {
         let description = art.description("", "", |_, _| String::new());
         assert!(description.contains("resize = [5, 3]"));
         assert!(description.contains("resize_step = [117964, 109226]"));
-        assert!(description.contains("palette_alpha = { source = \"Art/Explosion Palette.pcx\", first = 224, count = 16, skip = [0, 0, 255] }"));
+        assert!(description.contains("palette_alpha = { source = \"Art/Smoke Palette.pcx\", first = 224, count = 16, skip = [0, 0, 255] }"));
         let compiled = render_desc::Description::parse(&format!("[grid]\nlayout = 'orthogonal'\nstep = [1, 1]\n{description}")).unwrap().compile(&Plain, 256).unwrap();
         let sprites = sprites(&elements, &compiled, 0);
         assert_eq!(sprites.len(), 2);
