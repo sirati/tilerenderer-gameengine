@@ -288,6 +288,29 @@ struct Flight {
     to: (i32, i32),
 }
 
+impl Pan {
+    /// The live map movement after a frame prepared from `base` moved it
+    /// on to `frame` (`prepared_motion`): field by field, as input left it
+    /// where input changed it, else the frame's. A gesture's own fields
+    /// too: a flight input turned elsewhere flies on from where the frame
+    /// got it, a drag the pointer moves keeps the frame's velocity samples.
+    pub(super) fn carry(&mut self, base: &Pan, frame: Pan) {
+        use super::prepared_motion::{carry, carry_fields, carry_keyed, carry_some};
+        let Pan { mode, inside, press, grab, coast, manual_driver, edge_view, exact, replaying, flight, minimap_right } = frame;
+        carry(&mut self.mode, &base.mode, mode);
+        carry(&mut self.inside, &base.inside, inside);
+        carry(&mut self.press, &base.press, press);
+        carry_some(&mut self.grab, &base.grab, grab, |l, b, f| carry_fields!(Grab { hit, button, from, start, at, scale, tracker }, l, b, f));
+        carry_some(&mut self.coast, &base.coast, coast, |l, b, f| carry_fields!(Coast { hit, pos, momentum, scale }, l, b, f));
+        carry(&mut self.manual_driver, &base.manual_driver, manual_driver);
+        carry(&mut self.edge_view, &base.edge_view, edge_view);
+        carry_keyed(&mut self.exact, &base.exact, exact, |e| e.hit);
+        carry(&mut self.replaying, &base.replaying, replaying);
+        carry_some(&mut self.flight, &base.flight, flight, |l, b, f| carry_fields!(Flight { hit, glide, to }, l, b, f));
+        carry(&mut self.minimap_right, &base.minimap_right, minimap_right);
+    }
+}
+
 fn view_name(hit: Hit) -> String {
     match hit {
         Hit::Main => "A".into(),

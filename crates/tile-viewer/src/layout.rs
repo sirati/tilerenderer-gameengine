@@ -122,6 +122,8 @@ use scene::{Button, Input, Scene};
 
 #[path = "pan.rs"]
 mod pan;
+#[path = "prepared_motion.rs"]
+mod prepared_motion;
 #[path = "glass.rs"]
 mod glass;
 #[path = "capture.rs"]
@@ -972,6 +974,9 @@ pub struct Layout {
     beside_view_downscale: u32,
     /// Keys whose press exploring kept from the driver (their release too).
     kept_keys: Vec<u32>,
+    /// The motion as this layout's last frame began (`prepared_motion`):
+    /// what that frame moved on, once presented, is carried over from it.
+    prepared_from: Option<Box<prepared_motion::Motion>>,
 }
 
 impl Default for Layout {
@@ -1100,6 +1105,7 @@ impl Default for Layout {
             beside_press: None,
             beside_view_downscale: 1,
             kept_keys: Vec::new(),
+            prepared_from: None,
         }
     }
 }
@@ -2459,6 +2465,7 @@ impl Layout {
         interface: Vec<[i32; 4]>,
         bounds: Option<WorldBounds>,
     ) -> Frame {
+        self.prepared_from = Some(Box::new(self.prepared_motion()));
         self.window = window;
         self.bounds = bounds;
         self.focus_after_scale = None;
@@ -9441,10 +9448,29 @@ mod tests {
 }
 
 impl Layout {
-    /// Adopt only the routing geometry of the frame just presented. Live
-    /// pointer, keys, gestures and desired camera changes may have advanced
-    /// while its immutable GPU packet was in flight.
+    /// Adopt what the frame just presented decided, into a live layout
+    /// input changed while its immutable GPU packet was in flight (with no
+    /// input meanwhile the window takes the frame's layout whole instead).
+    ///
+    /// Two kinds of state, two rules:
+    /// - The routing geometry the frame drew (where views, the interface,
+    ///   screens and popups are; the list below): the frame's, always, so
+    ///   that input goes where it is shown.
+    /// - Motion the frame moved on in time (views gliding, flying,
+    ///   sliding or edge scrolling; the zoom boxes' glides; the frame
+    ///   clock): all of it in [`prepared_motion::Motion`], carried over
+    ///   field by field from what the frame began with: a field input
+    ///   changed since stays as input left it (a drag starting, a flight
+    ///   turned elsewhere, a view moved by hand); every other one takes
+    ///   the frame's value. Left behind, it would roll back: the next
+    ///   frame would move it on again from before this one, and frames of
+    ///   uneven length would show it going back and forth.
+    ///
+    /// Everything else (the pointer, keys, gestures, desired camera
+    /// changes) stays as input left it. State a frame moves on in time
+    /// belongs in `Motion`, not in the list.
     pub(crate) fn adopt_presented_mapping(&mut self, mut frame: Self) {
+        let motion = frame.prepared_from.take().map(|base| (base, frame.prepared_motion()));
         // A screen the frame opened or closed: what that does to the live
         // pointer and capture, once (the live layout is as it was before
         // that frame was prepared; the next frames see the screen as it is).
@@ -9493,11 +9519,11 @@ impl Layout {
         self.hud_scale = frame.hud_scale;
         self.window_pixel_scale = frame.window_pixel_scale;
         self.art_zooms = frame.art_zooms;
-        // Where a floating zoom box is on its way: the next frame glides on
-        // from where this one showed it (and clicks go where it is shown),
-        // not again from where it was before this frame.
-        self.zoom_box_motion = frame.zoom_box_motion;
-        self.zoom_mouse_motion = frame.zoom_mouse_motion;
+        // What it moved on, from where it showed it (and clicks go where
+        // it is shown).
+        if let Some((base, moved)) = motion {
+            self.carry_motion(&base, moved);
+        }
     }
 }
 
