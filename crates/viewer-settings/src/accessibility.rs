@@ -17,6 +17,9 @@ pub struct Accessibility {
     /// Index into HUD_SCALES, rather than an arbitrary fractional size.
     pub hud_size: usize,
     pub stack_count: bool,
+    /// The stack count on its dark translucent plate, as city labels;
+    /// off, bare white with a dark outline.
+    pub stack_backdrop: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +35,8 @@ impl Default for Accessibility {
     fn default() -> Self {
         Self { active_unit_arrow: false, arrow_bobbing: true, arrow_size: 0, unit_rings: false,
             war: RingColor::default(), allied: RingColor { color: [0, 64, 255], invert: false },
-            peace: RingColor { color: [64, 240, 96], invert: false }, ring_width: 2, hud_size: 0, stack_count: false }
+            peace: RingColor { color: [64, 240, 96], invert: false }, ring_width: 2, hud_size: 0, stack_count: false,
+            stack_backdrop: true }
     }
 }
 
@@ -45,10 +49,11 @@ pub const PALETTE: [[u8; 3]; 16] = [
     [200, 48, 160], [248, 144, 176], [144, 80, 40], [192, 168, 104],
     [255, 255, 255], [176, 176, 176], [80, 80, 80], [0, 0, 0],
 ];
-pub const KEYS: [&str; 13] = [
+pub const KEYS: [&str; 14] = [
     "accessibility.active_unit_arrow", "accessibility.arrow_bobbing", "accessibility.arrow_size", "accessibility.unit_rings",
     "accessibility.war.color", "accessibility.war.invert", "accessibility.allied.color", "accessibility.allied.invert",
     "accessibility.peace.color", "accessibility.peace.invert", "accessibility.ring_width", "accessibility.hud_size", "accessibility.stack_count",
+    "accessibility.stack_backdrop",
 ];
 pub fn range(key: &str) -> Option<Range> {
     match key {
@@ -66,6 +71,7 @@ impl Accessibility {
         Some(match key.strip_prefix("accessibility.")? {
             "active_unit_arrow" => On(self.active_unit_arrow), "arrow_bobbing" => On(self.arrow_bobbing),
             "unit_rings" => On(self.unit_rings), "stack_count" => On(self.stack_count),
+            "stack_backdrop" => On(self.stack_backdrop),
             "ring_width" => Number(self.ring_width.clamp(1, 6) as f32), "hud_size" => Number(self.hud_size.min(3) as f32),
             "arrow_size" => Number(self.arrow_size.min(4) as f32),
             relation => {
@@ -86,6 +92,7 @@ impl Accessibility {
             (Some("arrow_bobbing"), On(v)) => self.arrow_bobbing = *v,
             (Some("unit_rings"), On(v)) => self.unit_rings = *v,
             (Some("stack_count"), On(v)) => self.stack_count = *v,
+            (Some("stack_backdrop"), On(v)) => self.stack_backdrop = *v,
             (Some("ring_width"), Number(v)) => self.ring_width = range(key).unwrap().snap(*v) as u32,
             (Some("hud_size"), Number(v)) => self.hud_size = range(key).unwrap().snap(*v) as usize,
             (Some("arrow_size"), Number(v)) => self.arrow_size = range(key).unwrap().snap(*v) as usize,
@@ -117,6 +124,9 @@ mod tests {
         assert_eq!(s.accessibility, Accessibility::default());
         assert!(!s.accessibility.active_unit_arrow && s.accessibility.arrow_bobbing);
         assert!(!s.accessibility.unit_rings && !s.accessibility.stack_count);
+        assert!(s.accessibility.stack_backdrop, "the count on its plate, as before the option");
+        let bare: Settings = toml::from_str("[accessibility]\nstack_backdrop = false\n").unwrap();
+        assert!(!bare.accessibility.stack_backdrop && toml::from_str::<Settings>(&toml::to_string(&bare).unwrap()).unwrap() == bare);
         assert_eq!((s.accessibility.hud_scale(), s.accessibility.ring_width), (1.0, 2));
         for key in KEYS {
             let value = s.control(key).unwrap();
