@@ -1237,6 +1237,37 @@ pub fn render_planned_with_notice(
     config: &ViewerConfig,
     render_errors: Option<u64>,
 ) -> RgbaImage {
+    render_planned_inner(gpu, compiled, scene, window, resolution, settings, config, render_errors, None)
+}
+
+/// [`render_planned`] with the pointer at `pointer` (canvas pixels): for
+/// what follows it, the zoom at or beside the mouse.
+#[allow(clippy::too_many_arguments)]
+pub fn render_planned_at(
+    gpu: &tile_render::Headless,
+    compiled: &Compiled,
+    scene: &Scene,
+    window: (u32, u32),
+    resolution: &viewer_settings::Resolution,
+    settings: &viewer_settings::Layout,
+    config: &ViewerConfig,
+    pointer: (i32, i32),
+) -> RgbaImage {
+    render_planned_inner(gpu, compiled, scene, window, resolution, settings, config, None, Some(pointer))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_planned_inner(
+    gpu: &tile_render::Headless,
+    compiled: &Compiled,
+    scene: &Scene,
+    window: (u32, u32),
+    resolution: &viewer_settings::Resolution,
+    settings: &viewer_settings::Layout,
+    config: &ViewerConfig,
+    render_errors: Option<u64>,
+    pointer: Option<(i32, i32)>,
+) -> RgbaImage {
     let rect_of = |s: &scene::FreeSprite| sprite_rect(compiled, s);
     let plan = scaling::plan(window, scene.screen_size, resolution).for_scene(scene, rect_of);
     let mut layout = layout::Layout::default();
@@ -1248,6 +1279,10 @@ pub fn render_planned_with_notice(
     layout.window_pixel_scale = plan.factor();
     layout.screen_content = named_screen_content(compiled, scene);
     let mut frame = layout.frame(scene, plan.canvas(), config.overhang, interface_rects(compiled, scene), Some(world_bounds(compiled, scene)));
+    if let Some(p) = pointer {
+        layout.route(Input::MouseMove { x: p.0, y: p.1 });
+        frame = layout.frame(scene, plan.canvas(), config.overhang, interface_rects(compiled, scene), Some(world_bounds(compiled, scene)));
+    }
     let arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
     let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
@@ -1269,7 +1304,7 @@ pub fn render_planned_with_notice(
     renderer.set_markers(&gpu.device, &gpu.queue, &dividers);
     // (Shown in the window as the viewer shows it: a pixel scale's boxes,
     // glass shaded at window resolution.)
-    gpu.render_presented(&mut renderer, &cameras, &[], plan.present, scene.tick, config.clear)
+    gpu.render_presented(&mut renderer, &cameras, &frame.copies, plan.present, scene.tick, config.clear)
 }
 
 /// A device on `adapter` with `surface` configured for a window of `size`

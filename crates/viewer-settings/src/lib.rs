@@ -381,9 +381,10 @@ pub struct Layout {
     pub split: Split,
     /// Divider width in physical window pixels, clamped to 1..=16.
     pub separator_width: u32,
-    /// Round floating and mouse zoom lenses. The top strip stays square.
+    /// Round every zoom box (floating, at the mouse, beside it; world or
+    /// menus). The top strip stays square.
     pub zoom_rounded: bool,
-    /// Shade the zoom lens rim as polished glass.
+    /// Shade every zoom box's rim as polished glass (the strip has no rim).
     pub zoom_glass: bool,
     /// Draw every divider (the split's, the zoom strip's) as a bar of the
     /// zoom's glass, with round ends where it stops. It is then at least

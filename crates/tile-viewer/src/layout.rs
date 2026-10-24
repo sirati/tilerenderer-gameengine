@@ -2203,7 +2203,7 @@ impl Layout {
         let (n, d) = ZOOMS[m.zoom];
         let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
         let top = match m.place {
-            ZoomPlace::Strip(_) => (rect[1] + rect[3] + self.separator_gap()).min(wh),
+            ZoomPlace::Strip(_) => (rect[1] + rect[3] + self.divider_thickness()).min(wh),
             _ => 0,
         };
         let (sw, sh) = ((rect[2].max(0) as u32 * d).div_ceil(n) as i32, (rect[3].max(0) as u32 * d).div_ceil(n) as i32);
@@ -2399,14 +2399,33 @@ impl Layout {
         under.and_then(view).or_else(|| view(Hit::Main)).unwrap_or_else(|| self.main_view.zoom_by(self.world_scale))
     }
 
-    /// Floating, pointer and menu boxes have a lens; strips keep a plain line.
+    /// Every zoom box has a lens (floating, at the mouse, beside it; showing
+    /// the world or the menus), with the rounded corners and glass rim the
+    /// settings ask for; a strip has none (no corners, a line or a glass
+    /// divider below it, `Layout::dividers`).
     fn zoom_lens(&self, m: &Magnifier, rect: [i32; 4]) -> Option<tile_render::Lens> {
-        if matches!(m.place, ZoomPlace::Strip(..)) || (m.place == ZoomPlace::Beside && m.mode == MagnifierMode::World) { return None; }
+        if matches!(m.place, ZoomPlace::Strip(..)) { return None; }
         Some(tile_render::Lens {
             radius: if self.zoom_rounded { (rect[2].min(rect[3]) as f32 * 0.32).min(56.0 / self.window_pixel_scale.max(1.0) as f32) } else { 0.0 },
             rim: (if self.zoom_glass { 24.0 } else { self.separator_width as f32 }) / self.window_pixel_scale.max(1.0) as f32,
             glass: self.zoom_glass,
         })
+    }
+
+    /// The plain line below a zoom strip, whatever it shows (the world or
+    /// the menus): the strip's divider as `Layout::dividers` has it, cut
+    /// where the interface reaches through. None with glass dividers: the
+    /// glass bar is drawn with the split's (`Dividers::glass_order`).
+    fn strip_line(&self, frame: &mut Frame) {
+        if self.glass_dividers { return; }
+        let dividers = self.dividers();
+        let Some(band) = dividers.strip else { return };
+        let [x, y, w, h] = band.rect();
+        frame.cameras.push(Camera { origin: (x, y), cells: false, ..Camera::new((w.max(1) as u32, h.max(1) as u32)) });
+        let at = frame.cameras.len() as u32 - 1;
+        for s in dividers.segments.iter().filter(|s| s.band.kind == DividerKind::Strip) {
+            frame.separators.push((at, s.rect()));
+        }
     }
 
     /// Render full-size art while keeping the logical camera for input in
@@ -2904,7 +2923,10 @@ impl Layout {
         };
         let pane_shown = fit.is_none_or(|f| f.hit != Hit::Pane);
         let pane = pane_rect.filter(|_| self.split.is_some() && pane_shown && take(1));
-        let magnifier = self.magnifier.filter(|m| take(if m.mode == MagnifierMode::Screen { 1 } else { 2 }));
+        // (The magnifier: its world view (a screen copy is no view), and a
+        // strip's plain line below it; a box's lens is its frame.)
+        let magnifier_views = |m: &Magnifier| usize::from(m.mode == MagnifierMode::World) + usize::from(matches!(m.place, ZoomPlace::Strip(_)) && !self.glass_dividers);
+        let magnifier = self.magnifier.filter(|m| take(magnifier_views(m)));
         let insets = (0..self.insets.len()).take_while(|_| take(2)).count();
         let left_out = usize::from(pane.is_none() && pane_rect.is_some() && self.split.is_some() && pane_shown)
             + usize::from(magnifier.is_none() && self.magnifier.is_some())
@@ -2990,16 +3012,7 @@ impl Layout {
         if let Some(m) = zoom_box {
             let (rect, _) = self.magnifier_geometry(&m);
             let lens = self.zoom_lens(&m, rect);
-            // (A strip: its divider below it, as `Layout::dividers` has it.)
-            let dividers = if lens.is_none() && !self.glass_dividers { self.dividers() } else { Dividers::default() };
-            if let Some(band) = dividers.strip {
-                let [x, y, w, h] = band.rect();
-                let border = Camera { origin: (x, y), cells: false, ..Camera::new((w.max(1) as u32, h.max(1) as u32)) };
-                let at = push(&mut frame, border);
-                for s in dividers.segments.iter().filter(|s| s.band.kind == DividerKind::Strip) {
-                    frame.separators.push((at, s.rect()));
-                }
-            }
+            if matches!(m.place, ZoomPlace::Strip(_)) { self.strip_line(&mut frame); }
             // The world under the pointer (the world cursor while the mouse
             // is captured; where it looked last while nothing is under it).
             let center = if self.locked { Some(self.cursor) } else { self.world_under(self.pointer) }.or(self.magnifier_center);
@@ -3059,13 +3072,7 @@ impl Layout {
             let (rect, source) = self.magnifier_geometry(&m);
             let zoom = ZOOMS[m.zoom];
             let lens = self.zoom_lens(&m, rect);
-            if matches!(m.place, ZoomPlace::Strip(_)) {
-                // (A strip: the line below it, as a world one has.)
-                let border = Camera { origin: (rect[0], rect[1] + rect[3]), cells: false,
-                    ..Camera::new((rect[2].max(1) as u32, self.separator_gap() as u32)) };
-                let at = push(&mut frame, border);
-                frame.separators.push((at, rect_of(&border)));
-            } else if lens.is_none() { push(&mut frame, frame_of(rect)); }
+            if matches!(m.place, ZoomPlace::Strip(_)) { self.strip_line(&mut frame); }
             match source {
                 // The window around the pointer, at the magnifier's zoom.
                 Some(source) => frame.copies.push(ScreenCopy { source, at: (rect[0], rect[1]), zoom, lens }),
@@ -4978,31 +4985,66 @@ mod tests {
         out
     }
 
+    /// Every placement, showing the world or the menus, takes the rounded
+    /// corners and the glass rim from the settings, through `zoom_lens`
+    /// (the world view's camera, or the screen copy); the strip has no
+    /// lens (no corners), and below it the line or, with glass dividers,
+    /// the glass bar, whatever it shows.
     #[test]
-    fn lens_settings_reach_all_box_cameras_and_leave_the_strip_square() {
-        use viewer_settings::Zoom;
-        for mode in [Zoom::Floating131, Zoom::Floating171, Zoom::Mouse111, Zoom::Mouse131, Zoom::TopStrip] {
-            for rounded in [false, true] { for glass in [false, true] { for scale in [1, 2] {
-                let mut l = Layout::default();
-                l.window_pixel_scale = scale as f64;
-                l.apply_settings(&viewer_settings::Layout { zoom: mode, zoom_rounded: rounded, zoom_glass: glass, ..Default::default() });
-                l.pointer = (400, 400);
-                let f = frame(&mut l, vec![]);
-                let logical = l.shown.iter().find(|(h, _)| *h == Hit::Magnifier).unwrap().1;
-                let camera = f.cameras.iter().find(|c| c.lens.is_some());
-                if mode == Zoom::TopStrip { assert!(camera.is_none()); continue; }
-                let camera = camera.unwrap();
-                let lens = camera.lens.unwrap();
-                assert_eq!(lens.glass, glass);
-                assert_eq!(lens.radius > 0.0, rounded);
-                assert_eq!(lens.rim * scale as f32, if glass { 24.0 } else { 4.0 });
-                let corner = (logical.origin.0, logical.origin.1);
-                assert_eq!(l.hit(corner) == Hit::Magnifier, !rounded);
-                assert_eq!(l.hit((logical.origin.0 + logical.viewport.0 as i32 / 2, logical.origin.1 + logical.viewport.1 as i32 / 2)), Hit::Magnifier);
-            } } }
+    fn every_zoom_placement_and_content_honours_rounded_corners_and_glass() {
+        use viewer_settings::{Zoom, ZoomContent};
+        for zoom in [Zoom::Floating131, Zoom::Floating171, Zoom::Mouse111, Zoom::Mouse131, Zoom::Beside, Zoom::TopStrip] {
+            for content in [ZoomContent::World, ZoomContent::WorldAndMenus] {
+                for rounded in [false, true] { for glass in [false, true] { for glass_dividers in [false, true] { for scale in [1, 2] {
+                    let what = format!("{zoom:?} {content:?} rounded {rounded} glass {glass} glass dividers {glass_dividers} scale {scale}");
+                    let mut l = Layout::default();
+                    l.window_pixel_scale = scale as f64;
+                    l.apply_settings(&viewer_settings::Layout { zoom, zoom_content: content, zoom_rounded: rounded, zoom_glass: glass, glass_dividers, ..Default::default() });
+                    // (Over a strip: what it copies starts right below it.)
+                    l.pointer = if zoom == Zoom::TopStrip { (400, 0) } else { (400, 400) };
+                    let f = frame(&mut l, vec![]);
+                    let m = l.magnifier.unwrap();
+                    assert!(l.magnifier_shown, "{what}");
+                    let rect = l.magnifier_geometry(&m).0;
+                    let lens = match content {
+                        ZoomContent::World => {
+                            assert!(f.copies.is_empty(), "{what}");
+                            let logical = l.shown.iter().find(|(h, _)| *h == Hit::Magnifier).unwrap().1;
+                            assert_eq!(rect_of(&logical), rect, "{what}");
+                            // (Not the glass dividers' bars, clipped to their own place.)
+                            let lensed: Vec<_> = f.cameras.iter().filter(|c| c.lens.is_some() && c.target_clip.is_none()).collect();
+                            assert!(lensed.len() <= 1, "{what}: one zoom lens");
+                            lensed.first().map(|c| c.lens.unwrap())
+                        }
+                        ZoomContent::WorldAndMenus => {
+                            let [copy] = f.copies[..] else { panic!("{what}: one screen copy") };
+                            assert_eq!(copy.at, (rect[0], rect[1]), "{what}");
+                            copy.lens
+                        }
+                    };
+                    if zoom == Zoom::TopStrip {
+                        assert!(lens.is_none(), "{what}: a strip has no corners");
+                        let bars = f.glass_dividers.iter().filter(|(_, s)| s.band.kind == DividerKind::Strip).count();
+                        assert_eq!((f.separators.is_empty(), bars > 0), (glass_dividers, glass_dividers), "{what}: the line or the glass bar below it");
+                        if content == ZoomContent::WorldAndMenus {
+                            assert!(f.copies[0].source[1] >= rect[1] + rect[3] + l.divider_thickness(), "{what}: copies from below the divider, not the divider");
+                        }
+                        continue;
+                    }
+                    let lens = lens.unwrap_or_else(|| panic!("{what}: a lens"));
+                    assert_eq!(lens.glass, glass, "{what}");
+                    assert_eq!(lens.radius > 0.0, rounded, "{what}");
+                    assert_eq!(lens.rim * scale as f32, if glass { 24.0 } else { 4.0 }, "{what}");
+                    // Where the pointer works on the zoom (the world, or
+                    // beside the mouse), its rounded corner is not part of it.
+                    if content == ZoomContent::World || zoom == Zoom::Beside {
+                        assert_eq!(l.hit((rect[0], rect[1])) == Hit::Magnifier, !rounded, "{what}");
+                        assert_eq!(l.hit((rect[0] + rect[2] / 2, rect[1] + rect[3] / 2)), Hit::Magnifier, "{what}");
+                    }
+                } } } }
+            }
         }
     }
-
     #[test]
     fn a_box_beside_the_mouse_showing_menus_shares_size_and_magnification() {
         use viewer_settings::{Zoom, ZoomContent};
@@ -5735,14 +5777,15 @@ mod tests {
             }
             assert_eq!(l.insets.len(), MAX_INSETS);
             let f = frame(&mut l, vec![]);
-            // (The divider's two halves: the panes' pictures going on under
-            // the glass, a block of the background beside a fitted screen.)
-            assert_eq!(f.cameras.len(), 2 + 1 + 2 * MAX_INSETS + 2 + 2, "ui={ui}");
+            // (The magnifier one view, its lens in place of a frame; the
+            // divider's two halves: the panes' pictures going on under the
+            // glass, a block of the background beside a fitted screen.)
+            assert_eq!(f.cameras.len(), 2 + 1 + 2 * MAX_INSETS + 1 + 2, "ui={ui}");
             assert!(f.cameras.len() <= tile_render::MAX_VIEWS);
             // The interface on top of the viewer's own views (bar the
             // magnifier), or in the pane.
             let interface = f.view_cameras[1].unwrap() as usize;
-            assert_eq!(interface, if ui == "pane" { 1 } else { f.cameras.len() - 3 }, "ui={ui}");
+            assert_eq!(interface, if ui == "pane" { 1 } else { f.cameras.len() - 2 }, "ui={ui}");
         }
         // A driver with many views: the viewer leaves out what does not
         // fit (insets last), never more than the renderer draws.
@@ -6011,10 +6054,11 @@ mod tests {
         let grid = Grid { cols: 1, rows: 1, layout: tile_render::Layout::Orthogonal, wrap_x: false, wrap_y: false, step: (8, 8) };
         let mut world = TileWorld::new(grid, sets);
         world.free.push(PlacedSprite::new(set, rendered.x, rendered.y));
-        let local = Camera { origin: (0, 0), ..*rendered };
+        // (The art alone, without the lens's rounded corners and rim.)
+        let local = Camera { origin: (0, 0), lens: None, ..*rendered };
         let actual = tile_render::reference::render(&world, &atlas, &local, 0, [0; 4]);
         assert_eq!(actual, original);
-        let old = Camera { origin: (0, 0), ..logical };
+        let old = Camera { origin: (0, 0), lens: None, ..logical };
         let pixelated = tile_render::reference::render(&world, &atlas, &old, 0, [0; 4]);
         assert_ne!(pixelated, actual);
         assert_eq!(pixelated.get(0, 0), [255, 0, 255, 255]);
