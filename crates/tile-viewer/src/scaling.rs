@@ -2632,7 +2632,7 @@ mod tests {
                     }
                     let mut f = layout.frame(&scene, canvas, (0, 0, 0, 0), vec![], None);
                     if optional_views {
-                        assert_eq!(f.cameras.len(), base_views + 8, "all three framed insets and the magnifier remain visible");
+                        assert_eq!(f.cameras.len(), base_views + 7, "all three framed insets and the magnifier (its lens its frame) remain visible");
                     } else {
                         base_views = f.cameras.len();
                     }
@@ -2641,9 +2641,9 @@ mod tests {
                     if canvas == (1920, 1080) {
                         // (Besides the cameras kept for mirrored cursors under the
                         // interface, one per world view below it; the divider takes
-                        // two, its halves.)
+                        // two, its halves; the magnifier one, its lens its frame.)
                         // (One more for the orders, moved right of the gap they crossed.)
-                        assert_eq!(f.cameras.len() - f.cursor_slots.len(), if optional_views { 21 } else { 13 }, "the worker layout: {what}");
+                        assert_eq!(f.cameras.len() - f.cursor_slots.len(), if optional_views { 20 } else { 13 }, "the worker layout: {what}");
                         assert!((2..=4).contains(&f.cursor_slots.len()), "{what}: {:?}", f.cursor_slots);
                     }
                     let (_, cameras) = arranged.overlay_cameras.iter().find(|(view, _)| *view == 1).expect("the HUD keeps its panel cameras");

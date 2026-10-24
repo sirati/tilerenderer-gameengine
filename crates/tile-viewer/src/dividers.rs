@@ -8,7 +8,8 @@
 //!
 //! - drawing: the frosted strips over the split's gap and the strip's
 //!   plain separator, or the glass bars ([`Segment::glass`], with
-//!   glass dividers);
+//!   glass dividers) and the view whose picture goes on under each bar
+//!   ([`Dividers::under`]);
 //! - the pointer: the walls the system holds it out of
 //!   ([`Dividers::walls`], [`Layout::pointer_walls`]), the walls the
 //!   layout holds it back at ([`Dividers::holds`], `Layout::constrain`),
@@ -27,7 +28,7 @@
 //! is drawn whole and holds nothing: `wall` is false there, the pointer
 //! goes anywhere, the line only separates the pictures.)
 
-use super::{subtract_spans, Axis, Layout, Side, ZoomPlace, GAP};
+use super::{subtract_spans, Axis, Hit, Layout, Side, ZoomPlace, GAP};
 
 /// Which divider.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -150,6 +151,29 @@ impl Segment {
 
 }
 
+/// What a glass divider bends: a view's picture going on under it, past
+/// the view's own rectangle (only drawing goes on there: the walls, the
+/// hits and the views' rectangles stay where [`Dividers::segments`] and
+/// the panes have them). One view lies under each stretch, so the glass
+/// bends one continuous picture: no background, no seam between two views.
+///
+/// - The split's divider: the first view's picture (left, or top) under all
+///   of its band, the open stretches and the free ends' caps too; the
+///   second view's where the first shows a screen; the background where
+///   neither shows the world.
+/// - The strip's divider: the picture of the view below it; where it
+///   crosses a side by side split, the left one's up to the split's far
+///   side (the same view as under the split's divider, so the two bars
+///   meet over one picture), the right one's from there.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct UnderGlass {
+    pub kind: Kind,
+    /// Whose picture (none: the background colour).
+    pub side: Option<Side>,
+    /// The window rectangle it covers.
+    pub rect: [i32; 4],
+}
+
 /// Every divider of the arrangement (see the module's documentation).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Dividers {
@@ -162,6 +186,9 @@ pub struct Dividers {
     /// Where a left press grabs the split's divider to move it (window
     /// rectangles): its open stretches a little into each pane.
     pub handles: Vec<[i32; 4]>,
+    /// With glass dividers: what goes on under the glass ([`UnderGlass`]).
+    /// Drawing only.
+    pub under: Vec<UnderGlass>,
 }
 
 /// How far into each pane a press still grabs the split's divider.
@@ -306,6 +333,46 @@ impl Layout {
             let open: Vec<(i32, i32)> = self.strip_holes(s).iter().map(|c| (c[0], c[0] + c[2])).collect();
             let ends = [end(b, b.along.0, out.split, w), end(b, b.along.1, out.split, w)];
             out.segments.extend(carve(b, &open, true, ends));
+        }
+        if self.glass_dividers {
+            out.under = self.under_glass(&out, strip.and_then(|(_, side)| side));
+        }
+        out
+    }
+
+    /// What goes on under the glass of `dividers` ([`UnderGlass`]);
+    /// `strip_side`: the pane the zoom strip is carved from (none: across
+    /// the window).
+    fn under_glass(&self, dividers: &Dividers, strip_side: Option<Side>) -> Vec<UnderGlass> {
+        // A view whose pane shows a screen fitted into it has no picture to
+        // go on.
+        let fitted = self.fit.map(|f| f.hit);
+        let own = |side: Side| (fitted != Some(if side == Side::A { Hit::Main } else { Hit::Pane })).then_some(side);
+        let split_owner = own(Side::A).or(own(Side::B));
+        let mut out = Vec::new();
+        if let Some(b) = dividers.split {
+            out.push(UnderGlass { kind: Kind::Split, side: split_owner, rect: b.rect() });
+        }
+        if let Some(b) = dividers.strip {
+            let pieces = match (strip_side, dividers.split.filter(|s| s.vertical)) {
+                (Some(side), _) => vec![(b.along, own(side))],
+                // (Across a side by side split: the split's own column
+                // belongs to the view under its divider.)
+                (None, Some(s)) => vec![((b.along.0, s.across.0), own(Side::A)), (s.across, split_owner), ((s.across.1, b.along.1), own(Side::B))],
+                (None, None) => vec![(b.along, own(Side::A))],
+            };
+            let mut spans: Vec<((i32, i32), Option<Side>)> = Vec::new();
+            for ((a0, a1), side) in pieces {
+                let (a0, a1) = (a0.max(b.along.0), a1.min(b.along.1));
+                if a1 <= a0 {
+                    continue;
+                }
+                match spans.last_mut() {
+                    Some((span, s)) if *s == side && span.1 == a0 => span.1 = a1,
+                    _ => spans.push(((a0, a1), side)),
+                }
+            }
+            out.extend(spans.into_iter().map(|(span, side)| UnderGlass { kind: Kind::Strip, side, rect: b.rect_of(span) }));
         }
         out
     }
