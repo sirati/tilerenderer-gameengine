@@ -2222,6 +2222,7 @@ mod tests {
         state.values.insert("tab".into(), Value::Text("accessibility".into()));
         state.values.insert("accessibility.unit_rings".into(), Value::On(true));
         state.values.insert("accessibility.active_unit_arrow".into(), Value::On(true));
+        state.values.insert("accessibility.stack_count".into(), Value::On(true));
         for item in p.items.iter().filter(|i| i.control().is_some_and(|k| k.starts_with("accessibility."))) {
             assert!(Panels::visible(item, &state));
             assert!(Panels::enabled(item, &state));
@@ -2241,6 +2242,10 @@ mod tests {
         let bob = p.items.iter().find(|i| i.control() == Some("accessibility.arrow_bobbing")).unwrap();
         state.values.insert("accessibility.active_unit_arrow".into(), Value::On(false));
         assert!(!Panels::visible(bob, &state));
+        // The stack count's backdrop: shown, greyed out without the count.
+        let backdrop = p.items.iter().find(|i| i.control() == Some("accessibility.stack_backdrop")).unwrap();
+        state.values.insert("accessibility.stack_count".into(), Value::On(false));
+        assert!(Panels::visible(backdrop, &state) && !Panels::enabled(backdrop, &state));
         for tab in ["civ3", "resolution", "layout", "zoom", "clean_map"] {
             state.values.insert("tab".into(), Value::Text(tab.into()));
             assert!(p.items.iter().filter(|i| i.control().is_some_and(|k| k.starts_with("accessibility."))).all(|i| !Panels::visible(i, &state)));
@@ -2346,6 +2351,7 @@ mod tests {
                 for (control, card) in [("accessibility.active_unit_arrow", "Active unit"), ("accessibility.arrow_bobbing", "Active unit"),
                     ("accessibility.arrow_size", "Active unit"),
                     ("accessibility.hud_size", "Unit markers"), ("accessibility.stack_count", "Unit markers"),
+                    ("accessibility.stack_backdrop", "Unit markers"),
                     ("accessibility.unit_rings", "Diplomacy rings"), ("accessibility.war.color", "Diplomacy rings"),
                     ("accessibility.peace.invert", "Diplomacy rings"), ("accessibility.ring_width", "Diplomacy rings"),
                     ("input.alt_in_menus", "Mouse (Alt mode)"), ("input.snap_updates_per_second", "Mouse (Alt mode)"),
