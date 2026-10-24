@@ -30,6 +30,7 @@ members = [
     "crates/civ3r-sync",
     "crates/inproc",
     "crates/civ3-sys",
+    "crates/jgl",
     "crates/civ3-bridge",
 ]
 # The shader crate is compiled by rust-gpu (pinned nightly) from
