@@ -675,10 +675,11 @@ pub fn placed_sprite(compiled: &Compiled, s: &scene::FreeSprite, view: Option<u3
             2 => tile_render::ZoomArt::Zoomed { zoom: (u32::from(s.zoom.0), u32::from(s.zoom.1)), offset: s.zoom_offset },
             _ => tile_render::ZoomArt::Any,
         },
-        text: (available && s.solid.is_none()).then(|| s.glyph.and_then(|g| outline_glyph(compiled, &g, s.tint))).flatten(),
+        text: (available && s.solid.is_none() && s.output_rect.is_none()).then(|| s.glyph.and_then(|g| outline_glyph(compiled, &g, s.tint))).flatten(),
         palette: if available { s.palette } else { 0 },
         category: s.category,
         solid: available.then_some(s.solid).flatten().map(|r| tile_render::SolidRect { width: r.width, height: r.height, rgba: r.rgba }),
+        shape: s.output_rect.map(|r| tile_render::Shape::Rect(tile_render::OutputRect { rgba: r.rgba, lengths: r.lengths, x: r.x, y: r.y, scale: r.scale })),
     }
 }
 

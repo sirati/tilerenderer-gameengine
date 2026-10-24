@@ -88,7 +88,7 @@ fn set_available(compiled: &Compiled, set: u32) -> bool {
 }
 
 pub(crate) fn sprite_available(compiled: &Compiled, sprite: &FreeSprite) -> bool {
-    if sprite.solid.is_some() { return true; }
+    if sprite.solid.is_some() || sprite.output_rect.is_some() { return true; }
     match sprite.glyph {
         Some(glyph) => (glyph.font as usize) < compiled.fonts.len(),
         None => set_available(compiled, sprite.set) && palette_available(compiled, sprite.palette),

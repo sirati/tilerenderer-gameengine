@@ -149,6 +149,10 @@ pub struct FreeSprite {
     pub glyph: Option<Glyph>,
     /// An atlas-independent solid rectangle, anchored at x,y.
     pub solid: Option<SolidRect>,
+    /// A solid rectangle laid out in the pixels of whatever draws it (a
+    /// view drawn at its zoom: the window's), from the sprite's position
+    /// scaled (instead of the sprite or `solid`; see [`OutputRect`]).
+    pub output_rect: Option<OutputRect>,
     /// The named palette its indexed sprites are drawn with (an index into
     /// the render description's palettes; 0: none).
     pub palette: u32,
@@ -163,6 +167,27 @@ pub struct SolidRect {
     pub width: u32,
     pub height: u32,
     pub rgba: [u8; 4],
+}
+
+/// [`OutputRect::scale`]'s 1: sixteenths.
+pub const OUTPUT_SCALE_ONE: u16 = 16;
+
+/// A solid rectangle (unpremultiplied RGBA) laid out in the pixels of the
+/// stage drawing it rather than in world pixels: crisp at every zoom. Its
+/// edges are whole multiples of two lengths per axis (`lengths`: x1, x2,
+/// y1, y2, in 1:1 pixels), each scaled by `scale` (sixteenths, per axis)
+/// and the zoom and rounded to whole pixels once, from the sprite's position
+/// scaled: parts of the same length come out equally wide. Like `solid`
+/// it keeps its size where the world is shown smaller (`View::downscale`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputRect {
+    pub rgba: [u8; 4],
+    pub lengths: [u8; 4],
+    /// Left and right edges, as coefficients `[a, b]` of x1 and x2.
+    pub x: [[i8; 2]; 2],
+    /// Top and bottom edges, as coefficients of y1 and y2.
+    pub y: [[i8; 2]; 2],
+    pub scale: (u16, u16),
 }
 
 /// A glyph drawn from a font's outline (see [`FreeSprite::glyph`]).

@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, Button, DetachedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 55;
+pub const VERSION: u32 = 56;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -169,6 +169,12 @@ impl Writer {
                 self.u32(solid.height);
                 for channel in solid.rgba { self.u8(channel); }
             }
+            self.bool(f.output_rect.is_some());
+            if let Some(r) = f.output_rect {
+                for v in r.rgba.into_iter().chain(r.lengths) { self.u8(v); }
+                for v in r.x.into_iter().chain(r.y).flatten() { self.u8(v as u8); }
+                self.u32(u32::from(r.scale.0) << 16 | u32::from(r.scale.1));
+            }
         }
     }
 
@@ -287,6 +293,13 @@ impl Reader<'_> {
                     category: self.u32()?,
                     solid: if self.bool()? {
                         Some(crate::SolidRect { width: self.u32()?, height: self.u32()?, rgba: [self.u8()?, self.u8()?, self.u8()?, self.u8()?] })
+                    } else { None },
+                    output_rect: if self.bool()? {
+                        let mut b = [0u8; 16];
+                        for v in &mut b { *v = self.u8()?; }
+                        let s = self.u32()?;
+                        let e = |i: usize| [[b[i] as i8, b[i + 1] as i8], [b[i + 2] as i8, b[i + 3] as i8]];
+                        Some(crate::OutputRect { rgba: [b[0], b[1], b[2], b[3]], lengths: [b[4], b[5], b[6], b[7]], x: e(8), y: e(12), scale: ((s >> 16) as u16, s as u16) })
                     } else { None },
                 })
             })
@@ -1321,11 +1334,12 @@ mod tests {
         s.set(1, 2, 1, 0xABCDEF);
         s.layers[0].phases = Some(vec![1, 2, 3, 4, 5, 6]);
         s.layers[1].offsets = Some(vec![(0, 0), (-300, 7), (0, 0), (5, -1), (0, 0), (0, 0)]);
-        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, blend: crate::SpriteBlend::Alpha, tint: 0x123456, zoom_art: 2, zoom: (3, 2), zoom_offset: (-4, 7), clip: None, not_in_view: Some(3), glyph: None, solid: None, palette: 7, category: 0x456 });
+        s.sprites.push(FreeSprite { set: 4, x: -3, y: 9, screen: false, after_pass: u32::MAX, phase: 2, ticks_per_frame: 3, scale_den: 16, blend: crate::SpriteBlend::Alpha, tint: 0x123456, zoom_art: 2, zoom: (3, 2), zoom_offset: (-4, 7), clip: None, not_in_view: Some(3), glyph: None, solid: None, output_rect: None, palette: 7, category: 0x456 });
         s.sprites.push(FreeSprite { x: -4, y: 8, solid: Some(crate::SolidRect { width: 13, height: 7, rgba: [1, 2, 3, 128] }), ..Default::default() });
+        s.sprites.push(FreeSprite { x: 5, y: -6, output_rect: Some(crate::OutputRect { rgba: [9, 8, 7, 255], lengths: [1, 2, 1, 4], x: [[-1, 0], [-1, 1]], y: [[-3, -2], [0, 0]], scale: (24, 32) }), ..Default::default() });
         s.sprites.push(FreeSprite { x: 7, y: 30, zoom_art: 2, tint: 0xFFFF00, glyph: Some(Glyph { font: 1, ch: 'é', em64: 640, advance: 6, bold: true, italic: false, key: Some([255, 0, 255]), bar: None }), ..Default::default() });
         s.sprites.push(FreeSprite { x: 13, y: 30, zoom_art: 2, glyph: Some(Glyph { font: 0, ch: ' ', em64: 768, advance: 4, bold: false, italic: true, key: None, bar: Some((1, 2)) }), ..Default::default() });
-        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, blend: crate::SpriteBlend::Alpha, tint: 0, zoom_art: 0, zoom: (0, 0), zoom_offset: (0, 0), clip: Some([1, -2, 300, 40]), not_in_view: None, glyph: None, solid: None, palette: 0, category: 0x789 });
+        s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, blend: crate::SpriteBlend::Alpha, tint: 0, zoom_art: 0, zoom: (0, 0), zoom_offset: (0, 0), clip: Some([1, -2, 300, 40]), not_in_view: None, glyph: None, solid: None, output_rect: None, palette: 0, category: 0x789 });
         s.patches.push(Patch { sprite: "Screen@x/0".into(), width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
         s.focus = Some((-64, 96));
         s.camera_focus = Some(CameraFocus { serial: 0x1_0000_0002, center: (-4096, 1234) });
