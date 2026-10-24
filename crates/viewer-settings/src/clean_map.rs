@@ -1,4 +1,4 @@
-//! Independent map-detail controls. Inherit follows the game's Clean Map
+//! Independent map-detail controls. Inherit follows the driver's own map-detail
 //! command, Normal always shows every category, and Custom hides selected
 //! categories in just this view. Fog and player visibility are unaffected.
 
@@ -48,7 +48,7 @@ pub enum Mode {
 #[serde(default)]
 pub struct View {
     pub mode: Mode,
-    /// The same category order as the game's thirteen Clean Map checkboxes.
+    /// The same category order as the driver's map-detail categories.
     pub hidden: u32,
 }
 

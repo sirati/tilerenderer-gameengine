@@ -488,6 +488,7 @@ dependencies = [
  "scene",
  "tile-game",
  "tile-viewer",
+ "viewer-settings",
 ]
 
 [[package]]
