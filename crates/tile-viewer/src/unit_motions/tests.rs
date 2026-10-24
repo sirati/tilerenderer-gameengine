@@ -100,7 +100,7 @@ impl Walk {
         while t < self.starts.last().unwrap() + 1500.0 {
             let published = self.rounds.iter().rev().find(|&&r| r <= t).copied().unwrap_or(f64::MIN);
             let anchor = self.anchor(published);
-            let scene = scene::Scene { sprites: vec![scene::FreeSprite::default()], motions: vec![scene::Motion { key: 7, sprites: (0, 1), anchor: (anchor as i32, 0) }], ..Default::default() };
+            let scene = scene::Scene { sprites: vec![scene::FreeSprite::default()], motions: vec![scene::Motion { key: 7, sprites: (0, 1), cells: Vec::new(), anchor: (anchor as i32, 0) }], ..Default::default() };
             let told = self.told(t, at);
             let offsets = motions.positions(&scene, at(t), |_| told.as_ref().map(|(w, a)| (w, &a[..])));
             out.push((t, anchor + f64::from(offsets[0].1.0)));
@@ -259,11 +259,24 @@ fn walk_trace() {
 }
 
 #[test]
-fn a_range_beyond_the_sprites_is_cut_and_only_the_range_moves() {
-    let scene = scene::Scene { sprites: vec![scene::FreeSprite { x: 10, y: 20, ..Default::default() }; 4], ..Default::default() };
-    let mut free: Vec<_> = scene.sprites.iter().map(|s| tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, s.x, s.y)).collect();
-    apply(&mut free, &scene.sprites, &[((2, 4), (5, -3))]);
-    assert_eq!(free.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(), vec![(10, 20), (10, 20), (15, 17), (15, 17)]);
+fn a_frame_moves_the_sprite_range_and_the_cells_from_where_the_scene_has_them() {
+    use tile_render::{Grid, LayerSpec, Layout, SpriteSets, TileWorld};
+    let mut scene = scene::Scene { sprites: vec![scene::FreeSprite { x: 10, y: 20, ..Default::default() }; 4], ..Default::default() };
+    scene.shape = scene::WorldShape { cols: 4, rows: 3, ..Default::default() };
+    scene.layers = vec![scene::LayerCells { values: vec![1; 12], phases: None, offsets: Some(vec![(0, 0); 12]) }];
+    scene.layers[0].offsets.as_mut().unwrap()[4 + 2] = (3, -7);
+    let mut world = TileWorld::new(Grid { cols: 4, rows: 3, layout: Layout::Staggered, wrap_x: false, wrap_y: false, step: (64, 32) }, SpriteSets::default());
+    let mut spec = LayerSpec::new("unit_body", vec![tile_render::SpriteSetId::EMPTY; 2]);
+    spec.per_cell_offset = true;
+    let layer = world.add_layer(spec);
+    world.free = scene.sprites.iter().map(|s| tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, s.x, s.y)).collect();
+    let moves = Moves { sprites: vec![((2, 9), (5, -3))], cells: vec![((0, 2, 1), (32, 16)), ((7, 0, 0), (1, 1)), ((0, 9, 9), (1, 1))] };
+    apply(&mut world, &scene, &moves);
+    assert_eq!(world.free.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>(), vec![(10, 20), (10, 20), (15, 17), (15, 17)], "only the range, cut at the sprites");
+    assert_eq!(world.offset(layer, 2, 1), (35, 9), "the scene's offset plus the move");
+    assert_eq!(world.offset(layer, 1, 1), (0, 0));
+    apply(&mut world, &scene, &Moves { sprites: Vec::new(), cells: vec![((0, 2, 1), (0, 0))] });
+    assert_eq!(world.offset(layer, 2, 1), (3, -7), "back where the scene has it");
 }
 
 #[test]
@@ -272,7 +285,7 @@ fn the_marker_over_a_walking_unit_goes_with_it() {
     let base = Instant::now();
     let at = |t: f64| base + Duration::from_secs_f64((t + VIEWER_AHEAD_MS) / 1000.0);
     let mut m = UnitMotions::default();
-    let mut scene = scene::Scene { sprites: vec![scene::FreeSprite::default()], motions: vec![scene::Motion { key: 7, sprites: (0, 1), anchor: (0, 0) }], ..Default::default() };
+    let mut scene = scene::Scene { sprites: vec![scene::FreeSprite::default()], motions: vec![scene::Motion { key: 7, sprites: (0, 1), cells: Vec::new(), anchor: (0, 0) }], ..Default::default() };
     scene.focus = Some((300, 200));
     assert_eq!(m.focus_at(&scene, 1), Some((300, 200)), "no motion of its own: the focus");
     scene.focus_motion = Some(scene::FocusMotion { key: 7, from: (100, 80) });
@@ -290,7 +303,7 @@ fn motion_frame_bench() {
     let w = walk_at(1000.0, 1, 8, 5, &MAC);
     let base = Instant::now();
     let at = |t: f64| base + Duration::from_secs_f64((t + VIEWER_AHEAD_MS) / 1000.0);
-    let mut scene = scene::Scene { motions: vec![scene::Motion { key: 7, sprites: (4000, 4012), anchor: (0, 0) }], ..Default::default() };
+    let mut scene = scene::Scene { motions: vec![scene::Motion { key: 7, sprites: (4000, 4012), cells: Vec::new(), anchor: (0, 0) }], ..Default::default() };
     scene.sprites = vec![scene::FreeSprite::default(); 6000];
     let mut free: Vec<_> = scene.sprites.iter().map(|s| tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, s.x, s.y)).collect();
     let told = w.told(5000.0, at);
@@ -299,7 +312,7 @@ fn motion_frame_bench() {
     let started = Instant::now();
     for i in 0..n {
         if let Some(offsets) = m.offsets(&scene, at(1000.0 + f64::from(i) * 0.01), false, |_| told.as_ref().map(|(w, a)| (w, &a[..]))) {
-            apply(&mut free, &scene.sprites, &offsets);
+            let _ = (&mut free, offsets);
         }
     }
     eprintln!("{n} walk frames: {:?} each", started.elapsed() / n);

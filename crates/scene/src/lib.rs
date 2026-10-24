@@ -232,15 +232,18 @@ pub struct SpriteLifetime {
     pub duration_ms: u32,
 }
 
-/// World sprites drawing a unit that may be on a walk (see [`Walk`]):
-/// `sprites` (a half-open range in [`Scene::sprites`]) draw unit `key` with
+/// What draws a unit that may be on a walk (see [`Walk`]): `sprites` (a
+/// half-open range in [`Scene::sprites`]) and `cells` (layer, column, row:
+/// the unit's cells, at the depth the driver draws it) draw unit `key` with
 /// its anchor at world pixel `anchor` (full size). While the unit's walk is
 /// played, a renderer draws them moved by where the walk has the unit then,
-/// less `anchor`; else where the scene has them.
+/// less `anchor` (the cells by that added to their offsets); else where the
+/// scene has them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Motion {
     pub key: u32,
     pub sprites: (u32, u32),
+    pub cells: Vec<(u32, u32, u32)>,
     pub anchor: (i32, i32),
 }
 

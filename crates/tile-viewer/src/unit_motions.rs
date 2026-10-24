@@ -97,6 +97,8 @@ pub(crate) struct UnitMotions {
     moved: HashMap<u32, (i32, i32)>,
     /// The offsets applied last: (sprite range, offset).
     applied: Vec<((u32, u32), (i32, i32))>,
+    /// The cells moved last: (layer, column, row), offset.
+    applied_cells: Vec<((u32, u32, u32), (i32, i32))>,
 }
 
 /// A walk's point `along` tiles into it (world pixels, full size).
@@ -203,17 +205,24 @@ impl UnitMotions {
     /// was applied last and `rebuilt` (the world's sprites made again from
     /// the scene's) is false. `walk` gives a unit's walk and when each of
     /// its tiles arrived (`scene::Display::walk`).
-    pub(crate) fn offsets<'w>(&mut self, scene: &scene::Scene, now: Instant, rebuilt: bool, walk: impl Fn(u32) -> Option<(&'w scene::Walk, &'w [Instant])>) -> Option<Vec<((u32, u32), (i32, i32))>> {
+    pub(crate) fn offsets<'w>(&mut self, scene: &scene::Scene, now: Instant, rebuilt: bool, walk: impl Fn(u32) -> Option<(&'w scene::Walk, &'w [Instant])>) -> Option<Moves> {
         let offsets = self.positions(scene, now, walk);
-        if !rebuilt && offsets == self.applied {
+        let cells: Vec<_> = scene.motions.iter().zip(&offsets).flat_map(|(m, &(_, by))| m.cells.iter().map(move |&c| (c, by))).collect();
+        if !rebuilt && offsets == self.applied && cells == self.applied_cells {
             return None;
         }
-        let mut out: Vec<_> = if rebuilt { Vec::new() } else {
-            self.applied.iter().filter(|(range, _)| !offsets.iter().any(|(r, _)| r == range)).map(|&(range, _)| (range, (0, 0))).collect()
-        };
-        out.extend_from_slice(&offsets);
+        // (What moved last frame and no longer does goes back where the
+        // scene has it.)
+        let mut moves = Moves::default();
+        if !rebuilt {
+            moves.sprites.extend(self.applied.iter().filter(|(range, _)| !offsets.iter().any(|(r, _)| r == range)).map(|&(range, _)| (range, (0, 0))));
+        }
+        moves.cells.extend(self.applied_cells.iter().filter(|(c, _)| !cells.iter().any(|(d, _)| d == c)).map(|&(c, _)| (c, (0, 0))));
+        moves.sprites.extend_from_slice(&offsets);
+        moves.cells.extend_from_slice(&cells);
         self.applied = offsets;
-        Some(out)
+        self.applied_cells = cells;
+        Some(moves)
     }
 
     /// The offset of each of the scene's motions at `now`.
@@ -284,17 +293,45 @@ impl UnitMotions {
     }
 }
 
-/// Moves the world's sprites (`free`, the scene's sprites first, in order)
-/// to where the scene puts them plus their motions' offsets.
-pub(crate) fn apply(free: &mut [tile_render::PlacedSprite], sprites: &[scene::FreeSprite], offsets: &[((u32, u32), (i32, i32))]) {
-    for &((start, end), (dx, dy)) in offsets {
+/// What a frame moves: the world's sprites (ranges) and cells (layer,
+/// column, row) by their offsets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Moves {
+    pub sprites: Vec<((u32, u32), (i32, i32))>,
+    pub cells: Vec<((u32, u32, u32), (i32, i32))>,
+}
+
+impl Moves {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sprites.is_empty() && self.cells.is_empty()
+    }
+}
+
+/// Moves the world's sprites (`world.free`, the scene's sprites first, in
+/// order) and cells to where the scene puts them plus their offsets.
+pub(crate) fn apply(world: &mut tile_render::TileWorld, scene: &scene::Scene, moves: &Moves) {
+    for &((start, end), (dx, dy)) in &moves.sprites {
         for i in start as usize..end as usize {
-            if let (Some(placed), Some(s)) = (free.get_mut(i), sprites.get(i)) {
+            if let (Some(placed), Some(s)) = (world.free.get_mut(i), scene.sprites.get(i)) {
                 placed.x = s.x + dx;
                 placed.y = s.y + dy;
             }
         }
     }
+    for &((layer, col, row), by) in &moves.cells {
+        move_cell(world, scene, (layer, col, row), by);
+    }
+}
+
+/// Sets a cell's offset to the scene's plus `by`, on a layer with offsets.
+pub(crate) fn move_cell(world: &mut tile_render::TileWorld, scene: &scene::Scene, (layer, col, row): (u32, u32, u32), (dx, dy): (i32, i32)) {
+    let shape = scene.shape;
+    if col >= shape.cols || row >= shape.rows || !world.layers().get(layer as usize).is_some_and(|l| l.per_cell_offset) {
+        return;
+    }
+    let base = scene.layers.get(layer as usize).and_then(|l| l.offsets.as_ref()).and_then(|o| o.get((row * shape.cols + col) as usize)).copied().unwrap_or((0, 0));
+    let clamp = |v: i32| v.clamp(i16::MIN.into(), i16::MAX.into()) as i16;
+    world.set_offset(tile_render::LayerId(layer as usize), col, row, (clamp(i32::from(base.0) + dx), clamp(i32::from(base.1) + dy)));
 }
 
 #[cfg(test)]

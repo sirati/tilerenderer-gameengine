@@ -407,6 +407,12 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     w.u32(m.sprites.1);
                     w.i32(m.anchor.0);
                     w.i32(m.anchor.1);
+                    w.u32(m.cells.len() as u32);
+                    for &(layer, col, row) in &m.cells {
+                        w.u32(layer);
+                        w.u32(col);
+                        w.u32(row);
+                    }
                 }
             }
             Update::Walk(walk) => {
@@ -769,10 +775,12 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
             }
             2 => Update::Sprites(r.sprites()?),
             29 => {
-                let n = r.len(20)?;
+                let n = r.len(24)?;
                 let mut motions = Vec::with_capacity(n);
                 for _ in 0..n {
-                    motions.push(crate::Motion { key: r.u32()?, sprites: (r.u32()?, r.u32()?), anchor: (r.i32()?, r.i32()?) });
+                    let (key, sprites, anchor) = (r.u32()?, (r.u32()?, r.u32()?), (r.i32()?, r.i32()?));
+                    let cells = (0..r.len(12)?).map(|_| Ok((r.u32()?, r.u32()?, r.u32()?))).collect::<Result<Vec<_>, WireError>>()?;
+                    motions.push(crate::Motion { key, sprites, cells, anchor });
                 }
                 Update::Motions(motions)
             }
@@ -1420,7 +1428,7 @@ mod tests {
     #[test]
     fn motions_round_trip_diff_and_apply() {
         let mut after = crate::Scene::default();
-        after.motions = vec![crate::Motion { key: 0xDEAD_BEEF, sprites: (3, 9), anchor: (-64, 3200) }];
+        after.motions = vec![crate::Motion { key: 0xDEAD_BEEF, sprites: (3, 9), cells: vec![(4, 17, 9), (5, 17, 9)], anchor: (-64, 3200) }];
         let updates = after.updates_since(&crate::Scene::default());
         assert_eq!(updates, vec![Update::Motions(after.motions.clone())]);
         assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
