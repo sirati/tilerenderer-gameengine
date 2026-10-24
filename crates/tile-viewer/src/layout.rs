@@ -146,6 +146,8 @@ mod unit_orders;
 mod world_pointer;
 #[path = "detached_popups.rs"]
 mod detached_popups;
+#[path = "queued_popups.rs"]
+mod queued_popups;
 #[cfg(test)]
 #[path = "city_screen_tests.rs"]
 mod city_screen_tests;
@@ -809,6 +811,8 @@ pub struct Layout {
     world_press: Option<WorldPress>,
     /// The tile boxes the driver left to the viewer (`detached_popups`).
     detached: detached_popups::Detached,
+    /// The reports the driver accepted at once, as shown (`queued_popups`).
+    queued: queued_popups::Queued,
     /// The open popup the driver anchors at a world click
     /// (`scene::Interface::popup_anchor`), and that click.
     anchored: Option<(scene::PopupAnchor, WorldPress)>,
@@ -1068,6 +1072,7 @@ impl Default for Layout {
             popup_anchor: None,
             world_press: None,
             detached: Default::default(),
+            queued: Default::default(),
             anchored: None,
             popup_anchor_seen: None,
             chain_press: None,
@@ -2529,6 +2534,20 @@ impl Layout {
         bounds: Option<WorldBounds>,
     ) -> Frame {
         self.prepared_from = Some(Box::new(self.prepared_motion()));
+        let mut frame = self.frame_of(scene, window, overhang, interface, bounds);
+        // The queued reports the viewer's player has read: gone at once.
+        self.queued_frame(scene, &mut frame);
+        frame
+    }
+
+    fn frame_of(
+        &mut self,
+        scene: &Scene,
+        window: (u32, u32),
+        overhang: (u32, u32, u32, u32),
+        interface: Vec<[i32; 4]>,
+        bounds: Option<WorldBounds>,
+    ) -> Frame {
         self.window = window;
         self.bounds = bounds;
         self.focus_after_scale = None;
@@ -2864,7 +2883,7 @@ impl Layout {
             // (The roaming controls too, where the driver put them.)
             let layers: Vec<_> = parts.popup_views().collect();
             let mut order: Vec<_> = (0..base.len()).filter(|&index| index != m && Some(index) != hint).collect();
-            order.sort_by_key(|&index| layers.iter().position(|&id| id == scene.views[index].id).map_or(0, |layer| layer + 1));
+            order.sort_by_key(|&index| if parts.loading_bar == Some(scene.views[index].id) { layers.len() + 1 } else { layers.iter().position(|&id| id == scene.views[index].id).map_or(0, |layer| layer + 1) });
             for i in order {
                 let camera = &base[i];
                 let stacked = Camera {
@@ -2940,6 +2959,9 @@ impl Layout {
                     self.moved.push(([r[0] + d.0, r[1] + d.1, r[2], r[3]], d));
                     let moved = Camera { origin: (camera.origin.0 + d.0, camera.origin.1 + d.1), screen_shift: d, ..*camera };
                     if popup_layers.contains(&i) && modal.is_some() { on_top.push((i, moved)) } else { over.push((i, moved)) }
+                } else if parts.loading_bar == Some(v.id) {
+                    // (Over the popups too: `scene::Interface::loading_bar`.)
+                    on_top.push((i, *camera));
                 } else {
                     over.push((i, *camera));
                     if !v.view.interface_only {
@@ -2949,7 +2971,8 @@ impl Layout {
             }
             // The popups in the driver's order, bottom to top (a combo box's
             // open list over its dialog), not in the order of their views' ids.
-            let layer = |&(i, _): &(usize, Camera)| popup_layers.iter().position(|&l| l == i).map_or(0, |k| k + 1);
+            // (The loading bar over all of them: `scene::Interface::loading_bar`.)
+            let layer = |&(i, _): &(usize, Camera)| if parts.loading_bar == Some(scene.views[i].id) { popup_layers.len() + 1 } else { popup_layers.iter().position(|&l| l == i).map_or(0, |k| k + 1) };
             over.sort_by_key(layer);
             on_top.sort_by_key(layer);
         }
@@ -3272,7 +3295,8 @@ impl Layout {
         // traditional popup257 sorts before the screen258 it overlays.
         let layers: Vec<_> = scene.interface.popup_views().collect();
         let mut order: Vec<_> = (0..scene.views.len()).collect();
-        order.sort_by_key(|&index| layers.iter().position(|&id| id == scene.views[index].id).map_or(0, |layer| layer + 1));
+        // (The loading bar over all of them: `scene::Interface::loading_bar`.)
+        order.sort_by_key(|&index| if scene.interface.loading_bar == Some(scene.views[index].id) { layers.len() + 1 } else { layers.iter().position(|&id| id == scene.views[index].id).map_or(0, |layer| layer + 1) });
         let mut view_cameras = vec![None; base.len()];
         let cameras = order.iter().enumerate().map(|(camera, &view)| {
             view_cameras[view] = Some(camera as u32);
@@ -4399,6 +4423,7 @@ impl Layout {
         }
         let mut out = self.take_unit_order_events();
         out.extend(self.detached.take_inputs());
+        out.extend(self.queued.take_inputs());
         if self.unit_order_before(&input) {
             out.extend(self.take_unit_order_events());
             self.remember_world_inputs(&out);
@@ -4462,6 +4487,9 @@ impl Layout {
                 }
                 vec![]
             }
+            // Enter or Esc with the pointer on the queued reports: the first
+            // is read (neither reaches the driver, its release neither).
+            Input::Key { vk, down, .. } if self.queued_key(vk, down) => self.queued.take_inputs(),
             // Esc closes the kept tile box of the view the pointer is in.
             Input::Key { vk: VK_ESCAPE, down: true, .. } if self.detached_escape() => {
                 self.kept_keys.push(VK_ESCAPE);
@@ -4608,6 +4636,9 @@ impl Layout {
     fn button(&mut self, button: Button, down: bool, p: (i32, i32)) -> Vec<Input> {
         if !down && std::mem::take(&mut self.dismissed[button_index(button)]) {
             return vec![];
+        }
+        if let Some(out) = self.queued_button(button, down, p) {
+            return out;
         }
         if let Some(out) = self.detached_button(button, down, p) {
             return out;

@@ -487,6 +487,73 @@ pub struct Arranged {
     /// viewer's own screen sprites (e.g. the snapping pointer, in the
     /// canvas's pixels).
     pub overlay: Option<u32>,
+    /// The queued reports as shown (`scene::Interface::queued`), the one to
+    /// read first.
+    pub queued: Vec<QueuedShown>,
+}
+
+/// A queued report as shown on the canvas (`scene::QueuedPopup`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct QueuedShown {
+    pub serial: u64,
+    pub view: u32,
+    /// Its rectangle on the canvas.
+    pub rect: [i32; 4],
+    /// Its button there, if the driver named one.
+    pub button: Option<[i32; 4]>,
+}
+
+/// How far each queued report waiting behind the first shows below and
+/// right of the one before it (canvas pixels).
+pub const QUEUE_STEP: i32 = 10;
+/// How far the queued reports keep from the canvas's edges over the world.
+pub const QUEUE_MARGIN: i32 = 16;
+
+/// Where the queued reports of `sizes` (as shown, the first one to read
+/// first) go in `region`, their top-left corners: at its top-right, out of
+/// the way of the play in the world's middle and of a modal popup over the
+/// menus (`MODAL_TOP`, across in the middle), which would hide them. The
+/// ones waiting behind the first show a little below and right of it, as a
+/// stack.
+pub fn queued_places(sizes: &[(i32, i32)], region: [i32; 4]) -> Vec<(i32, i32)> {
+    let Some(&(w, _)) = sizes.first() else { return Vec::new() };
+    let behind = (sizes.len() as i32 - 1) * QUEUE_STEP;
+    let [rx, ry, rw, _] = region;
+    let first = (rx + (rw - QUEUE_MARGIN - w - behind).max(0), ry + QUEUE_MARGIN);
+    (0..sizes.len() as i32).map(|k| (first.0 + k * QUEUE_STEP, first.1 + k * QUEUE_STEP)).collect()
+}
+
+/// The space kept between the loading bar and a popup it is moved clear of.
+pub const BAR_GAP: i32 = 8;
+
+/// Where the loading bar goes: `piece` puts its rectangle `r` (the
+/// driver's pixels) on the canvas. Where that meets one of `dialogs` (the
+/// popups shown over it, canvas rectangles), it moves down below them,
+/// else up above them, as little as it can, staying whole in `region`.
+/// Its map, and whether it is clear of them; if it cannot be (a small
+/// window, the dialogs filling it), it stays where it was and is drawn in
+/// front of them (`scene::Interface::loading_bar`).
+pub fn bar_clear_of(piece: Affine, r: [i32; 4], dialogs: &[[i32; 4]], region: [i32; 4]) -> (Affine, bool) {
+    // (Whole in the region first, moved as little as it can: a menu larger
+    // than the canvas may hold it outside.)
+    let at = piece.rect(r);
+    let into = |at: i32, len: i32, lo: i32, side: i32| if len <= side { at.clamp(lo, lo + side - len) - at } else { lo - at };
+    let piece = Affine { to: (piece.to.0 + into(at[0], at[2], region[0], region[2]), piece.to.1 + into(at[1], at[3], region[1], region[3])), ..piece };
+    let drawn = piece.rect(r);
+    let meets = |a: [i32; 4], b: [i32; 4]| a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3];
+    let clear_at = |y: i32| { let at = [drawn[0], y, drawn[2], drawn[3]]; !dialogs.iter().any(|&d| meets(at, d)) };
+    if clear_at(drawn[1]) {
+        return (piece, true);
+    }
+    let fits = |y: i32| y >= region[1] && y + drawn[3] <= region[1] + region[3];
+    let mut downs: Vec<i32> = dialogs.iter().map(|d| d[1] + d[3] + BAR_GAP).filter(|&y| y > drawn[1]).collect();
+    downs.sort_unstable();
+    let mut ups: Vec<i32> = dialogs.iter().map(|d| d[1] - BAR_GAP - drawn[3]).filter(|&y| y < drawn[1]).collect();
+    ups.sort_unstable_by(|a, b| b.cmp(a));
+    match downs.into_iter().chain(ups).find(|&y| fits(y) && clear_at(y)) {
+        Some(y) => (Affine { to: (piece.to.0, piece.to.1 + y - drawn[1]), ..piece }, true),
+        None => (piece, false),
+    }
 }
 
 /// Interface sprites this close belong to the same panel.
@@ -667,6 +734,33 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     let menu = panned(menu);
     // The modal popup's map and its rectangle in the driver's window.
     let mut modal_shown: Option<(Affine, [i32; 4])> = None;
+    // The queued reports (`Interface::queued`, those the layout still
+    // shows: a view without a camera is closing), at the top-right of the
+    // window (of the menus' region while a game loads).
+    let queued_views: Vec<(u32, u64, Option<[i32; 4]>, Camera)> = parts.queued.iter().filter_map(|q| {
+        let i = scene.views.iter().position(|v| v.id == q.view)?;
+        let camera = frame.cameras[frame.view_cameras.get(i).copied().flatten()? as usize];
+        (camera.viewport.0 > 0 && camera.viewport.1 > 0).then_some((q.view, q.serial, q.button, camera))
+    }).collect();
+    let over_world = frame.cameras.iter().any(|c| c.cells);
+    let queue_region = if over_world { canvas_rect } else { modal_region };
+    let queue_zoom = |camera: &Camera| fit_at_most(if over_world { plan.menu.zoom } else { menu.zoom },
+        Some([0, 0, camera.viewport.0 as i32, camera.viewport.1 as i32]), region_size(Some(queue_region)));
+    let queued_sizes: Vec<(i32, i32)> = queued_views.iter().map(|(.., c)| {
+        // (As large as its camera is drawn: `Affine::camera`.)
+        let zoom = queue_zoom(c);
+        let size = |v: u32| (v as u64 * zoom.0 as u64).div_ceil(zoom.1.max(1) as u64).max(1) as i32;
+        (size(c.viewport.0), size(c.viewport.1))
+    }).collect();
+    let queued_at: Vec<(u32, (i32, i32), Ratio)> = queued_views.iter().zip(queued_places(&queued_sizes, queue_region))
+        .map(|((view, _, _, c), at)| (*view, at, queue_zoom(c))).collect();
+    out.queued = queued_views.iter().zip(&queued_at).zip(&queued_sizes).map(|(((view, serial, button, camera), (_, at, zoom)), &(w, h))| {
+        let piece = Affine { from: camera.origin, to: *at, zoom: *zoom };
+        let button = button.map(|[x, y, bw, bh]| piece.rect([camera.origin.0 + x, camera.origin.1 + y, bw, bh]));
+        QueuedShown { serial: *serial, view: *view, rect: [at.0, at.1, w, h], button }
+    }).collect();
+    // The loading bar's camera and rectangle (the driver's pixels).
+    let mut bar: Option<(usize, [i32; 4])> = None;
     for (i, v) in scene.views.iter().enumerate() {
         let Some(c) = frame.view_cameras.get(i).copied().flatten().map(|c| c as usize) else { continue };
         let camera = frame.cameras[c];
@@ -690,6 +784,21 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             if let Some((at, zoom)) = anchored(v.id) {
                 pieces[c] = Some(Affine { from: o, to: at, zoom }.at(o));
             }
+            continue;
+        }
+        // A queued report (`Interface::queued`): where `queued_places`
+        // put it. It takes no pointer input of the driver's (the layout
+        // reads it).
+        if let Some(&(_, at, zoom)) = queued_at.iter().find(|q| q.0 == v.id) {
+            pieces[c] = Some(Affine { from: o, to: at, zoom });
+            continue;
+        }
+        // The loading bar: where the menu it was cut out of puts it, moved
+        // clear of the popups below (`bar_clear_of`).
+        if parts.loading_bar == Some(v.id) {
+            pieces[c] = Some(if menu_box.is_some() { menu } else { middle }.at(o));
+            clips[c] = menu_region;
+            bar = Some((c, [o.0, o.1, size.0 as i32, size.1 as i32]));
             continue;
         }
         // (Where the layout put it: moved parts about their own place.)
@@ -775,6 +884,26 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let (x, y) = (a[0].max(b[0]), a[1].max(b[1]));
         [x, y, (a[0] + a[2]).min(b[0] + b[2]) - x, (a[1] + a[3]).min(b[1] + b[3]) - y]
     };
+    // The loading bar clear of the popups and queued reports over it.
+    if let Some((c, r)) = bar {
+        let dialogs: Vec<[i32; 4]> = scene.views.iter().enumerate()
+            .filter(|(_, v)| parts.is_popup_view(v.id))
+            .filter_map(|(i, _)| {
+                let k = frame.view_cameras.get(i).copied().flatten()? as usize;
+                let camera = frame.cameras[k];
+                Some(pieces[k]?.rect([camera.origin.0, camera.origin.1, camera.viewport.0 as i32, camera.viewport.1 as i32]))
+            })
+            .chain(out.queued.iter().map(|q| q.rect))
+            .collect();
+        if let Some(piece) = pieces[c] {
+            let (moved, clear) = bar_clear_of(piece, r, &dialogs, menu_region.unwrap_or(canvas_rect));
+            if !clear {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| log::info!("viewer: no room for the loading bar beside the popups: drawn in front of them"));
+            }
+            pieces[c] = Some(moved);
+        }
+    }
     // Place the orders after every interface piece has its final map,
     // including panels supplied in a separate view.
     if let (Some(place), Some(orders)) = (frame.unit_orders, parts.reachable) {
@@ -2860,6 +2989,136 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A game loading (no world yet) with popups over its loading screen:
+    /// the loading bar (`Interface::loading_bar`) never shares a pixel
+    /// with the popups and queued reports where the window has room for
+    /// both; where it has not, it is drawn in front of them (its camera
+    /// after theirs). Across the driver's screen sizes, windows, pixel
+    /// scales, menu scales, split settings, and bars placed where the
+    /// popups go and elsewhere.
+    #[test]
+    fn the_loading_bar_keeps_clear_of_the_popups_over_it_or_shows_in_front() {
+        use scene::{QueuedPopup, View, ViewState};
+        const BAR: u32 = 0xFFFF_0100;
+        let (background, info, bar_art) = (1, 2, 3);
+        let screens = [(1024u32, 768u32), (1920, 1080), (3274, 2048)];
+        let windows = [((800u32, 600u32), 1u32), ((1024, 768), 1), ((1280, 800), 1), ((1920, 1080), 1), ((3258, 1904), 2), ((3840, 2160), 3)];
+        let mut cases = 0;
+        let mut in_front = 0;
+        for screen in screens {
+            let menu = [(screen.0 as i32 - 1024) / 2, (screen.1 as i32 - 768) / 2, 1024, 768];
+            // Where the game draws its bar: where its popups go (the
+            // middle, a third down), at its window's top-left, low down.
+            let bars = [[menu[0] + 312, menu[1] + 250, 400, 24], [0, 0, 300, 30], [menu[0] + 312, menu[1] + 700, 400, 24]];
+            for bar in bars {
+                for (popup_size, queued) in [((500, 300), 0), ((500, 300), 2), ((640, 700), 0), ((420, 260), 1)] {
+                    let popup = [(screen.0 as i32 - popup_size.0) / 2, (screen.1 as i32 - popup_size.1) / 2, popup_size.0, popup_size.1];
+                    let rect_of = |s: &FreeSprite| Some(match s.set {
+                        x if x == background => [s.x, s.y, 1024, 768],
+                        x if x == info => [s.x, s.y, popup_size.0, popup_size.1],
+                        x if x == bar_art => [s.x, s.y, bar[2], bar[3]],
+                        _ => [s.x, s.y, 300, 120],
+                    });
+                    let sprite = |set: u32, (x, y): (i32, i32)| FreeSprite { set, x, y, screen: true, ..Default::default() };
+                    let mut scene = Scene { screen_size: screen, ..Default::default() };
+                    scene.views.push(ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() }, overlay: vec![sprite(background, (menu[0], menu[1]))] });
+                    scene.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (popup[0], popup[1]), viewport: (popup[2] as u32, popup[3] as u32), ..Default::default() }, overlay: vec![sprite(info, (popup[0], popup[1]))] });
+                    scene.views.push(ViewState { id: BAR, view: View { interface_only: true, origin: (bar[0], bar[1]), viewport: (bar[2] as u32, bar[3] as u32), ..Default::default() }, overlay: vec![sprite(bar_art, (bar[0], bar[1]))] });
+                    for k in 0..queued {
+                        let id = 0x1100 + k as u32;
+                        scene.views.push(ViewState { id, view: View { interface_only: true, origin: (100, 100), viewport: (300, 120), ..Default::default() }, overlay: vec![sprite(9, (100, 100))] });
+                        scene.interface.queued.insert(0, QueuedPopup { view: id, serial: 10 + k as u64, button: Some([130, 80, 32, 32]) });
+                    }
+                    scene.views.sort_by_key(|v| v.id);
+                    scene.interface.popup = Some(257);
+                    scene.interface.loading_bar = Some(BAR);
+                    for (window, pixel_scale) in windows {
+                        for split in [viewer_settings::Split::Standard, viewer_settings::Split::Vertical1To1, viewer_settings::Split::Horizontal1To1] {
+                            for (scale_menus, menu_scale_percent) in [(false, 100.0), (true, 60.0), (true, 100.0), (true, 150.0)] {
+                                let settings = Resolution { pixel_scale, scale_menus, menu_scale_percent, ..Default::default() };
+                                let what = format!("screen {screen:?}, window {window:?}/{pixel_scale}, {split:?}, menus {scale_menus} {menu_scale_percent}%, bar {bar:?}, popup {popup:?}, {queued} queued");
+                                let p = plan(window, screen, &settings).for_scene(&scene, rect_of);
+                                let mut layout = layout::Layout::default();
+                                layout.apply_settings(&viewer_settings::Layout { split, ..Default::default() });
+                                layout.driver_screen = Some(p.screen);
+                                layout.menu_scale = p.menu.zoom;
+                                let mut f = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+                                let arranged = arrange_panned(&p, &scene, &mut f, &mut layout.menu_pan, rect_of);
+                                let camera_of = |id: u32| {
+                                    let i = scene.views.iter().position(|v| v.id == id).unwrap();
+                                    let k = f.view_cameras[i].unwrap_or_else(|| panic!("{what}: view {id:x} has a camera"));
+                                    (k, f.cameras[k as usize])
+                                };
+                                let drawn = |c: &Camera| [c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32];
+                                let (bar_k, bar_c) = camera_of(BAR);
+                                let (popup_k, popup_c) = camera_of(257);
+                                let mut dialogs = vec![(popup_k, drawn(&popup_c))];
+                                assert_eq!(arranged.queued.len(), queued, "{what}");
+                                for q in &arranged.queued {
+                                    let (k, c) = camera_of(q.view);
+                                    assert_eq!(drawn(&c), q.rect, "{what}: the queued report where the layout reads it");
+                                    dialogs.push((k, q.rect));
+                                }
+                                let (cw, ch) = (p.canvas().0 as i32, p.canvas().1 as i32);
+                                let b = drawn(&bar_c);
+                                assert!(b[0] >= -1 && b[1] >= 0 && b[1] + b[3] <= ch, "{what}: the bar on the canvas: {b:?} in {cw}x{ch}");
+                                let meets = |a: [i32; 4], d: [i32; 4]| a[0] < d[0] + d[2] && d[0] < a[0] + a[2] && a[1] < d[1] + d[3] && d[1] < a[1] + a[3];
+                                let overlapping: Vec<_> = dialogs.iter().filter(|(_, d)| meets(b, *d)).collect();
+                                // Room for both: a bar's height beside the
+                                // dialogs' rows, above or below them.
+                                let top = dialogs.iter().map(|(_, d)| d[1]).min().unwrap();
+                                let bottom = dialogs.iter().map(|(_, d)| d[1] + d[3]).max().unwrap();
+                                let room = top - BAR_GAP >= b[3] || ch - bottom - BAR_GAP >= b[3];
+                                if room {
+                                    assert!(overlapping.is_empty(), "{what}: the bar {b:?} clear of the dialogs {dialogs:?}");
+                                } else if !overlapping.is_empty() {
+                                    in_front += 1;
+                                }
+                                // In front of every dialog, whatever happens.
+                                assert!(dialogs.iter().all(|(k, _)| bar_k > *k), "{what}: the bar's camera {bar_k} after the dialogs' {dialogs:?}");
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 1000, "{cases} cases");
+        eprintln!("loading bar layout: {cases} cases, {in_front} with no room (bar in front)");
+    }
+
+    #[test]
+    fn queued_reports_stack_at_the_top_right() {
+        let region = [0, 0, 1600, 900];
+        let places = queued_places(&[(300, 200), (300, 200)], region);
+        assert_eq!(places, vec![(1600 - QUEUE_MARGIN - 300 - QUEUE_STEP, QUEUE_MARGIN), (1600 - QUEUE_MARGIN - 300, QUEUE_MARGIN + QUEUE_STEP)]);
+        assert_eq!(queued_places(&[(300, 200)], [100, 50, 800, 600]), vec![(900 - QUEUE_MARGIN - 300, 50 + QUEUE_MARGIN)]);
+        assert!(queued_places(&[], region).is_empty());
+        // Wider than the region: at its left edge, not off it.
+        assert_eq!(queued_places(&[(2000, 200)], region)[0].0, 0);
+    }
+
+    #[test]
+    fn the_bar_moves_down_below_the_dialogs_else_up_else_stays_in_front() {
+        let piece = Affine::IDENTITY;
+        let region = [0, 0, 1000, 800];
+        // Clear already: unmoved.
+        assert_eq!(bar_clear_of(piece, [100, 700, 400, 24], &[[100, 100, 500, 300]], region), (piece, true));
+        // Under the dialog: below it.
+        let (moved, clear) = bar_clear_of(piece, [100, 200, 400, 24], &[[100, 100, 500, 300]], region);
+        assert!(clear);
+        assert_eq!(moved.rect([100, 200, 400, 24]), [100, 400 + BAR_GAP, 400, 24]);
+        // Below two stacked dialogs, not between them.
+        let (moved, _) = bar_clear_of(piece, [100, 200, 400, 24], &[[100, 100, 500, 300], [110, 410, 500, 300]], region);
+        assert_eq!(moved.rect([100, 200, 400, 24])[1], 710 + BAR_GAP);
+        // No room below: above.
+        let (moved, clear) = bar_clear_of(piece, [100, 700, 400, 24], &[[100, 300, 500, 480]], region);
+        assert!(clear);
+        assert_eq!(moved.rect([100, 700, 400, 24])[1], 300 - BAR_GAP - 24);
+        // No room at all: where it was (drawn in front).
+        assert_eq!(bar_clear_of(piece, [100, 400, 400, 24], &[[0, 10, 1000, 780]], region), (piece, false));
     }
 
     /// A full menu-sized modal screen over the title (the Hall of Fame:

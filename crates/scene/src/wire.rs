@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Beside, Binding, Button, DetachedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
+use crate::{Beside, Binding, Button, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 55;
+pub const VERSION: u32 = 56;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -554,6 +554,19 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                     }
                     w.bool(d.anchor.world_scaled);
                 }
+                w.u32(i.queued.len() as u32);
+                for q in &i.queued {
+                    w.u32(q.view);
+                    w.u32(q.serial as u32);
+                    w.u32((q.serial >> 32) as u32);
+                    w.bool(q.button.is_some());
+                    for v in q.button.unwrap_or_default() {
+                        w.i32(v);
+                    }
+                }
+                w.u32(i.queued_more);
+                w.bool(i.loading_bar.is_some());
+                w.u32(i.loading_bar.unwrap_or_default());
                 w.bool(i.targeting);
                 w.bool(i.snap_to_tiles);
             }
@@ -645,6 +658,8 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
 const INTERACTABLE_BYTES: usize = 16 + 1 + 8 + 16 + 8 + 1 + 16 + 4;
 /// One `DetachedPopup`: view, serial, anchor and click, `world_scaled`.
 const DETACHED_BYTES: usize = 4 + 8 + 6 * 4 + 1;
+/// One `QueuedPopup`: view, serial, whether it has a button, the button.
+const QUEUED_BYTES: usize = 4 + 8 + 1 + 4 * 4;
 
 /// Decodes a batch of updates.
 pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
@@ -810,6 +825,15 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     let world_scaled = r.bool()?;
                     Ok(DetachedPopup { view, serial, anchor: PopupAnchor { world: (v[0], v[1]), offset: (v[2], v[3]), world_scaled }, click: (v[4], v[5]) })
                 }).collect::<Result<Vec<_>, _>>()?;
+                let queued = (0..r.len(QUEUED_BYTES)?).map(|_| -> Result<QueuedPopup, WireError> {
+                    let view = r.u32()?;
+                    let serial = r.u32()? as u64 | (r.u32()? as u64) << 32;
+                    let some = r.bool()?;
+                    let b = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                    Ok(QueuedPopup { view, serial, button: some.then_some(b) })
+                }).collect::<Result<Vec<_>, _>>()?;
+                let queued_more = r.u32()?;
+                let loading_bar = { let some = r.bool()?; let id = r.u32()?; some.then_some(id) };
                 let targeting = r.bool()?;
                 let snap_to_tiles = r.bool()?;
                 Update::Interface(Interface {
@@ -828,6 +852,9 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     popup_anchor,
                     popup_on_screen,
                     detached,
+                    queued,
+                    queued_more,
+                    loading_bar,
                     targeting,
                     snap_to_tiles,
                 })
@@ -999,6 +1026,11 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.u32(serial as u32);
                 w.u32((serial >> 32) as u32);
             }
+            Input::CloseQueued { serial } => {
+                w.u8(23);
+                w.u32(serial as u32);
+                w.u32((serial >> 32) as u32);
+            }
             Input::WorldMove { x, y } => {
                 w.u8(14);
                 w.i32(x);
@@ -1125,6 +1157,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
             },
             17 => Input::DismissPopup,
             22 => Input::CloseDetached { serial: r.u32()? as u64 | (r.u32()? as u64) << 32 },
+            23 => Input::CloseQueued { serial: r.u32()? as u64 | (r.u32()? as u64) << 32 },
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
             14 => Input::WorldMove { x: r.i32()?, y: r.i32()? },
             15 => {
@@ -1356,6 +1389,12 @@ mod tests {
                 DetachedPopup { view: 0xC9_5314, serial: 0x1_0000_0007, anchor: PopupAnchor { world: (-64, 9), offset: (0, 0), world_scaled: true }, click: (-40, 30) },
                 DetachedPopup { view: 300, serial: 8, anchor: PopupAnchor { world: (5, 6), offset: (1, 1), world_scaled: false }, click: (7, 8) },
             ],
+            queued: vec![
+                QueuedPopup { view: 0x1102, serial: 0x3_0000_0001, button: Some([-2, 140, 32, 16]) },
+                QueuedPopup { view: 0x1101, serial: 9, button: None },
+            ],
+            queued_more: 7,
+            loading_bar: Some(0xFFFF_0100),
             targeting: true,
             snap_to_tiles: true,
         };
@@ -1429,6 +1468,7 @@ mod tests {
             Input::Look { x: -5, y: 7000 },
             Input::DismissPopup,
             Input::CloseDetached { serial: 0x2_0000_0009 },
+            Input::CloseQueued { serial: 0x5_0000_000B },
             Input::SettingsPreviewDecision { session: 0x3_0000_0003, id: 0x4_0000_0004, keep: false },
             Input::WorldMove { x: -64, y: 12345 },
             Input::UnitOrder { action: UnitOrderAction::Preview, x: -100, y: 9999 },
