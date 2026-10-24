@@ -916,10 +916,21 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             }).filter(|(d, r)| r[2] > 0 && r[3] > 0 && !in_tip(*d)).collect()
         } else { Vec::new() };
         for (_, i, anchors, of_sprite, start, tip) in &mut panelled {
-            place_unit_orders(place, orders, &scene.views[*i].overlay, &rect_of, &occupied, anchors, of_sprite);
+            place_unit_orders(place, orders, &scene.views[*i].overlay, &rect_of, &occupied, anchors, of_sprite, tip.map(|(t, _)| t));
             // (The tooltip goes with its control, wherever that went.)
             if let Some((t, host)) = *tip {
                 anchors[t].0 = anchors[of_sprite[host]].0.at((anchors[t].1[0], anchors[t].1[1]));
+                // Over everything, as the game draws it: its camera the
+                // last, after the orders' own.
+                let last = anchors.len() - 1;
+                if t < last {
+                    let a = anchors.remove(t);
+                    anchors.push(a);
+                    for k in of_sprite.iter_mut().filter(|k| **k != usize::MAX && **k >= t) {
+                        *k = if *k == t { last } else { *k - 1 };
+                    }
+                    *tip = Some((last, host));
+                }
             }
             let maps = scene.views[*i].overlay.iter().zip(of_sprite.iter()).filter_map(|(s, &k)| rect_of(s).map(|_| anchors[k].0));
             for (entry, piece) in shown[*start..].iter_mut().zip(maps) {
@@ -1125,9 +1136,13 @@ fn drawn_boxed(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: 
 /// that takes; or all of them go into the active view's area, as large as
 /// they are elsewhere where that fits it, centred in the widest free
 /// span along their row, at the same height where that is inside it.
-fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, occupied: &[([i32; 4], [i32; 4])], anchors: &mut Vec<(Affine, [i32; 4])>, of_sprite: &mut [usize]) {
+/// The tooltip (the sprites of panel `tip`, or of no panel) is none of
+/// them, wherever the game drew it: it goes with its button, and its size
+/// moves nothing.
+fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, occupied: &[([i32; 4], [i32; 4])], anchors: &mut Vec<(Affine, [i32; 4])>, of_sprite: &mut [usize], tip: Option<usize>) {
     let within = |r: &[i32; 4]| r[2] > 0 && r[3] > 0 && r[0] >= orders[0] && r[1] >= orders[1] && r[0] + r[2] <= orders[0] + orders[2] && r[1] + r[3] <= orders[1] + orders[3];
-    let members: Vec<(usize, [i32; 4])> = sprites.iter().enumerate().filter_map(|(i, s)| rect_of(s).filter(within).map(|r| (i, r))).collect();
+    let order = |i: usize| of_sprite[i] != usize::MAX && Some(of_sprite[i]) != tip;
+    let members: Vec<(usize, [i32; 4])> = sprites.iter().enumerate().filter(|&(i, _)| order(i)).filter_map(|(i, s)| rect_of(s).filter(within).map(|r| (i, r))).collect();
     if members.is_empty() { return; }
     let shown: Vec<[i32; 4]> = members.iter().map(|&(i, r)| anchors[of_sprite[i]].0.rect(r)).collect();
     let zoom_before = anchors[of_sprite[members[0].0]].0.zoom;
@@ -2554,6 +2569,113 @@ mod tests {
                         let s = b[2] as f64 / 32.0;
                         for (got, want) in [(t[0] - b[0], (tip[0] - near[0]) as f64 * s), (t[1] - b[1], (tip[1] - near[1]) as f64 * s)] {
                             assert!((got as f64 - want).abs() <= 1.0, "{what}: tooltip at {t:?}, its button at {b:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The orders as the game draws them at 1920x1080 (measured): eight in
+    /// a row and two above the fourth, `reachable` round them all; the
+    /// tooltip of one (if `tip`: its box, left of and above it, inside that
+    /// rectangle's columns, and its letters, each a glyph whose em box
+    /// reaches past the box, clipped to it as the bridge sends them).
+    fn hud_with_order_tooltip(tip: Option<([i32; 4], usize)>) -> (Scene, impl Fn(&FreeSprite) -> Option<[i32; 4]> + Clone) {
+        use scene::{View, ViewState};
+        let sprite = |x, y| FreeSprite { x, y, screen: true, after_pass: u32::MAX, ..Default::default() };
+        let mut overlay = vec![sprite(5, 949), sprite(1621, 942)];
+        let mut rects: Vec<[i32; 4]> = vec![[5, 949, 280, 130], [1621, 942, 294, 137]];
+        for b in order_buttons() {
+            overlay.push(sprite(b[0], b[1]));
+            rects.push(b);
+        }
+        if let Some((t, letters)) = tip {
+            overlay.push(sprite(t[0], t[1]));
+            rects.push(t);
+            // Pen on the baseline 3 above the box's bottom, 7 apart; the
+            // em box 12 above it and 4 below (past the box), clipped to it.
+            let clip = [t[0], t[1], t[0] + t[2], t[1] + t[3]];
+            for k in 0..letters as i32 {
+                let (x, y) = (t[0] + 4 + 7 * k, t[1] + t[3] - 3);
+                overlay.push(FreeSprite { clip: Some(clip), ..sprite(x, y) });
+                let [l, top, r, b] = [x.max(clip[0]), (y - 12).max(clip[1]), (x + 7).min(clip[2]), (y + 4).min(clip[3])];
+                rects.push([l, top, r - l, b - top]);
+            }
+        }
+        let world = View { camera_x: 1000, camera_y: 500, zoom: (1, 1), ..Default::default() };
+        let scene = Scene {
+            views: vec![
+                ViewState { id: 0, view: world, overlay: vec![] },
+                ViewState { id: 254, view: View { interface_only: true, ..Default::default() }, overlay: overlay.clone() },
+            ],
+            shape: scene::WorldShape { cols: 60, rows: 62, wrap_x: true, wrap_y: false },
+            interface: scene::Interface { reachable: Some([836, 966, 256, 96]), tooltip: tip.map(|t| t.0), ..Default::default() },
+            screen_size: (1920, 1080),
+            ..Default::default()
+        };
+        let rect_of = move |s: &FreeSprite| overlay.iter().position(|o| (o.x, o.y, o.clip) == (s.x, s.y, s.clip)).map(|k| rects[k]);
+        (scene, rect_of)
+    }
+
+    fn order_buttons() -> Vec<[i32; 4]> {
+        let mut b: Vec<[i32; 4]> = (0..8).map(|k| [836 + 32 * k, 1030, 32, 32]).collect();
+        b.extend([[932, 998, 32, 32], [932, 966, 32, 32]]);
+        b
+    }
+
+    /// The tooltip of an order the orders were moved into the active view
+    /// with, over their rectangle (`reachable`), its text wider than the
+    /// buttons left of it: none of it is an order. The buttons stay where
+    /// they are without it, whatever its size; its letters go with its box,
+    /// and all of it is drawn over them, as the game draws it.
+    #[test]
+    fn order_tooltips_inside_the_orders_rectangle_move_no_button_and_keep_their_text() {
+        use viewer_settings::{Split, UnitButtons};
+        let buttons = order_buttons();
+        for side in [layout::Side::A, layout::Side::B] {
+            for frame_scale in [1.0, 1.25, 1.5] {
+                for pixel_scale in [1, 2] {
+                    // "Hold (Spacebar): Skip turn" of the first button, a
+                    // long one of the sixth ("Sentry (Enemy only)
+                    // (Shift-Y)"), a short one left of the upper ones.
+                    for tip in [([772, 1015, 160, 15], 22), ([900, 1015, 260, 15], 36), ([850, 1000, 78, 15], 10)] {
+                        let what = format!("{side:?}, frame ×{frame_scale}, ×{pixel_scale}, tooltip {tip:?}");
+                        let shown = |tip: Option<([i32; 4], usize)>| {
+                            let (scene, rect_of) = hud_with_order_tooltip(tip);
+                            let p = fixed_plan((1920 * pixel_scale, 1080 * pixel_scale), (1920, 1080), (pixel_scale, 1.0, frame_scale, 1.0));
+                            let mut l = layout::Layout::default();
+                            l.apply_settings(&viewer_settings::Layout { split: Split::Vertical1To1, unit_buttons: UnitButtons::ActiveView, ..Default::default() });
+                            l.driver_screen = Some(p.screen);
+                            l.frame(&scene, (1920, 1080), (0, 0, 0, 0), vec![], None);
+                            let area = l.view_area(side);
+                            l.route(scene::Input::MouseMove { x: area[0] + area[2] / 2, y: area[1] + area[3] / 2 });
+                            let (mut shown, mut cameras) = (Vec::new(), Vec::new());
+                            for _ in 0..3 {
+                                let mut f = l.frame(&scene, (1920, 1080), (0, 0, 0, 0), vec![], None);
+                                let arranged = arrange(&p, &scene, &mut f, &rect_of);
+                                shown = arranged.shown.unwrap();
+                                cameras = arranged.overlay_cameras.into_iter().find(|c| c.0 == 1).map(|c| c.1).unwrap_or_default();
+                                l.set_interface_shown(Some(shown.clone()));
+                            }
+                            (shown, cameras)
+                        };
+                        let (before, _) = shown(None);
+                        let (hovered, cameras) = shown(Some(tip));
+                        // (Sprites 2..12 are the orders, the rest the tooltip.)
+                        let tip_cameras = &cameras[2 + buttons.len()..];
+                        assert!(tip_cameras.iter().all(|&c| c == tip_cameras[0]), "{what}: the tooltip in one camera");
+                        assert!(cameras[2..2 + buttons.len()].iter().all(|&c| c < tip_cameras[0]), "{what}: the tooltip over the orders");
+                        let at = |shown: &[ShownPiece], d: [i32; 4]| shown.iter().find(|s| s.driver == d).unwrap_or_else(|| panic!("{what}: {d:?} shown")).clone();
+                        for b in &buttons {
+                            assert_eq!(at(&hovered, *b).rect, at(&before, *b).rect, "{what}: button {b:?} moved for its tooltip");
+                        }
+                        // Every letter drawn as its box is.
+                        let tip_piece = at(&hovered, tip.0).piece;
+                        let letters: Vec<&ShownPiece> = hovered.iter().filter(|s| s.driver != tip.0 && s.driver[1] >= tip.0[1] && s.driver[1] + s.driver[3] <= tip.0[1] + tip.0[3] && s.driver[0] >= tip.0[0] && s.driver[0] + s.driver[2] <= tip.0[0] + tip.0[2]).collect();
+                        assert_eq!(letters.len(), tip.1, "{what}");
+                        for s in letters {
+                            assert_eq!(s.piece, tip_piece, "{what}: letter at {:?} not with its box", s.driver);
                         }
                     }
                 }
