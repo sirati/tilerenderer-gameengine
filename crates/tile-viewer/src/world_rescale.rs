@@ -1,4 +1,4 @@
-//! Preserve world positions when Civ III changes its artwork scale with Z.
+//! Preserve world positions when the game changes its artwork scale with Z.
 //! Window pixels and UI geometry stay unchanged; cached world coordinates
 //! and motion state move to the new game-pixel coordinate system.
 
@@ -50,7 +50,7 @@ impl Layout {
             camera.downscale = downscale;
         }
         self.pan_rescale_world(ratio);
-        // Unit-order gestures use game pixels too. Their helper also
+        // World-order gestures use game pixels too. Their helper also
         // rebases the captured pointer's projected threshold coordinates.
         self.world_orders_rescale_world(ratio);
     }
@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_focus_after_selection_in_either_view_overrides_only_older_semantic_requests() {
+    fn piece_focus_after_selection_in_either_view_overrides_only_older_semantic_requests() {
         for smooth in [false, true] {
             let mut l = Layout::default();
             l.apply_settings(&viewer_settings::Layout { split: Split::Vertical1To1, roles: Roles::UnitMouse, smooth_world_movement: smooth, ..Default::default() });
@@ -189,7 +189,7 @@ mod tests {
             settle(&mut l, &s);
             let out = click(&mut l, (600, 300));
             assert!(out.iter().any(|input| matches!(input, Input::WorldButton { button: Button::Left, down: true, x: 6500, y: 2600 })));
-            // Selection through B changes only the selected-unit focus.
+            // Selection through B changes only the selected-piece focus.
             // The native camera stays parked and emits no new request.
             s.focus = Some((6500, 2600));
             settle(&mut l, &s);
@@ -203,7 +203,7 @@ mod tests {
             settle(&mut l, &s);
             assert_eq!((l.main_view.center, l.split.unwrap().view.center), (selected, (6500, 2600)));
             // A new visible AI movement wins while the player's active
-            // unit stays selected, then a later unit selection wins again.
+            // piece stays selected, then a later piece selection wins again.
             s.camera_focus = Some(CameraFocus { serial: 2, center: (4500, 1800) });
             settle(&mut l, &s);
             assert_eq!((l.main_view.center, l.split.unwrap().view.center), ((4500, 1800), (6500, 2600)));
@@ -212,7 +212,7 @@ mod tests {
             assert_eq!(l.main_view.center, (3600, 2400));
             s.focus = Some(selected);
             settle(&mut l, &s);
-            assert_eq!(l.main_view.center, selected, "returning to an old unit must not revive the earlier AI request");
+            assert_eq!(l.main_view.center, selected, "returning to an old piece must not revive the earlier AI request");
             // Z changes coordinates without changing either focus signal.
             s.views[0].view.downscale = 2;
             s.camera_focus.as_mut().unwrap().center = (2250, 900);
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn z_does_not_end_an_ai_focus_when_the_unit_baseline_has_odd_pixels() {
+    fn z_does_not_end_an_ai_focus_when_the_piece_baseline_has_odd_pixels() {
         let mut l = Layout::default();
         l.apply_settings(&viewer_settings::Layout { split: Split::Vertical1To1, roles: Roles::UnitMouse, ..Default::default() });
         let mut s = scene(1);
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_driver_follow_keeps_semantic_camera_target_after_a_unit_focus_change() {
+    fn explicit_driver_follow_keeps_semantic_camera_target_after_a_piece_focus_change() {
         let mut l = Layout::default();
         l.apply_settings(&viewer_settings::Layout { split: Split::Vertical1To1, roles: Roles::Free, ..Default::default() });
         let mut s = scene(1);

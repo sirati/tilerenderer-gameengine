@@ -150,7 +150,7 @@ impl Record {
 }
 
 /// Where a host records the Alt mode: `CIV3R_ALTREC_DIR` if set, else
-/// `default` (the folder of the game's log, `civ3-bridge.log`).
+/// `default` (the folder of the game's log).
 pub fn recording_dir(default: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
     std::env::var_os("CIV3R_ALTREC_DIR").filter(|d| !d.is_empty()).map(Into::into).or(default)
 }

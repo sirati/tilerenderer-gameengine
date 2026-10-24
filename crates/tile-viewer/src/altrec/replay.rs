@@ -361,7 +361,7 @@ fn share(n: usize, of: usize) -> String {
     if of == 0 { "-".into() } else { format!("{:.0} %", 100.0 * n as f64 / of as f64) }
 }
 
-/// What `civ3-tool altrec` prints for a session: what the recording shows,
+/// What the driver's altrec tool prints for a session: what the recording shows,
 /// and what the picker does with `options` over the same motion.
 pub fn report(session: &Session, options: &Options) -> String {
     use std::fmt::Write;

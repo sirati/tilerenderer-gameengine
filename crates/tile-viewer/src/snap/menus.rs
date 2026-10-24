@@ -65,7 +65,7 @@ fn the_mode_comes_on_with_a_menu_and_goes_with_the_last_but_never_in_the_world()
     let (mut snap, mut l) = setup();
     run(&mut snap, &mut l, &scene(None), 0.0, 1.0);
     assert!(!snap.active(), "in the world the player presses Alt");
-    run(&mut snap, &mut l, &scene(Some("F1")), 1.0, 0.2);
+    run(&mut snap, &mut l, &scene(Some("Report")), 1.0, 0.2);
     assert!(snap.active() && snap.snapper.snapping(), "a menu: on by itself");
     assert!(!l.captured());
     // Another menu after it: still on.
@@ -79,7 +79,7 @@ fn the_mode_comes_on_with_a_menu_and_goes_with_the_last_but_never_in_the_world()
 #[test]
 fn esc_closes_the_menu_and_alt_turns_the_mode_off_until_the_menus_are_gone() {
     let (mut snap, mut l) = setup();
-    let menu = scene(Some("F1"));
+    let menu = scene(Some("Report"));
     run(&mut snap, &mut l, &menu, 0.0, 0.2);
     assert!(snap.snapper.snapping());
     // Esc is the menu's (the game closes it), the mode stays.
@@ -93,11 +93,11 @@ fn esc_closes_the_menu_and_alt_turns_the_mode_off_until_the_menus_are_gone() {
     key(&mut snap, &mut l, &menu, ALT, false, 0.45);
     run(&mut snap, &mut l, &menu, 0.5, 1.0);
     assert!(!snap.active());
-    run(&mut snap, &mut l, &scene(Some("F2")), 1.5, 0.5);
+    run(&mut snap, &mut l, &scene(Some("Overview")), 1.5, 0.5);
     assert!(!snap.active(), "declined until the menus are all closed");
     // Closed, then a menu again: on again.
     run(&mut snap, &mut l, &scene(None), 2.0, 0.5);
-    run(&mut snap, &mut l, &scene(Some("F3")), 2.5, 0.2);
+    run(&mut snap, &mut l, &scene(Some("Summary")), 2.5, 0.2);
     assert!(snap.snapper.snapping());
 }
 
@@ -109,13 +109,13 @@ fn the_players_own_mode_stays_after_the_menus_and_the_setting_off_or_the_window_
     key(&mut snap, &mut l, &scene(None), ALT, true, 0.3);
     key(&mut snap, &mut l, &scene(None), ALT, false, 0.35);
     assert!(snap.snapper.snapping());
-    run(&mut snap, &mut l, &scene(Some("F1")), 0.4, 0.3);
+    run(&mut snap, &mut l, &scene(Some("Report")), 0.4, 0.3);
     run(&mut snap, &mut l, &scene(None), 0.7, 1.0);
     assert!(snap.snapper.snapping(), "the player's, not the menu's");
     // The setting off (or the window not in front): menus as before.
     let (mut snap, mut l) = setup();
     snap.set_alt_in_menus(false);
-    run(&mut snap, &mut l, &scene(Some("F1")), 0.0, 1.0);
+    run(&mut snap, &mut l, &scene(Some("Report")), 0.0, 1.0);
     assert!(!snap.active());
 }
 
@@ -251,11 +251,11 @@ fn the_game_menu_and_the_quit_dialogue_keep_the_mode_as_any_menu_does() {
     key(&mut snap, &mut l, &menu, ALT, true, 1.1);
     key(&mut snap, &mut l, &menu, ALT, false, 1.15);
     assert!(snap.active(), "and on again");
-    // On for an advisor; the quit popup over it leaves it on.
+    // On for a report screen; the quit popup over it leaves it on.
     let (mut snap, mut l) = setup();
-    run(&mut snap, &mut l, &scene(Some("F1")), 0.0, 0.3);
+    run(&mut snap, &mut l, &scene(Some("Report")), 0.0, 0.3);
     assert!(snap.active());
-    run(&mut snap, &mut l, &releasing(scene(Some("F1"))), 0.3, 0.3);
+    run(&mut snap, &mut l, &releasing(scene(Some("Report"))), 0.3, 0.3);
     assert!(snap.active() && l.snapping());
     // The player's own mode, turned on in the world, stays too.
     let (mut snap, mut l) = setup();

@@ -56,7 +56,7 @@ fn layout_of(c: &Case) -> (Layout, Frame) {
     let mut s = scene();
     let (w, h) = (c.canvas.0 as i32, c.canvas.1 as i32);
     let vertical = c.split != S::Horizontal1To1;
-    // The unit's orders: low in the window, over the gap where it is.
+    // The piece's orders: low in the window, over the gap where it is.
     if c.orders {
         s.interface.reachable = Some(if vertical { [w / 3, h - 40 * c.ui - 20, w / 3 + 30 * c.ui, 30 * c.ui] } else { [w - 70 * c.ui - 10, h / 3, 60 * c.ui, h / 3] });
     }

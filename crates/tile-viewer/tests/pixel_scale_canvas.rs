@@ -48,7 +48,7 @@ fn every_pixel_scale_renders_the_window_divided_by_it() {
     }
 }
 
-/// A Civ III-like world: RGB555, two passes (terrain and a translucent
+/// A world like the game's: RGB555, two passes (terrain and a translucent
 /// one) of 64×32 cells, enough to cover a 4K canvas.
 fn world() -> (tile_render::Atlas, TileWorld) {
     let mut atlas = tile_render::AtlasBuilder::new(512);

@@ -25,7 +25,7 @@ use crate::pointer_thread::{OnTick, Tick};
 
 /// How near (in window pixels) a window edge the pointer scrolls the view
 /// it is in: three times the game's own zone
-/// (`civ3_sys::hooks::EDGE_SCROLL_ZONE`, `scene::EDGE_ZONE`).
+/// (`scene::EDGE_ZONE`).
 pub const EDGE_ZONE: i32 = 3 * scene::EDGE_ZONE;
 
 /// How far past the window (in window pixels) a pointer still counts as

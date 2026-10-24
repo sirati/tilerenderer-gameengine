@@ -321,7 +321,7 @@ fn a_command_waiting_for_a_place_recaptures_where_the_player_looks_and_targets_t
 }
 
 #[test]
-fn c_centres_the_capture_view_on_the_active_unit() {
+fn c_centres_the_capture_view_on_the_selected_piece() {
     const C: u32 = 0x43;
     const CTRL: u32 = 0x11;
     let mut s = scene();
@@ -333,11 +333,11 @@ fn c_centres_the_capture_view_on_the_active_unit() {
             frame(&mut l, &s);
         }
         let (rect, _) = l.capture_view().unwrap();
-        // The unit: a world pixel off the capture view's middle.
-        let unit_at = (rect[0] + rect[2] / 4, rect[1] + rect[3] / 3);
-        l.route(Input::MouseMove { x: unit_at.0, y: unit_at.1 });
-        let unit = l.pointer_world().unwrap();
-        s.focus = Some(unit);
+        // The piece: a world pixel off the capture view's middle.
+        let piece_at = (rect[0] + rect[2] / 4, rect[1] + rect[3] / 3);
+        l.route(Input::MouseMove { x: piece_at.0, y: piece_at.1 });
+        let piece = l.pointer_world().unwrap();
+        s.focus = Some(piece);
         let mut snap = SnapInput::default();
         // Ctrl+C is not the game's C.
         snap.route(key(CTRL, true), &mut l, &s, 0.0, Rates::default());
@@ -346,7 +346,7 @@ fn c_centres_the_capture_view_on_the_active_unit() {
         snap.route(key(CTRL, false), &mut l, &s, 0.0, Rates::default());
         frame(&mut l, &s);
         l.route(Input::MouseMove { x: middle(rect).0, y: middle(rect).1 });
-        assert_ne!(l.pointer_world(), Some(unit), "{spec}");
+        assert_ne!(l.pointer_world(), Some(piece), "{spec}");
         // C: the game centres its view; the capture view centres too.
         let out = snap.route(key(C, true), &mut l, &s, 0.1, Rates::default());
         assert!(out.iter().any(|i| matches!(i, Input::Key { vk: C, down: true, .. } | Input::WorldKey { vk: C, down: true, .. })), "{spec}: the game gets it: {out:?}");
@@ -356,7 +356,7 @@ fn c_centres_the_capture_view_on_the_active_unit() {
         }
         l.route(Input::MouseMove { x: middle(rect).0, y: middle(rect).1 });
         let at = l.pointer_world().unwrap();
-        assert!((at.0 - unit.0).abs() <= 1 && (at.1 - unit.1).abs() <= 1, "{spec}: {at:?} vs {unit:?}");
+        assert!((at.0 - piece.0).abs() <= 1 && (at.1 - piece.1).abs() <= 1, "{spec}: {at:?} vs {piece:?}");
         s.focus = None;
     }
 }

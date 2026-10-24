@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn waiting_in_the_message_loop_counts_as_answering() {
         // An idle game asleep in its message wait reports 0, however long
-        // ago its last message was (`civ3_bridge::heartbeat`).
+        // ago its last message was (the driver's heartbeat).
         let t0 = Instant::now();
         for since_ms in [0u64, 50, 99] {
             assert_eq!(judge(Some((status(0), t0)), t0 + Duration::from_millis(since_ms)), Responsiveness::Answering);
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn busy_is_orange_and_stuck_red_both_readable_on_the_parchment() {
-        // Art/PopUpandMenuBackground.pcx's top-left 240x40: its mean colour
+        // The game's parchment background's top-left 240x40: its mean colour
         // and its darkest pixel.
         let (mean, darkest) = ([245, 233, 198], [189, 189, 156]);
         for c in [BUSY_COLOR, STUCK_COLOR] {
@@ -590,7 +590,7 @@ mod tests {
         let mut s = scene::Scene::default();
         s.views = vec![view(258)];
         s.interface.screen_view = Some(258);
-        // The city screen at the left, its world beside it at the right.
+        // The site screen at the left, its world beside it at the right.
         let screen = cam((0, 0), (1024, 768));
         let world = Camera { cells: true, origin: (1024, 0), ..Camera::new((576, 768)) };
         let a = anchor(&empty(), &s, &[screen, world], &[Some(0)]);
