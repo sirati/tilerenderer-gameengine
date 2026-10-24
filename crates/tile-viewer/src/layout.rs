@@ -2998,6 +2998,7 @@ impl Layout {
         if left_out != self.left_out {
             if left_out > 0 {
                 log::warn!("viewer: {left_out} of its own views left out (at most {} views are drawn)", tile_render::MAX_VIEWS);
+                render_errors::report(render_errors::Kind::ViewsLeftOut, "the layout's own views", format_args!("{left_out} left out"));
             }
             self.left_out = left_out;
         }

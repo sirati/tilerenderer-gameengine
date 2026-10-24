@@ -1123,6 +1123,7 @@ impl State {
                         "viewer: replacement art {} could not be prepared: {e}",
                         preparing.base
                     );
+                    render_errors::report(render_errors::Kind::Atlas, "replacement art could not be prepared", format_args!("art {}: {e}", preparing.base));
                     preparing.renderer.cancel_atlas_transfer(&gpu.queue);
                     preparing.pending = None;
                     preparing.failed = true;
@@ -1151,6 +1152,7 @@ impl State {
                         "viewer: replacement art {} could not be activated: {e}",
                         preparing.base
                     );
+                    render_errors::report(render_errors::Kind::Atlas, "replacement art could not be activated", format_args!("art {}: {e}", preparing.base));
                     preparing.failed = true;
                     self.art_error =
                         Some(format!("replacement atlas {} failed: {e}", preparing.base));
@@ -1208,6 +1210,7 @@ impl State {
                         "viewer: cannot prepare atlas generation {}: {e}",
                         p.payload.base()
                     );
+                    render_errors::report(render_errors::Kind::Atlas, "atlas generation could not be prepared", format_args!("generation {}: {e}", p.payload.base()));
                     p.failed = true;
                     self.art_error = Some(format!("atlas {} failed: {e}", p.payload.base()));
                     return false;
@@ -1237,6 +1240,7 @@ impl State {
                     "viewer: atlas generation {} transfer failed: {e}",
                     p.payload.base()
                 );
+                render_errors::report(render_errors::Kind::Atlas, "atlas transfer failed", format_args!("generation {}: {e}", p.payload.base()));
                 gpu.renderer.cancel_atlas_transfer(&gpu.queue);
                 p.failed = true;
                 self.art_error = Some(format!("atlas {} failed: {e}", p.payload.base()));

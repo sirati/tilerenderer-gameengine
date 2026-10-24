@@ -1421,6 +1421,7 @@ mod host_app {
                 // owner's guards report the end.)
                 if let Err(e) = event_loop.run_app_attached(Attached { app, on_exit: Some(on_exit) }) {
                     log::error!("viewer: {e}");
+                    render_errors::report(render_errors::Kind::Viewer, "running", format_args!("{e}"));
                 }
             }
             Err(e) => on_exit(Err(e)),
@@ -3392,7 +3393,11 @@ impl App {
                     {
                         let result = self.gpu.as_mut().and_then(|gpu| gpu.bitmap.as_mut()).ok_or_else(|| ViewerError::SoftwarePresent("bitmap presenter is absent".into()))
                             .and_then(|presenter| presenter.present(width, height, &pixels));
-                        if let Err(error) = result { self.error = Some(error); continue; }
+                        if let Err(error) = result {
+                            render_errors::report(render_errors::Kind::Gpu, "software present", format_args!("{error}"));
+                            self.error = Some(error);
+                            continue;
+                        }
                         self.commit_ui(id, worker_prepare);
                     }
                     #[cfg(not(target_os = "macos"))]
@@ -3424,6 +3429,7 @@ impl App {
                     }
                     self.pending_ui = None;
                     self.pending_replay = None;
+                    render_errors::report(render_errors::Kind::RenderWorker, "it failed", format_args!("{error}"));
                     self.error = Some(ViewerError::RenderWorker(error));
                 }
             }
@@ -3550,6 +3556,7 @@ impl App {
         }
         if !accepted {
             self.error = Some(ViewerError::RenderWorker("rejected a cached frame".into()));
+            render_errors::report(render_errors::Kind::RenderWorker, "a cached frame", format_args!("rejected"));
             return;
         }
         self.pending_replay = Some((id, gpu.config_revision, started, started.elapsed()));
@@ -3977,6 +3984,7 @@ impl App {
         if !accepted {
             self.pending_ui = None;
             self.error = Some(ViewerError::RenderWorker("rejected a complete frame".into()));
+            render_errors::report(render_errors::Kind::RenderWorker, "a complete frame", format_args!("frame {id}"));
         }
 
     }
@@ -3996,6 +4004,7 @@ impl ApplicationHandler for App {
         if self.gpu.is_none() {
             if let Err(e) = self.init(event_loop) {
                 log::error!("viewer init: {e}");
+                render_errors::report(render_errors::Kind::Viewer, "starting it", format_args!("{e}"));
                 self.error = Some(e);
                 event_loop.exit();
             }
@@ -4367,7 +4376,10 @@ impl CursorBuilds {
         std::thread::spawn(move || thread_start::initialized(initialize, || {
             let source = art.native_image(key.0, key.1).and_then(|native| {
                 winit::window::CustomCursor::from_rgba(native.rgba, native.size.0, native.size.1, native.hotspot.0, native.hotspot.1)
-                    .inspect_err(|e| log::warn!("viewer: cursor {:?}: {e}", key.0))
+                    .inspect_err(|e| {
+                        log::warn!("viewer: cursor {:?}: {e}", key.0);
+                        render_errors::report(render_errors::Kind::MissingSprite, "the system pointer's cursor image", format_args!("{:?}: {e}", key.0));
+                    })
                     .ok()
             });
             if tx.send((generation, key, source)).is_ok() {
