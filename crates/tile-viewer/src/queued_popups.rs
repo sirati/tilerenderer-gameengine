@@ -2,8 +2,8 @@
 //! (`scene::Interface::queued`, docs/modal-input.md "Reports the game does
 //! not wait for"). They are no modal: the driver's game went on. The viewer
 //! shows them as a stack, the first to read on top (`scaling::queued_places`:
-//! over the world at its top-right, over the menus while a game loads where
-//! a modal popup would be), and the player reads them one by one: a press
+//! at the window's top-right, clear of a modal popup and the world's
+//! middle), and the player reads them one by one: a press
 //! on the stack, or Enter or Esc with the pointer on it, closes the first
 //! and does nothing else. Every other input goes on to the driver as if
 //! they were not there. The first one's button is a target of the Alt

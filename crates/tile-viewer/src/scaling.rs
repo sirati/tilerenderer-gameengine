@@ -510,20 +510,16 @@ pub const QUEUE_STEP: i32 = 10;
 pub const QUEUE_MARGIN: i32 = 16;
 
 /// Where the queued reports of `sizes` (as shown, the first one to read
-/// first) go in `region`, their top-left corners: over the world (`world`)
-/// at its top-right, out of the way of the play in its middle; over a menu
-/// (a game loading: no world yet) where a modal popup over it would go
-/// (`MODAL_TOP`). The ones waiting behind the first show a little below
-/// and right of it, as a stack.
-pub fn queued_places(sizes: &[(i32, i32)], region: [i32; 4], world: bool) -> Vec<(i32, i32)> {
-    let Some(&(w, h)) = sizes.first() else { return Vec::new() };
+/// first) go in `region`, their top-left corners: at its top-right, out of
+/// the way of the play in the world's middle and of a modal popup over the
+/// menus (`MODAL_TOP`, across in the middle), which would hide them. The
+/// ones waiting behind the first show a little below and right of it, as a
+/// stack.
+pub fn queued_places(sizes: &[(i32, i32)], region: [i32; 4]) -> Vec<(i32, i32)> {
+    let Some(&(w, _)) = sizes.first() else { return Vec::new() };
     let behind = (sizes.len() as i32 - 1) * QUEUE_STEP;
     let [rx, ry, rw, _] = region;
-    let first = if world {
-        (rx + (rw - QUEUE_MARGIN - w - behind).max(0), ry + QUEUE_MARGIN)
-    } else {
-        modal_place((w + behind, h + behind), region)
-    };
+    let first = (rx + (rw - QUEUE_MARGIN - w - behind).max(0), ry + QUEUE_MARGIN);
     (0..sizes.len() as i32).map(|k| (first.0 + k * QUEUE_STEP, first.1 + k * QUEUE_STEP)).collect()
 }
 
@@ -739,8 +735,8 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     // The modal popup's map and its rectangle in the driver's window.
     let mut modal_shown: Option<(Affine, [i32; 4])> = None;
     // The queued reports (`Interface::queued`, those the layout still
-    // shows: a view without a camera is closing), over the world at its
-    // top-right, else over the menus as a modal popup would be.
+    // shows: a view without a camera is closing), at the top-right of the
+    // window (of the menus' region while a game loads).
     let queued_views: Vec<(u32, u64, Option<[i32; 4]>, Camera)> = parts.queued.iter().filter_map(|q| {
         let i = scene.views.iter().position(|v| v.id == q.view)?;
         let camera = frame.cameras[frame.view_cameras.get(i).copied().flatten()? as usize];
@@ -756,7 +752,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let size = |v: u32| (v as u64 * zoom.0 as u64).div_ceil(zoom.1.max(1) as u64).max(1) as i32;
         (size(c.viewport.0), size(c.viewport.1))
     }).collect();
-    let queued_at: Vec<(u32, (i32, i32), Ratio)> = queued_views.iter().zip(queued_places(&queued_sizes, queue_region, over_world))
+    let queued_at: Vec<(u32, (i32, i32), Ratio)> = queued_views.iter().zip(queued_places(&queued_sizes, queue_region))
         .map(|((view, _, _, c), at)| (*view, at, queue_zoom(c))).collect();
     out.queued = queued_views.iter().zip(&queued_at).zip(&queued_sizes).map(|(((view, serial, button, camera), (_, at, zoom)), &(w, h))| {
         let piece = Affine { from: camera.origin, to: *at, zoom: *zoom };
@@ -3094,15 +3090,14 @@ mod tests {
     }
 
     #[test]
-    fn queued_reports_stack_at_the_worlds_top_right_or_where_a_modal_goes() {
+    fn queued_reports_stack_at_the_top_right() {
         let region = [0, 0, 1600, 900];
-        let places = queued_places(&[(300, 200), (300, 200)], region, true);
+        let places = queued_places(&[(300, 200), (300, 200)], region);
         assert_eq!(places, vec![(1600 - QUEUE_MARGIN - 300 - QUEUE_STEP, QUEUE_MARGIN), (1600 - QUEUE_MARGIN - 300, QUEUE_MARGIN + QUEUE_STEP)]);
-        let places = queued_places(&[(300, 200)], region, false);
-        assert_eq!(places, vec![modal_place((300, 200), region)]);
-        assert!(queued_places(&[], region, true).is_empty());
+        assert_eq!(queued_places(&[(300, 200)], [100, 50, 800, 600]), vec![(900 - QUEUE_MARGIN - 300, 50 + QUEUE_MARGIN)]);
+        assert!(queued_places(&[], region).is_empty());
         // Wider than the region: at its left edge, not off it.
-        assert_eq!(queued_places(&[(2000, 200)], region, true)[0].0, 0);
+        assert_eq!(queued_places(&[(2000, 200)], region)[0].0, 0);
     }
 
     #[test]

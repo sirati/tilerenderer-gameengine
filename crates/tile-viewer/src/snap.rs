@@ -1880,3 +1880,7 @@ mod city_work;
 #[cfg(test)]
 #[path = "snap/regions.rs"]
 mod regions;
+
+#[cfg(test)]
+#[path = "snap/queued_reports.rs"]
+mod queued_reports;
