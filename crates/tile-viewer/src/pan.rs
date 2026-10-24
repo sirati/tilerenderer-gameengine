@@ -352,6 +352,17 @@ impl Layout {
         self.pan.press.is_some() || self.pan.grab.is_some()
     }
 
+    /// Whether `button` holds a view grabbed (a drag, not a click).
+    pub(super) fn pan_grabbed(&self, button: Button) -> bool {
+        self.pan.grab.is_some_and(|g| g.button == button)
+    }
+
+    /// Forgets a left press that may have become a drag: it was a click
+    /// taken by someone else (`unit_orders`), never replayed to the driver.
+    pub(super) fn pan_forget_press(&mut self) {
+        self.pan.press = None;
+    }
+
     fn driver_center(&self) -> Option<(i32, i32)> {
         self.main.map(|m| (m.x + m.viewport.0 as i32 / 2, m.y + m.viewport.1 as i32 / 2))
     }

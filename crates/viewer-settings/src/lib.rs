@@ -561,8 +561,9 @@ pub enum MapMovement {
     /// Civilization IV style: the left button held on the map and dragged
     /// past a few pixels grabs it, the map following the pointer 1:1 and
     /// sliding on with momentum when let go (a shorter click is a click);
-    /// no edge scrolling. A short right click opens the unit menu, while
-    /// right-drag previews a unit order for a separate left-click confirmation.
+    /// no edge scrolling. A quick right click opens the unit menu, while a
+    /// right drag or a long right press preselects a unit order's tile for a
+    /// separate left-click confirmation.
     Drag,
 }
 
