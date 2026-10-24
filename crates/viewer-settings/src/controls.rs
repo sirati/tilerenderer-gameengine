@@ -8,7 +8,7 @@
 //! Choices are named like the enum variants they stand for (`"Vertical2To1"`,
 //! `"LeftOrBottom"`); the pixel scale by its number (`"1"` .. `"6"`).
 
-use crate::{BackgroundSampling, Layout, MapMovement, Place, Resolution, Roles, Settings, Split, UnitButtons, Zoom};
+use crate::{BackgroundSampling, Layout, MapMovement, Place, Resolution, Roles, Settings, Split, UnitButtons, Zoom, ZoomContent};
 
 /// A control's value.
 #[derive(Clone, Debug, PartialEq)]
@@ -94,7 +94,7 @@ pub const KEYS: [&str; 39] = [
     "layout.zoom_glass",
     "layout.zoom_place",
     "layout.zoom",
-    "layout.menu_zoom",
+    "layout.zoom_content",
     "layout.zoom_strip",
     "layout.zoom_box_top",
     "layout.zoom_box_drop",
@@ -180,7 +180,12 @@ impl Named for Zoom {
         (Zoom::Mouse111, "Mouse111"),
         (Zoom::Mouse131, "Mouse131"),
         (Zoom::TopStrip, "TopStrip"),
+        (Zoom::Beside, "Beside"),
     ];
+}
+
+impl Named for ZoomContent {
+    const ALL: &'static [(Self, &'static str)] = &[(ZoomContent::World, "World"), (ZoomContent::WorldAndMenus, "WorldAndMenus")];
 }
 
 impl Named for Roles {
@@ -250,7 +255,7 @@ impl Settings {
             "layout.split" => choice(l.split),
             "layout.zoom_place" => choice(l.zoom_place),
             "layout.zoom" => choice(l.zoom),
-            "layout.menu_zoom" => Some(ControlValue::On(l.menu_zoom)),
+            "layout.zoom_content" => choice(l.zoom_content),
             "layout.separator_width" => Some(ControlValue::Number(l.separator_width.clamp(1, 16) as f32)),
             "layout.zoom_rounded" => Some(ControlValue::On(l.zoom_rounded)),
             "layout.zoom_glass" => Some(ControlValue::On(l.zoom_glass)),
@@ -369,17 +374,17 @@ impl Settings {
                 "layout.split" => set_choice(&mut l.split, value),
                 "layout.zoom_place" => set_choice(&mut l.zoom_place, value),
                 "layout.zoom" => set_choice(&mut l.zoom, value),
+                "layout.zoom_content" => set_choice(&mut l.zoom_content, value),
                 "layout.separator_width" => {
                     let mut width = l.separator_width as f32;
                     let ok = set_number(&mut width, key, value);
                     if ok { l.separator_width = width as u32; }
                     ok
                 }
-                "layout.zoom_rounded" | "layout.zoom_glass" | "layout.menu_zoom" => match value {
+                "layout.zoom_rounded" | "layout.zoom_glass" => match value {
                     ControlValue::On(on) => {
                         match key {
                             "layout.zoom_rounded" => l.zoom_rounded = *on,
-                            "layout.menu_zoom" => l.menu_zoom = *on,
                             _ => l.zoom_glass = *on,
                         }
                         true
