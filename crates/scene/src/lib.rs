@@ -580,6 +580,13 @@ pub struct Interface {
     pub snap_to_tiles: bool,
     /// A build queue shown that the player may reorder by dragging.
     pub build_queue: Option<BuildQueue>,
+    /// One of the driver's dialogues a player opens to get out of the game
+    /// is open (Civilization III: its game menu with Save, Load and Quit
+    /// Game, and the "really quit?" popup Escape opens on the map). While
+    /// it is, a renderer holds the pointer in no way: no capture, no
+    /// confinement, no walls, no warps, so it can leave the window. The
+    /// driver sets it from its state in every scene, never from events.
+    pub releases_pointer: bool,
 }
 
 impl Interface {

@@ -862,6 +862,11 @@ pub struct Layout {
     /// Where the open menus lie over the window, as of the last frame
     /// (`capture`: a view they overlap does not capture the mouse).
     menu_cover: capture::Cover,
+    /// A dialogue that lets go of the pointer is open, as the driver says
+    /// in its scene (`scene::Interface::releases_pointer`, `capture`).
+    releases_pointer: bool,
+    /// The system pointer is in the window (as the window last said).
+    pointer_inside: bool,
     /// The pointer goes to the screen just opened (this frame), or to the
     /// popup.
     pointer_to_screen: bool,
@@ -1111,6 +1116,8 @@ impl Default for Layout {
             world_period: (0, 0),
             resume: capture::Resume::default(),
             menu_cover: capture::Cover::default(),
+            releases_pointer: false,
+            pointer_inside: true,
             pointer_to_screen: false,
             pointer_to_popup: false,
             notes: Vec::new(),
@@ -1621,7 +1628,7 @@ impl Layout {
     /// They are the split's drawn segments ([`Layout::dividers`]), as
     /// [`Layout::constrain`] holds the pointer back.
     fn divider_pointer_walls(&self) -> Option<Vec<[i32; 4]>> {
-        if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping || self.pointer_free_everywhere() {
+        if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping || self.pointer_unbounded() {
             return None;
         }
         let walls: Vec<[i32; 4]> = self.dividers().segments.iter().filter(|s| s.wall && s.band.kind == DividerKind::Split).map(|s| s.rect()).collect();
@@ -1633,7 +1640,7 @@ impl Layout {
     /// strips include the gap below them, so the pointer stops on the map's
     /// top row. Interface controls drawn over a zoom remain reachable.
     pub fn pointer_walls(&self) -> Option<Vec<[i32; 4]>> {
-        if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping || self.pointer_free_everywhere() {
+        if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping || self.pointer_unbounded() {
             return None;
         }
         let mut walls = self.divider_pointer_walls().unwrap_or_default();
@@ -1675,7 +1682,7 @@ impl Layout {
     }
 
     fn zoom_pointer_walls(&self) -> Vec<[i32; 4]> {
-        if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping {
+        if (self.locked && !self.pointer_at_edge) || self.drag.is_some() || (self.beside.is_some() && !self.pointer_at_edge) || self.snapping || self.releases_pointer {
             return vec![];
         }
         let Some(m) = self.magnifier.filter(|_| self.magnifier_shown && self.world_shown) else { return vec![] };
@@ -2135,7 +2142,7 @@ impl Layout {
         self.against = None;
         // (Where the system pointer cannot be moved back, a wall would hold
         // the pointer where it is not seen: it passes.)
-        if self.walls == Walls::Open || self.pointer_free_everywhere() {
+        if self.walls == Walls::Open || self.pointer_unbounded() {
             self.side = self.side_of(to);
             return to;
         }
@@ -2500,6 +2507,14 @@ impl Layout {
     ) -> Frame {
         self.window = window;
         self.bounds = bounds;
+        // (Before anything that captures the mouse or holds the pointer.)
+        if std::mem::replace(&mut self.releases_pointer, scene.interface.releases_pointer) != self.releases_pointer {
+            self.notes.push(if self.releases_pointer {
+                "viewer: the game menu or the quit dialogue is open: no capture, no walls, no confinement, the pointer is free".into()
+            } else {
+                "viewer: the dialogue that let the pointer go closed".into()
+            });
+        }
         self.focus_after_scale = None;
         // The driver publishes an empty world outside a game. Keep its
         // title and setup screens independent of the configured map views.
@@ -9762,6 +9777,160 @@ mod tests {
             }
             sides.sort_by_key(|s| *s == Side::B);
             assert_eq!(sides, [Side::A, Side::B], "{split:?}");
+        }
+    }
+
+    /// `s` with the driver saying a dialogue that lets go of the pointer is
+    /// open (the game menu, the popup Escape opens on the map).
+    fn releasing(mut s: Scene) -> Scene {
+        s.interface.releases_pointer = true;
+        s
+    }
+
+    /// A vertical split, B following the world cursor, a world zoom box;
+    /// the mouse free over A.
+    fn split_free() -> Layout {
+        let mut l = Layout::default();
+        l.configure("split=vertical,pane=pointer,magnifier=world").unwrap();
+        frame(&mut l, vec![]);
+        mv(&mut l, (390, 100));
+        l
+    }
+
+    /// The divider holds the free pointer back outside its open middle
+    /// third (a warp back, or the system's walls).
+    fn divider_holds(l: &mut Layout) -> bool {
+        // (Into A through the open middle third, from wherever it is.)
+        for p in [(600, 300), (390, 300), (390, 100)] {
+            mv(l, p);
+        }
+        l.take_warp();
+        mv(l, (420, 100));
+        l.pointer.0 < 400
+    }
+
+    #[test]
+    fn the_game_menu_and_the_quit_dialogue_hold_the_pointer_nowhere() {
+        for dialogue in [releasing(with_screen("Menu")), releasing(with_parts(Some(300)))] {
+            let mut l = split_free();
+            assert!(l.pointer_walls().is_some());
+            assert!(divider_holds(&mut l));
+            click(&mut l, (600, 300));
+            assert!(l.captured());
+            assert_eq!(l.take_grab(), Some(true));
+            l.frame(&dialogue, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert!(!l.captured(), "let go");
+            assert_eq!(l.take_grab(), Some(false));
+            // (Shown where the world cursor was: once.)
+            l.take_warp();
+            assert!(l.releases_pointer());
+            assert_eq!(l.pointer_walls(), None, "no system confinement");
+            assert_eq!(l.pointer_bounds(), None);
+            assert!(l.zoom_pointer_walls().is_empty());
+            // Across the divider, into the zoom box, to the window's edges
+            // and corners: nothing holds it, nothing moves it.
+            for p in [(390, 100), (420, 100), (380, 300), (402, 300), (0, 0), (799, 0), (0, 599), (799, 599), (400, 599)] {
+                mv(&mut l, p);
+                assert_eq!(l.pointer, p);
+                assert_eq!(l.take_warp(), None, "{p:?}");
+            }
+            // Nothing captures it: a click into B, Ctrl+Shift+Space, the
+            // Alt mode's attractors.
+            click(&mut l, (600, 300));
+            mv(&mut l, (600, 300));
+            ctrl_shift(&mut l, 0x20);
+            assert!(!l.captured());
+            assert_eq!(l.take_grab(), None);
+            assert!(!l.may_capture());
+            assert!(l.attractors().iter().all(|a| !a.captures));
+            assert_ne!(l.take_pointer_icon(), Some(PointerIcon::Capture));
+            // Still open next frame: the same.
+            l.frame(&dialogue, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert_eq!((l.captured(), l.pointer_walls(), l.take_grab()), (false, None, None));
+            // Closed: captured again as after any menu, at the same world
+            // cursor; let go, the divider holds the free pointer again.
+            let cursor = l.cursor;
+            menus_gone(&mut l, &scene());
+            assert!(l.captured(), "taken up again");
+            assert_eq!(l.cursor, cursor);
+            assert_eq!(l.take_grab(), Some(true));
+            ctrl_shift(&mut l, 0x20);
+            assert!(!l.captured());
+            assert!(l.pointer_walls().is_some());
+            assert!(divider_holds(&mut l));
+        }
+    }
+
+    #[test]
+    fn closed_with_the_pointer_outside_the_window_the_mouse_stays_free_until_a_click() {
+        for dialogue in [releasing(with_screen("Menu")), releasing(with_parts(Some(300)))] {
+            let mut l = split_free();
+            click(&mut l, (600, 300));
+            assert!(l.captured());
+            l.frame(&dialogue, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            l.take_grab();
+            // The player leaves the window with it, and closes it (Enter,
+            // Escape) from outside.
+            l.set_pointer_inside(false);
+            menus_gone(&mut l, &scene());
+            assert!(!l.captured(), "not pulled back into the window");
+            assert_eq!(l.take_grab(), None);
+            for _ in 0..5 {
+                l.advance(std::time::Duration::from_millis(100));
+                frame(&mut l, vec![]);
+            }
+            l.set_pointer_inside(true);
+            frame(&mut l, vec![]);
+            assert!(!l.captured(), "forgotten, not waiting for the pointer");
+            // As always, a click into the view captures it.
+            mv(&mut l, (600, 300));
+            click(&mut l, (600, 300));
+            assert!(l.captured());
+        }
+        // Back in the window before it closes: captured again.
+        let mut l = split_free();
+        click(&mut l, (600, 300));
+        l.frame(&releasing(with_screen("Menu")), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        l.set_pointer_inside(false);
+        l.frame(&releasing(with_screen("Menu")), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        l.set_pointer_inside(true);
+        menus_gone(&mut l, &scene());
+        assert!(l.captured());
+    }
+
+    #[test]
+    fn a_free_mouse_stays_free_after_the_dialogue() {
+        let mut l = split_free();
+        l.frame(&releasing(with_screen("Menu")), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(l.pointer_walls(), None);
+        assert_eq!(l.take_grab(), None);
+        menus_gone(&mut l, &scene());
+        assert!(!l.captured());
+        assert_eq!(l.take_grab(), None);
+        assert!(l.pointer_walls().is_some());
+    }
+
+    #[test]
+    fn other_menus_and_popups_hold_and_capture_as_before() {
+        for other in [with_screen("F1"), with_screen("Menu"), with_parts(Some(300))] {
+            let mut l = split_free();
+            l.frame(&other, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert!(!l.releases_pointer());
+            assert!(l.pointer_walls().is_some(), "the divider's walls");
+            assert!(divider_holds(&mut l));
+            // A capture they interrupt is taken up again, the pointer in
+            // the window or not (as before).
+            frame(&mut l, vec![]);
+            for p in [(390, 300), (600, 300)] {
+                mv(&mut l, p);
+            }
+            click(&mut l, (600, 300));
+            assert!(l.captured(), "{:?}", other.interface.screen);
+            l.frame(&other, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert!(!l.captured());
+            l.set_pointer_inside(false);
+            menus_gone(&mut l, &scene());
+            assert!(l.captured());
         }
     }
 }

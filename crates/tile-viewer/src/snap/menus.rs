@@ -227,3 +227,54 @@ fn steer(snap: &mut SnapInput, l: &mut Layout, s: &Scene, from: f64, to: f64, mo
         snap.tick(l, s, t, Rates::default());
     }
 }
+
+/// `s` with the driver saying a dialogue that lets go of the pointer is
+/// open (the game menu, the quit popup).
+fn releasing(mut s: Scene) -> Scene {
+    s.interface.releases_pointer = true;
+    s
+}
+
+#[test]
+fn the_game_menu_and_the_quit_dialogue_keep_the_mode_off_and_alt_is_the_games() {
+    let (mut snap, mut l) = setup();
+    let menu = releasing(scene(Some("Menu")));
+    run(&mut snap, &mut l, &menu, 0.0, 0.5);
+    assert!(!snap.active() && !l.snapping(), "not on by itself: its grab would hold the pointer");
+    let out = key(&mut snap, &mut l, &menu, ALT, true, 0.6);
+    assert!(out.contains(&Input::Key { vk: ALT, down: true, text: None }), "{out:?}");
+    let out = key(&mut snap, &mut l, &menu, ALT, false, 0.65);
+    assert!(out.contains(&Input::Key { vk: ALT, down: false, text: None }), "{out:?}");
+    run(&mut snap, &mut l, &menu, 0.7, 0.5);
+    assert!(!snap.active());
+    // On for an advisor; the quit popup over it turns it off at once.
+    let (mut snap, mut l) = setup();
+    run(&mut snap, &mut l, &scene(Some("F1")), 0.0, 0.3);
+    assert!(snap.active());
+    run(&mut snap, &mut l, &releasing(scene(Some("F1"))), 0.3, TICK);
+    assert!(!snap.active() && !l.snapping(), "off in one tick, not landing");
+    // The player's own mode, turned on in the world, goes too.
+    let (mut snap, mut l) = setup();
+    key(&mut snap, &mut l, &scene(None), ALT, true, 0.0);
+    key(&mut snap, &mut l, &scene(None), ALT, false, 0.05);
+    assert!(snap.active());
+    run(&mut snap, &mut l, &releasing(scene(None)), 0.1, TICK);
+    assert!(!snap.active());
+}
+
+#[test]
+fn captured_beside_a_popup_the_quit_dialogue_lets_go_and_no_click_captures() {
+    let (mut snap, mut l) = beside_setup();
+    let menu = beside(true);
+    snap.set_alt_in_menus(false);
+    run(&mut snap, &mut l, &menu, 0.0, 0.2);
+    press(&mut snap, &mut l, &menu, 0.25);
+    assert!(l.captured(), "the player's capture beside the popup");
+    let quit = releasing(beside(true));
+    run(&mut snap, &mut l, &quit, 0.3, 0.2);
+    assert!(!l.captured(), "let go, though no menu lies over B");
+    l.route(Input::MouseMove { x: 600, y: 300 });
+    press(&mut snap, &mut l, &quit, 0.6);
+    assert!(!l.captured(), "a click into B does not capture");
+    assert!(l.attractors().iter().all(|a| !a.captures));
+}
