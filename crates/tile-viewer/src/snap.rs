@@ -1845,17 +1845,22 @@ impl SnapInput {
     }
 
     /// The snapping pointer's art: the driver's own pointer (`driver`, a
-    /// sprite set with pixels) while the pointer rests on one of its
-    /// elements and the driver has it there, so that it tells what a click
-    /// does as the driver's pointer would (the game's Civilopedia book over
-    /// an entry a click opens the Civilopedia on); else, and for a system
-    /// icon the viewer has no art of, the driver's arrow (else the
-    /// viewer's own pointer). In flight it is the arrow: the driver's
-    /// pointer is still the one for the element left.
-    pub fn pointer_set(&self, compiled: &render_desc::Compiled, driver: scene::Cursor) -> Option<tile_render::SpriteSetId> {
+    /// sprite set with pixels; `current`: it answers the last pointer move
+    /// sent to the driver, `scene::Scene::cursor_at`) while the pointer
+    /// rests on one of its elements and the driver has handled the move
+    /// there, so that it tells
+    /// what a click does as the driver's pointer would (the game's
+    /// Civilopedia book over an entry a click opens the Civilopedia on);
+    /// else, and for a system icon the viewer has no art of, the driver's
+    /// arrow (else the viewer's own pointer). In flight, and at rest until
+    /// the driver has handled the move there, it is the arrow: the driver's
+    /// pointer is still the one for where it was before, never shown where
+    /// it does not belong.
+    pub fn pointer_set(&self, compiled: &render_desc::Compiled, driver: scene::Cursor, current: bool) -> Option<tile_render::SpriteSetId> {
         let arrow = || [ARROW_SPRITE, POINTER_SPRITE, crate::CURSOR_SPRITE].iter().find_map(|n| compiled.set(n).map(|(s, _)| s));
+        let answered = self.snapper.resting_on_driver() && current;
         let own = match driver {
-            scene::Cursor::Sprite(raw) if self.snapper.resting_on_driver() => Some(tile_render::SpriteSetId::from_raw(raw)),
+            scene::Cursor::Sprite(raw) if answered => Some(tile_render::SpriteSetId::from_raw(raw)),
             _ => None,
         };
         own.filter(|&s| crate::cursor::SetArt::of(compiled, s).is_some()).or_else(arrow)
@@ -1868,20 +1873,21 @@ impl SnapInput {
     /// as long as the renderer draws that many views. `window`: the
     /// canvas.
     pub fn compose(&self, compiled: &render_desc::Compiled, overlay: u32, next: u32, scale: crate::cursor::Scale, window: (u32, u32)) -> crate::cursor::Composed {
-        self.compose_with_busy(compiled, &crate::cursor::Art::default(), overlay, next, scale, window, crate::host_status::Responsiveness::Answering, scene::Cursor::Default)
+        self.compose_with_busy(compiled, &crate::cursor::Art::default(), overlay, next, scale, window, crate::host_status::Responsiveness::Answering, (scene::Cursor::Default, false))
     }
 
     /// As [`SnapInput::compose`], with the busy badge for `status` on the
     /// pointer, and `driver` the pointer the driver shows (as
-    /// `crate::cursor::Art::shown` makes it): while the pointer rests on
-    /// one of the driver's elements, that pointer's art
-    /// ([`SnapInput::pointer_set`]).
+    /// `crate::cursor::Art::shown` makes it) and whether it answers the
+    /// last pointer move sent to the driver: while the pointer rests on one
+    /// of the driver's elements and the driver has handled the move there,
+    /// that pointer's art ([`SnapInput::pointer_set`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn compose_with_busy(&self, compiled: &render_desc::Compiled, pixels: &crate::cursor::Art, overlay: u32, next: u32, scale: crate::cursor::Scale, window: (u32, u32), status: crate::host_status::Responsiveness, driver: scene::Cursor) -> crate::cursor::Composed {
+    pub fn compose_with_busy(&self, compiled: &render_desc::Compiled, pixels: &crate::cursor::Art, overlay: u32, next: u32, scale: crate::cursor::Scale, window: (u32, u32), status: crate::host_status::Responsiveness, driver: (scene::Cursor, bool)) -> crate::cursor::Composed {
         let mut out = crate::cursor::Composed::default();
         let Some(pointer) = self.snapper.pointer() else { return out };
         let set = |names: &[&str]| names.iter().find_map(|n| compiled.set(n).map(|(s, _)| s));
-        let pointer_set = self.pointer_set(compiled, driver);
+        let pointer_set = self.pointer_set(compiled, driver.0, driver.1);
         // (Under the pointer it would not be seen.)
         let ghost = self.snapper.ghost().filter(|g| (g.0 - pointer.0).hypot(g.1 - pointer.1) >= 2.0).map(|g| (set(&[ARROW_GHOST_SPRITE, GHOST_SPRITE]), g));
         let solid = Some((pointer_set, pointer));
