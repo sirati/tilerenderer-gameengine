@@ -1227,7 +1227,7 @@ impl Panels {
                         }
                     }
                     let region = [l, t, r - l, b - t];
-                    (Some(anchor), (region != rect).then_some(region))
+                    (Some(anchor), Some(region))
                 }
                 _ => (None, None),
             };
@@ -1376,8 +1376,8 @@ pub struct ControlLooks {
     /// Where a pointer goes on it (`scene::Interactable::anchor`): a check
     /// box's box.
     pub anchor: Option<[i32; 2]>,
-    /// All of it as a person sees it, when more than `rect`
-    /// (`scene::Interactable::region`): a check box with its label.
+    /// All of it as a person sees it (`scene::Interactable::region`): a
+    /// check box with its label, also where `rect` holds the label already.
     pub region: Option<[i32; 4]>,
     pub kind: scene::InteractableKind,
     pub select: scene::Select,
@@ -1860,7 +1860,7 @@ mod tests {
         // On the box (its art at the item's corner), inside the hit area.
         assert!(ax >= x && ax < x + 16 && ay >= y && ay < y + h, "{:?} {:?}", check.anchor, check.rect);
         // The region holds the hit area and every bit of the label's text.
-        let [rx, ry, rw, rh] = check.region.unwrap_or(check.rect);
+        let [rx, ry, rw, rh] = check.region.expect("a check box always has its region (Alt mode is drawn from all of it)");
         assert!(rx <= x && ry <= y && rx + rw >= x + w && ry + rh >= y + h);
         for d in &check.draws {
             if let Draw::Text(t) = d {

@@ -192,6 +192,10 @@ pub struct Target {
     /// snapping pointer is drawn to it from anywhere in it, and lands on
     /// [`Target::center`] all the same.
     pub area: [f64; 4],
+    /// It has an area of its own (`Interactable::region`: a check box
+    /// and its label), even one no larger than `rect` (a menu's check box
+    /// takes clicks on its label too, its pointer spot on the box).
+    pub spread: bool,
     /// Preferred pointer tip, transformed with the same affine as `rect`.
     pub anchor: Option<Point>,
     pub kind: TargetKind,
@@ -225,7 +229,7 @@ impl Target {
     pub fn capture(rect: [i32; 4], at: (i32, i32)) -> Self {
         let [x, y, w, h] = rect;
         let rect = [x as f64, y as f64, w as f64, h as f64];
-        Self { rect, area: rect, anchor: None, kind: TargetKind::Capture { at: (at.0 as f64, at.1 as f64) }, id: CAPTURE_ID, alt_right_click: false }
+        Self { rect, area: rect, spread: false, anchor: None, kind: TargetKind::Capture { at: (at.0 as f64, at.1 as f64) }, id: CAPTURE_ID, alt_right_click: false }
     }
 
     /// Where the pointer goes on it: a slider's (or scroll bar's) knob,
@@ -259,7 +263,7 @@ impl Target {
     /// its label), and a slider or scroll bar (the pointer goes on its
     /// knob, the whole bar is the control).
     fn spread(&self) -> bool {
-        !self.is_capture() && (self.area != self.rect || matches!(self.kind, TargetKind::Slider { .. }))
+        !self.is_capture() && (self.spread || self.area != self.rect || matches!(self.kind, TargetKind::Slider { .. }))
     }
 
     /// The point of the whole control ([`Target::area`]) nearest `p`.
@@ -306,6 +310,7 @@ pub fn targets_mapped(items: &[Interactable], map: impl Fn([i32; 4]) -> [f64; 4]
         .map(|i| Target {
             alt_right_click: i.alt_right_click,
             rect: map(i.rect),
+            spread: i.region.is_some(),
             // (The same affine as the control's, as its anchor.)
             area: i.region.map_or_else(|| map(i.rect), |[x, y, w, h]| {
                 let shown = map(i.rect);
