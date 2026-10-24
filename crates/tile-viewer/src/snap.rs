@@ -172,6 +172,9 @@ pub const ATTRACTOR_SPRITES: &str = "Viewer@attractor/";
 
 /// The id of the capture view's target (no driver's element has it).
 pub const CAPTURE_ID: u64 = u64::MAX;
+/// The Alt mode's target on the first queued report's button (and below it,
+/// none of the driver's: its ids are its controls' addresses).
+pub const QUEUED_ID: u64 = u64::MAX - 0x100;
 
 const VK_CONTROL: u32 = 0x11;
 const VK_MENU: u32 = 0x12;
@@ -1242,6 +1245,12 @@ impl SnapInput {
             scene.interactables.iter().find(|item| item.id == target.id)
                 .and_then(|item| layout.driver_target_clip(item.rect))
         });
+        // The first queued report's button (`Layout::queued_targets`): the
+        // viewer's own, over everything of the driver's.
+        for (k, [x, y, w, h]) in layout.queued_targets().into_iter().enumerate() {
+            let rect = [x as f64, y as f64, w as f64, h as f64];
+            out.push(Target { rect, area: rect, anchor: None, kind: TargetKind::Button, id: QUEUED_ID - k as u64, alt_right_click: false });
+        }
         // Each view's attractor (A's and B's in a split), the capturing ones
         // first; the first keeps the one id of old.
         for (k, a) in layout.attractors().into_iter().enumerate() {
@@ -1263,6 +1272,8 @@ impl SnapInput {
                     layout.attractor_clicked(p);
                     log::debug!("snap: an attractor clicked: off, the mouse {} at {p:?}", if layout.captured() { "captured" } else { "free" });
                 }
+                // On the queued reports, the viewer's own: the first is read.
+                Action::Button { button, down, at } if layout.queued_click(button, down, (at.0.round() as i32, at.1.round() as i32)).is_some_and(|inputs| { out.extend(inputs); true }) => {}
                 // A press on the menu outside the view the mouse is captured
                 // in (beside the menu) lets the mouse go; it goes to the menu.
                 Action::Button { down: true, at, .. } => {

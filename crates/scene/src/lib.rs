@@ -485,6 +485,22 @@ pub struct Interface {
     /// click was made in, while every view goes on playing, until the
     /// renderer closes it (`Input::CloseDetached`).
     pub detached: Vec<DetachedPopup>,
+    /// Popups the driver accepted at once in its own interface (they only
+    /// told the player something: a report with nothing to choose), leaving
+    /// their picture to the renderer, oldest first (`QueuedPopup`). The
+    /// driver's game goes on meanwhile. A renderer shows them one after the
+    /// other, the first on top, and tells the driver when one is read
+    /// (`Input::CloseQueued`). Not a modal: input elsewhere goes on to the
+    /// driver.
+    pub queued: Vec<QueuedPopup>,
+    /// How many more such popups wait behind those in `queued`.
+    pub queued_more: u32,
+    /// An interface-only view holding the driver's loading progress (a bar
+    /// over a menu while a game loads; its `origin` and `viewport` are its
+    /// rectangle; the menus do not have it). A renderer keeps it clear of
+    /// the popups it shows over the menu (it may move it), and draws it in
+    /// front of them where it cannot.
+    pub loading_bar: Option<u32>,
     /// A command of the driver's waits for the player to pick a place of
     /// the world (e.g. a unit's go-to destination, a bombard target): the
     /// next click that matters is one on the world (a renderer may give
@@ -550,6 +566,19 @@ pub struct DetachedPopup {
     /// The world pixel of the press that opened it (as `Input::WorldButton`
     /// sent it).
     pub click: (i32, i32),
+}
+
+/// A popup the driver closed at once, accepting it as its own user would
+/// have (`Interface::queued`): an interface-only view (`view`, its `origin`
+/// and `viewport` the popup's rectangle). `button` (x, y, w, h, in the
+/// view's own pixels from its top-left corner) is the button that accepted
+/// it, for a renderer's own pointer snapping; `None`: none known.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueuedPopup {
+    pub view: u32,
+    /// Names this popup for its lifetime (increasing, never reused).
+    pub serial: u64,
+    pub button: Option<[i32; 4]>,
 }
 
 /// The driver's screen and its world side by side (`Interface::beside`):
@@ -1202,6 +1231,9 @@ pub enum Input {
     /// The renderer is done with detached popup `serial`
     /// (`Interface::detached`): the driver stops sending it.
     CloseDetached { serial: u64 },
+    /// The renderer's user has read queued popup `serial`
+    /// (`Interface::queued`): the driver stops sending it.
+    CloseQueued { serial: u64 },
 }
 
 /// How near the window's edge the pointer counts as at it ([`Input::Edge`]).

@@ -3563,6 +3563,7 @@ impl App {
             let compiled = layout_compiled;
             let shown = scaling::arrange_panned(&plan, scene, &mut arranged, &mut self.layout.menu_pan, |s| sprite_rect(compiled, s));
             self.layout.set_interface_shown(shown.shown);
+            self.layout.set_queued_shown(shown.queued);
             // A middle drag suppresses hover while the menu moves. Restore
             // it through the map of the pixels this frame actually shows.
             if self.layout.menu_pan.take_hover_refresh() {
