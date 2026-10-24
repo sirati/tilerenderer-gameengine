@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, BuildQueue, BuildQueueRow, Button, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 62;
+pub const VERSION: u32 = 63;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -635,6 +635,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u32(i.loading_bar.unwrap_or_default());
                 w.bool(i.targeting);
                 w.bool(i.snap_to_tiles);
+                w.bool(i.releases_pointer);
                 w.bool(i.build_queue.is_some());
                 let q = i.build_queue.clone().unwrap_or_default();
                 w.u32(q.stamp);
@@ -946,6 +947,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let loading_bar = { let some = r.bool()?; let id = r.u32()?; some.then_some(id) };
                 let targeting = r.bool()?;
                 let snap_to_tiles = r.bool()?;
+                let releases_pointer = r.bool()?;
                 let build_queue = {
                     let some = r.bool()?;
                     let stamp = r.u32()?;
@@ -981,6 +983,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     targeting,
                     snap_to_tiles,
                     build_queue,
+                    releases_pointer,
                 })
             }
             12 => {
@@ -1550,6 +1553,7 @@ mod tests {
             targeting: true,
             snap_to_tiles: true,
             build_queue: None,
+            releases_pointer: true,
         };
         s.interactables = vec![
             Interactable { alt_right_click: false, anchor: Some([12, 30]), region: Some([10, 20, 160, 24]), rect: [10, 20, 16, 24], kind: InteractableKind::Button, id: 0x1_0000_0002 },
