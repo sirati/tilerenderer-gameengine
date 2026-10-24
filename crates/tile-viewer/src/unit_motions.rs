@@ -48,6 +48,20 @@ impl UnitMotions {
         Some(out)
     }
 
+    /// Where a marker over the scene's point of interest goes at `now`
+    /// (`scene::Scene::focus_motion`): along its motion as far as that
+    /// moves its sprites (`offsets`), in the pixels of views showing the
+    /// world `downscale` times smaller (the focus's); else the focus.
+    pub(crate) fn focus_at(&self, scene: &scene::Scene, now: Instant, downscale: u32) -> Option<(i32, i32)> {
+        let Some(m) = scene.focus_motion else { return scene.focus };
+        let n = downscale.max(1) as i32;
+        let (dx, dy) = scene.motions.iter().find(|motion| motion.serial == m.serial && m.serial != 0).map_or((0, 0), |motion| {
+            let started = self.started.get(&motion.serial).copied().unwrap_or(now);
+            offset_at(motion.way, motion.duration_ms, now.saturating_duration_since(started))
+        });
+        Some((m.from.0 + dx / n, m.from.1 + dy / n))
+    }
+
     /// Whether some sprites are off where the scene has them.
     #[cfg(test)]
     pub(crate) fn any_applied(&self) -> bool {
@@ -123,6 +137,25 @@ mod tests {
         // First drawn 10 ms after its batch arrived (a frame later).
         assert_eq!(m.offsets(&scene, at(10), false, |s| (s == 8).then_some(arrived)).unwrap(), [((1, 3), (6, 3))]);
         assert_eq!(m.offsets(&scene, at(100), false, |_| None).unwrap(), [((1, 3), (64, 32))]);
+    }
+
+    #[test]
+    fn the_marker_over_a_sliding_unit_goes_with_it() {
+        let arrived = Instant::now();
+        let mut m = UnitMotions::default();
+        let at = |ms| arrived + Duration::from_millis(ms);
+        let mut scene = scene_with(vec![motion(8)]);
+        scene.focus = Some((300, 200));
+        assert_eq!(m.focus_at(&scene, at(50), 1), Some((300, 200)), "no motion of its own: the focus");
+        scene.focus_motion = Some(scene::FocusMotion { serial: 8, from: (100, 80) });
+        // On the same clock as its unit's sprites.
+        assert_eq!(m.offsets(&scene, at(50), false, |_| Some(arrived)).unwrap(), [((1, 3), (32, 16))]);
+        assert_eq!(m.focus_at(&scene, at(50), 1), Some((132, 96)));
+        assert_eq!(m.focus_at(&scene, at(50), 2), Some((116, 88)), "in the pixels of a half-size world");
+        assert_eq!(m.focus_at(&scene, at(500), 1), Some((164, 112)), "at the end of its way");
+        // Held at the end of its way (no motion): there.
+        scene.focus_motion = Some(scene::FocusMotion { serial: 0, from: (164, 112) });
+        assert_eq!(m.focus_at(&scene, at(600), 1), Some((164, 112)));
     }
 
     /// What a frame of a slide costs the viewer (`--ignored --nocapture`):

@@ -2084,7 +2084,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(count, 17);
+        assert_eq!(count, 18);
     }
 
     #[test]
@@ -2203,7 +2203,7 @@ mod tests {
             }
             state.hover = None;
         }
-        assert_eq!(checked, 15);
+        assert_eq!(checked, 16);
     }
 
     #[test]
@@ -2288,7 +2288,7 @@ mod tests {
             state.values.insert(key.into(), Value::On(true));
         }
         for (key, value) in [("layout.zoom", "Floating131"), ("layout.zoom_magnification_label", "4×"), ("layout.split", "Vertical1To1"),
-            ("layout.orientation", "vertical"), ("layout.screen_place", "Floating"), ("accessibility.hud_percent", "300")] {
+            ("layout.orientation", "vertical"), ("layout.screen_place", "Floating"), ("accessibility.hud_percent", "300"), ("accessibility.arrow_percent", "300")] {
             state.values.insert(key.into(), Value::Text(value.into()));
         }
         let overlap = |a: [i32; 4], b: [i32; 4]| a[0] < b[0]+b[2] && b[0] < a[0]+a[2] && a[1] < b[1]+b[3] && b[1] < a[1]+a[3];
@@ -2344,6 +2344,7 @@ mod tests {
                     heading(card_of(*rect)).unwrap()
                 };
                 for (control, card) in [("accessibility.active_unit_arrow", "Active unit"), ("accessibility.arrow_bobbing", "Active unit"),
+                    ("accessibility.arrow_size", "Active unit"),
                     ("accessibility.hud_size", "Unit markers"), ("accessibility.stack_count", "Unit markers"),
                     ("accessibility.unit_rings", "Diplomacy rings"), ("accessibility.war.color", "Diplomacy rings"),
                     ("accessibility.peace.invert", "Diplomacy rings"), ("accessibility.ring_width", "Diplomacy rings"),

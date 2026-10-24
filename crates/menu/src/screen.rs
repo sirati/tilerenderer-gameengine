@@ -597,7 +597,7 @@ pub fn sprites_with_backgrounds(elements: &[Element], compiled: &Compiled, after
                 zoom_offset: (0, 0),
                 clip: Some(clip),
                 not_in_view: None,
-                glyph: None, solid: None,
+                glyph: None, solid: None, output_rect: None,
                 palette: palette,
                 category: 0,
             }))
