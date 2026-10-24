@@ -8,6 +8,7 @@ members = [
     "crates/pointer-x11",
     "crates/pointer-wayland",
     "crates/pointer-windows",
+    "crates/pointer-windows-ffi",
     "crates/pointer-macos",
     "crates/pointer-fallback",
     "crates/pointer-control",
