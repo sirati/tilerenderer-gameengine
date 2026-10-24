@@ -1,5 +1,24 @@
-//! Right-drag unit orders in the map-drag mouse mode. The native game
-//! draws the go-to route, but only a later left click may commit the order.
+//! Right-button unit orders in the map-drag mouse mode (the Civ6 movement
+//! style). A right drag preselects a destination: the driver arms its
+//! go-to there and draws the route, but only a later left click on that
+//! tile may commit the order. A short right click is the game's own right
+//! click (its menu, the tile box).
+//!
+//! A preselected destination stays until the driver's command stops
+//! waiting for it, or until one of these:
+//! - a left click on the world (the confirmation; on another tile it only
+//!   ends the preselection) or a new right press there;
+//! - Escape (its key goes no further);
+//! - a screen or a popup opening, the world closing, the map movement
+//!   mode changing.
+//!
+//! Moving over the map or the interface, the wheel, keys, dragging the map
+//! (left or middle button), the pointer leaving the window and clicks on
+//! the interface keep it. Those clicks and keys go to the driver, which
+//! decides: a command that takes the same tile (Move All, Road to, Rail
+//! to, Colony to) keeps it, waiting for the same confirmation; any other
+//! ends the command, and with it the preselection here, as the next frame
+//! shows (`scene::Interface::targeting`).
 
 use scene::{Button, Input, UnitOrderAction};
 use viewer_settings::MapMovement;
@@ -19,6 +38,7 @@ struct Point {
 struct Press {
     point: Point,
     window: (i32, i32),
+    /// A drag (never the game's right click).
     dragging: bool,
 }
 
@@ -27,6 +47,9 @@ pub(super) struct UnitOrders {
     right: Option<Press>,
     confirm: Option<Press>,
     destination: Option<(i32, i32)>,
+    /// The driver has shown its command waiting for a tile since the
+    /// destination was preselected (before that, its absence means nothing).
+    armed_seen: bool,
     eat_right_up: bool,
     eat_left_up: bool,
     eat_escape_up: bool,
@@ -82,10 +105,25 @@ impl Layout {
     /// forwards the cancellation before any later input can reach the game.
     pub(super) fn cancel_unit_order(&mut self) {
         let state = &mut self.unit_orders;
+        state.armed_seen = false;
         if state.destination.take().is_some() {
             state.queued.push(order(UnitOrderAction::Cancel, (0, 0)));
         }
         if state.right.take().is_some() { state.eat_right_up = true; }
+        if state.confirm.take().is_some() { state.eat_left_up = true; }
+    }
+
+    /// The pointer left the window or the window lost the mouse: a button
+    /// held for an order is let go of (its release eaten), the preselected
+    /// destination stays. A right press not yet a drag preselects nothing.
+    pub(super) fn unit_order_presses_lost(&mut self) {
+        let state = &mut self.unit_orders;
+        if let Some(press) = state.right.take() {
+            state.eat_right_up = true;
+            if !press.dragging && state.destination.take().is_some() {
+                state.queued.push(order(UnitOrderAction::Cancel, (0, 0)));
+            }
+        }
         if state.confirm.take().is_some() { state.eat_left_up = true; }
     }
 
@@ -101,12 +139,15 @@ impl Layout {
         self.unit_orders.queued.push(input);
     }
 
-    /// A key or wheel leaves the pending order before it does its usual
-    /// work. Escape belongs to the cancellation and must not also open the
-    /// game's menu. Its release is paired here too.
+    /// A key or wheel during a held order press ends it before it does its
+    /// usual work; with only a destination preselected it goes on (to the
+    /// driver: a command's key may keep or end it there). Escape belongs to
+    /// the cancellation and must not also open the game's menu. Its release
+    /// is paired here too.
     pub(super) fn unit_order_before(&mut self, input: &Input) -> bool {
         let state = &self.unit_orders;
-        let active = state.right.is_some() || state.confirm.is_some() || state.destination.is_some();
+        let pressing = state.right.is_some() || state.confirm.is_some();
+        let active = pressing || state.destination.is_some();
         match *input {
             Input::Key { vk: VK_ESCAPE, down: true, .. } if state.eat_escape_up => true,
             Input::Key { vk: VK_ESCAPE, down: false, .. } if state.eat_escape_up => {
@@ -118,11 +159,11 @@ impl Layout {
                 self.unit_orders.eat_escape_up = true;
                 true
             }
-            Input::MouseButton { down: true, x, y, .. } if active && self.order_point(self.held_back((x, y))).is_none() => {
+            Input::MouseButton { down: true, x, y, .. } if pressing && self.order_point(self.held_back((x, y))).is_none() => {
                 self.cancel_unit_order();
                 false
             }
-            Input::Key { down: true, .. } | Input::Wheel { .. } | Input::Scroll { .. } if active => {
+            Input::Key { down: true, .. } | Input::Wheel { .. } | Input::Scroll { .. } if pressing => {
                 self.cancel_unit_order();
                 false
             }
@@ -136,12 +177,30 @@ impl Layout {
         self.unit_orders.right.is_some_and(|press| press.dragging)
     }
 
+    /// Each frame: a preselection ends once the
+    /// driver's command no longer waits for its tile (`targeting`:
+    /// `scene::Interface::targeting`), e.g. after another unit command.
+    pub(super) fn unit_orders_frame(&mut self, targeting: bool) {
+        let state = &mut self.unit_orders;
+        if state.destination.is_none() || state.right.is_some() {
+            return;
+        }
+        if targeting {
+            state.armed_seen = true;
+        } else if state.armed_seen {
+            log::info!("viewer: the driver's command no longer waits for the preselected destination");
+            self.cancel_unit_order();
+        }
+    }
+
     /// Called after ordinary pointer confinement and cursor placement, so
     /// the native target is the tile actually shown under that pointer.
     pub(super) fn unit_order_motion(&mut self, p: (i32, i32)) -> Option<Vec<Input>> {
         if let Some(press) = self.unit_orders.right {
             let Some(point) = self.order_point(p) else {
-                self.cancel_unit_order();
+                // Over the interface: the destination stays as it was, and
+                // the press is a drag (its release opens no menu).
+                self.unit_orders.right.as_mut().unwrap().dragging = true;
                 return Some(vec![]);
             };
             if press.dragging || past_threshold(press.point.motion, point.motion) {
@@ -152,6 +211,8 @@ impl Layout {
             return Some(vec![]);
         }
         if let Some(press) = self.unit_orders.confirm {
+            // (Where the map is dragged from the press, `pan` has this
+            // motion; here: the captured world cursor.)
             if self.order_point(p).is_none_or(|point| past_threshold(press.point.motion, point.motion)) {
                 self.cancel_unit_order();
             }
@@ -159,9 +220,9 @@ impl Layout {
         }
         if self.unit_orders.destination.is_some() {
             // Keep the selected destination still after the right button
-            // was released. Ordinary hover must not retarget native G mode.
-            if self.order_point(p).is_none() { self.cancel_unit_order(); }
-            return Some(vec![]);
+            // was released. Ordinary hover must not retarget native G mode;
+            // over the interface the pointer is the interface's.
+            return self.order_point(p).map(|_| vec![]);
         }
         None
     }
@@ -177,23 +238,20 @@ impl Layout {
             if std::mem::take(eat) { return Some(vec![]); }
             if button == Button::Right {
                 let press = self.unit_orders.right.take()?;
-                let release = self.order_point(p);
-                if release.is_none() {
-                    self.cancel_unit_order();
-                    return Some(vec![]);
-                }
-                if press.dragging || release.is_some_and(|point| past_threshold(press.point.motion, point.motion)) {
-                    match self.order_point(p) {
-                        Some(point) if self.unit_orders.destination != Some(point.world) => {
+                let long = press.dragging;
+                match self.order_point(p) {
+                    // Over the interface: the destination as it was.
+                    None => return Some(vec![]),
+                    Some(point) if long || past_threshold(press.point.motion, point.motion) => {
+                        if self.unit_orders.destination != Some(point.world) {
                             self.unit_orders.destination = Some(point.world);
                             return Some(vec![order(UnitOrderAction::Preview, point.world)]);
                         }
-                        None => self.cancel_unit_order(),
-                        _ => {}
+                        // Never send a native button release here. The next
+                        // deliberate click is required to move the unit.
+                        return Some(vec![]);
                     }
-                    // Never send a native button release here. The next
-                    // deliberate click is required to move the unit.
-                    return Some(vec![]);
+                    Some(_) => {}
                 }
                 // A short right click is the game's ordinary context menu.
                 // Replay through its existing screen/world coordinate path.
@@ -204,8 +262,15 @@ impl Layout {
                 return Some(out);
             }
             if let Some(press) = self.unit_orders.confirm.take() {
+                if self.pan_grabbed(Button::Left) {
+                    // The press dragged the map: the destination stays, the
+                    // release lets go of the map.
+                    return None;
+                }
+                self.pan_forget_press();
                 let point = self.order_point(p);
                 self.unit_orders.destination = None;
+                self.unit_orders.armed_seen = false;
                 return Some(match point {
                     // The driver compares exact native tiles with its last
                     // preview, along with the selected unit and loaded map.
@@ -231,17 +296,33 @@ impl Layout {
                 return Some(vec![]);
             }
         }
-        if self.unit_orders.destination.is_some() || self.unit_orders.right.is_some() {
-            if button == Button::Left {
-                if let Some(point) = self.order_point(p).filter(|_| self.unit_orders.destination.is_some() && self.unit_orders.right.is_none()) {
-                    self.unit_orders.confirm = Some(Press { point, window: p, dragging: false });
-                    self.unit_orders.eat_left_up = false;
-                    return Some(vec![]);
-                }
-            }
+        if self.unit_orders.right.is_some() {
             self.cancel_unit_order();
+            return None;
         }
-        None
+        if self.unit_orders.destination.is_none() {
+            return None;
+        }
+        let Some(point) = self.order_point(p) else {
+            // On the interface (a unit's command among them): the driver's.
+            return None;
+        };
+        match button {
+            Button::Left => {
+                self.unit_orders.confirm = Some(Press { point, window: p, dragging: false });
+                self.unit_orders.eat_left_up = false;
+                // The map may still be dragged from here (`pan`), keeping
+                // the destination; a click confirms.
+                let _ = self.pan_button(button, true, p);
+                Some(vec![])
+            }
+            // (Grabs the map; the destination stays.)
+            Button::Middle => None,
+            Button::Right => {
+                self.cancel_unit_order();
+                None
+            }
+        }
     }
 }
 
@@ -376,35 +457,135 @@ mod tests {
         assert_eq!(button(&mut l, Button::Left, false, click), [order(UnitOrderAction::Confirm, clicked)]);
     }
 
-    #[test]
-    fn dragging_the_confirmation_cancels_without_a_map_drag_or_order() {
-        let mut l = layout();
-        preview(&mut l, (100, 100), (170, 190));
-        let before = l.main_view;
-        button(&mut l, Button::Left, true, (170, 190));
-        assert!(cancelled(&mv(&mut l, (200, 190))));
-        assert_eq!(button(&mut l, Button::Left, false, (200, 190)), []);
-        assert_eq!(l.main_view, before);
+    /// A frame whose driver shows a command waiting for its tile, or not.
+    fn targeting(l: &mut Layout, waiting: bool, ui: Vec<[i32; 4]>) {
+        let mut s = scene();
+        s.interface.targeting = waiting;
+        frame(l, &s, ui);
+    }
+    fn to_driver(out: &[Input]) -> bool {
+        out.iter().any(|i| matches!(i, Input::MouseButton { .. } | Input::WorldButton { .. }))
+    }
+    fn confirms(out: &[Input]) -> bool {
+        out.iter().any(|i| matches!(i, Input::UnitOrder { action: UnitOrderAction::Confirm, .. }))
     }
 
     #[test]
-    fn crossing_interface_during_right_drag_cancels_and_swallows_release() {
+    fn dragging_the_map_from_the_world_keeps_the_destination() {
+        for b in [Button::Left, Button::Middle] {
+            let mut l = layout();
+            let destination = preview(&mut l, (100, 100), (170, 190));
+            let before = l.main_view;
+            assert_eq!(button(&mut l, b, true, (170, 190)), [], "{b:?}");
+            assert!(!cancelled(&mv(&mut l, (220, 190))), "{b:?}");
+            let out = button(&mut l, b, false, (220, 190));
+            assert!(!cancelled(&out) && !confirms(&out) && !to_driver(&out), "{b:?}: {out:?}");
+            assert_ne!(l.main_view, before, "{b:?}: the map moved");
+            assert_eq!(l.unit_orders.destination, Some(destination), "{b:?}");
+            assert!(l.take_unit_order_events().is_empty(), "{b:?}");
+        }
+    }
+
+    #[test]
+    fn hovering_the_interface_keeps_the_destination_and_reaches_the_driver() {
+        let mut l = layout();
+        let ui = vec![[100, 300, 200, 150]];
+        frame(&mut l, &scene(), ui.clone());
+        let destination = preview(&mut l, (100, 100), (170, 190));
+        targeting(&mut l, true, ui.clone());
+        assert!(matches!(mv(&mut l, (150, 350))[..], [Input::MouseMove { .. }, ..]));
+        targeting(&mut l, true, ui);
+        // Back over the map: hover still does not retarget it.
+        assert_eq!(mv(&mut l, (300, 200)), []);
+        assert_eq!(l.unit_orders.destination, Some(destination));
+        button(&mut l, Button::Left, true, (170, 190));
+        assert_eq!(button(&mut l, Button::Left, false, (170, 190)), [order(UnitOrderAction::Confirm, destination)]);
+    }
+
+    #[test]
+    fn a_click_on_the_interface_reaches_the_driver_and_keeps_the_destination() {
+        // A unit's command button (Move All, Road to, ...): the driver keeps
+        // its command waiting for the same tile, and the same click
+        // confirms it.
+        let mut l = layout();
+        let ui = vec![[100, 300, 200, 150]];
+        frame(&mut l, &scene(), ui.clone());
+        let destination = preview(&mut l, (100, 100), (170, 190));
+        targeting(&mut l, true, ui.clone());
+        mv(&mut l, (150, 350));
+        let out = [button(&mut l, Button::Left, true, (150, 350)), button(&mut l, Button::Left, false, (150, 350))].concat();
+        assert!(matches!(out[..], [Input::MouseButton { button: Button::Left, down: true, .. }, Input::MouseButton { button: Button::Left, down: false, .. }]), "{out:?}");
+        // A right click there too.
+        let out = [button(&mut l, Button::Right, true, (150, 350)), button(&mut l, Button::Right, false, (150, 350))].concat();
+        assert!(!cancelled(&out) && to_driver(&out), "{out:?}");
+        targeting(&mut l, true, ui);
+        assert_eq!(l.unit_orders.destination, Some(destination));
+        assert!(l.take_unit_order_events().is_empty());
+        mv(&mut l, (170, 190));
+        button(&mut l, Button::Left, true, (170, 190));
+        assert_eq!(button(&mut l, Button::Left, false, (170, 190)), [order(UnitOrderAction::Confirm, destination)]);
+    }
+
+    #[test]
+    fn the_destination_ends_when_the_driver_stops_waiting_for_it() {
+        // Another command (Fortify, Sentry, ...), another unit selected, the
+        // unit unable to go: the driver's targeting ends.
+        let mut l = layout();
+        preview(&mut l, (100, 100), (170, 190));
+        // (Before the driver armed it, no targeting means nothing.)
+        targeting(&mut l, false, vec![]);
+        assert!(l.unit_orders.destination.is_some());
+        assert!(l.take_unit_order_events().is_empty());
+        targeting(&mut l, true, vec![]);
+        targeting(&mut l, false, vec![]);
+        assert!(l.unit_orders.destination.is_none());
+        assert_eq!(l.take_unit_order_events(), [order(UnitOrderAction::Cancel, (0, 0))]);
+        // The next left click on the world is an ordinary one.
+        let out = [button(&mut l, Button::Left, true, (170, 190)), button(&mut l, Button::Left, false, (170, 190))].concat();
+        assert!(!confirms(&out), "{out:?}");
+    }
+
+    #[test]
+    fn a_new_right_press_on_the_world_ends_the_destination() {
+        let mut l = layout();
+        preview(&mut l, (100, 100), (170, 190));
+        assert!(cancelled(&button(&mut l, Button::Right, true, (300, 300))));
+        assert!(l.unit_orders.destination.is_none());
+    }
+
+    #[test]
+    fn crossing_interface_during_right_drag_keeps_the_destination_and_swallows_release() {
         let mut l = layout();
         frame(&mut l, &scene(), vec![[100, 300, 200, 150]]);
-        preview(&mut l, (100, 100), (170, 190));
-        assert_eq!(mv(&mut l, (150, 350)), [order(UnitOrderAction::Cancel, (0, 0))]);
+        assert_eq!(button(&mut l, Button::Right, true, (100, 100)), []);
+        let destination = l.world_under((170, 190)).unwrap();
+        assert_eq!(mv(&mut l, (170, 190)), [order(UnitOrderAction::Preview, destination)]);
+        assert_eq!(mv(&mut l, (150, 350)), []);
         assert_eq!(button(&mut l, Button::Right, false, (150, 350)), []);
-        assert!(l.unit_orders.destination.is_none());
+        assert_eq!(l.unit_orders.destination, Some(destination));
     }
 
     #[test]
     fn entering_interface_while_the_right_button_is_held_never_opens_a_menu() {
         let mut l = layout();
         frame(&mut l, &scene(), vec![[100, 300, 200, 150]]);
-        button(&mut l, Button::Right, true, (100, 100));
-        mv(&mut l, (170, 190));
-        assert!(cancelled(&mv(&mut l, (150, 350))));
-        assert_eq!(button(&mut l, Button::Right, false, (150, 350)), []);
+        button(&mut l, Button::Right, true, (100, 300 - 2));
+        // (Into the interface before the drag threshold.)
+        assert_eq!(mv(&mut l, (100, 302)), []);
+        assert_eq!(button(&mut l, Button::Right, false, (100, 302)), []);
+    }
+
+    #[test]
+    fn alt_snapping_keeps_the_destination() {
+        let mut l = layout();
+        let destination = preview(&mut l, (100, 100), (170, 190));
+        l.snapping = true;
+        let out = [mv(&mut l, (200, 200)), button(&mut l, Button::Left, true, (200, 200)), button(&mut l, Button::Left, false, (200, 200))].concat();
+        assert!(!cancelled(&out) && !confirms(&out), "{out:?}");
+        l.snapping = false;
+        assert_eq!(l.unit_orders.destination, Some(destination));
+        button(&mut l, Button::Left, true, (170, 190));
+        assert_eq!(button(&mut l, Button::Left, false, (170, 190)), [order(UnitOrderAction::Confirm, destination)]);
     }
 
     #[test]
@@ -419,19 +600,43 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_wheel_mode_changes_and_focus_loss_cancel_before_other_input() {
+    fn keys_wheel_and_focus_loss_keep_the_destination() {
+        // (Keys go on to the game: Ctrl-X, Ctrl-R and the like take the
+        // same tile there, others end its command, `targeting`.)
         for cause in 0..4 {
             let mut l = layout();
-            preview(&mut l, (100, 100), (170, 190));
+            let destination = preview(&mut l, (100, 100), (170, 190));
             let out = match cause {
                 0 => l.route(Input::Key { vk: super::super::VK_CONTROL, down: true, text: None }),
-                1 => l.route(Input::Wheel { delta: 120, x: 170, y: 190 }),
-                2 => { l.set_map_movement(MapMovement::EdgeScroll); l.take_unit_order_events() },
+                1 => l.route(Input::Key { vk: u32::from(b'R'), down: true, text: Some('r') }),
+                2 => l.route(Input::Wheel { delta: 120, x: 170, y: 190 }),
                 _ => { l.released(); l.pointer_gone() },
             };
-            assert_eq!(out.first(), Some(&order(UnitOrderAction::Cancel, (0, 0))), "cause {cause}: {out:?}");
-            assert!(l.unit_orders.destination.is_none());
+            assert!(!cancelled(&out), "cause {cause}: {out:?}");
+            assert_eq!(l.unit_orders.destination, Some(destination), "cause {cause}");
         }
+    }
+
+    #[test]
+    fn a_key_or_focus_loss_during_a_held_press_ends_it() {
+        let mut l = layout();
+        button(&mut l, Button::Right, true, (100, 100));
+        mv(&mut l, (170, 190));
+        assert!(cancelled(&l.route(Input::Key { vk: super::super::VK_CONTROL, down: true, text: None })));
+        let mut l = layout();
+        button(&mut l, Button::Right, true, (100, 100));
+        l.pointer_gone();
+        assert!(l.unit_orders.destination.is_none());
+        assert_eq!(button(&mut l, Button::Right, false, (100, 100)), []);
+    }
+
+    #[test]
+    fn a_mode_change_ends_the_destination() {
+        let mut l = layout();
+        preview(&mut l, (100, 100), (170, 190));
+        l.set_map_movement(MapMovement::EdgeScroll);
+        assert_eq!(l.take_unit_order_events(), [order(UnitOrderAction::Cancel, (0, 0))]);
+        assert!(l.unit_orders.destination.is_none());
     }
 
     #[test]

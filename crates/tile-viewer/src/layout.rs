@@ -1873,7 +1873,7 @@ impl Layout {
 
     /// The mouse was let go (e.g. the window lost focus).
     pub fn released(&mut self) {
-        self.cancel_unit_order();
+        self.unit_order_presses_lost();
         self.last_world_pointer = None;
         self.menu_pan.cancel_drag();
         // (Back in the window a click captures it: nothing pending does.)
@@ -1940,7 +1940,7 @@ impl Layout {
     /// no edge any more (what goes to the driver), and comes back into
     /// whichever view it enters.
     pub fn pointer_gone(&mut self) -> Vec<Input> {
-        self.cancel_unit_order();
+        self.unit_order_presses_lost();
         self.last_world_pointer = None;
         self.menu_pan.cancel_drag();
         self.side = None;
@@ -2527,6 +2527,7 @@ impl Layout {
             self.screen_changes(parts.screen.is_some());
         }
         self.clock += dt;
+        self.unit_orders_frame(scene.interface.targeting);
         // A popup over a menu (a screen part or the menus): placed over that
         // menu (`scaling::MODAL_TOP`), never at a click nor in a pane.
         let over_menu = parts.screen.is_some() || screen_part.is_some() || scene.views.iter().any(|v| v.view.interface_only && v.view.menu && !v.overlay.is_empty());
