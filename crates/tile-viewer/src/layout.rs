@@ -2071,7 +2071,9 @@ impl Layout {
         let r = self.reachable?;
         let Some(shown) = &self.interface_shown else { return Some(r) };
         let within = |d: [i32; 4]| d[2] > 0 && d[3] > 0 && d[0] >= r[0] && d[1] >= r[1] && d[0] + d[2] <= r[0] + r[2] && d[1] + d[3] <= r[1] + r[3];
-        shown.iter().filter(|s| within(s.driver)).map(|s| s.rect).reduce(|a, b| {
+        // (All of their rectangle where the maps of those shown put it:
+        // the same whichever of them a frame has.)
+        shown.iter().filter(|s| within(s.driver)).map(|s| s.drawn_at(r)).reduce(|a, b| {
             let (x, y) = (a[0].min(b[0]), a[1].min(b[1]));
             [x, y, (a[0] + a[2]).max(b[0] + b[2]) - x, (a[1] + a[3]).max(b[1] + b[3]) - y]
         })
