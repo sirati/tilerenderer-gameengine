@@ -80,7 +80,7 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 41] = [
+pub const KEYS: [&str; 42] = [
     "resolution.pixel_scale",
     "resolution.base_ui_scale",
     "resolution.scale_menus",
@@ -113,6 +113,7 @@ pub const KEYS: [&str; 41] = [
     "animation.combat_speed",
     "input.map_movement",
     "input.smooth_menu_scrolling",
+    "input.snap_lists_to_items",
     "input.alt_in_menus",
     "input.capture_function_keys",
     "input.media_keys_as_function_keys",
@@ -280,6 +281,7 @@ impl Settings {
             "animation.combat_speed" => Some(ControlValue::Number(self.animation.effective_combat_speed())),
             "input.map_movement" => choice(i.map_movement),
             "input.smooth_menu_scrolling" => Some(ControlValue::On(i.smooth_menu_scrolling)),
+            "input.snap_lists_to_items" => Some(ControlValue::On(i.snap_lists_to_items)),
             "input.alt_in_menus" => Some(ControlValue::On(i.alt_in_menus)),
             "input.capture_function_keys" => Some(ControlValue::On(i.capture_function_keys)),
             "input.media_keys_as_function_keys" => Some(ControlValue::On(i.media_keys_as_function_keys)),
@@ -440,6 +442,13 @@ impl Settings {
                 "input.smooth_menu_scrolling" => match value {
                     ControlValue::On(on) => {
                         i.smooth_menu_scrolling = *on;
+                        true
+                    }
+                    _ => false,
+                },
+                "input.snap_lists_to_items" => match value {
+                    ControlValue::On(on) => {
+                        i.snap_lists_to_items = *on;
                         true
                     }
                     _ => false,
@@ -669,6 +678,7 @@ mod tests {
             ("display.show_fps", ControlValue::On(true)),
             ("input.map_movement", ControlValue::Choice("Drag".into())),
             ("input.smooth_menu_scrolling", ControlValue::On(true)),
+            ("input.snap_lists_to_items", ControlValue::On(false)),
             ("input.alt_in_menus", ControlValue::On(false)),
             ("input.capture_function_keys", ControlValue::On(false)),
             ("input.media_keys_as_function_keys", ControlValue::On(true)),

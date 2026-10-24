@@ -1,0 +1,324 @@
+use super::*;
+use scene::{Interactable, ViewState};
+use tile_render::SpriteSetId;
+
+const ROW: i32 = 20;
+const FRAME: f64 = 1.0 / 60.0;
+
+/// The driver's list: `count` rows of 20 pixels, three shown from `first`
+/// (1-based ids, sprite set = row id) in [10, 10, 100, 60].
+fn frame(first: u64, count: u64) -> (Scene, Vec<PlacedSprite>, Vec<Span>) {
+    let mut scene = Scene::default();
+    scene.views.push(ViewState { id: 7, ..Default::default() });
+    scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None, id: 99, rect: [10, 10, 100, 60], kind: InteractableKind::List { scroll: [10, 10, 100, 60], step: ROW } });
+    let mut free = Vec::new();
+    for k in 0..3 {
+        let id = first + k;
+        if id > count { break }
+        let y = 10 + k as i32 * ROW;
+        scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None, id, rect: [10, y, 100, ROW], kind: InteractableKind::ListItem });
+        free.push(PlacedSprite { screen: true, view: Some(0), clip: Some([10, 10, 110, 70]), ..PlacedSprite::new(SpriteSetId::from_raw(id as u32), 10, y) });
+    }
+    let spans = vec![Span { view: 7, start: 0, len: free.len(), cameras: vec![0; free.len()] }];
+    (scene, free, spans)
+}
+
+fn rect(s: &PlacedSprite) -> Option<[i32; 4]> {
+    let r = bounds([s.x, s.y, 100, ROW]);
+    let r = s.clip.map_or(Some(r), |c| intersect(r, c))?;
+    Some([r[0], r[1], r[2] - r[0], r[3] - r[1]])
+}
+
+fn pixel(sprites: &[PlacedSprite], at: (i32, i32)) -> Option<u32> {
+    sprites.iter().filter(|s| s.screen && rect(s).is_some_and(|r| inside(bounds(r), at))).last().map(|s| s.set.raw())
+}
+
+/// The game and the viewer, a frame at a time: what the viewer sends
+/// reaches the game after the frame, its drawing the next frame.
+struct Sim {
+    state: SmoothMenus,
+    first: u64,
+    count: u64,
+    now: f64,
+    snap: bool,
+    shown: Vec<PlacedSprite>,
+    notches: Vec<i32>,
+}
+
+impl Sim {
+    fn new(count: u64, snap: bool) -> Self {
+        let mut sim = Sim { state: SmoothMenus::default(), first: 1, count, now: 0.0, snap, shown: vec![], notches: vec![] };
+        sim.frame();
+        sim
+    }
+
+    fn apply(&mut self, inputs: Vec<Input>) {
+        for input in inputs {
+            if let Input::Wheel { delta, .. } = input {
+                self.notches.push(delta);
+                let last = self.count.saturating_sub(2).max(1);
+                self.first = if delta < 0 { (self.first + 1).min(last) } else { self.first.saturating_sub(1).max(1) };
+            }
+        }
+    }
+
+    fn frame(&mut self) {
+        let (scene, free, spans) = frame(self.first, self.count);
+        self.shown = self.state.draw(&scene, &free, &spans, self.now, true, self.snap, 1, None, rect).unwrap_or(free);
+        let out = self.state.take_inputs();
+        self.apply(out);
+        self.now += FRAME;
+    }
+
+    fn frames(&mut self, n: usize) { for _ in 0..n { self.frame() } }
+
+    fn route(&mut self, input: Input) -> Vec<Input> {
+        let out = self.state.route(input, false);
+        self.apply(out.clone());
+        out
+    }
+
+    fn wheel(&mut self, notches: i32) { assert!(self.route(Input::Wheel { delta: -notches * NOTCH, x: 20, y: 30 }).is_empty()) }
+
+    fn pos(&self) -> f64 { self.state.lists[0].pos }
+    fn shown(&self) -> i64 { self.state.lists[0].shown }
+}
+
+#[test]
+fn the_wheel_moves_the_list_continuously_and_new_notches_add_at_once() {
+    let mut sim = Sim::new(20, true);
+    sim.wheel(1);
+    let mut seen = vec![sim.pos()];
+    for _ in 0..12 {
+        sim.frame();
+        seen.push(sim.pos());
+    }
+    assert!(seen.windows(2).all(|w| w[1] >= w[0]), "never back: {seen:?}");
+    assert!(seen.iter().any(|&p| p > 0.5 && (p % ROW as f64) > 0.5 && (p % ROW as f64) < 19.5), "between items: {seen:?}");
+    let before = sim.pos();
+    assert!(before < ROW as f64, "still on the way: {before}");
+    // A second notch mid-way: the target grows at once, the motion goes on
+    // without a stop and ends two items down.
+    sim.wheel(1);
+    assert_eq!(sim.state.lists[0].target, 2.0 * ROW as f64);
+    sim.frame();
+    assert!(sim.pos() > before);
+    sim.frames(60);
+    assert_eq!(sim.pos(), 2.0 * ROW as f64);
+    assert_eq!(sim.first, 3, "the driver shows the list's items");
+    assert!(!sim.state.running());
+    assert_eq!(pixel(&sim.shown, (20, 15)), Some(3));
+}
+
+#[test]
+fn a_notch_against_the_motion_turns_it_at_once() {
+    let mut sim = Sim::new(20, true);
+    sim.wheel(2);
+    sim.frames(8);
+    let at = sim.pos();
+    assert!(at > 0.0 && at < 2.0 * ROW as f64);
+    sim.wheel(-2);
+    sim.frame();
+    assert!(sim.pos() < at, "turned within a frame: {at} -> {}", sim.pos());
+    sim.frames(60);
+    assert_eq!(sim.pos(), 0.0);
+    assert_eq!(sim.first, 1);
+}
+
+#[test]
+fn rows_show_at_every_pixel_on_the_way_from_both_drawings() {
+    let mut sim = Sim::new(20, true);
+    sim.wheel(1);
+    for _ in 0..30 {
+        sim.frame();
+        let p = sim.shown() as i32;
+        // Every pixel of the list shows the row the content has there.
+        for y in 10..70 {
+            let want = 1 + (y - 10 + p) / ROW;
+            assert_eq!(pixel(&sim.shown, (20, y)), Some(want as u32), "at offset {p}, y {y}");
+        }
+    }
+}
+
+fn trackpad(sim: &mut Sim, pixels: i32) {
+    // (A finger moving up scrolls down: negative dy.)
+    assert!(sim.route(Input::Scroll { dx: 0, dy: -pixels * 1000, pixels: true, x: 20, y: 30 }).is_empty());
+    assert!(sim.route(Input::Wheel { delta: -NOTCH, x: 20, y: 30 }).is_empty(), "the scroll's own notch is not sent too");
+}
+
+#[test]
+fn a_trackpad_stops_anywhere_and_snaps_only_after_the_input_rests() {
+    let mut sim = Sim::new(20, true);
+    trackpad(&mut sim, 5);
+    sim.frames(4);
+    assert_eq!(sim.pos(), 5.0, "at the finger's pixel, not an item");
+    sim.frames(((IDLE - 4.0 * FRAME) / FRAME) as usize - 1);
+    assert_eq!(sim.pos(), 5.0, "no snap while input may go on");
+    sim.frames(60);
+    assert_eq!(sim.pos(), 0.0, "a quarter of an item on: back to its edge");
+    assert_eq!(sim.first, 1);
+    trackpad(&mut sim, 9);
+    sim.frames(60);
+    assert_eq!(sim.pos(), ROW as f64, "beyond a third in the direction of travel: on to the next");
+    assert_eq!(sim.first, 2);
+    assert!(!sim.state.running());
+}
+
+#[test]
+fn without_snapping_a_list_rests_between_items() {
+    let mut sim = Sim::new(20, false);
+    trackpad(&mut sim, 9);
+    sim.frames(60);
+    assert_eq!(sim.pos(), 9.0);
+    assert!(!sim.state.running());
+    // The driver holds the nearer whole position, the rest is drawn from
+    // the drawing it made on the way.
+    assert_eq!(sim.first, 1);
+    assert_eq!(pixel(&sim.shown, (20, 15)), Some(1));
+    assert_eq!(pixel(&sim.shown, (20, 25)), Some(2));
+    assert_eq!(pixel(&sim.shown, (20, 62)), Some(4));
+    assert_eq!(sim.state.shifts(), vec![([10, 10, 100, 60], -9)], "the button snapping's targets follow the rows shown");
+}
+
+#[test]
+fn pointer_input_goes_to_the_row_shown_at_a_fractional_offset() {
+    let mut sim = Sim::new(20, false);
+    trackpad(&mut sim, 9);
+    sim.frames(60);
+    // Row 2 shows at 21..41; the driver has it at 30..50.
+    assert_eq!(sim.route(Input::MouseMove { x: 20, y: 25 }), vec![Input::MouseMove { x: 20, y: 34 }]);
+    // Row 4 (51..70 shown) is not the driver's yet: the press brings it
+    // in with a notch, then lands on it.
+    let press = sim.route(Input::MouseButton { button: Button::Left, down: true, x: 20, y: 65 });
+    assert_eq!(press, vec![Input::Wheel { delta: -NOTCH, x: 60, y: 40 }, Input::MouseButton { button: Button::Left, down: true, x: 20, y: 54 }]);
+    assert_eq!(sim.first, 2);
+    sim.frames(30);
+    assert_eq!(sim.first, 2, "the driver's position stays while the button is held");
+    let release = sim.route(Input::MouseButton { button: Button::Left, down: false, x: 20, y: 65 });
+    assert_eq!(release, vec![Input::MouseButton { button: Button::Left, down: false, x: 20, y: 54 }]);
+    // Row 4 in the driver's list at first = 2: 50..70.
+    assert!((50..70).contains(&54));
+}
+
+#[test]
+fn the_list_stops_where_the_driver_does_at_its_end() {
+    let mut sim = Sim::new(5, true);
+    sim.wheel(6);
+    sim.frames(120);
+    assert_eq!(sim.first, 3);
+    assert_eq!(sim.pos(), 2.0 * ROW as f64, "never past the last row drawn");
+    assert_eq!(sim.state.lists[0].target, 2.0 * ROW as f64, "and goes no further");
+    assert!(!sim.state.running());
+    assert_eq!(pixel(&sim.shown, (20, 65)), Some(5));
+    // Back up: free to go.
+    sim.wheel(-1);
+    sim.frames(60);
+    assert_eq!(sim.pos(), ROW as f64);
+}
+
+#[test]
+fn the_scroll_bar_tells_the_ends_at_once() {
+    let mut state = SmoothMenus::default();
+    let (mut scene, free, spans) = frame(1, 20);
+    scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None, id: 500, rect: [96, 10, 14, 60], kind: InteractableKind::Slider { track: [96, 24, 14, 32], value: 0 } });
+    state.draw(&scene, &free, &spans, 0.0, true, true, 1, None, rect);
+    assert!(state.route(Input::Wheel { delta: NOTCH, x: 20, y: 30 }, false).is_empty());
+    assert_eq!(state.lists[0].target, 0.0, "nothing above the top");
+    for k in 1..20 {
+        state.draw(&scene, &free, &spans, k as f64 * FRAME, true, true, 1, None, rect);
+        assert!(state.take_inputs().is_empty());
+    }
+    assert!(!state.running());
+}
+
+#[test]
+fn a_list_the_driver_scrolls_itself_glides_after_it() {
+    let mut sim = Sim::new(20, true);
+    // (The scroll bar's arrow, in the driver.)
+    sim.first = 2;
+    sim.frames(3);
+    assert!(sim.pos() > 0.0 && sim.pos() < ROW as f64, "on the way: {}", sim.pos());
+    sim.frames(60);
+    assert_eq!(sim.pos(), ROW as f64);
+    assert!(sim.notches.is_empty(), "the driver is not sent back");
+}
+
+#[test]
+fn snap_points_follow_the_direction_of_travel() {
+    assert_eq!(snap_point(5.0, 0.0, 20.0, 1.0), 0.0);
+    assert_eq!(snap_point(7.0, 0.0, 20.0, 1.0), 20.0);
+    // Up from 20: a quarter of an item back stays, a third goes on.
+    assert_eq!(snap_point(15.0, 0.0, 20.0, -1.0), 20.0);
+    assert_eq!(snap_point(13.0, 0.0, 20.0, -1.0), 0.0);
+    assert_eq!(snap_point(31.0, 10.0, 20.0, 0.0), 30.0);
+}
+
+#[test]
+fn alt_mode_notches_scroll_and_its_window_scroll_is_dropped() {
+    let mut sim = Sim::new(20, true);
+    assert!(sim.state.route(Input::Scroll { dx: 0, dy: -5000, pixels: true, x: 20, y: 30 }, true).is_empty());
+    assert_eq!(sim.state.lists[0].target, 0.0);
+    assert!(sim.state.route(Input::Wheel { delta: -NOTCH, x: 20, y: 30 }, true).is_empty());
+    assert_eq!(sim.state.lists[0].target, ROW as f64);
+}
+
+#[test]
+fn input_away_from_lists_and_with_the_option_off_is_unchanged() {
+    let mut sim = Sim::new(20, true);
+    let wheel = Input::Wheel { delta: -NOTCH, x: 300, y: 300 };
+    assert_eq!(sim.state.route(wheel.clone(), false), vec![wheel.clone()]);
+    let mut off = SmoothMenus::default();
+    let (scene, free, spans) = frame(1, 20);
+    assert!(off.draw(&scene, &free, &spans, 0.0, false, true, 1, None, rect).is_none());
+    let inside = Input::Wheel { delta: -NOTCH, x: 20, y: 30 };
+    assert_eq!(off.route(inside.clone(), false), vec![inside]);
+}
+
+#[test]
+fn a_scroll_bar_in_the_list_stays_put_while_the_rows_glide() {
+    let bar = |thumb_y: i32, first: u64| {
+        let (mut scene, mut free, _) = frame(first, 20);
+        scene.interactables.push(Interactable { region: None, alt_right_click: false, anchor: None, id: 500, rect: [96, 10, 14, 60], kind: InteractableKind::Slider { track: [96, 24, 14, 32], value: 300_000 } });
+        let track = PlacedSprite { screen: true, view: Some(0), clip: Some([96, 10, 110, 70]), ..PlacedSprite::new(SpriteSetId::from_raw(900), 96, 10) };
+        let thumb = PlacedSprite { screen: true, view: Some(0), clip: Some([96, thumb_y, 110, thumb_y + 10]), ..PlacedSprite::new(SpriteSetId::from_raw(901), 96, thumb_y) };
+        free.extend([track, thumb]);
+        let spans = vec![Span { view: 7, start: 0, len: free.len(), cameras: vec![0; free.len()] }];
+        (scene, free, spans, [track, thumb])
+    };
+    let mut state = SmoothMenus::default();
+    let (scene, free, spans, _) = bar(20, 1);
+    state.draw(&scene, &free, &spans, 0.0, true, true, 1, None, rect);
+    assert!(state.route(Input::Wheel { delta: -NOTCH, x: 20, y: 30 }, false).is_empty());
+    state.draw(&scene, &free, &spans, FRAME, true, true, 1, None, rect);
+    assert_eq!(state.take_inputs().len(), 1);
+    let (scene, free, spans, still) = bar(30, 2);
+    let animated = state.draw(&scene, &free, &spans, 3.0 * FRAME, true, true, 1, None, rect).expect("glides");
+    assert_eq!(pixel(&animated, (20, 12)), Some(1), "the rows glide");
+    for s in still { assert!(animated.contains(&s), "{s:?} unchanged"); }
+    assert!(!animated.iter().any(|s| matches!(s.set.raw(), 900 | 901) && !still.contains(s)), "a moved copy of the bar");
+}
+
+#[test]
+fn map_sprites_and_controls_outside_the_list_stay_unchanged() {
+    let mut sim = Sim::new(20, false);
+    trackpad(&mut sim, 9);
+    sim.frames(30);
+    let (scene, mut free, spans) = frame(sim.first, 20);
+    let world = PlacedSprite { view: None, screen: false, ..free[0] };
+    let button = PlacedSprite { x: 150, y: 150, clip: Some([150, 150, 250, 170]), ..free[0] };
+    free.extend([world, button]);
+    let shown = sim.state.draw(&scene, &free, &spans, sim.now, true, false, 1, None, rect).expect("between items");
+    assert!(shown.contains(&world));
+    assert!(shown.contains(&button));
+}
+
+#[test]
+fn a_new_screen_starts_afresh() {
+    let mut sim = Sim::new(20, false);
+    trackpad(&mut sim, 9);
+    sim.frames(30);
+    let (mut scene, free, spans) = frame(sim.first, 20);
+    scene.interface.popup = Some(5);
+    assert!(sim.state.draw(&scene, &free, &spans, sim.now, true, false, 1, None, rect).is_none());
+    assert!(!sim.state.running());
+}

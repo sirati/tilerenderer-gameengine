@@ -574,8 +574,12 @@ pub struct Input {
     pub capture_sensitivity: f32,
     /// Edge scrolling, or grabbing the map and dragging it.
     pub map_movement: MapMovement,
-    /// Animate list scrolling in menus independently of map movement.
+    /// Scroll lists in menus by pixels (the wheel and trackpad move them at
+    /// once and they stop anywhere) independently of map movement.
     pub smooth_menu_scrolling: bool,
+    /// With smooth list scrolling: once the scroll input rests, a list
+    /// glides to an item's edge (else it stays where scrolling stopped).
+    pub snap_lists_to_items: bool,
     /// Button snapping (the Alt mode) comes on by itself while a menu is
     /// open (a screen, popup, dialog or context menu) and goes off when the
     /// last one closes. In the world Alt still turns it on.
@@ -593,7 +597,7 @@ pub struct Input {
 
 impl Default for Input {
     fn default() -> Self {
-        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 3.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false, alt_in_menus: true, capture_function_keys: true, media_keys_as_function_keys: false }
+        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 3.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false, snap_lists_to_items: true, alt_in_menus: true, capture_function_keys: true, media_keys_as_function_keys: false }
     }
 }
 
@@ -846,6 +850,10 @@ mod tests {
         let old: Settings = toml::from_str("[input]\nsnap_updates_per_second = 5.0\n").unwrap();
         assert_eq!((old.input.map_movement, old.input.snap_updates_per_second), (MapMovement::EdgeScroll, 5.0));
         assert!(!old.input.smooth_menu_scrolling);
+        // Lists snap to items by default, in older files too.
+        assert!(Settings::default().input.snap_lists_to_items && old.input.snap_lists_to_items);
+        let free: Settings = toml::from_str("[input]\nsnap_lists_to_items = false\n").unwrap();
+        assert!(!free.input.snap_lists_to_items);
         let smooth: Settings = toml::from_str("[input]\nsmooth_menu_scrolling = true\n").unwrap();
         assert!(smooth.input.smooth_menu_scrolling);
         assert_eq!(toml::from_str::<Settings>(&toml::to_string(&smooth).unwrap()).unwrap(), smooth);

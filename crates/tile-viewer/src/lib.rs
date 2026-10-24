@@ -2861,22 +2861,29 @@ impl App {
 
     fn send(&mut self, input: Input) {
         let now = self.now();
-        let input = if self.snap.snap_mode_active() { input } else {
-            let Some(input) = self.menu_scroll.route(input, now) else {
-                self.feedback.pointer_gone(now);
-                return;
-            };
-            input
-        };
-        if self.feedback.sent(&input, &self.look_scene, now) {
-            if let Some(gpu) = &self.gpu {
-                gpu.window.request_redraw();
+        // (Lists scrolled by the viewer: scroll input moves them, pointer
+        // input goes to the row shown, `smooth_menus`.)
+        let moves = matches!(input, Input::MouseMove { .. });
+        let routed = self.menu_scroll.route(input, self.snap.snap_mode_active());
+        if moves && routed.is_empty() {
+            self.feedback.pointer_gone(now);
+        }
+        if routed.iter().any(|i| matches!(i, Input::Wheel { .. })) || self.menu_scroll.running() {
+            if let Some(gpu) = &self.gpu { gpu.window.request_redraw(); }
+        }
+        for input in routed {
+            // (A window scroll is the viewer's; its notches are the driver's.)
+            if matches!(input, Input::Scroll { .. }) { continue }
+            if self.feedback.sent(&input, &self.look_scene, now) {
+                if let Some(gpu) = &self.gpu {
+                    gpu.window.request_redraw();
+                }
             }
+            if matches!(input, Input::MouseButton { .. }) {
+                log::debug!("viewer: forwarding {input:?}");
+            }
+            frame_input(&mut self.preparing_inputs, &self.display, input);
         }
-        if matches!(input, Input::MouseButton { .. }) {
-            log::debug!("viewer: forwarding {input:?}");
-        }
-        frame_input(&mut self.preparing_inputs, &self.display, input);
     }
 
     /// The slider arrow keys step is drawn hovered (a frame at once when
@@ -3738,11 +3745,13 @@ impl App {
             if self.layout.menu_pan.take_hover_refresh() {
                 if let Some((x, y)) = self.layout.route_window(self.layout.pointer_in_window()) {
                     let now = self.started.elapsed().as_secs_f64();
-                    if let Some(input) = self.menu_scroll.route(Input::MouseMove { x, y }, now) {
-                        self.feedback.sent(&input, &self.look_scene, now);
-                        frame_input(&mut self.preparing_inputs, &self.display, input);
-                    } else {
-                        self.feedback.pointer_gone(now);
+                    let alt = self.snap.snap_mode_active();
+                    match self.menu_scroll.route(Input::MouseMove { x, y }, alt).pop() {
+                        Some(input) => {
+                            self.feedback.sent(&input, &self.look_scene, now);
+                            frame_input(&mut self.preparing_inputs, &self.display, input);
+                        }
+                        None => self.feedback.pointer_gone(now),
                     }
                 }
             }
@@ -3821,7 +3830,7 @@ impl App {
         let replacements = self.feedback.replacements(&self.look_scene, now);
         let menu_was_scrolling = self.menu_scroll.running();
         let mut looks_changed = full || free_changed || looks_metadata_changed || self.feedback.drawn() != &self.drawn_looks[..]
-            || self.menu_scroll.running();
+            || self.menu_scroll.running() || self.menu_scroll.patched();
         if looks_changed {
             let compiled = &self.compiled;
             Arc::make_mut(self.world.as_mut().expect("built above")).free = looks::splice(&self.base_free, &self.spans, &replacements, |s, camera| placed_sprite(compiled, s, Some(camera), None));
@@ -3830,11 +3839,18 @@ impl App {
         drop(replacements);
         let menu_pointer = (self.pointer_inside && !self.layout.captured() && !self.snap.snap_mode_active())
             .then(|| self.layout.route_window(self.layout.pointer_in_window())).flatten();
+        let input = &self.settings.input;
         if let Some(scrolled) = self.menu_scroll.draw(scene, &self.world.as_ref().expect("built above").free, &self.spans,
-            now, self.settings.input.smooth_menu_scrolling && !self.snap.snap_mode_active(), self.whole_version, menu_pointer, |s| placed_rect(&self.compiled, s)) {
+            now, input.smooth_menu_scrolling, input.snap_lists_to_items, self.whole_version, menu_pointer, |s| placed_rect(&self.compiled, s)) {
             Arc::make_mut(self.world.as_mut().expect("built above")).free = scrolled;
             looks_changed = true;
         }
+        // The notches that take the driver where its lists are shown, and
+        // where the button snapping finds their rows.
+        for input in self.menu_scroll.take_inputs() {
+            frame_input(&mut self.preparing_inputs, &self.display, input);
+        }
+        self.snap.set_list_shifts(self.menu_scroll.shifts());
         if (menu_was_scrolling || self.menu_scroll.running()) && self.pointer_inside && !self.layout.captured() && !self.snap.snap_mode_active() {
             if let Some(point) = self.layout.route_window(self.layout.pointer_in_window()) {
                 match self.menu_scroll.refresh_pointer(point, now) {

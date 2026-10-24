@@ -2413,7 +2413,9 @@ mod tests {
         let (a, b0) = (l.main_view.center, b(&l));
         // Over the interface: its wheel, no pan.
         let out = scroll(&mut l, (1.0, 1.0), false, (100, 550));
-        assert!(matches!(out[..], [Input::Wheel { delta: 120, .. }]), "{out:?}");
+        // (The scroll itself in the driver's pixels for the viewer's list
+        // scrolling, then the driver's notch.)
+        assert!(matches!(out[..], [Input::Scroll { dx: 1000, dy: 1000, pixels: false, .. }, Input::Wheel { delta: 120, .. }]), "{out:?}");
         assert_eq!((l.main_view.center, b(&l)), (a, b0));
         // Captured: the world cursor's view (B) pans, diagonally too.
         assert!(l.capture_at((600, 300)));
