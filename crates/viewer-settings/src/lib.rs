@@ -580,11 +580,20 @@ pub struct Input {
     /// open (a screen, popup, dialog or context menu) and goes off when the
     /// last one closes. In the world Alt still turns it on.
     pub alt_in_menus: bool,
+    /// macOS: while the game's window is in front, the system shortcuts
+    /// on F1-F12 (F11 Show Desktop, Ctrl+F1..F8, ...) are paused so the keys
+    /// reach the game, and restored when it is not (`function_keys`).
+    /// Elsewhere nothing takes them.
+    pub capture_function_keys: bool,
+    /// macOS, with `capture_function_keys`: the top row's media keys
+    /// (brightness, volume, Mission Control, ...) act as F1-F12 as if Fn
+    /// were held. Needs the Accessibility permission.
+    pub media_keys_as_function_keys: bool,
 }
 
 impl Default for Input {
     fn default() -> Self {
-        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 3.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false, alt_in_menus: true }
+        Self { snap_updates_per_second: 3.0, snap_ghost_fps: 30.0, capture_sensitivity: 3.0, map_movement: MapMovement::EdgeScroll, smooth_menu_scrolling: false, alt_in_menus: true, capture_function_keys: true, media_keys_as_function_keys: false }
     }
 }
 
