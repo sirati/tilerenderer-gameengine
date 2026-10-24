@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, BuildQueue, BuildQueueRow, Button, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 59;
+pub const VERSION: u32 = 60;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -402,13 +402,28 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u8(29);
                 w.u32(motions.len() as u32);
                 for m in motions {
-                    w.u32(m.serial as u32);
-                    w.u32((m.serial >> 32) as u32);
+                    w.u32(m.key);
                     w.u32(m.sprites.0);
                     w.u32(m.sprites.1);
-                    w.i32(m.way.0);
-                    w.i32(m.way.1);
-                    w.u32(m.duration_ms);
+                    w.i32(m.anchor.0);
+                    w.i32(m.anchor.1);
+                }
+            }
+            Update::Walk(walk) => {
+                w.u8(31);
+                w.u32(walk.key);
+                w.u32(walk.serial as u32);
+                w.u32((walk.serial >> 32) as u32);
+                w.i32(walk.origin.0);
+                w.i32(walk.origin.1);
+                w.u32(walk.planned);
+                w.u32(walk.tiles.len() as u32);
+                for t in &walk.tiles {
+                    w.u32(t.start_ms as u32);
+                    w.u32((t.start_ms >> 32) as u32);
+                    w.i32(t.way.0);
+                    w.i32(t.way.1);
+                    w.u32(t.ms);
                 }
             }
             Update::View { id, view } => {
@@ -451,8 +466,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u8(30);
                 w.bool(m.is_some());
                 let m = m.unwrap_or_default();
-                w.u32(m.serial as u32);
-                w.u32((m.serial >> 32) as u32);
+                w.u32(m.key);
                 w.i32(m.from.0);
                 w.i32(m.from.1);
             }
@@ -755,13 +769,25 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
             }
             2 => Update::Sprites(r.sprites()?),
             29 => {
-                let n = r.len(28)?;
+                let n = r.len(20)?;
                 let mut motions = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let serial = u64::from(r.u32()?) | (u64::from(r.u32()?) << 32);
-                    motions.push(crate::Motion { serial, sprites: (r.u32()?, r.u32()?), way: (r.i32()?, r.i32()?), duration_ms: r.u32()? });
+                    motions.push(crate::Motion { key: r.u32()?, sprites: (r.u32()?, r.u32()?), anchor: (r.i32()?, r.i32()?) });
                 }
                 Update::Motions(motions)
+            }
+            31 => {
+                let key = r.u32()?;
+                let serial = u64::from(r.u32()?) | (u64::from(r.u32()?) << 32);
+                let origin = (r.i32()?, r.i32()?);
+                let planned = r.u32()?;
+                let n = r.len(20)?;
+                let mut tiles = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let start_ms = u64::from(r.u32()?) | (u64::from(r.u32()?) << 32);
+                    tiles.push(crate::WalkTile { start_ms, way: (r.i32()?, r.i32()?), ms: r.u32()? });
+                }
+                Update::Walk(crate::Walk { key, serial, origin, tiles, planned })
             }
             3 => {
                 let id = r.u32()?;
@@ -789,9 +815,9 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
             }
             30 => {
                 let some = r.bool()?;
-                let serial = r.u32()? as u64 | (r.u32()? as u64) << 32;
+                let key = r.u32()?;
                 let from = (r.i32()?, r.i32()?);
-                Update::FocusMotion(some.then_some(crate::FocusMotion { serial, from }))
+                Update::FocusMotion(some.then_some(crate::FocusMotion { key, from }))
             }
             18 => {
                 let some = r.bool()?;
@@ -1394,7 +1420,7 @@ mod tests {
     #[test]
     fn motions_round_trip_diff_and_apply() {
         let mut after = crate::Scene::default();
-        after.motions = vec![crate::Motion { serial: 0x0123_4567_89AB_CDEF, sprites: (3, 9), way: (-64, 32), duration_ms: 75 }];
+        after.motions = vec![crate::Motion { key: 0xDEAD_BEEF, sprites: (3, 9), anchor: (-64, 3200) }];
         let updates = after.updates_since(&crate::Scene::default());
         assert_eq!(updates, vec![Update::Motions(after.motions.clone())]);
         assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
@@ -1403,6 +1429,14 @@ mod tests {
         assert_eq!(received.motions, after.motions);
         assert!(after.updates_since(&received).is_empty(), "an unchanged motion is not sent again");
         assert_eq!(crate::Scene::default().updates_since(&received), vec![Update::Motions(Vec::new())]);
+    }
+
+    #[test]
+    fn walks_round_trip() {
+        let walk = crate::Walk { key: 9, serial: 1 << 40 | 5, origin: (-64, 2208), planned: 3,
+            tiles: vec![crate::WalkTile { start_ms: 1 << 33 | 7, way: (64, -32), ms: 100 }, crate::WalkTile { start_ms: 1 << 33 | 140, way: (128, 0), ms: 10 }] };
+        let updates = vec![Update::Walk(walk), Update::Walk(crate::Walk::default())];
+        assert_eq!(decode_updates(&encode_updates(&updates)).unwrap(), updates);
     }
 
     #[test]
@@ -1434,7 +1468,7 @@ mod tests {
         s.view_mut(2).overlay.push(FreeSprite { set: 5, x: 1, y: 2, screen: true, after_pass: 0, phase: 0, ticks_per_frame: 1, scale_den: 0, blend: crate::SpriteBlend::Alpha, tint: 0, zoom_art: 0, zoom: (0, 0), zoom_offset: (0, 0), clip: Some([1, -2, 300, 40]), not_in_view: None, glyph: None, solid: None, output_rect: None, palette: 0, category: 0x789 });
         s.patches.push(Patch { sprite: "Screen@x/0".into(), width: 1, height: 2, rgba: vec![1, 2, 3, 4, 5, 6, 7, 8] });
         s.focus = Some((-64, 96));
-        s.focus_motion = Some(crate::FocusMotion { serial: 1 << 40 | 3, from: (-32, 80) });
+        s.focus_motion = Some(crate::FocusMotion { key: 0xFFFF_FF03, from: (-32, 80) });
         s.camera_focus = Some(CameraFocus { serial: 0x1_0000_0002, center: (-4096, 1234) });
         s.assets = 3;
         s.zooms = vec![(3, 2)];

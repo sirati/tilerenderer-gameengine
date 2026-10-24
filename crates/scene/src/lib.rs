@@ -232,20 +232,41 @@ pub struct SpriteLifetime {
     pub duration_ms: u32,
 }
 
-/// A range of world sprites on its way: they move by `way` (world pixels,
-/// full size), evenly over `duration_ms`, then stay there. Its clock runs on
-/// the viewer's monotonic clock from when the batch first telling `serial`
-/// arrived: the sprites start at the start of the way, however late the
-/// driver could send it. A nonzero serial identifies one telling; resending it must
-/// not restart its clock. Drivers allocate serials in increasing order
-/// across the session. `sprites` is a half-open range in
-/// [`Scene::sprites`], drawn where the way begins.
+/// World sprites drawing a unit that may be on a walk (see [`Walk`]):
+/// `sprites` (a half-open range in [`Scene::sprites`]) draw unit `key` with
+/// its anchor at world pixel `anchor` (full size). While the unit's walk is
+/// played, a renderer draws them moved by where the walk has the unit then,
+/// less `anchor`; else where the scene has them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Motion {
-    pub serial: u64,
+    pub key: u32,
     pub sprites: (u32, u32),
+    pub anchor: (i32, i32),
+}
+
+/// A unit's walk from tile to tile, told the moment each tile starts (not
+/// with the scene: see [`Update::Walk`]). `serial` identifies the walk
+/// (increasing across the session); `origin` is the world pixel (full
+/// size) of the unit's anchor where it began; `tiles` are its tiles started
+/// so far, in order; `planned` how many more the driver expects to follow
+/// (its path), 0 for a single step or the walk's last tile.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Walk {
+    pub key: u32,
+    pub serial: u64,
+    pub origin: (i32, i32),
+    pub tiles: Vec<WalkTile>,
+    pub planned: u32,
+}
+
+/// A tile of a [`Walk`]: when the driver started it (ms on its monotonic
+/// clock), the way to the next tile (world pixels, full size) and the
+/// time it takes at least (ms).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WalkTile {
+    pub start_ms: u64,
     pub way: (i32, i32),
-    pub duration_ms: u32,
+    pub ms: u32,
 }
 
 /// What the renderer knows: the whole world and the views of it. Drivers
@@ -270,7 +291,7 @@ pub struct Scene {
     /// drawing order (within the pass each follows).
     pub sprites: Vec<FreeSprite>,
     pub sprite_lifetimes: Vec<SpriteLifetime>,
-    /// World sprites on their way (units sliding to the next tile).
+    /// World sprites drawing units that may be on a walk.
     pub motions: Vec<Motion>,
     /// By id.
     pub views: Vec<ViewState>,
@@ -285,9 +306,9 @@ pub struct Scene {
     /// [`View::downscale`]).
     pub focus: Option<(i32, i32)>,
     /// Where a marker over the point of interest goes instead of `focus`
-    /// (which follows the driver's own frames): from `from` (in the pixels
-    /// of `focus`) along the motion `serial` while the scene has it (a unit
-    /// on its way, [`Motion::serial`]); else at `from` (one held there).
+    /// (which follows the driver's own frames): `from` (in the pixels of
+    /// `focus`) moved as the walk of unit `key` moves its sprites
+    /// ([`Motion`]: from its anchor; `key` 0, or no walk: not moved).
     pub focus_motion: Option<FocusMotion>,
     /// Semantic main-camera request independent of the native rendering camera.
     /// A new serial repeats a request even when its destination is unchanged.
@@ -333,7 +354,7 @@ pub struct Scene {
 /// The point of interest on its way (see [`Scene::focus_motion`]).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FocusMotion {
-    pub serial: u64,
+    pub key: u32,
     pub from: (i32, i32),
 }
 
@@ -819,6 +840,10 @@ pub enum Update {
     SpriteLifetimes(Vec<SpriteLifetime>),
     /// See [`Scene::motions`] (replaced).
     Motions(Vec<Motion>),
+    /// A unit's walk as it is now (replacing any it had): kept by the
+    /// [`Display`], not the scene, and sent the moment a tile starts (a
+    /// batch of these alone is no new scene).
+    Walk(Walk),
     /// View `id` added or changed (its overlay kept), or removed (`None`).
     View { id: u32, view: Option<View> },
     /// The screen-space sprites over view `id` (replaced).
@@ -1000,7 +1025,7 @@ impl Scene {
             Update::ScreenSize(s) => self.screen_size = s,
             Update::Looks(l) => self.looks = l,
             // (Not the scene's: see `Display::host`.)
-            Update::Host(_) => {}
+            Update::Host(_) | Update::Walk(_) => {}
         }
     }
 
@@ -1336,7 +1361,7 @@ pub fn connect() -> (Driver, Display) {
     let wake = Waker::default();
     (
         Driver { updates: updates_tx, input: input_rx, in_flight: in_flight.clone(), wake: wake.clone() },
-        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() }, changes_from_seq: 0, host: None, motion_arrivals: Default::default() },
+        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() }, changes_from_seq: 0, host: None, walks: Default::default() },
     )
 }
 
@@ -1377,7 +1402,34 @@ pub struct Driver {
     wake: Waker,
 }
 
+/// Another sender of the driver's batches, for a thread of its own (what
+/// must not wait for the driver's next batch: [`Update::Walk`]).
+#[derive(Clone)]
+pub struct Pusher {
+    updates: Updater,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    wake: Waker,
+}
+
+impl Pusher {
+    /// As [`Driver::send`].
+    pub fn send(&self, batch: Vec<Update>) -> bool {
+        if batch.is_empty() {
+            return true;
+        }
+        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sent = self.updates.send(batch).is_ok();
+        self.wake.wake();
+        sent
+    }
+}
+
 impl Driver {
+    /// A sender for another thread (see [`Pusher`]).
+    pub fn pusher(&self) -> Pusher {
+        Pusher { updates: self.updates.clone(), in_flight: self.in_flight.clone(), wake: self.wake.clone() }
+    }
+
     /// Sends a batch of updates, applied by the renderer at once; false
     /// once the renderer is gone.
     pub fn send(&self, batch: Vec<Update>) -> bool {
@@ -1438,9 +1490,9 @@ pub struct Display {
     changes_from_seq: u64,
     /// The host's status last received, and when (see [`Display::host`]).
     host: Option<(HostStatus, std::time::Instant)>,
-    /// When each motion of the scene first arrived (see
-    /// [`Display::motion_arrival`]).
-    motion_arrivals: std::collections::HashMap<u64, std::time::Instant>,
+    /// The walk each unit was told last (see [`Update::Walk`]), with when
+    /// each of its tiles first arrived.
+    walks: std::collections::HashMap<u32, (Walk, Vec<std::time::Instant>)>,
 }
 
 /// What of a [`Scene`] changed (see [`Display::take_changes`]), for a
@@ -1549,9 +1601,14 @@ impl Display {
     /// statuses alone does not: no new scene for the renderer to take).
     fn apply(&mut self, batch: Vec<Update>) -> bool {
         let _ = self.in_flight.try_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
-        let (host, batch): (Vec<Update>, Vec<Update>) = batch.into_iter().partition(|u| matches!(u, Update::Host(_)));
-        if let Some(Update::Host(h)) = host.last() {
-            self.host = Some((*h, std::time::Instant::now()));
+        let (host, batch): (Vec<Update>, Vec<Update>) = batch.into_iter().partition(|u| matches!(u, Update::Host(_) | Update::Walk(_)));
+        let now = std::time::Instant::now();
+        for u in host {
+            match u {
+                Update::Host(h) => self.host = Some((h, now)),
+                Update::Walk(w) => self.take_walk(w, now),
+                _ => {}
+            }
         }
         if batch.is_empty() {
             return false;
@@ -1559,13 +1616,6 @@ impl Display {
         for u in batch {
             if let Update::Settings(s) = &u {
                 self.new_settings = Some(s.clone());
-            }
-            if let Update::Motions(motions) = &u {
-                let now = std::time::Instant::now();
-                self.motion_arrivals.retain(|serial, _| motions.iter().any(|m| m.serial == *serial));
-                for m in motions {
-                    self.motion_arrivals.entry(m.serial).or_insert(now);
-                }
             }
             self.changes.note(&u);
             self.scene.apply(u);
@@ -1582,11 +1632,22 @@ impl Display {
         self.host
     }
 
-    /// When the batch first telling motion `serial` (of the latest scene)
-    /// arrived, on the renderer's clock: the driver sent it then, however
-    /// long the renderer takes to show that scene.
-    pub fn motion_arrival(&self, serial: u64) -> Option<std::time::Instant> {
-        self.motion_arrivals.get(&serial).copied()
+    /// The walk unit `key` was told last, and when each of its tiles first
+    /// arrived on the renderer's clock (the driver sent it then).
+    pub fn walk(&self, key: u32) -> Option<(&Walk, &[std::time::Instant])> {
+        self.walks.get(&key).map(|(w, at)| (w, &at[..]))
+    }
+
+    fn take_walk(&mut self, walk: Walk, now: std::time::Instant) {
+        // (Walks a minute old are let go: their units stand still.)
+        self.walks.retain(|_, (_, at)| at.last().is_some_and(|t| now.saturating_duration_since(*t) < Duration::from_secs(60)));
+        let entry = self.walks.entry(walk.key).or_insert_with(|| (Walk::default(), Vec::new()));
+        if entry.0.serial != walk.serial {
+            entry.1.clear();
+        }
+        entry.1.resize(walk.tiles.len().max(entry.1.len()), now);
+        entry.1.truncate(walk.tiles.len());
+        entry.0 = walk;
     }
 
     pub fn scene(&self) -> &Scene {
@@ -1680,7 +1741,6 @@ mod tests {
         assert_eq!(display.scene().seq, 0);
         assert_eq!(display.host().map(|h| h.0), Some(HostStatus { stale_ms: 700, serial: 1, render_errors: 0 }));
         assert!(!driver.busy(), "taken");
-        // (See `motions_keep_their_first_arrival` for motions.)
         // With other updates: a new scene, the latest status kept.
         driver.send(vec![Update::Tick(3), Update::Host(HostStatus { stale_ms: 0, serial: 2, render_errors: 0 })]);
         assert!(display.receive(Duration::ZERO));
@@ -1689,24 +1749,28 @@ mod tests {
     }
 
     #[test]
-    fn motions_keep_their_first_arrival() {
+    fn walks_keep_when_each_tile_first_arrived() {
         let (driver, mut display) = connect();
-        let motion = |serial| Motion { serial, sprites: (0, 1), way: (64, 32), duration_ms: 100 };
+        let tile = |start_ms| WalkTile { start_ms, way: (64, 32), ms: 100 };
+        let walk = |serial, tiles: Vec<WalkTile>| Walk { key: 7, serial, origin: (100, 50), tiles, planned: 2 };
         let before = std::time::Instant::now();
-        driver.send(vec![Update::Motions(vec![motion(1)])]);
-        assert!(display.receive(Duration::ZERO));
-        let first = display.motion_arrival(1).unwrap();
+        driver.send(vec![Update::Walk(walk(1, vec![tile(10)]))]);
+        assert!(!display.receive(Duration::ZERO), "a walk alone is no new scene");
+        let first = display.walk(7).unwrap().1[0];
         assert!(first >= before);
         std::thread::sleep(Duration::from_millis(2));
-        // Told again (its range moved): the same clock.
-        driver.send(vec![Update::Motions(vec![Motion { sprites: (2, 3), ..motion(1) }, motion(2)])]);
-        assert!(display.receive(Duration::ZERO));
-        assert_eq!(display.motion_arrival(1), Some(first));
-        assert!(display.motion_arrival(2).unwrap() > first);
-        // Gone from the scene: forgotten.
-        driver.send(vec![Update::Motions(vec![motion(2)])]);
-        assert!(display.receive(Duration::ZERO));
-        assert_eq!(display.motion_arrival(1), None);
+        driver.send(vec![Update::Walk(walk(1, vec![tile(10), tile(130)]))]);
+        display.receive(Duration::ZERO);
+        let (w, at) = display.walk(7).unwrap();
+        assert_eq!((w.tiles.len(), at[0]), (2, first), "an earlier tile keeps its arrival");
+        assert!(at[1] > first);
+        // A new walk of the unit: its own arrivals.
+        driver.send(vec![Update::Walk(walk(2, vec![tile(900)]))]);
+        display.receive(Duration::ZERO);
+        let (w, at) = display.walk(7).unwrap();
+        assert_eq!((w.serial, at.len()), (2, 1));
+        assert!(at[0] > first);
+        assert!(display.walk(8).is_none());
     }
 
     #[test]
