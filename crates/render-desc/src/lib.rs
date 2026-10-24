@@ -529,7 +529,7 @@ pub struct Description {
     #[serde(default)]
     pub layers: Vec<LayerDesc>,
     /// Font faces text is drawn with from outlines (`tile_render::OutlineGlyph`),
-    /// by name: `[fonts."Lucida Sans"] source = "LSANS.TTF"`, loaded with
+    /// by name: `[fonts."Sans"] source = "sans.ttf"`, loaded with
     /// [`ImageLoader::font`]. A face that does not load is left out (logged):
     /// its text is then not drawn from outlines.
     #[serde(default)]
@@ -925,7 +925,7 @@ fn arrow(spec: &str) -> Result<RgbaImage, String> {
 }
 
 /// A painted, bevelled map marker: warm metal, a brown ink edge and a
-/// soft shadow, matching the palette of Civ III's parchment and brass UI.
+/// soft shadow, in the warm palette of a parchment and brass interface.
 /// The supplied RGB sets the metal's midtone; alpha applies to the art.
 fn gilded_arrow(spec: &str) -> Result<RgbaImage, String> {
     // Optional @N shifts the art by N quarter pixels within an eight-pixel
@@ -3128,12 +3128,12 @@ mod tests {
     fn indexed_images_share_their_pixels_and_pick_named_palettes() {
         let text = r#"
             grid = { layout = "orthogonal", step = [8, 4] }
-            [palettes.civ]
+            [palettes.player]
             source = "pal{v}"
             variants = [1, 22]
             [palettes.army]
-            base = "civ@1"
-            copy = [["civ@22", 2, 5, 2]]
+            base = "player@1"
+            copy = [["player@22", 2, 5, 2]]
             [images.body]
             source = "a.flc"
             remap = [2, 6]
@@ -3178,30 +3178,32 @@ mod tests {
         // Named rows after the own ones (row 0 clear, body, shadow).
         assert_eq!(c.atlas.named_palettes, 3);
         let row = |name: &str| c.palette(name).unwrap();
-        assert_eq!((row("army"), row("civ@1"), row("civ@22")), (1, 2, 3));
+        assert_eq!((row("army"), row("player@1"), row("player@22")), (1, 2, 3));
         let entry = |r: u32, i: u32| c.atlas.palettes[((c.atlas.named_palettes + r - 1) * tile_render_shared::PALETTE_SIZE + i) as usize].to_le_bytes();
-        // (civ@1: 4 · i, from "pal1"; civ@22: 5 · i, from "pal22"; the army
-        // row civ@1's with entries 2, 3 of civ@22 at 5, 6.)
+        // (player@1: 4 · i, from "pal1"; player@22: 5 · i, from "pal22"; the army
+        // row player@1's with entries 2, 3 of player@22 at 5, 6.)
         assert_eq!((entry(2, 3), entry(3, 3), entry(1, 5), entry(1, 7)), ([12, 0, 0, 255], [15, 0, 0, 255], [10, 0, 0, 255], [28, 0, 0, 255]));
-        // Drawn: the body's frame 2 (indices 20..27) through civ@22 where remapped (none are: 2..6).
-        let tile = tile_render_shared::indexed_color(22, body.palette, body.remap, row("civ@22"), c.atlas.named_palettes, &c.atlas.palettes);
+        // Drawn: the body's frame 2 (indices 20..27) through player@22 where remapped (none are: 2..6).
+        let tile = tile_render_shared::indexed_color(22, body.palette, body.remap, row("player@22"), c.atlas.named_palettes, &c.atlas.palettes);
         assert_eq!(tile, [22, 22, 22, 255]);
-        let remapped = tile_render_shared::indexed_color(3, body.palette, body.remap, row("civ@22"), c.atlas.named_palettes, &c.atlas.palettes);
+        let remapped = tile_render_shared::indexed_color(3, body.palette, body.remap, row("player@22"), c.atlas.named_palettes, &c.atlas.palettes);
         assert_eq!(remapped, [15, 0, 0, 255]);
         // A layer value picks a named palette in its upper bits.
-        let v = c.value_in("units", "body/1", row("civ@22")).unwrap();
+        let v = c.value_in("units", "body/1", row("player@22")).unwrap();
         assert_eq!(v & 3, c.value("units", "body/1").unwrap());
         assert_eq!(c.layers[0].value_in(c.value("units", "body/1").unwrap(), 3), Some(v));
     }
 
-    /// Fonts from the game's folder, where there is a Civ III installation.
+    /// A real TrueType font as "test-font.ttf", where the environment names
+    /// one (`TEST_FONT`).
     struct Fonts(std::path::PathBuf);
     impl ImageLoader for Fonts {
         fn load(&self, source: &str, options: &toml::Table) -> Result<Vec<RgbaImage>, String> {
             Checker.load(source, options)
         }
         fn font(&self, source: &str) -> Result<Vec<u8>, String> {
-            std::fs::read(self.0.join(source)).map_err(|e| e.to_string())
+            if source != "test-font.ttf" { return Err(format!("{source}: no such font")) }
+            std::fs::read(&self.0).map_err(|e| e.to_string())
         }
     }
 
@@ -3210,8 +3212,8 @@ mod tests {
         let d = Description::parse(
             r#"
             grid = { layout = "orthogonal", step = [64, 32] }
-            [fonts."Lucida Sans"]
-            source = "LSANS.TTF"
+            [fonts."Test Sans"]
+            source = "test-font.ttf"
             [fonts.missing]
             source = "none.ttf"
             "#,
@@ -3220,13 +3222,12 @@ mod tests {
         // A loader without fonts: none, and the rest compiles.
         let c = d.compile(&Checker, 256).unwrap();
         assert_eq!(c.fonts.len(), 1);
-        assert!(c.font(FALLBACK_FONT).is_some() && c.font("Lucida Sans").is_none());
-        let install = std::path::PathBuf::from(std::env::var("CIV3_INSTALL").unwrap_or_else(|_| "/mnt/datasets/winvm/civ3-src/Civilization III Complete".into()));
-        if !install.join("LSANS.TTF").is_file() {
-            return eprintln!("no Civ III installation, skipped");
-        }
-        for c in [d.compile(&Fonts(install.clone()), 256).unwrap(), d.compile_layout(&Fonts(install), 256).unwrap().without_pixels()] {
-            let (index, face) = c.font("Lucida Sans").expect("loaded");
+        assert!(c.font(FALLBACK_FONT).is_some() && c.font("Test Sans").is_none());
+        let Some(font) = std::env::var_os("TEST_FONT").map(std::path::PathBuf::from).filter(|f| f.is_file()) else {
+            return eprintln!("no TEST_FONT, skipped");
+        };
+        for c in [d.compile(&Fonts(font.clone()), 256).unwrap(), d.compile_layout(&Fonts(font), 256).unwrap().without_pixels()] {
+            let (index, face) = c.font("Test Sans").expect("loaded");
             assert_eq!(index, 0);
             assert!(face.glyph('R').is_some());
             assert!(c.font("missing").is_none());
@@ -4037,7 +4038,7 @@ mod tests {
     fn grown_indexed_art_shares_pixels_and_keeps_the_palette_rows() {
         let base = r#"
             grid = { layout = "orthogonal", step = [8, 4] }
-            [palettes.civ]
+            [palettes.player]
             source = "pal{v}"
             variants = [1, 22]
             [images.body]
@@ -4063,27 +4064,27 @@ mod tests {
             group = "Shadow@a"
         "#;
         let (mut grown, mut growing) = Description::parse(base).unwrap().compile_growing(&Indexed, 64, true).unwrap();
-        let before = (grown.palette("civ@22"), grown.atlas.named_palettes, grown.value_in("units", "body/1", 2));
+        let before = (grown.palette("player@22"), grown.atlas.named_palettes, grown.value_in("units", "body/1", 2));
         let g = growing.grow(&grown, add, &Indexed).unwrap();
         // The shadow's indices are the body's: no pixels, a palette row of its own.
         assert!(g.atlas.blits.is_empty());
         assert_eq!(g.atlas.palettes.len(), tile_render_shared::PALETTE_SIZE as usize);
         grown.apply(&g);
-        assert_eq!((grown.palette("civ@22"), grown.atlas.named_palettes, grown.value_in("units", "body/1", 2)), before);
+        assert_eq!((grown.palette("player@22"), grown.atlas.named_palettes, grown.value_in("units", "body/1", 2)), before);
         let whole = Description::parse(&format!("{base}{add}")).unwrap().compile(&Indexed, 64).unwrap();
         for (name, index) in [("body/2", 3), ("body/2", 22), ("Shadow@a/2", 22), ("Shadow@a/0", 9)] {
             let color = |c: &Compiled| {
                 let s = c.atlas.sprites[c.sprite(name).unwrap().0 as usize];
                 let page = &c.atlas.index_pages[s.page as usize];
                 let i = page.get(s.atlas_x + index % 8, s.atlas_y) as u32;
-                tile_render_shared::indexed_color(i, s.palette, s.remap, c.palette("civ@22").unwrap(), c.atlas.named_palettes, &c.atlas.palettes)
+                tile_render_shared::indexed_color(i, s.palette, s.remap, c.palette("player@22").unwrap(), c.atlas.named_palettes, &c.atlas.palettes)
             };
             assert_eq!(color(&grown), color(&whole), "{name} at {index}");
         }
         assert!(grown.value("units", "Shadow@a/1").is_some());
         // A named palette added later, based on one there: its row counts
         // on past the own rows, values pick it.
-        let army = "[palettes.army]\nbase = \"civ@1\"\ncopy = [[\"civ@22\", 2, 5, 2]]\n";
+        let army = "[palettes.army]\nbase = \"player@1\"\ncopy = [[\"player@22\", 2, 5, 2]]\n";
         let g = growing.grow(&grown, army, &Indexed).unwrap();
         grown.apply(&g);
         let whole = Description::parse(&format!("{base}{add}{army}")).unwrap().compile(&Indexed, 64).unwrap();
@@ -4179,7 +4180,7 @@ mod tests {
 
     #[test]
     fn lines_follow_the_column_rule() {
-        // Civ III's tile-edge lines (measured): 2 pixels per column, rows
+        // Tile-edge lines as an isometric game draws them: 2 pixels per column, rows
         // j/2 and j/2 + 1 from the start, the end column excluded.
         for (dx, dy) in [(-64, -32), (-64, 32), (64, 32), (64, -32)] {
             let img = line(&format!("1,2,3,128:{dx},{dy}:2")).unwrap();
