@@ -1342,6 +1342,7 @@ dependencies = [
 name = "jgl-ffi"
 version = "0.1.0"
 dependencies = [
+ "handoff",
  "inproc",
  "jgl",
  "log",
