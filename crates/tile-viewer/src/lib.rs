@@ -1299,7 +1299,9 @@ fn render_planned_inner(
         frame = layout.frame(scene, plan.canvas(), config.overhang, interface_rects(compiled, scene), Some(world_bounds(compiled, scene)));
     }
     let arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    // (In the format windows mostly have.)
+    let format = wgpu::TextureFormat::Bgra8Unorm;
+    let mut renderer = TileRenderer::new(&gpu.device, format);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     let mut world = scene_world_arranged(compiled, scene, &frame.view_cameras, &arranged.overlay_cameras);
     let mut cameras = frame.cameras.clone();
@@ -1319,7 +1321,7 @@ fn render_planned_inner(
     renderer.set_markers(&gpu.device, &gpu.queue, &dividers);
     // (Shown in the window as the viewer shows it: a pixel scale's boxes,
     // glass shaded at window resolution.)
-    gpu.render_presented(&mut renderer, &cameras, &frame.copies, plan.present, scene.tick, config.clear)
+    gpu.render_presented_in(format, &mut renderer, &cameras, &frame.copies, plan.present, scene.tick, config.clear)
 }
 
 /// A device on `adapter` with `surface` configured for a window of `size`
