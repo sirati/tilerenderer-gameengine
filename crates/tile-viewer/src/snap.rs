@@ -1510,14 +1510,6 @@ impl SnapInput {
                     before.extend(layout.route(input));
                     return before;
                 }
-                // The game menu or the quit dialogue lets go of the pointer,
-                // which the mode would hold: Alt is the driver's.
-                if layout.releases_pointer() {
-                    log::debug!("snap: a dialogue lets the pointer go: Alt is the driver's");
-                    self.alt_sent = true;
-                    before.extend(layout.route(input));
-                    return before;
-                }
                 // (Nothing of the driver's to snap to, e.g. before its first
                 // screen: Alt is the driver's.)
                 if !self.shown_targets(scene, layout).iter().any(|t| !t.is_capture()) {
@@ -1665,26 +1657,9 @@ impl SnapInput {
     /// mouse beside the menu) keeps it off
     /// until the menus are all closed.
     fn menu_mode(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
-        // The game menu or the quit dialogue lets go of the pointer: the
-        // mode, which holds it, is off while one is open, and does not come
-        // on by itself (nor by Alt, `route_input`).
-        if layout.releases_pointer() {
-            self.by_menu = false;
-            if !self.active() {
-                return vec![];
-            }
-            // (At once, not landing: the system pointer shows where the
-            // mode's pointer is.)
-            let mut out = self.end_slider(SliderAction::Cancel);
-            let at = self.snapper.pointer();
-            self.snapper.stop();
-            if let Some(p) = at.filter(|_| !layout.captured()) {
-                layout.place_pointer((p.0.round() as i32, p.1.round() as i32));
-            }
-            log::debug!("viewer: button snapping off (the game menu or the quit dialogue lets the pointer go)");
-            out.extend(self.sync(layout));
-            return out;
-        }
+        // (The game menu and the quit dialogue let go of the pointer, but
+        // not the mode: it works there as in any menu, its grab the one
+        // hold they keep.)
         let menu = layout.menu_open();
         if self.by_menu && !self.snapper.snapping() {
             self.by_menu = false;

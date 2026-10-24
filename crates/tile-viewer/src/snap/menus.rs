@@ -236,30 +236,33 @@ fn releasing(mut s: Scene) -> Scene {
 }
 
 #[test]
-fn the_game_menu_and_the_quit_dialogue_keep_the_mode_off_and_alt_is_the_games() {
+fn the_game_menu_and_the_quit_dialogue_keep_the_mode_as_any_menu_does() {
+    // The one hold these dialogues keep: the mode comes on in them as in
+    // any menu, and Alt turns it off and on again.
     let (mut snap, mut l) = setup();
     let menu = releasing(scene(Some("Menu")));
     run(&mut snap, &mut l, &menu, 0.0, 0.5);
-    assert!(!snap.active() && !l.snapping(), "not on by itself: its grab would hold the pointer");
-    let out = key(&mut snap, &mut l, &menu, ALT, true, 0.6);
-    assert!(out.contains(&Input::Key { vk: ALT, down: true, text: None }), "{out:?}");
-    let out = key(&mut snap, &mut l, &menu, ALT, false, 0.65);
-    assert!(out.contains(&Input::Key { vk: ALT, down: false, text: None }), "{out:?}");
-    run(&mut snap, &mut l, &menu, 0.7, 0.5);
-    assert!(!snap.active());
-    // On for an advisor; the quit popup over it turns it off at once.
+    assert!(snap.active() && l.snapping(), "on by itself, as in any menu");
+    key(&mut snap, &mut l, &menu, ALT, true, 0.6);
+    key(&mut snap, &mut l, &menu, ALT, false, 0.65);
+    run(&mut snap, &mut l, &menu, 0.7, 0.3);
+    assert!(!snap.active(), "Alt turns it off");
+    key(&mut snap, &mut l, &menu, ALT, true, 1.1);
+    key(&mut snap, &mut l, &menu, ALT, false, 1.15);
+    assert!(snap.active(), "and on again");
+    // On for an advisor; the quit popup over it leaves it on.
     let (mut snap, mut l) = setup();
     run(&mut snap, &mut l, &scene(Some("F1")), 0.0, 0.3);
     assert!(snap.active());
-    run(&mut snap, &mut l, &releasing(scene(Some("F1"))), 0.3, TICK);
-    assert!(!snap.active() && !l.snapping(), "off in one tick, not landing");
-    // The player's own mode, turned on in the world, goes too.
+    run(&mut snap, &mut l, &releasing(scene(Some("F1"))), 0.3, 0.3);
+    assert!(snap.active() && l.snapping());
+    // The player's own mode, turned on in the world, stays too.
     let (mut snap, mut l) = setup();
     key(&mut snap, &mut l, &scene(None), ALT, true, 0.0);
     key(&mut snap, &mut l, &scene(None), ALT, false, 0.05);
     assert!(snap.active());
-    run(&mut snap, &mut l, &releasing(scene(None)), 0.1, TICK);
-    assert!(!snap.active());
+    run(&mut snap, &mut l, &releasing(scene(None)), 0.1, 0.3);
+    assert!(snap.active());
 }
 
 #[test]

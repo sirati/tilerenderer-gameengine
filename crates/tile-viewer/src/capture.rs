@@ -56,9 +56,10 @@
 //! boxes and the window's edges hold the free pointer nowhere
 //! ([`Layout::pointer_unbounded`]), so the window asks the system for no
 //! confinement either (ClipCursor, Wayland constraints, X11 barriers, the
-//! macOS region) and warps it nowhere. The Alt mode is off (`crate::snap`:
-//! its own grab holds the pointer). The pointer is free to leave the window
-//! on every system.
+//! macOS region) and warps it nowhere. The one exception is the Alt mode
+//! (`crate::snap`): it works in these dialogues as in any menu, its own
+//! grab holding the pointer while it is on; with it off the pointer is free
+//! to leave the window on every system.
 //!
 //! As the dialogue closes, everything that is decided from the frame (the
 //! walls, the confinement) is as before at once. A capture the dialogue
