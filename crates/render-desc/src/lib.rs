@@ -4541,7 +4541,7 @@ mod tests {
             let got = tile_render::reference::render(&world, &c.atlas, &tile_render::Camera { downscale: 2, ..camera }, 0, [0, 0, 0, 255]);
             assert_eq!(got, want, "camera at ({x}, {y})");
             // The shaders draw the same.
-            let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+            let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, tile_render::Shaders::new(viewer_spirv::SPIRV, viewer_spirv::SPIRV_FALLBACK));
             renderer.set_atlas(&gpu.device, &gpu.queue, &c.atlas);
             renderer.set_world(&gpu.device, &world);
             assert_eq!(gpu.render(&mut renderer, &tile_render::Camera { downscale: 2, ..camera }, 0, [0, 0, 0, 255]), want, "GPU, camera at ({x}, {y})");

@@ -503,6 +503,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "tile-render",
+ "viewer-spirv",
  "wgpu",
  "winit",
 ]
@@ -2415,6 +2416,7 @@ dependencies = [
  "tile-render",
  "tile-render-shared",
  "toml 0.9.12+spec-1.1.0",
+ "viewer-spirv",
  "wgpu",
 ]
 
@@ -2918,7 +2920,6 @@ name = "tile-render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "cargo-gpu-install",
  "gpu-text",
  "image",
  "log",
@@ -2926,6 +2927,7 @@ dependencies = [
  "render-errors",
  "thiserror 2.0.21",
  "tile-render-shared",
+ "viewer-spirv",
  "wgpu",
 ]
 
@@ -2955,6 +2957,7 @@ dependencies = [
  "tile-render",
  "toml 0.9.12+spec-1.1.0",
  "viewer-settings",
+ "viewer-spirv",
  "wgpu",
  "winit",
 ]
@@ -3199,6 +3202,13 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "viewer-spirv"
+version = "0.1.0"
+dependencies = [
+ "cargo-gpu-install",
 ]
 
 [[package]]

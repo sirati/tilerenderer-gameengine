@@ -10,6 +10,7 @@ render-errors = { path = "../render-errors" }
 application-icon = { path = "../application-icon" }
 handoff = { path = "../handoff" }
 tile-render.workspace = true
+viewer-spirv.workspace = true
 render-desc = { path = "../render-desc" }
 scene = { path = "../scene" }
 viewer-settings = { path = "../viewer-settings" }

@@ -674,7 +674,7 @@ fn check_opaque_modal_stack(gpu: Option<&tile_render::Headless>) {
                 let world = scene_world_arranged(&compiled, scene, &frame.view_cameras, &arranged.overlay_cameras);
                 let reference = tile_render::reference::render_views(&world, &compiled.atlas, &frame.cameras, plan.canvas(), 0, BACKGROUND);
                 let image = if let Some(gpu) = gpu {
-                    let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+                    let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
                     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
                     renderer.set_world(&gpu.device, &world);
                     let actual = gpu.render_views(&mut renderer, &frame.cameras, plan.canvas(), 0, BACKGROUND);

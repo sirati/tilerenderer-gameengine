@@ -45,6 +45,11 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Fullscreen, Window, WindowId};
 
+/// The shader module the viewer draws with: `viewer-shaders` (the tile
+/// renderer's, the glass lens's and the selection marker's shaders, one
+/// SPIR-V module), with what the renderer draws from it.
+pub const SHADERS: tile_render::Shaders = tile_render::Shaders::new(viewer_spirv::SPIRV, viewer_spirv::SPIRV_FALLBACK);
+
 #[derive(Clone, Debug)]
 pub struct ViewerConfig {
     pub title: String,
@@ -943,7 +948,7 @@ mod accessibility_arrow_tests {
         // moving the arrow invalidates its world, a static/absent one does
         // not create further full redraws as the animation clock advances.
         let gpu = tile_render::Headless::new().unwrap();
-        let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
         renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
         let mut world = compiled.world(1, 1, false, false);
         world.color = tile_render::ColorModel::Quantized { bits: 5 };
@@ -1204,7 +1209,7 @@ pub fn render_offscreen(
     size: (u32, u32),
     config: &ViewerConfig,
 ) -> RgbaImage {
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world(compiled, scene));
     apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
@@ -1222,7 +1227,7 @@ pub fn render_arranged(
     config: &ViewerConfig,
 ) -> RgbaImage {
     let frame = arranged_frame(compiled, scene, size, config);
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world_for(compiled, scene, &frame.view_cameras));
     apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
@@ -1314,7 +1319,7 @@ fn render_planned_inner(
     arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
     // (In the format windows mostly have.)
     let format = wgpu::TextureFormat::Bgra8Unorm;
-    let mut renderer = TileRenderer::new(&gpu.device, format);
+    let mut renderer = TileRenderer::new(&gpu.device, format, crate::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     let mut world = scene_world_arranged(compiled, scene, &frame.view_cameras, &arranged.overlay_cameras);
     let mut cameras = frame.cameras.clone();
@@ -2714,7 +2719,7 @@ mod preparation_gpu_tests {
     fn delayed_required_growth_does_not_activate_an_intermediate_whole() {
         let gpu = Headless::new().unwrap();
         let whole = compiled();
-        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
         active.set_atlas(&gpu.device, &gpu.queue, &whole.atlas);
         let old_room = active.atlas_room();
         let mut assets = ArtInbox::new(Assets::new(whole.clone()));
@@ -2748,7 +2753,7 @@ mod preparation_gpu_tests {
     fn tight_peak_limit_replays_directly_into_mandatory_final_capacity() {
         let gpu = Headless::new().unwrap();
         let whole = compiled();
-        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
         active.set_atlas(&gpu.device, &gpu.queue, &whole.atlas);
         let old_resident = active.atlas_resident_bytes();
         let desc = std::mem::size_of_val(&whole.atlas.sprites[0]) as u64;

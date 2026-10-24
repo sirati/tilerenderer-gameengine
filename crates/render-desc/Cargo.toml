@@ -16,3 +16,4 @@ log.workspace = true
 
 [dev-dependencies]
 wgpu.workspace = true
+viewer-spirv.workspace = true

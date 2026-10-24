@@ -723,7 +723,7 @@ impl State {
             |surface| surface.get_capabilities(&adapter).present_modes,
         );
         let software = init.bitmap || adapter.get_info().device_type == wgpu::DeviceType::Cpu;
-        let mut renderer = TileRenderer::new(&device, config.format);
+        let mut renderer = TileRenderer::new(&device, config.format, crate::SHADERS);
         if init.profile {
             renderer.enable_timing(&device, &queue);
         }
@@ -1818,7 +1818,7 @@ mod tests {
                     color_space: wgpu::SurfaceColorSpace::Auto,
                 };
                 let bitmap = BitmapTarget::new(&headless.device, &config).unwrap();
-                let mut renderer = TileRenderer::new(&headless.device, config.format);
+                let mut renderer = TileRenderer::new(&headless.device, config.format, crate::SHADERS);
                 renderer.set_atlas(&headless.device, &headless.queue, &compiled.atlas);
                 let mut state = State {
                     diagnostics: None,
