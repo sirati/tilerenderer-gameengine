@@ -80,7 +80,7 @@ pub const FPS_LIMIT_RANGE: Range = Range { min: 30.0, max: 480.0, step: 1.0 };
 /// Every key [`Settings::control`] answers (besides the derived
 /// `"layout.orientation"`). `"layout.screen_place"` is the one place of
 /// every screen, for the split's orientation.
-pub const KEYS: [&str; 39] = [
+pub const KEYS: [&str; 41] = [
     "resolution.pixel_scale",
     "resolution.base_ui_scale",
     "resolution.scale_menus",
@@ -114,6 +114,8 @@ pub const KEYS: [&str; 39] = [
     "input.map_movement",
     "input.smooth_menu_scrolling",
     "input.alt_in_menus",
+    "input.capture_function_keys",
+    "input.media_keys_as_function_keys",
     "display.show_fps",
     "display.fps_detailed",
     "display.vsync",
@@ -274,6 +276,8 @@ impl Settings {
             "input.map_movement" => choice(i.map_movement),
             "input.smooth_menu_scrolling" => Some(ControlValue::On(i.smooth_menu_scrolling)),
             "input.alt_in_menus" => Some(ControlValue::On(i.alt_in_menus)),
+            "input.capture_function_keys" => Some(ControlValue::On(i.capture_function_keys)),
+            "input.media_keys_as_function_keys" => Some(ControlValue::On(i.media_keys_as_function_keys)),
             "display.vsync" => Some(ControlValue::On(self.display.present == crate::Present::Vsync)),
             "display.limit_fps" => Some(ControlValue::On(self.display.max_fps > 0)),
             "display.fps_limit" => Some(ControlValue::Number(FPS_LIMIT_RANGE.snap(if self.display.max_fps > 0 { self.display.max_fps } else { self.display.fps_limit } as f32))),
@@ -437,6 +441,20 @@ impl Settings {
                 "input.alt_in_menus" => match value {
                     ControlValue::On(on) => {
                         i.alt_in_menus = *on;
+                        true
+                    }
+                    _ => false,
+                },
+                "input.capture_function_keys" => match value {
+                    ControlValue::On(on) => {
+                        i.capture_function_keys = *on;
+                        true
+                    }
+                    _ => false,
+                },
+                "input.media_keys_as_function_keys" => match value {
+                    ControlValue::On(on) => {
+                        i.media_keys_as_function_keys = *on;
                         true
                     }
                     _ => false,
@@ -642,6 +660,8 @@ mod tests {
             ("input.map_movement", ControlValue::Choice("Drag".into())),
             ("input.smooth_menu_scrolling", ControlValue::On(true)),
             ("input.alt_in_menus", ControlValue::On(false)),
+            ("input.capture_function_keys", ControlValue::On(false)),
+            ("input.media_keys_as_function_keys", ControlValue::On(true)),
             ("layout.screen_place", ControlValue::Choice("LeftOrBottom".into())),
         ] {
             assert!(s.set_control(key, &value), "{key}");
