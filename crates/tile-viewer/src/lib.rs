@@ -1298,7 +1298,13 @@ fn render_planned_inner(
         layout.route(Input::MouseMove { x: p.0, y: p.1 });
         frame = layout.frame(scene, plan.canvas(), config.overhang, interface_rects(compiled, scene), Some(world_bounds(compiled, scene)));
     }
-    let arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
+    let mut arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
+    // A frame more with the interface where the first showed it, as the
+    // viewer's next one: what follows where it is drawn (the dividers cut
+    // where it lies over them) follows it there.
+    layout.set_interface_shown(arranged.shown.clone());
+    frame = layout.frame(scene, plan.canvas(), config.overhang, interface_rects(compiled, scene), Some(world_bounds(compiled, scene)));
+    arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
     // (In the format windows mostly have.)
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let mut renderer = TileRenderer::new(&gpu.device, format);
