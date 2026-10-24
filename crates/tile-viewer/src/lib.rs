@@ -1511,6 +1511,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         menu_scroll: smooth_menus::SmoothMenus::default(),
         function_keys: function_keys::Controller::new(function_keys::journal_path(&viewer_settings::Settings::default_path())),
         queue_drag: build_queue::BuildQueueDrag::default(),
+        host_closed: false,
     };
     // The arrangement to start with: the user's settings.
     app.set_settings(load_settings());
@@ -1854,6 +1855,8 @@ struct App {
     function_keys: function_keys::Controller,
     /// Dragging a city's build queue entries (`build_queue`).
     queue_drag: build_queue::BuildQueueDrag,
+    /// The host is ending and this viewer closes ([`App::close_for_host`]).
+    host_closed: bool,
 }
 
 /// Adds the time since `t` to span `name` of the profile, if one is kept,
@@ -4285,6 +4288,28 @@ impl App {
 
 }
 
+impl App {
+    /// Whether the host is ending ([`scene::Update::Close`]): its world is
+    /// being freed, so nothing newer is shown. The window goes at once,
+    /// F1-F12 are the system's again, and the host hears that the viewer
+    /// is gone (it ends its process on that) before anything slow (the
+    /// event loop's end, the GPU's teardown) runs.
+    fn close_for_host(&mut self) -> bool {
+        if !self.display.closing() {
+            return false;
+        }
+        if !std::mem::replace(&mut self.host_closed, true) {
+            log::info!("viewer: the host is ending: the window closes");
+            if let Some(gpu) = &self.gpu {
+                gpu.window.set_visible(false);
+            }
+            self.function_keys.release();
+            self.display.send_input(Input::Quit);
+        }
+        true
+    }
+}
+
 impl ApplicationHandler for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.function_keys.release();
@@ -4465,6 +4490,10 @@ impl ApplicationHandler for App {
             && self.frame_clock.deadline().is_some_and(|t| t > Instant::now());
         let received = Instant::now();
         let mut changed = self.display.receive(if idle { IDLE_WAIT } else { Duration::ZERO });
+        if self.close_for_host() {
+            event_loop.exit();
+            return;
+        }
         if let Some(p) = &mut self.profile {
             // (Waiting for nothing, when idle, is not the work of receiving.)
             if changed {
@@ -4754,6 +4783,36 @@ mod snap_hover_tests {
         // Had it been taken off, row 2 would be drawn unhovered.
         feedback.pointer_gone(0.02);
         assert_eq!(feedback.replacements(&scene, 0.03).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod host_close_tests {
+    use super::*;
+
+    struct NoImages;
+    impl render_desc::ImageLoader for NoImages {
+        fn load(&self, _: &str, _: &toml::Table) -> Result<Vec<tile_render::RgbaImage>, String> { Err("no images in this fixture".into()) }
+    }
+
+    #[test]
+    fn a_closing_host_hears_the_viewer_is_gone_at_once_and_once() {
+        let compiled = render_desc::Description::parse("grid={layout='orthogonal',step=[8,8]}").unwrap().compile(&NoImages, 16).unwrap();
+        let (driver, display) = scene::connect();
+        let mut app = new_app(ViewerConfig::default(), Assets::new(Arc::new(compiled)), display, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        driver.send(vec![scene::Update::Tick(2)]);
+        app.display.receive(Duration::ZERO);
+        assert!(!app.close_for_host());
+        assert!(driver.take_input().is_empty());
+        driver.send(vec![scene::Update::Close]);
+        driver.send(vec![scene::Update::Tick(9)]);
+        let started = Instant::now();
+        app.display.receive(Duration::ZERO);
+        assert!(app.close_for_host());
+        assert!(app.close_for_host(), "stays closed");
+        assert_eq!(driver.take_input(), [Input::Quit], "told once, before the event loop ends");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(app.display.scene().tick, 2, "the last picture before the close");
     }
 }
 
