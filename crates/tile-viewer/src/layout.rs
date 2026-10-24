@@ -2508,7 +2508,13 @@ impl Layout {
         self.window = window;
         self.bounds = bounds;
         // (Before anything that captures the mouse or holds the pointer.)
-        self.releases_pointer = scene.interface.releases_pointer;
+        if std::mem::replace(&mut self.releases_pointer, scene.interface.releases_pointer) != self.releases_pointer {
+            self.notes.push(if self.releases_pointer {
+                "viewer: the game menu or the quit dialogue is open: no capture, no walls, no confinement, the pointer is free".into()
+            } else {
+                "viewer: the dialogue that let the pointer go closed".into()
+            });
+        }
         self.focus_after_scale = None;
         // The driver publishes an empty world outside a game. Keep its
         // title and setup screens independent of the configured map views.
