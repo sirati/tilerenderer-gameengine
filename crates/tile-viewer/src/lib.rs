@@ -4150,8 +4150,13 @@ impl App {
         // cursor's own.) Once it parked, only until the system pointer
         // shows there (as `pointer_hidden`): never both.
         let system_hidden = (captured && !self.machine.edge()) || facts.snap_mode || self.unlock_pending.is_some() || self.constraints.moving() || snapping;
+        // The driver's cursor answers the last pointer move it got, and no
+        // other waits to be sent (`scene::Scene::cursor_at`): only then is
+        // it the pointer for where the snapping pointer rests.
+        let move_waits = self.preparing_inputs.iter().flatten().chain(self.pending_ui.iter().flat_map(|p| p.inputs.iter())).any(|i| matches!(i, Input::MouseMove { .. }));
+        let current = !move_waits && scene.cursor_at.is_some() && scene.cursor_at == self.display.last_pointer_move();
         let snap = if cameras.len() < tile_render::MAX_VIEWS && system_hidden {
-            self.snap.compose_with_busy(&self.compiled, &self.cursor_art, overlay, overlay + 1 + composed.top.len() as u32, cursor_scale, window, busy_status)
+            self.snap.compose_with_busy(&self.compiled, &self.cursor_art, overlay, overlay + 1 + composed.top.len() as u32, cursor_scale, window, busy_status, (self.cursor_art.shown(self.cursor), current))
         } else {
             cursor::Composed::default()
         };

@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, BuildQueue, BuildQueueRow, Button, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 61;
+pub const VERSION: u32 = 62;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -692,6 +692,13 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u8(tag);
                 w.u32(value);
             }
+            Update::CursorAt(at) => {
+                w.u8(32);
+                w.bool(at.is_some());
+                let (x, y) = at.unwrap_or_default();
+                w.i32(x);
+                w.i32(y);
+            }
             Update::ScreenSize((width, height)) => {
                 w.u8(16);
                 w.u32(*width);
@@ -1024,6 +1031,11 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 })
             }
             16 => Update::ScreenSize((r.u32()?, r.u32()?)),
+            32 => {
+                let some = r.bool()?;
+                let at = (r.i32()?, r.i32()?);
+                Update::CursorAt(some.then_some(at))
+            }
             24 => Update::SettingsPreview(if r.bool()? {
                 Some(crate::SettingsPreview {
                     session: r.u32()? as u64 | (r.u32()? as u64) << 32,
@@ -1573,6 +1585,8 @@ mod tests {
         updates.push(Update::Cursor(Cursor::Sprite(42)));
         updates.push(Update::Cursor(Cursor::System(SystemCursor::ResizeNesw)));
         updates.push(Update::Cursor(Cursor::Default));
+        updates.push(Update::CursorAt(Some((-3, 1079))));
+        updates.push(Update::CursorAt(None));
         updates.push(Update::Host(crate::HostStatus { stale_ms: 3_250, serial: 77, render_errors: 9 }));
         updates.push(Update::SettingsPreview(Some(crate::SettingsPreview { session: 0x1_0000_0001, id: 0x2_0000_0002, value: crate::PreviewValue::menus(true, 62.5), previous: crate::PreviewValue::PixelScale(1) })));
         updates.push(Update::SettingsPreview(Some(crate::SettingsPreview { session: 3, id: 4, value: crate::PreviewValue::Windowed(true), previous: crate::PreviewValue::Windowed(false) })));

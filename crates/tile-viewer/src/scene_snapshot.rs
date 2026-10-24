@@ -14,7 +14,7 @@ pub(crate) fn update(shown: &mut Scene, latest: &Scene, changes: &Changes) -> Wo
     // omitted from an adopted immutable snapshot.
     let Scene { seq, tick, shape, layers, slots, bindings, sprites, sprite_lifetimes, motions,
         views, zooms, assets, focus, focus_motion, camera_focus, camera_arrival, map_wheel_step, minimap, patches, settings, settings_preview,
-        interface, interactables, cursor, screen_size, looks } = latest;
+        interface, interactables, cursor, cursor_at, screen_size, looks } = latest;
     let mut work = Work::default();
     if changes.world || shown.shape != *shape || shown.layers.len() != layers.len() {
         shown.layers.clone_from(layers);
@@ -68,6 +68,7 @@ pub(crate) fn update(shown: &mut Scene, latest: &Scene, changes: &Changes) -> Wo
     shown.interface.clone_from(interface);
     shown.interactables.clone_from(interactables);
     shown.cursor = *cursor;
+    shown.cursor_at = *cursor_at;
     shown.screen_size = *screen_size;
     shown.looks.clone_from(looks);
     work

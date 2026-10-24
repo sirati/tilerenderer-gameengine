@@ -987,7 +987,7 @@ fn in_the_mode_only_the_snapping_pointer_and_its_ghost_are_drawn() {
     assert_eq!((sprites[1].x, sprites[1].y, sprites[1].view, sprites[1].screen), (400, 300, Some(7), true));
     assert!(sprites.iter().all(|p| p.view == Some(7) && p.screen));
     for status in [crate::host_status::Responsiveness::Busy, crate::host_status::Responsiveness::Stuck] {
-        let busy = snap.compose_with_busy(&compiled, &crate::cursor::Art::of(&compiled), 7, 8, crate::cursor::Scale::default(), WINDOW, status);
+        let busy = snap.compose_with_busy(&compiled, &crate::cursor::Art::of(&compiled), 7, 8, crate::cursor::Scale::default(), WINDOW, status, (scene::Cursor::Default, false));
         assert_eq!(&busy.sprites[..2], sprites.as_slice(), "keep both pointer and ghost for {status:?}");
         assert_eq!(busy.sprites.len(), 3, "one badge on the solid pointer only");
         assert_eq!(busy.sprites[2].set, compiled.set(crate::cursor::BADGE_SPRITES).unwrap().0);
@@ -1006,6 +1006,84 @@ fn in_the_mode_only_the_snapping_pointer_and_its_ghost_are_drawn() {
     assert!(!snap.snap_mode_active());
 }
 
+
+/// The driver's own pointer for an element (the game's Civilopedia book
+/// over a wonder a click opens the Civilopedia on) shows on the snapping
+/// pointer once it rests there and the driver has handled the move there,
+/// with the busy badge on it; in flight, before the driver's answer, and
+/// for a system icon the viewer has no art of, the arrow.
+#[test]
+fn the_snapping_pointer_resting_on_an_element_shows_the_drivers_pointer_for_it() {
+    let compiled = render_desc::Description::parse(
+        r#"
+        grid = { layout = "orthogonal", step = [8, 8] }
+        [images.p]
+        source = "pointer:255,255,255,255:14x22"
+        [images.book]
+        source = "pointer:200,120,40,255:20x24"
+        [sheets.p]
+        image = "p"
+        cell = [14, 22]
+        group = "Viewer@cursors"
+        [sheets.book]
+        image = "book"
+        cell = [20, 24]
+        group = "Viewer@book"
+        [images.badge]
+        source = "hourglass:11x17:12"
+        [sheets.badge]
+        image = "badge"
+        cell = [11, 17]
+        grid = [12, 1]
+        group = "Viewer@busy_badge"
+        "#,
+    )
+    .unwrap()
+    .compile(&NoFiles, 256)
+    .unwrap();
+    let (arrow, book) = (compiled.set(ARROW_SPRITE).unwrap().0, compiled.set("Viewer@book/0").unwrap().0);
+    let driver = scene::Cursor::Sprite(book.raw());
+    let (mut l, s) = captured();
+    frame(&mut l, &s);
+    let mut snap = SnapInput::default();
+    snap.route(key(ALT, true), &mut l, &s, 0.0, Rates::default());
+    // In flight to B: the driver's pointer is still the one for where the
+    // pointer was.
+    assert!(!snap.snapper.resting_on_driver());
+    assert_eq!(snap.pointer_set(&compiled, driver, true), Some(arrow));
+    let solid = |snap: &SnapInput, driver| *snap.compose_with_busy(&compiled, &crate::cursor::Art::default(), 7, 8, crate::cursor::Scale::default(), WINDOW, crate::host_status::Responsiveness::Answering, (driver, true)).sprites.last().unwrap();
+    assert_eq!(solid(&snap, driver).set, arrow);
+    // Landed on B, the move there sent: until the driver has handled it,
+    // its pointer is the one for where the pointer was (no book where it
+    // may not belong).
+    let sent = ticks(&mut snap, &mut l, &s, 0.0, 1.0);
+    assert!(snap.snapper.resting_on_driver());
+    assert!(sent.iter().any(|i| matches!(i, Input::MouseMove { .. })), "{sent:?}");
+    assert_eq!(snap.pointer_set(&compiled, driver, false), Some(arrow));
+    // Handled: its pointer, at the same place.
+    assert_eq!(snap.pointer_set(&compiled, driver, true), Some(book));
+    let shown = solid(&snap, driver);
+    assert_eq!((shown.set, shown.x, shown.y, shown.view), (book, 330, 535, Some(7)));
+    // The driver's plain arrow, a system icon without art, nothing: the arrow.
+    for other in [scene::Cursor::Sprite(arrow.raw()), scene::Cursor::System(scene::SystemCursor::Hand), scene::Cursor::Default] {
+        assert_eq!(snap.pointer_set(&compiled, other, true), Some(arrow), "{other:?}");
+    }
+    // Busy: the badge on the book, beside it.
+    let pixels = crate::cursor::Art::of(&compiled);
+    let busy = snap.compose_with_busy(&compiled, &pixels, 7, 8, crate::cursor::Scale::default(), WINDOW, crate::host_status::Responsiveness::Busy, (driver, true));
+    assert_eq!(busy.sprites.len(), 2, "{:?}", busy.sprites);
+    assert_eq!(busy.sprites[0].set, book);
+    assert_eq!(busy.sprites[1].set, compiled.set(crate::cursor::BADGE_SPRITES).unwrap().0);
+    let place = pixels.badge_for(book.raw(), (20, 24), (0, 0)).unwrap();
+    let arrow_place = pixels.badge_for(arrow.raw(), (14, 22), (0, 0)).unwrap();
+    assert_ne!(place, arrow_place, "placed on the book's own shape");
+    assert!(busy.top.len() == 1 && busy.top[0].origin.0 > 330 && busy.top[0].origin.1 > 535);
+    // Off: it lands and parks; the system pointer takes over from there.
+    snap.route(key(ALT, false), &mut l, &s, 1.0, Rates::default());
+    snap.route(key(ALT, true), &mut l, &s, 1.1, Rates::default());
+    assert!(!snap.snapper.resting_on_driver());
+    assert_eq!(snap.pointer_set(&compiled, driver, true), Some(arrow));
+}
 #[test]
 fn targets_in_parts_drawn_elsewhere_are_where_they_are_drawn() {
     // (No part moved here: the targets are the driver's, and the capture

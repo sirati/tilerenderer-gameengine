@@ -343,6 +343,12 @@ pub struct Scene {
     /// The mouse pointer the driver's interface shows now (e.g. a game's
     /// targeting cursor while the player picks a target).
     pub cursor: Cursor,
+    /// The pointer position (as in [`Input::MouseMove`]) of the last
+    /// pointer move the driver has handled, which [`Scene::cursor`]
+    /// answers: `None` if not known (none yet, or one the driver made
+    /// itself). A renderer that moved the driver's pointer itself knows by
+    /// it whether the cursor is the one for where it put the pointer.
+    pub cursor_at: Option<(i32, i32)>,
     /// The size of the driver's screen (its interface's window pixels;
     /// (0, 0): unknown, the renderer's window). A renderer whose window is
     /// larger may show it scaled up (see [`Input::Resized`]).
@@ -879,6 +885,8 @@ pub enum Update {
     Interactables(Vec<Interactable>),
     /// See [`Scene::cursor`].
     Cursor(Cursor),
+    /// See [`Scene::cursor_at`].
+    CursorAt(Option<(i32, i32)>),
     /// See [`Scene::screen_size`].
     ScreenSize((u32, u32)),
     /// See [`Scene::looks`] (replaced).
@@ -1025,6 +1033,7 @@ impl Scene {
             Update::Interface(i) => self.interface = i,
             Update::Interactables(i) => self.interactables = i,
             Update::Cursor(c) => self.cursor = c,
+            Update::CursorAt(at) => self.cursor_at = at,
             Update::ScreenSize(s) => self.screen_size = s,
             Update::Looks(l) => self.looks = l,
             // (Not the scene's: see `Display::host`.)
@@ -1160,6 +1169,9 @@ impl Scene {
         }
         if self.cursor != old.cursor {
             out.push(Update::Cursor(self.cursor));
+        }
+        if self.cursor_at != old.cursor_at {
+            out.push(Update::CursorAt(self.cursor_at));
         }
         if self.screen_size != old.screen_size {
             out.push(Update::ScreenSize(self.screen_size));
@@ -1407,7 +1419,7 @@ pub fn connect() -> (Driver, Display) {
     let wake = Waker::default();
     (
         Driver { updates: updates_tx, input: input_rx, in_flight: in_flight.clone(), wake: wake.clone() },
-        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() }, changes_from_seq: 0, host: None, walks: Default::default() },
+        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() }, changes_from_seq: 0, host: None, walks: Default::default(), last_move: Default::default() },
     )
 }
 
@@ -1539,6 +1551,8 @@ pub struct Display {
     /// The walk each unit was told last (see [`Update::Walk`]), with when
     /// each of its tiles first arrived.
     walks: std::collections::HashMap<u32, (Walk, Vec<std::time::Instant>)>,
+    /// The last [`Input::MouseMove`] sent (see [`Display::last_pointer_move`]).
+    last_move: std::sync::atomic::AtomicU64,
 }
 
 /// What of a [`Scene`] changed (see [`Display::take_changes`]), for a
@@ -1737,7 +1751,19 @@ impl Display {
     }
 
     pub fn send_input(&self, input: Input) {
+        if let Input::MouseMove { x, y } = input {
+            let packed = 1 << 32 | (x as u16 as u64) << 16 | y as u16 as u64;
+            self.last_move.store(packed, std::sync::atomic::Ordering::Relaxed);
+        }
         let _ = self.input.send(input);
+    }
+
+    /// Where the last [`Input::MouseMove`] sent through
+    /// [`Display::send_input`] put the driver's pointer: compared with
+    /// [`Scene::cursor_at`], whether the driver's cursor is its answer to it.
+    pub fn last_pointer_move(&self) -> Option<(i32, i32)> {
+        let v = self.last_move.load(std::sync::atomic::Ordering::Relaxed);
+        (v != 0).then(|| ((v >> 16) as u16 as i16 as i32, v as u16 as i16 as i32))
     }
 
     /// Another sender of input to the same driver.
