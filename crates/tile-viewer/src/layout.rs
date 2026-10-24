@@ -962,6 +962,18 @@ pub struct Layout {
     pub hud_scale: (u32, u32),
     /// Edge scrolling and dragging the map (`pan`).
     pan: pan::Pan,
+    /// Edge scrolling on the pointer thread's clock (`edge_clock`); `None`:
+    /// scrolled here, by each frame's time.
+    edge_clock: Option<std::sync::Arc<crate::edge_clock::EdgeClock>>,
+    /// The view fitted to the driver's screen as of the last frame (it does
+    /// not edge scroll).
+    edge_fitted: Option<Hit>,
+    /// How the canvas shows in the window (for the pointer thread, which
+    /// sees the pointer in window pixels); set by the window each frame.
+    pub pointer_present: Option<tile_render::Present>,
+    /// When the frame being prepared is to show (the pointer thread's
+    /// scrolling is shown as of then); set by the window each frame.
+    pub frame_instant: Option<std::time::Instant>,
     unit_orders: unit_orders::UnitOrders,
     /// Exploring the world beside the driver's screen ([`Explore`]); the
     /// world beside it in the last frame; the last left press on it (when,
@@ -1099,6 +1111,10 @@ impl Default for Layout {
             menu_scale: (1, 1),
             hud_scale: (1, 1),
             pan: pan::Pan::default(),
+            edge_clock: None,
+            edge_fitted: None,
+            pointer_present: None,
+            frame_instant: None,
             unit_orders: unit_orders::UnitOrders::default(),
             explore: None,
             beside_of: None,
@@ -3692,6 +3708,29 @@ impl Layout {
         self.interface.iter().chain(&self.driver_rects).any(|&r| inside(r, p)).then_some(Hit::Interface)
     }
 
+    /// Every rectangle where [`Layout::interface_at`] finds the interface
+    /// (for the pointer thread, which cannot ask the layout).
+    pub(crate) fn interface_cover(&self) -> Vec<[i32; 4]> {
+        let mut out = Vec::new();
+        if self.modal_shown().is_some() {
+            out.extend(self.interface_shown.iter().flatten().filter(|s| s.is_modal()).map(|s| s.rect));
+        }
+        if let Some(f) = self.placed_screen {
+            let size = ((f.source[2] as u32 * f.zoom.0).div_ceil(f.zoom.1), (f.source[3] as u32 * f.zoom.0).div_ceil(f.zoom.1));
+            out.push([f.origin.0, f.origin.1, size.0 as i32, size.1 as i32]);
+        }
+        if self.fit.is_some() {
+            return out;
+        }
+        if let Some(shown) = &self.interface_shown {
+            out.extend(shown.iter().map(|s| s.rect));
+            return out;
+        }
+        out.extend(self.moved.iter().map(|(r, _)| *r));
+        out.extend(self.interface.iter().chain(&self.driver_rects).copied());
+        out
+    }
+
     /// [`Layout::hit`] as if there were no magnifier.
     fn hit_below_magnifier(&self, p: (i32, i32)) -> Hit {
         if let Some(b) = self.beside_hit(p) {
@@ -4286,6 +4325,16 @@ impl Layout {
 
     /// Takes a window input; returns what goes to the driver.
     pub fn route(&mut self, input: Input) -> Vec<Input> {
+        let pointer = matches!(input, Input::MouseMove { .. } | Input::MouseButton { .. });
+        let out = self.route_input(input);
+        if pointer {
+            // (The pointer thread scrolls the view the pointer is in now.)
+            self.aim_edge_clock();
+        }
+        out
+    }
+
+    fn route_input(&mut self, input: Input) -> Vec<Input> {
         if !matches!(input, Input::Wheel { .. } | Input::Scroll { .. }) {
             self.scroll_panned = false;
         }
@@ -7341,7 +7390,7 @@ mod tests {
                     frame(&mut l, vec![]);
                     let slow = if hit == Hit::Main { l.main_view.center } else { l.split.unwrap().view.center };
                     assert_eq!(slow.1, after.1 - 46);
-                    mv(&mut l, (x, boundary + pan::EDGE_ZONE));
+                    mv(&mut l, (x, boundary + crate::edge_clock::EDGE_ZONE));
                     l.advance(std::time::Duration::from_millis(100));
                     frame(&mut l, vec![]);
                     let stopped = if hit == Hit::Main { l.main_view.center } else { l.split.unwrap().view.center };

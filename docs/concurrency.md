@@ -144,7 +144,77 @@ window, input, layout, OS cursor, scene metadata and softbuffer bitmap output.
 and acquisition, renderer, atlas preparation, uploads, encoding and submission.
 `viewer-session` owns the socket's write side and the `Driver`;
 `viewer-receive` reads the socket; `viewer-art` grows the art and publishes
-it to `Assets`.
+it to `Assets`. `viewer-pointer` and, on macOS, `winit-pointer` handle the
+pointer (below).
+
+### Pointer threads
+
+The main thread prepares frames (layout, scene adoption, interface
+arrangement) between window events; in the game's process on macOS it also
+shares AppKit's thread with Wine's own work. Frames of 40 to 60 ms happen.
+Pointer handling that ran there stood still for that long.
+
+`viewer-pointer` (`tile-viewer/src/pointer_thread.rs`) ticks at twice the
+display's refresh rate (`winit` `refresh_rate_millihertz`; 120 Hz assumed
+when unknown; at least 120, at most 1000 ticks a second), retimed when the
+window moves to another display. It sleeps to absolute deadlines with
+`std::thread::sleep` (high-resolution timers on Linux, macOS and Windows),
+never spins, and checks a stop flag every tick; dropping it joins it within
+one tick. Each tick it reads the pointer: from the backend's thread-safe
+feed when there is one (`pointer_api::Backend::feed`), else the newest
+`CursorMoved` the main thread reported (`Latest`). Its rate is logged every
+10 s at debug level. Measured with the main thread spinning through 50 ms
+frames: pointer updates on the main thread every 50 ms, on `viewer-pointer`
+every 4.17 ms (at most 5.6 ms) at 240 Hz
+(`pointer_thread::tests::pointer_intervals_under_render_load`).
+
+`winit-pointer` (macOS only, `vendor/winit/.../macos/pointer_tap.rs`) is a
+listen-only CoreGraphics event tap (`CGEventTapCreate`, session level) on a
+`CFRunLoop` of its own: event-driven, it runs once per mouse event, as the
+window server delivers it, independent of the main thread. While a pointer
+region (split divider, zoom box, captured edge) holds the pointer, the
+pointer is detached from the mouse and this thread applies each motion
+delta to the region and warps the pointer (`CGWarpMouseCursorPosition`, a
+CoreGraphics call any thread may make). So the visible pointer moves with
+the mouse even while the main thread is busy. The main thread publishes the
+region (`ArcSwap`, a new generation per region or main-thread warp) and the
+view's place on the screen, and reads the position back for its
+`CursorMoved` events; detaching and reattaching
+(`CGAssociateMouseAndMouseCursorPosition`) stay on the main thread, where
+regions are set and released. The tap also reports the free pointer in
+view pixels, which `viewer-pointer` reads. The run loop wakes every 250 ms
+to check its stop flag and to enable the tap again if the system disabled
+it. A listen-only tap of mouse events needs no Accessibility permission; if
+the system still refuses the tap, or `WINIT_POINTER_TAP=0`, the main thread
+places the pointer as before. Both threads run the host's thread policy
+first (`ViewerConfig::native_thread_init`: Wine's signals blocked).
+
+Edge scrolling runs on `viewer-pointer`'s clock (`tile-viewer/src/edge_clock.rs`).
+The layout publishes, through `Latest`, the view the pointer is in and how
+that view meets the window's edges (`EdgeTarget`: its rectangle, the edges it
+reaches, the zoom strip's row, the divider it is pushed against, the
+interface's rectangles for the thin zone, the speed). It republishes each
+frame and after each pointer event it handles; it clears the target when edge
+scrolling is not active. Every tick, the thread finds the newest pointer's
+edge and adds that tick's scrolling to the view's running total (`Totals`,
+`Latest`, one writer). Each frame moves every view by how much its total grew
+since the previous frame. The frame reads the total as of one tick before its
+own time, interpolated between the last two ticks. Frames at any phase to the
+ticks then move by exactly their own time and never back. What the thread
+scrolled while scrolling was no longer active (the pointer left, a grab, a
+popup at a click) is dropped. The amount taken is part of `Pan` and is
+carried with the frame's other motion (`prepared_motion`). Without the
+thread (tests, headless rendering) each frame scrolls by its own time.
+
+Latency: a held pointer moves within the tap callback of its own event
+(microseconds after the window server sees it); the main thread's
+`CursorMoved` carries that position when it handles the event, which is when
+it is free again. `viewer-pointer` sees the tap's position on its next tick
+(at most one tick, 4.2 ms at 240 Hz). On Linux and Windows the system
+confines the pointer itself (Wayland constraints, X11 barriers, `ClipCursor`)
+and there is no feed: `viewer-pointer` reads the main thread's reports, so
+it sees motion only once the main thread handled it. Button snapping (Alt
+mode) still integrates device motion on the main thread.
 
 The GPU actor creates its instance and requests a native surface binding through
 an event. Only that binding runs on the main thread, because AppKit's window

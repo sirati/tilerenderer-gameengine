@@ -3719,6 +3719,7 @@ version = "0.30.13"
 dependencies = [
  "ahash",
  "android-activity",
+ "arc-swap",
  "atomic-waker",
  "bitflags 2.13.2",
  "block2 0.5.1",
