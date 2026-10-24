@@ -505,6 +505,7 @@ dependencies = [
  "sha2",
  "signal-hook",
  "tile-render",
+ "viewer-spirv",
  "wgpu",
  "winit",
 ]
@@ -1050,6 +1051,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glass-shared",
+ "image",
+ "pollster",
+ "tile-render",
+ "viewer-spirv",
+ "wgpu",
+]
+
+[[package]]
+name = "glass-shared"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "glow"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1521,6 +1542,15 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "marker"
+version = "0.1.0"
+dependencies = [
+ "tile-render",
+ "viewer-spirv",
+ "wgpu",
+]
 
 [[package]]
 name = "memchr"
@@ -2411,12 +2441,14 @@ name = "render-desc"
 version = "0.1.0"
 dependencies = [
  "log",
+ "marker",
  "render-errors",
  "serde",
  "thiserror 2.0.21",
  "tile-render",
  "tile-render-shared",
  "toml 0.9.12+spec-1.1.0",
+ "viewer-spirv",
  "wgpu",
 ]
 
@@ -2920,7 +2952,6 @@ name = "tile-render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "cargo-gpu-install",
  "gpu-text",
  "image",
  "log",
@@ -2928,6 +2959,7 @@ dependencies = [
  "render-errors",
  "thiserror 2.0.21",
  "tile-render-shared",
+ "viewer-spirv",
  "wgpu",
 ]
 
@@ -2945,8 +2977,10 @@ dependencies = [
  "application-icon",
  "dispatch2",
  "function-keys",
+ "glass",
  "handoff",
  "log",
+ "marker",
  "pointer-control",
  "pollster",
  "render-desc",
@@ -2957,6 +2991,7 @@ dependencies = [
  "tile-render",
  "toml 0.9.12+spec-1.1.0",
  "viewer-settings",
+ "viewer-spirv",
  "wgpu",
  "winit",
 ]
@@ -3201,6 +3236,13 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "viewer-spirv"
+version = "0.1.0"
+dependencies = [
+ "cargo-gpu-install",
 ]
 
 [[package]]

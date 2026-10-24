@@ -20,7 +20,7 @@ fn gpu_host_warning_has_readable_ink_with_only_the_embedded_vector_face() {
     assert!(compiled.font("game").is_none());
     assert!(compiled.font(render_desc::FALLBACK_FONT).is_some());
     let world=compiled.world(1,1,false,false);
-    let mut renderer=TileRenderer::new(&gpu.device,wgpu::TextureFormat::Rgba8Unorm);
+    let mut renderer=TileRenderer::new(&gpu.device,wgpu::TextureFormat::Rgba8Unorm, tile_viewer::SHADERS);
     renderer.set_world(&gpu.device,&world);
     for (window,controls,scale) in [((300,200),[0,0,149,54],(2,1)),((900,600),[0,0,224,81],(3,2)),
         ((1600,900),[800,0,298,108],(2,1)),((1600,900),[0,0,596,216],(4,1)),((640,480),[0,0,596,216],(32,1))] {

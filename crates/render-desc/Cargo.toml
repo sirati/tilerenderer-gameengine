@@ -9,6 +9,7 @@ version.workspace = true
 render-errors = { path = "../render-errors" }
 tile-render-shared.workspace = true
 tile-render.workspace = true
+marker = { path = "../marker" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 thiserror.workspace = true
@@ -16,3 +17,4 @@ log.workspace = true
 
 [dev-dependencies]
 wgpu.workspace = true
+viewer-spirv.workspace = true

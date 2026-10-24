@@ -15,6 +15,10 @@ members = [
     "crates/pointer-api",
     "crates/tile-render-shared",
     "crates/tile-render",
+    "crates/glass-shared",
+    "crates/glass",
+    "crates/marker",
+    "crates/viewer-spirv",
     "crates/civ3-assets",
     "crates/render-desc",
     "crates/render-errors",
@@ -40,9 +44,9 @@ members = [
     "crates/civ3-ui",
     "crates/civ3-bridge",
 ]
-# The shader crate is compiled by rust-gpu (pinned nightly) from
-# tile-render's build script, never by the workspace toolchain.
-exclude = ["crates/tile-render-shaders", "vendor"]
+# The shader crates are compiled by rust-gpu (pinned nightly), as one module
+# (viewer-shaders), from viewer-spirv's build script, never by the workspace toolchain.
+exclude = ["crates/tile-render-shaders", "crates/glass-shaders", "crates/marker-shaders", "crates/viewer-shaders", "vendor"]
 
 [workspace.package]
 edition = "2024"
@@ -52,6 +56,7 @@ version = "0.1.0"
 [workspace.dependencies]
 tile-render-shared = { path = "crates/tile-render-shared" }
 tile-render = { path = "crates/tile-render" }
+viewer-spirv = { path = "crates/viewer-spirv" }
 gpu-text = { path = "crates/gpu-text" }
 bytemuck = { version = "1.24", features = ["derive", "min_const_generics"] }
 glam = "0.30"

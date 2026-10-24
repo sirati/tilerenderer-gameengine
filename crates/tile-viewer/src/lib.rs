@@ -45,6 +45,17 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Fullscreen, Window, WindowId};
 
+/// The shader module the viewer draws with: `viewer-shaders` (the tile
+/// renderer's, the glass lens's and the selection marker's shaders, one
+/// SPIR-V module), with what the renderer draws from it.
+pub const SHADERS: tile_render::Shaders = tile_render::Shaders::new(viewer_spirv::SPIRV, viewer_spirv::SPIRV_FALLBACK)
+    .with_effect(glass_lens::effect)
+    .with_painter(viewer_spirv::PAINTER);
+
+/// The CPU oracle of a renderer drawing with [`SHADERS`] (the glass lens's
+/// and the selection marker's).
+pub const ORACLE: tile_render::reference::Oracle<'static> = tile_render::reference::Oracle { effect: Some(&glass_lens::ORACLE), painter: Some(&marker::PAINTER) };
+
 #[derive(Clone, Debug)]
 pub struct ViewerConfig {
     pub title: String,
@@ -757,7 +768,7 @@ pub fn scene_cameras(scene: &Scene, window: (u32, u32), overhang: (u32, u32, u32
                 cull: v.cull,
                 origin: v.origin,
                 target_clip: None,
-                lens: None,
+                effect: None,
                 cells: !v.interface_only,
                 screen_shift: (0, 0),
                 zoomed_art: false,
@@ -824,7 +835,7 @@ const ARROW_SHADOW_CENTRE: (i32, i32) = (8, 4);
 
 /// [`marker_sprites`] with the arrow `size` times as large as its 1:1 art.
 /// Larger, it is painted at the resolution of each view showing it
-/// (`tile_render::Shape::Arrow`) rather than scaled from its art: crisp at
+/// (`marker::arrow`) rather than scaled from its art: crisp at
 /// any world scale and in the zoom box. Its tip stays where the 1:1 arrow's
 /// is, above the piece; it bobs `size` times as far, its shadow (on the
 /// ground, as wide as it) shaped likewise.
@@ -838,9 +849,8 @@ pub fn marker_sprites_sized(compiled: &Compiled, markers: &[layout::Marker], dow
             let sprite = |shape| tile_render::PlacedSprite { category: viewer_settings::clean_map::UNITS, shape: Some(shape),
                 ..tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, x * n, y * n) };
             vec![
-                sprite(tile_render::Shape::ArrowShadow { size: sixteenths, bob, rgba: ARROW_SHADOW_RGBA,
-                    centre: ((ARROW_SHADOW_CENTRE.0 as f32 * size).round() as i32, ARROW_SHADOW_CENTRE.1) }),
-                sprite(tile_render::Shape::Arrow { size: sixteenths, tip: ARROW_TIP, bob, rgba: ARROW_RGBA }),
+                sprite(marker::shadow(sixteenths, ((ARROW_SHADOW_CENTRE.0 as f32 * size).round() as i32, ARROW_SHADOW_CENTRE.1), bob, ARROW_SHADOW_RGBA)),
+                sprite(marker::arrow(sixteenths, ARROW_TIP, bob, ARROW_RGBA)),
             ]
         }).collect();
     }
@@ -951,7 +961,7 @@ mod accessibility_arrow_tests {
         // moving the arrow invalidates its world, a static/absent one does
         // not create further full redraws as the animation clock advances.
         let gpu = tile_render::Headless::new().unwrap();
-        let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
         renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
         let mut world = compiled.world(1, 1, false, false);
         world.color = tile_render::ColorModel::Quantized { bits: 5 };
@@ -975,9 +985,9 @@ mod accessibility_arrow_tests {
     /// `sprites` alone (its shadow left out) at `zoom` around (100, 230).
     fn arrow_extent(sprites: &[tile_render::PlacedSprite], zoom: u32) -> (u32, u32, u32, u32) {
         let mut world = tile_render::TileWorld::new(tile_render::Grid { cols: 1, rows: 1, layout: tile_render::Layout::Orthogonal, step: (32, 32), wrap_x: false, wrap_y: false }, Default::default());
-        world.free = sprites.iter().filter(|s| !matches!(s.shape, Some(tile_render::Shape::ArrowShadow { .. }))).cloned().collect();
+        world.free = sprites.iter().filter(|s| !marker::is_shadow(s.shape)).cloned().collect();
         let camera = Camera { zoom: (zoom, 1), zoomed_art: true, ..Camera::new((200 * zoom, 260 * zoom)) };
-        let image = tile_render::reference::render(&world, &tile_render::AtlasBuilder::new(16).finish(), &camera, 0, [0, 0, 0, 255]);
+        let image = crate::ORACLE.render(&world, &tile_render::AtlasBuilder::new(16).finish(), &camera, 0, [0, 0, 0, 255]);
         let lit: Vec<(u32, u32)> = (0..image.height).flat_map(|y| (0..image.width).map(move |x| (x, y))).filter(|&(x, y)| image.get(x, y) != [0, 0, 0, 255]).collect();
         let xs = lit.iter().map(|p| p.0);
         let ys = lit.iter().map(|p| p.1);
@@ -1008,7 +1018,7 @@ mod accessibility_arrow_tests {
         for size in [1.5f32, 2.0, 2.5, 3.0] {
             let sprites = marker_sprites_sized(&compiled, &m, 1, Duration::ZERO, false, size);
             assert_eq!(sprites.len(), 2);
-            assert!(matches!(sprites[1].shape, Some(tile_render::Shape::Arrow { .. })), "the arrow over its shadow");
+            assert!(marker::is_arrow(sprites[1].shape), "the arrow over its shadow");
             for zoom in [1, 2, 3] {
                 let (l, t, r, b) = arrow_extent(&sprites, zoom);
                 let e = size * zoom as f32;
@@ -1212,7 +1222,7 @@ pub fn render_offscreen(
     size: (u32, u32),
     config: &ViewerConfig,
 ) -> RgbaImage {
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world(compiled, scene));
     apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
@@ -1230,7 +1240,7 @@ pub fn render_arranged(
     config: &ViewerConfig,
 ) -> RgbaImage {
     let frame = arranged_frame(compiled, scene, size, config);
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world_for(compiled, scene, &frame.view_cameras));
     apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
@@ -1322,7 +1332,7 @@ fn render_planned_inner(
     arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
     // (In the format windows mostly have.)
     let format = wgpu::TextureFormat::Bgra8Unorm;
-    let mut renderer = TileRenderer::new(&gpu.device, format);
+    let mut renderer = TileRenderer::new(&gpu.device, format, crate::SHADERS);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     let mut world = scene_world_arranged(compiled, scene, &frame.view_cameras, &arranged.overlay_cameras);
     let mut cameras = frame.cameras.clone();
@@ -2722,7 +2732,7 @@ mod preparation_gpu_tests {
     fn delayed_required_growth_does_not_activate_an_intermediate_whole() {
         let gpu = Headless::new().unwrap();
         let whole = compiled();
-        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
         active.set_atlas(&gpu.device, &gpu.queue, &whole.atlas);
         let old_room = active.atlas_room();
         let mut assets = ArtInbox::new(Assets::new(whole.clone()));
@@ -2756,7 +2766,7 @@ mod preparation_gpu_tests {
     fn tight_peak_limit_replays_directly_into_mandatory_final_capacity() {
         let gpu = Headless::new().unwrap();
         let whole = compiled();
-        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut active = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
         active.set_atlas(&gpu.device, &gpu.queue, &whole.atlas);
         let old_resident = active.atlas_resident_bytes();
         let desc = std::mem::size_of_val(&whole.atlas.sprites[0]) as u64;
@@ -2832,7 +2842,7 @@ mod cached_picture_tests {
         plan.present = Present { canvas: (640, 480), zoom: (2, 1), at: (0, 0), target: (1280, 960) };
         CachedPicture {
             plan,
-            copies: vec![ScreenCopy { source: [100, 80, 120, 100], at: (300, 180), zoom: (2, 1), lens: None }],
+            copies: vec![ScreenCopy { source: [100, 80, 120, 100], at: (300, 180), zoom: (2, 1), effect: None }],
             pixel_box: 1,
         }
     }

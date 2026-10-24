@@ -455,7 +455,7 @@ mod gpu_tests {
         let known = old.set("old/0").unwrap().0.raw();
         let unknown = future.set("new/0").unwrap().0.raw();
         let gpu = tile_render::Headless::new().expect("RADV test device");
-        let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut renderer = tile_render::TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
         renderer.set_atlas(&gpu.device, &gpu.queue, &old.atlas);
         let camera = tile_render::Camera::new((64, 16));
         let clear = [17, 29, 43, 255];
