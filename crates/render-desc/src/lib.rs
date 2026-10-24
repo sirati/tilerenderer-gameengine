@@ -749,6 +749,12 @@ pub struct LayerDesc {
     /// says, whatever the clock.
     #[serde(default = "one")]
     pub ticks_per_frame: u32,
+    /// Non-zero: the layer's animations run on the renderer's own clock, a
+    /// frame every this many milliseconds from the cell's phase on, whatever
+    /// the driver sends (`tile_render_shared::HOST_CLOCK`); replaces
+    /// `ticks_per_frame`.
+    #[serde(default)]
+    pub viewer_ms_per_frame: u32,
     #[serde(default)]
     pub per_cell_phase: bool,
     /// Cells carry a pixel offset each (`TileWorld::set_offset`).
@@ -1891,7 +1897,10 @@ impl Description {
             }
             let mut spec = LayerSpec::new(layer.name.clone(), lut);
             spec.offset = (layer.offset[0], layer.offset[1]);
-            spec.ticks_per_frame = layer.ticks_per_frame;
+            spec.ticks_per_frame = match layer.viewer_ms_per_frame {
+                0 => layer.ticks_per_frame,
+                ms => tile_render_shared::HOST_CLOCK | ms.min(!tile_render_shared::HOST_CLOCK),
+            };
             spec.per_cell_phase = layer.per_cell_phase;
             spec.per_cell_offset = layer.per_cell_offset;
             spec.descending = layer.descending;
@@ -3542,6 +3551,11 @@ mod tests {
             name = "top"
             sets = ["anim"]
             ticks_per_frame = 5
+            [[layers]]
+            name = "viewer_clock"
+            sets = ["anim"]
+            per_cell_phase = true
+            viewer_ms_per_frame = 83
             "#,
         )
         .unwrap();
@@ -3551,6 +3565,7 @@ mod tests {
         assert_eq!(c.value("base", "s/7"), Some(8));
         assert_eq!(c.value("top", "anim"), Some(1));
         assert_eq!(c.layers[1].ticks_per_frame, 5);
+        assert_eq!(c.layers[2].ticks_per_frame, tile_render_shared::HOST_CLOCK | 83, "the renderer's own clock, in ms");
         // Sprite s/5 is column 1, row 1 of the image.
         let s5 = c.atlas.sprites[5];
         let page = &c.atlas.pages[s5.page as usize];
