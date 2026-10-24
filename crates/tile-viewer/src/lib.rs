@@ -2880,7 +2880,13 @@ impl App {
         // (Lists scrolled by the viewer: scroll input moves them, pointer
         // input goes to the row shown, `smooth_menus`.)
         let moves = matches!(input, Input::MouseMove { .. });
+        let press = match input { Input::MouseButton { down: true, x, y, .. } => Some((x, y)), _ => None };
         let routed = self.menu_scroll.route(input, self.snap.snap_mode_active());
+        // A press the list took to another row's place in the driver: a
+        // popup it opens at that click is placed at the pointer all the same.
+        if let (Some(from), Some(&Input::MouseButton { down: true, x, y, .. })) = (press, routed.iter().rev().find(|i| matches!(i, Input::MouseButton { .. }))) {
+            if from != (x, y) { self.layout.press_delivered(from, (x, y)); }
+        }
         if moves && routed.is_empty() {
             self.feedback.pointer_gone(now);
         }

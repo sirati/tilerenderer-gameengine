@@ -3552,6 +3552,17 @@ impl Layout {
         }
     }
 
+    /// The last press went to the driver at `to` rather than at `from`
+    /// (where the layout sent it): a list the viewer shows scrolled by
+    /// pixels took it to the row's place in the driver
+    /// (`smooth_menus`). A popup the driver opens at that click is placed
+    /// as if opened at the pointer.
+    pub fn press_delivered(&mut self, from: (i32, i32), to: (i32, i32)) {
+        if let Some((_, q, _)) = &mut self.last_press {
+            if *q == from { *q = to }
+        }
+    }
+
     /// Where driver window pixel `p` shows in the window (as of this frame):
     /// in the screen fitted into a pane, in a part drawn elsewhere (by the
     /// viewer, or the layout), or where the driver has it.
@@ -9538,6 +9549,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The domestic advisor's production menu, opened by a right click on
+    /// a row of a list shown scrolled by pixels: the driver got the click
+    /// at the row's place in its list (`smooth_menus`), and anchored its
+    /// menu there; the menu goes to the pointer, as without the scrolling.
+    #[test]
+    fn a_menu_opened_from_a_list_row_shown_scrolled_is_at_the_pointer() {
+        for shift in [0, 9, 23, 37, 61] {
+            let mut l = Layout::default();
+            l.window = (1024, 768);
+            l.last_press = Some(((500, 300), (500, 300), 0.0));
+            l.press_delivered((500, 300), (500, 300 + shift));
+            // (The game's menu: its corner at the click it got.)
+            l.popup_opened([500, 300 + shift, 120, 90], None, false);
+            let moved = l.popup_anchor.unwrap_or((0, 0));
+            assert_eq!((500 + moved.0, 300 + shift + moved.1), (500, 300), "shift {shift}");
+        }
+        // Another press since: not this one's.
+        let mut l = Layout::default();
+        l.window = (1024, 768);
+        l.last_press = Some(((500, 300), (500, 300), 0.0));
+        l.press_delivered((400, 300), (400, 330));
+        assert_eq!(l.last_press.map(|p| p.1), Some((500, 300)));
     }
 
     #[test]
