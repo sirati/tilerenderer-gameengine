@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, BuildQueue, BuildQueueRow, Button, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 63;
+pub const VERSION: u32 = 64;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -705,6 +705,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u32(*width);
                 w.u32(*height);
             }
+            Update::Close => w.u8(33),
             Update::Host(h) => {
                 w.u8(23);
                 w.u32(h.stale_ms);
@@ -1047,6 +1048,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 })
             } else { None }),
             23 => Update::Host(crate::HostStatus { stale_ms: r.u32()?, serial: r.u32()?, render_errors: r.u32()? }),
+            33 => Update::Close,
             17 => {
                 let n = r.len(22)?;
                 let mut looks = Vec::with_capacity(n);
@@ -1592,6 +1594,7 @@ mod tests {
         updates.push(Update::CursorAt(Some((-3, 1079))));
         updates.push(Update::CursorAt(None));
         updates.push(Update::Host(crate::HostStatus { stale_ms: 3_250, serial: 77, render_errors: 9 }));
+        updates.push(Update::Close);
         updates.push(Update::SettingsPreview(Some(crate::SettingsPreview { session: 0x1_0000_0001, id: 0x2_0000_0002, value: crate::PreviewValue::menus(true, 62.5), previous: crate::PreviewValue::PixelScale(1) })));
         updates.push(Update::SettingsPreview(Some(crate::SettingsPreview { session: 3, id: 4, value: crate::PreviewValue::Windowed(true), previous: crate::PreviewValue::Windowed(false) })));
         updates.push(Update::SettingsPreview(None));

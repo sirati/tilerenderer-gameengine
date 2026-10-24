@@ -901,6 +901,11 @@ pub enum Update {
     /// The host's [`HostStatus`]; kept by the [`Display`], not the scene
     /// (a batch of these alone is no new scene).
     Host(HostStatus),
+    /// The host is ending (the game quits and tears down its world): the
+    /// renderer closes now. Nothing in this batch or any later one reaches
+    /// the scene, so what it shows until it is gone is the last picture
+    /// the host sent before (see [`Display::closing`]).
+    Close,
 }
 
 impl Scene {
@@ -1043,8 +1048,8 @@ impl Scene {
             Update::CursorAt(at) => self.cursor_at = at,
             Update::ScreenSize(s) => self.screen_size = s,
             Update::Looks(l) => self.looks = l,
-            // (Not the scene's: see `Display::host`.)
-            Update::Host(_) | Update::Walk(_) => {}
+            // (Not the scene's: see `Display::host`, `Display::closing`.)
+            Update::Host(_) | Update::Walk(_) | Update::Close => {}
         }
     }
 
@@ -1426,7 +1431,7 @@ pub fn connect() -> (Driver, Display) {
     let wake = Waker::default();
     (
         Driver { updates: updates_tx, input: input_rx, in_flight: in_flight.clone(), wake: wake.clone() },
-        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() }, changes_from_seq: 0, host: None, walks: Default::default(), last_move: Default::default() },
+        Display { updates: updates_rx, input: input_tx, scene: Scene::default(), in_flight, new_settings: None, wake, changes: Changes { world: true, ..Default::default() }, changes_from_seq: 0, host: None, walks: Default::default(), last_move: Default::default(), closing: false },
     )
 }
 
@@ -1560,6 +1565,8 @@ pub struct Display {
     walks: std::collections::HashMap<u32, (Walk, Vec<std::time::Instant>)>,
     /// The last [`Input::MouseMove`] sent (see [`Display::last_pointer_move`]).
     last_move: std::sync::atomic::AtomicU64,
+    /// The host said it is ending ([`Update::Close`]).
+    closing: bool,
 }
 
 /// What of a [`Scene`] changed (see [`Display::take_changes`]), for a
@@ -1668,6 +1675,12 @@ impl Display {
     /// statuses alone does not: no new scene for the renderer to take).
     fn apply(&mut self, batch: Vec<Update>) -> bool {
         let _ = self.in_flight.try_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
+        // Once the host is ending, its world may be half freed: nothing of
+        // this batch or a later one is shown.
+        if self.closing || batch.iter().any(|u| matches!(u, Update::Close)) {
+            self.closing = true;
+            return false;
+        }
         let (host, batch): (Vec<Update>, Vec<Update>) = batch.into_iter().partition(|u| matches!(u, Update::Host(_) | Update::Walk(_)));
         let now = std::time::Instant::now();
         for u in host {
@@ -1757,6 +1770,13 @@ impl Display {
         self.new_settings.take()
     }
 
+    /// Whether the host said it is ending ([`Update::Close`], among what
+    /// [`Display::receive`] applied): the renderer closes at once, and the
+    /// scene stays the last one before it.
+    pub fn closing(&self) -> bool {
+        self.closing
+    }
+
     pub fn send_input(&self, input: Input) {
         if let Input::MouseMove { x, y } = input {
             let packed = 1 << 32 | (x as u16 as u64) << 16 | y as u16 as u64;
@@ -1825,6 +1845,22 @@ mod tests {
         assert!(display.receive(Duration::ZERO));
         assert_eq!((display.scene().seq, display.scene().tick), (1, 3));
         assert_eq!(display.host().map(|h| h.0.serial), Some(2));
+    }
+
+    #[test]
+    fn a_closing_host_ends_the_scene_where_it_was() {
+        let (driver, mut display) = connect();
+        driver.send(vec![Update::Tick(3)]);
+        assert!(display.receive(Duration::ZERO));
+        assert!(!display.closing());
+        // What the host sends with its close or after it (read from a world
+        // being freed) never reaches the scene.
+        driver.send(vec![Update::Tick(4), Update::Close, Update::Tick(5)]);
+        driver.send(vec![Update::Tick(6), Update::Focus(Some((1, 2)))]);
+        assert!(!display.receive(Duration::ZERO), "no new scene");
+        assert!(display.closing());
+        assert_eq!((display.scene().seq, display.scene().tick, display.scene().focus), (1, 3, None));
+        assert!(!driver.busy(), "every batch taken: a host waiting on it is not held up");
     }
 
     #[test]
