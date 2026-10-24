@@ -60,6 +60,22 @@ pub enum DescError {
     Atlas(#[from] tile_render::atlas::AtlasError),
 }
 
+impl DescError {
+    /// The render error this is (`render_errors`): its kind and the class of
+    /// what failed (the image's or sheet's name without its number), for a
+    /// context; the error's text holds the rest.
+    pub fn render_error(&self) -> (render_errors::Kind, String) {
+        use render_errors::{Kind, class_of};
+        match self {
+            DescError::Toml(_) => (Kind::ArtDescription, "its TOML".into()),
+            DescError::Unknown { kind, .. } => (Kind::ArtDescription, format!("an unknown {kind}")),
+            DescError::Image { name, .. } => (Kind::ArtImage, format!("image {}", class_of(name))),
+            DescError::Sheet { sheet, .. } => (Kind::ArtSheet, format!("sheet {}", class_of(sheet))),
+            DescError::Atlas(_) => (Kind::Atlas, "a sprite too large".into()),
+        }
+    }
+}
+
 /// Loads the images a description names. `options` are the image's TOML
 /// keys other than `source`, for the loader to interpret.
 pub trait ImageLoader {
@@ -424,6 +440,7 @@ impl Placer {
     fn add(&mut self, name: &str, cut: Option<&Cut>, (w, h): (u32, u32), anchor: (i32, i32), scaling: u32, sample_box: [u32; 4], remap: u32, known: Option<&Compiled>) -> Result<SpriteId, DescError> {
         if w > self.page_size || h > self.page_size {
             log::warn!("sprite {name} of {w}×{h} does not fit an atlas page of {0}×{0}: left out", self.page_size);
+            render_errors::report(render_errors::Kind::Atlas, &format!("sprite {} too large, left out", render_errors::class_of(name)), format_args!("sprite {name} of {w}×{h} does not fit an atlas page of {0}×{0}", self.page_size));
             let blank = cut.map(|_| Cut::Rgba(RgbaImage::new(1, 1)));
             let id = self.add(name, blank.as_ref(), (1, 1), anchor, scaling, [0, 0, 1, 1], 0, known)?;
             self.unavailable.insert(id.0);
@@ -1963,7 +1980,10 @@ impl Description {
             let face = loader.font(&font.source).and_then(|data| tile_render::gpu_text::Face::parse(&data, font.index).map_err(|e| e.to_string()));
             match face {
                 Ok(face) => fonts.push((name.clone(), std::sync::Arc::new(face))),
-                Err(e) => log::warn!("font {name:?} ({}): {e}", font.source),
+                Err(e) => {
+                    log::warn!("font {name:?} ({}): {e}", font.source);
+                    render_errors::report(render_errors::Kind::MissingFont, &format!("font {name}"), format_args!("{}: {e}", font.source));
+                }
             }
         }
         if !known(FALLBACK_FONT) {
@@ -2136,6 +2156,7 @@ impl Description {
                     Err(e) if pixels && !e.to_string().contains(CANCELLED) => {
                         let tables = slice(false)?;
                         log::error!("sheet {sheet_name}: {e}: its {} sprites are left clear", tables.sprites.len());
+                        render_errors::report(e.render_error().0, &format!("sheet {}, left clear", render_errors::class_of(sheet_name)), format_args!("sheet {sheet_name}: {e}"));
                         clear = true;
                         Ok(std::sync::Arc::new(tables))
                     }
@@ -2575,6 +2596,7 @@ impl Compiled {
             let Some(layer) = self.layers.get_mut(*i) else { continue };
             if layer.palette_bits > 0 && layer.index_bits > 0 && layer.lut.len() + names.len() > 1 << layer.index_bits {
                 log::error!("layer {}: more than {} sets, values that pick a palette change", layer.name, 1u32 << layer.index_bits);
+                render_errors::report(render_errors::Kind::ArtDescription, &format!("layer {}: too many palette sets", layer.name), format_args!("more than {} sets", 1u32 << layer.index_bits));
             }
             for n in names {
                 let Some(&set) = self.set_ids.get(n) else { continue };

@@ -16,6 +16,7 @@ members = [
     "crates/tile-render",
     "crates/civ3-assets",
     "crates/render-desc",
+    "crates/render-errors",
     "crates/scene",
     "crates/menu",
     "crates/gdi-text",

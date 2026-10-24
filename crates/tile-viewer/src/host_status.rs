@@ -348,7 +348,7 @@ mod tests {
     }
 
     fn status(stale_ms: u32) -> scene::HostStatus {
-        scene::HostStatus { stale_ms, serial: 1 }
+        scene::HostStatus { stale_ms, serial: 1, render_errors: 0 }
     }
 
     #[test]

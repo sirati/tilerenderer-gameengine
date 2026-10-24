@@ -750,6 +750,11 @@ pub struct HostStatus {
     pub stale_ms: u32,
     /// Counts the statuses sent.
     pub serial: u32,
+    /// The render errors the driver had reported so far (wrapping; 0 from
+    /// a driver sharing the renderer's process, whose errors the renderer
+    /// counts itself): the renderer's on-screen count takes its increase
+    /// (`render_errors::Rolling`).
+    pub render_errors: u32,
 }
 
 /// One change of a [`Scene`].
@@ -1590,14 +1595,14 @@ mod tests {
     fn host_statuses_are_kept_by_the_display_and_alone_are_no_new_scene() {
         let (driver, mut display) = connect();
         assert_eq!(display.host(), None);
-        driver.send(vec![Update::Host(HostStatus { stale_ms: 700, serial: 1 })]);
+        driver.send(vec![Update::Host(HostStatus { stale_ms: 700, serial: 1, render_errors: 0 })]);
         assert!(!display.receive(Duration::ZERO));
         assert_eq!(display.scene().seq, 0);
-        assert_eq!(display.host().map(|h| h.0), Some(HostStatus { stale_ms: 700, serial: 1 }));
+        assert_eq!(display.host().map(|h| h.0), Some(HostStatus { stale_ms: 700, serial: 1, render_errors: 0 }));
         assert!(!driver.busy(), "taken");
         // (See `motions_keep_their_first_arrival` for motions.)
         // With other updates: a new scene, the latest status kept.
-        driver.send(vec![Update::Tick(3), Update::Host(HostStatus { stale_ms: 0, serial: 2 })]);
+        driver.send(vec![Update::Tick(3), Update::Host(HostStatus { stale_ms: 0, serial: 2, render_errors: 0 })]);
         assert!(display.receive(Duration::ZERO));
         assert_eq!((display.scene().seq, display.scene().tick), (1, 3));
         assert_eq!(display.host().map(|h| h.0.serial), Some(2));

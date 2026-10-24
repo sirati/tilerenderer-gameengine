@@ -451,6 +451,7 @@ dependencies = [
  "log",
  "menu",
  "render-desc",
+ "render-errors",
  "scene",
  "thiserror 2.0.21",
  "tile-render",
@@ -512,6 +513,7 @@ dependencies = [
  "env_logger",
  "log",
  "render-desc",
+ "render-errors",
  "scene",
  "tile-render",
  "tile-viewer",
@@ -546,6 +548,7 @@ dependencies = [
  "image",
  "log",
  "render-desc",
+ "render-errors",
  "scene",
  "tile-render",
  "tile-viewer",
@@ -2391,12 +2394,21 @@ name = "render-desc"
 version = "0.1.0"
 dependencies = [
  "log",
+ "render-errors",
  "serde",
  "thiserror 2.0.21",
  "tile-render",
  "tile-render-shared",
  "toml 0.9.12+spec-1.1.0",
  "wgpu",
+]
+
+[[package]]
+name = "render-errors"
+version = "0.1.0"
+dependencies = [
+ "civ3r-sync",
+ "log",
 ]
 
 [[package]]
@@ -2911,6 +2923,7 @@ dependencies = [
  "pointer-control",
  "pollster",
  "render-desc",
+ "render-errors",
  "scene",
  "softbuffer",
  "thiserror 2.0.21",

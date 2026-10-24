@@ -6,6 +6,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+render-errors = { path = "../render-errors" }
 tile-render-shared.workspace = true
 tile-render.workspace = true
 serde = { version = "1", features = ["derive"] }
