@@ -112,8 +112,9 @@
 //! The divider is a band of frosted glass (`glass`). While the mouse is not
 //! captured it is a wall except in its middle third (no glass there) and
 //! along the rows of the driver's always reachable controls
-//! (`Interface::reachable`, e.g. the unit's orders, reaching over the gap
-//! or cut there); with Drag map movement nowhere (`capture`). The pointer
+//! (`Interface::reachable`, e.g. the unit's orders) and of its interface,
+//! where they are drawn over it (moved into the active view, the orders
+//! are clear of it and it runs on); with Drag map movement nowhere (`capture`). The pointer
 //! pushed against it stays in its view (the
 //! window is asked to move the system pointer back, [`Layout::take_warp`],
 //! or the system holds it out of [`Layout::pointer_walls`], [`Walls`])
@@ -2056,16 +2057,17 @@ impl Layout {
 
     /// The unit's order buttons (`scene::Interface::reachable`) where they
     /// are drawn (canvas pixels): their pieces as shown, the scale of the
-    /// game's frame and the place `unit_orders_place` gave them applied;
-    /// where the driver put them before the interface was arranged.
-    fn orders_shown(&self) -> Option<[i32; 4]> {
+    /// game's frame and the place `unit_orders_place` gave them applied
+    /// (none: the viewer shows the interface, but none of them); where the
+    /// driver put them while the viewer shows no interface of its own.
+    pub(crate) fn orders_shown(&self) -> Option<[i32; 4]> {
         let r = self.reachable?;
+        let Some(shown) = &self.interface_shown else { return Some(r) };
         let within = |d: [i32; 4]| d[2] > 0 && d[3] > 0 && d[0] >= r[0] && d[1] >= r[1] && d[0] + d[2] <= r[0] + r[2] && d[1] + d[3] <= r[1] + r[3];
-        let drawn = self.interface_shown.iter().flatten().filter(|s| within(s.driver)).map(|s| s.rect).reduce(|a, b| {
+        shown.iter().filter(|s| within(s.driver)).map(|s| s.rect).reduce(|a, b| {
             let (x, y) = (a[0].min(b[0]), a[1].min(b[1]));
             [x, y, (a[0] + a[2]).max(b[0] + b[2]) - x, (a[1] + a[3]).max(b[1] + b[3]) - y]
-        });
-        Some(drawn.unwrap_or(r))
+        })
     }
 
     /// The zoom box or strip as the last frame showed it (canvas pixels).
@@ -2112,8 +2114,8 @@ impl Layout {
     /// The stretches along the split's divider (from, to) where the
     /// pointer passes from one view to the other (where it is not drawn,
     /// [`Layout::dividers`]): its middle third while the mouse is not
-    /// captured, where the driver's always reachable controls are (a little
-    /// around them), and where its interface reaches across the gap.
+    /// captured, and where the driver's always reachable controls and its
+    /// interface are drawn over it (exactly their rows).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_spans(&self) -> Vec<(i32, i32)> {
         self.dividers().split_openings()
@@ -7916,10 +7918,13 @@ mod tests {
     fn the_walls_the_system_holds_the_pointer_out_of_are_the_gaps_closed_stretches() {
         let mut l = split_1to1();
         assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 200], [400, 400, 4, 200]]));
-        // Always reachable unit controls open a gap with the same margin
-        // as pointer routing, even when only part overlaps the divider.
+        // Always reachable unit controls drawn over the divider open it
+        // along exactly their rows, also where only part of them is over it.
         l.reachable = Some([398, 100, 20, 30]);
-        assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 96], [400, 134, 4, 66], [400, 400, 4, 200]]));
+        assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 100], [400, 130, 4, 70], [400, 400, 4, 200]]));
+        // Drawn clear of it, however close: none.
+        l.reachable = Some([380, 100, 20, 30]);
+        assert_eq!(l.pointer_walls(), Some(vec![[400, 0, 4, 200], [400, 400, 4, 200]]));
         l.reachable = None;
         let h = arranged(&settings(|s| s.split = S::Horizontal1To1));
         assert_eq!(h.pointer_walls(), Some(vec![[0, 300, 266, 4], [534, 300, 266, 4]]));
@@ -8050,10 +8055,11 @@ mod tests {
         s.interface.reachable = Some([340, 520, 128, 64]);
         l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         let f = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        // (Open a little around them, as the walls are: `Layout::dividers`.)
-        assert_eq!(l.open_spans(), [(200, 400), (520 - GAP, 584 + GAP)]);
-        // No glass over their rows (nor next to them, where it is open).
-        assert!(f.divider.iter().all(|d| d.1[1] + d.1[3] <= 520 - GAP || d.1[1] >= 584 + GAP), "{:?}", f.divider);
+        // (Open exactly along their rows, as the walls are: `Layout::dividers`.)
+        assert_eq!(l.open_spans(), [(200, 400), (520, 584)]);
+        // No glass over their rows; right above and below them it goes on.
+        assert!(f.divider.iter().all(|d| d.1[1] + d.1[3] <= 520 || d.1[1] >= 584), "{:?}", f.divider);
+        assert!(f.divider.iter().any(|d| d.1[1] + d.1[3] == 520) && f.divider.iter().any(|d| d.1[1] == 584), "{:?}", f.divider);
         // From A into them and on into B.
         mv(&mut l, (300, 540));
         mv(&mut l, (420, 540));
@@ -8069,19 +8075,23 @@ mod tests {
         mv(&mut l, (600, 595));
         mv(&mut l, (100, 595));
         assert_eq!(l.pointer, (404, 595));
-        // Not reaching over the gap (the strip cut at the divider, or all
-        // in one view): their rows are open all the same, the pointer
-        // crosses from one view to the other there, both ways.
+        // Drawn clear of the gap (all in one view, as moved into the
+        // active view): the divider runs on beside them, the pointer
+        // reaches them in their view and stays there.
         let mut s = scene();
         s.interface.reachable = Some([100, 520, 128, 64]);
         l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-        assert_eq!(l.open_spans(), [(200, 400), (520 - GAP, 584 + GAP)]);
-        assert!(l.pointer_walls().unwrap_or_default().iter().all(|w| w[1] + w[3] <= 520 - GAP || w[1] >= 584 + GAP), "{:?}", l.pointer_walls());
+        assert_eq!(l.open_spans(), [(200, 400)]);
+        // (From B, where the pointer was left.)
         mv(&mut l, (300, 540));
+        assert_eq!((l.pointer, l.side), ((404, 540), Some(Side::B)));
+        // (Into A through the middle third, down to their row, on to B.)
+        mv(&mut l, (450, 300));
+        mv(&mut l, (300, 300));
+        mv(&mut l, (300, 540));
+        assert_eq!((l.pointer, l.side), ((300, 540), Some(Side::A)));
         mv(&mut l, (500, 540));
-        assert_eq!((l.pointer, l.side), ((500, 540), Some(Side::B)));
-        mv(&mut l, (300, 570));
-        assert_eq!((l.pointer, l.side), ((300, 570), Some(Side::A)));
+        assert_eq!((l.pointer, l.side), ((399, 540), Some(Side::A)));
     }
 
     #[test]
