@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Beside, Binding, Button, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
+use crate::{Beside, Binding, BuildQueue, BuildQueueRow, Button, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 57;
+pub const VERSION: u32 = 58;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -591,6 +591,21 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 w.u32(i.loading_bar.unwrap_or_default());
                 w.bool(i.targeting);
                 w.bool(i.snap_to_tiles);
+                w.bool(i.build_queue.is_some());
+                let q = i.build_queue.clone().unwrap_or_default();
+                w.u32(q.stamp);
+                for v in q.current {
+                    w.i32(v);
+                }
+                w.u32(q.rows.len() as u32);
+                for row in &q.rows {
+                    w.u8(row.slot);
+                    for v in row.rect.into_iter().chain(row.grip) {
+                        w.i32(v);
+                    }
+                    w.u32(row.grip_id as u32);
+                    w.u32((row.grip_id >> 32) as u32);
+                }
             }
             Update::Interactables(items) => {
                 w.u8(12);
@@ -682,6 +697,7 @@ const INTERACTABLE_BYTES: usize = 16 + 1 + 8 + 16 + 8 + 1 + 16 + 4;
 const DETACHED_BYTES: usize = 4 + 8 + 6 * 4 + 1;
 /// One `QueuedPopup`: view, serial, whether it has a button, the button.
 const QUEUED_BYTES: usize = 4 + 8 + 1 + 4 * 4;
+const BUILD_QUEUE_ROW_BYTES: usize = 1 + 8 * 4 + 8;
 
 /// Decodes a batch of updates.
 pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
@@ -864,6 +880,19 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                 let loading_bar = { let some = r.bool()?; let id = r.u32()?; some.then_some(id) };
                 let targeting = r.bool()?;
                 let snap_to_tiles = r.bool()?;
+                let build_queue = {
+                    let some = r.bool()?;
+                    let stamp = r.u32()?;
+                    let current = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                    let rows = (0..r.len(BUILD_QUEUE_ROW_BYTES)?).map(|_| -> Result<BuildQueueRow, WireError> {
+                        let slot = r.u8()?;
+                        let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                        let grip = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
+                        let grip_id = r.u32()? as u64 | (r.u32()? as u64) << 32;
+                        Ok(BuildQueueRow { slot, rect, grip, grip_id })
+                    }).collect::<Result<Vec<_>, _>>()?;
+                    some.then_some(BuildQueue { stamp, current, rows })
+                };
                 Update::Interface(Interface {
                     screen: named.then_some(screen),
                     menu_fit,
@@ -885,6 +914,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     loading_bar,
                     targeting,
                     snap_to_tiles,
+                    build_queue,
                 })
             }
             12 => {
@@ -1049,6 +1079,12 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.bool(keep);
             }
             Input::DismissPopup => w.u8(17),
+            Input::BuildQueue { stamp, from, to } => {
+                w.u8(24);
+                w.u32(stamp);
+                w.u8(from);
+                w.u8(to);
+            }
             Input::CloseDetached { serial } => {
                 w.u8(22);
                 w.u32(serial as u32);
@@ -1184,6 +1220,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
                 id: r.u32()? as u64 | (r.u32()? as u64) << 32, keep: r.bool()?,
             },
             17 => Input::DismissPopup,
+            24 => Input::BuildQueue { stamp: r.u32()?, from: r.u8()?, to: r.u8()? },
             22 => Input::CloseDetached { serial: r.u32()? as u64 | (r.u32()? as u64) << 32 },
             23 => Input::CloseQueued { serial: r.u32()? as u64 | (r.u32()? as u64) << 32 },
             6 => Input::Look { x: r.i32()?, y: r.i32()? },
@@ -1427,6 +1464,7 @@ mod tests {
             loading_bar: Some(0xFFFF_0100),
             targeting: true,
             snap_to_tiles: true,
+            build_queue: None,
         };
         s.interactables = vec![
             Interactable { alt_right_click: false, anchor: Some([12, 30]), region: Some([10, 20, 160, 24]), rect: [10, 20, 16, 24], kind: InteractableKind::Button, id: 0x1_0000_0002 },
@@ -1457,6 +1495,8 @@ mod tests {
         updates.push(Update::Bindings(Vec::new()));
         updates.push(Update::View { id: 2, view: None });
         updates.push(Update::Interface(Interface { popup: Some(7), ..Default::default() }));
+        updates.push(Update::Interface(Interface { build_queue: Some(BuildQueue { stamp: 0xDEAD_BEEF, current: [1, 2, 3, 4],
+            rows: vec![BuildQueueRow { slot: 2, rect: [5, -6, 7, 8], grip: [5, -6, 9, 8], grip_id: 0x7_0000_0002 }] }), ..Default::default() }));
         updates.push(Update::Cursor(Cursor::Sprite(42)));
         updates.push(Update::Cursor(Cursor::System(SystemCursor::ResizeNesw)));
         updates.push(Update::Cursor(Cursor::Default));
@@ -1497,6 +1537,7 @@ mod tests {
             Input::Quit,
             Input::Look { x: -5, y: 7000 },
             Input::DismissPopup,
+            Input::BuildQueue { stamp: 0x1234_5678, from: 3, to: crate::BUILD_QUEUE_CURRENT },
             Input::CloseDetached { serial: 0x2_0000_0009 },
             Input::CloseQueued { serial: 0x5_0000_000B },
             Input::SettingsPreviewDecision { session: 0x3_0000_0003, id: 0x4_0000_0004, keep: false },

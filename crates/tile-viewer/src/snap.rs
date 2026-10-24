@@ -1181,10 +1181,31 @@ pub struct SnapInput {
     /// The attractors drawn (window pixels; whether a click captures), as
     /// of the last update: while the mode is on and the mouse is free.
     attractors: Vec<(Point, bool)>,
+    /// Lists the viewer shows scrolled away from the driver's rows
+    /// (`smooth_menus`): their rectangles and how far down the rows show.
+    list_shifts: Vec<([i32; 4], i32)>,
 }
 
 /// An action as the driver gets it (nothing for a point it does not take
 /// input at).
+/// Moves the entries in each of `shifts`' rectangles (x, y, w, h) down by
+/// its amount, clipped to it (an entry shown only in part is a target
+/// where it shows).
+fn shift_list_entries(items: &mut Vec<Interactable>, shifts: &[([i32; 4], i32)]) {
+    items.retain_mut(|i| {
+        if i.kind != InteractableKind::ListItem { return true }
+        let middle = (i.rect[0] + i.rect[2] / 2, i.rect[1] + i.rect[3] / 2);
+        let Some(&([x, y, w, h], dy)) = shifts.iter().find(|([x, y, w, h], _)| middle.0 >= *x && middle.0 < x + w && middle.1 >= *y && middle.1 < y + h) else { return true };
+        let (top, bottom) = ((i.rect[1] + dy).max(y), (i.rect[1] + i.rect[3] + dy).min(y + h));
+        if bottom - top < 2 || i.rect[0] >= x + w || i.rect[0] + i.rect[2] <= x { return false }
+        i.rect[1] = top;
+        i.rect[3] = bottom - top;
+        if let Some(anchor) = &mut i.anchor { anchor[1] = (anchor[1] + dy).clamp(top, bottom - 1) }
+        i.region = i.region.map(|[rx, ry, rw, rh]| [rx, ry + dy, rw, rh]);
+        true
+    });
+}
+
 fn to_input(action: Action, layout: &Layout) -> Option<Input> {
     let whole = |(x, y): Point| (x.round() as i32, y.round() as i32);
     Some(match action {
@@ -1211,11 +1232,30 @@ impl SnapInput {
         self.snapper.holds_pointer()
     }
 
+    /// Lists the viewer shows scrolled by `shifts` (rectangle, rows moved
+    /// down) from where the driver has their rows: their entries are
+    /// targets where they show.
+    pub fn set_list_shifts(&mut self, shifts: Vec<([i32; 4], i32)>) {
+        self.list_shifts = shifts;
+    }
+
+    /// [`SnapInput::targets`] with the lists' entries where they show.
+    fn shown_targets(&self, scene: &scene::Scene, layout: &Layout) -> Vec<Target> {
+        if self.list_shifts.is_empty() { return Self::targets(scene, layout) }
+        let mut shown = scene.interactables.clone();
+        shift_list_entries(&mut shown, &self.list_shifts);
+        Self::targets_of(&shown, layout)
+    }
+
     /// The targets in `scene` as `layout` shows them, and the view a click
     /// captures the mouse in.
     fn targets(scene: &scene::Scene, layout: &Layout) -> Vec<Target> {
+        Self::targets_of(&scene.interactables, layout)
+    }
+
+    fn targets_of(interactables: &[Interactable], layout: &Layout) -> Vec<Target> {
         // (Where the viewer shows each piece of the driver's interface.)
-        let mut out = targets_mapped(&scene.interactables, |r| layout.driver_rect_to_window(r), layout.window());
+        let mut out = targets_mapped(interactables, |r| layout.driver_rect_to_window(r), layout.window());
         // What lies in a part of the interface drawn elsewhere by the layout
         // (the corner's buttons, a popup moved into a view) is there, unless
         // the viewer arranged the interface itself (then the pieces as shown
@@ -1247,7 +1287,7 @@ impl SnapInput {
             }
         }
         clip_targets(&mut out, |target| {
-            scene.interactables.iter().find(|item| item.id == target.id)
+            interactables.iter().find(|item| item.id == target.id)
                 .and_then(|item| layout.driver_target_clip(item.rect))
         });
         // The first queued report's button (`Layout::queued_targets`): the
@@ -1322,7 +1362,7 @@ impl SnapInput {
             let (x, y) = layout.pointer_in_window();
             (x as f64, y as f64)
         });
-        self.snapper.enter(now, at, &Self::targets(scene, layout), rates);
+        self.snapper.enter(now, at, &self.shown_targets(scene, layout), rates);
         log::debug!("viewer: button snapping on (the mouse {})", if layout.captured() { "captured" } else { "free" });
         self.sync(layout)
     }
@@ -1413,7 +1453,7 @@ impl SnapInput {
         }) {
             return None;
         }
-        let targets = Self::targets(scene, layout);
+        let targets = self.shown_targets(scene, layout);
         let slider = targets.iter().find(|target| target.id == id && matches!(target.kind, TargetKind::Slider { .. }))?;
         let [x, y, w, h] = slider.rect;
         let (x0, y0, x1, y1) = (x.floor() as i32, y.floor() as i32, (x + w).ceil() as i32, (y + h).ceil() as i32);
@@ -1496,7 +1536,7 @@ impl SnapInput {
         if !matches!(input, Input::Key { .. } | Input::MouseButton { down: true, .. }) {
             return self.route_input(input, layout, scene, now, rates);
         }
-        let targets = Self::targets(scene, layout);
+        let targets = self.shown_targets(scene, layout);
         self.validate_selection(&targets);
         // A tab or modal can replace the edited control between animation
         // ticks. Retire that transaction before a key resolves its slider ID.
@@ -1511,7 +1551,7 @@ impl SnapInput {
     }
 
     fn route_input(&mut self, input: Input, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
-        let targets = Self::targets(scene, layout);
+        let targets = self.shown_targets(scene, layout);
         let mut before = self.validate_slider(&targets);
         // Scene/layout publication can precede the next animation tick.
         // Revalidate a new gesture now; releases retain their press identity.
@@ -1559,7 +1599,7 @@ impl SnapInput {
                 }
                 // (Nothing of the driver's to snap to, e.g. before its first
                 // screen: Alt is the driver's.)
-                if !Self::targets(scene, layout).iter().any(|t| !t.is_capture()) {
+                if !self.shown_targets(scene, layout).iter().any(|t| !t.is_capture()) {
                     log::debug!("snap: nothing to snap to: Alt is the driver's");
                     self.alt_sent = true;
                     before.extend(layout.route(input));
@@ -1724,7 +1764,7 @@ impl SnapInput {
             self.menu_declined = true;
             log::debug!("snap: the mouse captured beside a menu: no button snapping by itself");
         }
-        if self.alt_in_menus && !self.by_menu && !self.menu_declined && !self.snapper.snapping() && !self.alt && Self::targets(scene, layout).iter().any(|t| !t.is_capture()) {
+        if self.alt_in_menus && !self.by_menu && !self.menu_declined && !self.snapper.snapping() && !self.alt && self.shown_targets(scene, layout).iter().any(|t| !t.is_capture()) {
             self.by_menu = true;
             log::debug!("snap: a menu is open: button snapping on by itself");
             return self.enter(layout, scene, now, rates);
@@ -1740,7 +1780,7 @@ impl SnapInput {
         if scene.interface.targeting && !targeting && self.snapper.snapping() {
             return self.capture_for_target(layout);
         }
-        let targets = Self::targets(scene, layout);
+        let targets = self.shown_targets(scene, layout);
         let mut out = self.validate_slider(&targets);
         self.validate_selection(&targets);
         self.shown = self.keyboard_slider(&targets);

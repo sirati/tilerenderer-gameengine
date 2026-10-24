@@ -4581,7 +4581,22 @@ impl Layout {
                         self.scroll_panned = true;
                         out
                     }
-                    None => vec![],
+                    // The interface's: in the driver's pixels, for the
+                    // viewer's own list scrolling (`smooth_menus`; the
+                    // driver gets the notches that follow, or none).
+                    None => match self.route_point((x, y)) {
+                        Ok((dx_at, dy_at)) => {
+                            let per = if pixels {
+                                let shown = self.driver_rect_to_window([dx_at, dy_at, 1000, 1000]);
+                                (1000.0 / shown[2].max(1.0), 1000.0 / shown[3].max(1.0))
+                            } else {
+                                (1.0, 1.0)
+                            };
+                            let milli = |v: f64| (v * 1000.0).round().clamp(-1e9, 1e9) as i32;
+                            vec![Input::Scroll { dx: milli(d.0 * per.0), dy: milli(d.1 * per.1), pixels, x: dx_at, y: dy_at }]
+                        }
+                        Err(_) => vec![],
+                    },
                 }
             }
             other => vec![other],
