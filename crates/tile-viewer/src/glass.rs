@@ -1,5 +1,6 @@
 //! The divider between A and B: a band of frosted glass across the gap
-//! (`GAP`, 4 pixels), in every map movement mode. A child of `layout`.
+//! (the divider's thickness, `Layout::dividers`), in every map movement
+//! mode. A child of `layout`.
 //!
 //! Each pane's picture goes on under its half of the gap (one camera a
 //! half, [`Layout::gap_halves`]; a half whose pane shows no world, a
@@ -11,17 +12,16 @@
 //! and bright terrain alike, and it costs two small cameras and a few
 //! sprites (no extra pass, no shader of its own).
 //!
-//! The glass is shown where the divider holds the pointer back: its closed
-//! stretches with edge scrolling (the open middle third and the controls'
-//! rows show the pictures alone, as before the line was not drawn there),
-//! all of it while the mouse is captured, and all of it with Drag map
-//! movement, where the pointer passes it everywhere (nothing there to show
-//! as open).
+//! The glass is shown where the divider is drawn, which is where it holds
+//! the pointer back (`Layout::dividers`, the one source of both): its
+//! closed stretches with edge scrolling (the open middle third, the
+//! controls' rows and where the interface reaches across show the
+//! pictures alone), all of it while the mouse is captured, and all of it
+//! with Drag map movement, where the pointer passes it everywhere (nothing
+//! there to show as open).
 
 use tile_render::Camera;
-use viewer_settings::MapMovement;
-
-use super::{world_at_floor, Axis, Hit, Layout};
+use super::{world_at_floor, Axis, DividerKind, Hit, Layout};
 
 /// The shade of one column (side by side) or row (stacked) of the glass.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -81,21 +81,15 @@ impl Layout {
 
     /// The glass's strips: each a window rectangle one pixel across the
     /// gap, whether the split is side by side, and its shade; over the
-    /// divider's closed stretches (all of it while captured or with Drag).
+    /// split's drawn segments (`Layout::dividers`).
     pub(super) fn glass_strips(&self) -> Vec<([i32; 4], bool, Shade)> {
-        let (Some(((g0, g1), (s0, s1))), Some(split)) = (self.gap(), self.split) else { return vec![] };
-        let vertical = split.axis == Axis::Vertical;
-        let pieces: Vec<[i32; 4]> = if !self.locked && self.map_movement() == MapMovement::Drag {
-            vec![if vertical { [g0, s0, g1 - g0, s1 - s0] } else { [s0, g0, s1 - s0, g1 - g0] }]
-        } else {
-            self.divider_pieces().into_iter().map(|(r, _)| r).collect()
-        };
-        let width = g1 - g0;
         let mut out = Vec::new();
-        for r in pieces {
+        for s in self.dividers().segments.iter().filter(|s| s.band.kind == DividerKind::Split) {
+            let (r, (g0, g1)) = (s.rect(), s.band.across);
+            let width = g1 - g0;
             for k in 0..width {
-                let strip = if vertical { [g0 + k, r[1], 1, r[3]] } else { [r[0], g0 + k, r[2], 1] };
-                out.push((strip, vertical, Shade::at(k, width)));
+                let strip = if s.band.vertical { [g0 + k, r[1], 1, r[3]] } else { [r[0], g0 + k, r[2], 1] };
+                out.push((strip, s.band.vertical, Shade::at(k, width)));
             }
         }
         out
