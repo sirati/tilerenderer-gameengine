@@ -4350,9 +4350,13 @@ impl ApplicationHandler for App {
                 }
                 if !self.settings_preview.active() { self.pointer_moved(); }
             }
-            WindowEvent::CursorEntered { .. } => self.pointer_inside = true,
+            WindowEvent::CursorEntered { .. } => {
+                self.pointer_inside = true;
+                self.layout.set_pointer_inside(true);
+            }
             WindowEvent::CursorLeft { .. } => {
                 self.pointer_inside = false;
+                self.layout.set_pointer_inside(false);
                 if let Some(thread) = &self.pointer_thread { thread.report(None); }
             }
             WindowEvent::Moved(_) => self.retime_pointer_thread(),

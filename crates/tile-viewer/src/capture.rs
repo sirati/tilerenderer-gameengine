@@ -44,6 +44,30 @@
 //! Losing the window's focus forgets a pending capture: coming back, a
 //! click captures the mouse, as before. Activation never captures it.
 //!
+//! # The dialogues that let go of the pointer
+//!
+//! A player who wants to leave the window and does not know how may open
+//! the game menu (Save, Load, Quit Game) or press Escape on the map (the
+//! "really quit?" popup). While either is open the driver says so in every
+//! scene (`scene::Interface::releases_pointer`, from the game's state) and
+//! nothing holds the pointer: the mouse is let go wherever it was captured
+//! (beside the menu too) and is not captured by a click, Ctrl+Shift+Space
+//! or the Alt mode ([`Layout::capture_refused`]); the divider, the zoom
+//! boxes and the window's edges hold the free pointer nowhere
+//! ([`Layout::pointer_unbounded`]), so the window asks the system for no
+//! confinement either (ClipCursor, Wayland constraints, X11 barriers, the
+//! macOS region) and warps it nowhere. The Alt mode is off (`crate::snap`:
+//! its own grab holds the pointer). The pointer is free to leave the window
+//! on every system.
+//!
+//! As the dialogue closes, everything that is decided from the frame (the
+//! walls, the confinement) is as before at once. A capture the dialogue
+//! interrupted is taken up again as after any menu, at the same world
+//! cursor once no menu has been open for [`RESUME_AFTER`], only if the
+//! pointer is in the window then: a player who used the dialogue to leave
+//! the window is not pulled back into it, and a click into the view
+//! captures the mouse again, as always. A mouse that was free stays free.
+//!
 //! # Drag map movement
 //!
 //! With `MapMovement::Drag` the window's edges and the divider do nothing,
@@ -93,6 +117,9 @@ pub(super) struct Resume {
     pub at: Option<(i32, i32)>,
     /// Since when (the layout's clock) no menu has been open.
     pub clear_since: Option<f64>,
+    /// A dialogue that lets go of the pointer was open since the capture
+    /// was interrupted: taken up again only with the pointer in the window.
+    pub released: bool,
 }
 
 impl Layout {
@@ -111,6 +138,9 @@ impl Layout {
 
     /// [`Layout::capture_refused`], the open popup counting or not.
     fn capture_refused_by(&self, hit: Hit, popup: bool) -> Option<&'static str> {
+        if self.releases_pointer {
+            return Some("the game menu or the quit dialogue lets the pointer go");
+        }
         if hit == Hit::Beside {
             return None;
         }
@@ -180,7 +210,25 @@ impl Layout {
     /// cursor at all (the Alt mode's attractors capture or just put the
     /// pointer there).
     pub fn may_capture(&self) -> bool {
-        self.map_movement() != MapMovement::Drag
+        self.map_movement() != MapMovement::Drag && !self.releases_pointer
+    }
+
+    /// Whether a dialogue that lets go of the pointer is open (the game
+    /// menu, the quit dialogue: see the module's documentation).
+    pub fn releases_pointer(&self) -> bool {
+        self.releases_pointer
+    }
+
+    /// The window says whether the system pointer is in it.
+    pub fn set_pointer_inside(&mut self, inside: bool) {
+        self.pointer_inside = inside;
+    }
+
+    /// Nothing holds the free pointer back: no divider, no window edge, no
+    /// system confinement ([`Layout::pointer_free_everywhere`], or a
+    /// dialogue that lets go of the pointer is open).
+    pub(super) fn pointer_unbounded(&self) -> bool {
+        self.releases_pointer || self.pointer_free_everywhere()
     }
 
     /// With Drag map movement the free pointer goes anywhere: the divider
@@ -228,7 +276,7 @@ impl Layout {
             return;
         }
         if let Some(at) = self.view_middle(hit) {
-            self.resume = Resume { at: Some(at), clear_since: None };
+            self.resume = Resume { at: Some(at), ..Resume::default() };
             log::info!("viewer: the mouse is captured in {hit:?} once the popup is gone");
         }
     }
@@ -293,6 +341,18 @@ impl Layout {
     /// mouse captured lets it go; with no menu open for [`RESUME_AFTER`],
     /// a capture a menu interrupted is taken up again.
     pub(super) fn settle_capture(&mut self) {
+        if self.releases_pointer {
+            // (Wherever it was captured: beside the menu too.)
+            if self.locked {
+                self.suspend_capture();
+                self.release_here("the game menu or the quit dialogue is open: nothing holds the pointer");
+            }
+            if self.resume.at.is_some() {
+                self.resume.released = true;
+            }
+            self.resume.clear_since = None;
+            return;
+        }
         if self.locked && self.explore.is_none() {
             if self.map_movement() == MapMovement::Drag {
                 self.forget_resume();
@@ -316,6 +376,11 @@ impl Layout {
         }
         let since = *self.resume.clear_since.get_or_insert(self.clock);
         if self.clock - since < RESUME_AFTER {
+            return;
+        }
+        if self.resume.released && !self.pointer_inside {
+            self.forget_resume();
+            log::info!("viewer: the mouse stays free (the pointer is outside the window as the dialogue that let it go closed); a click into the view following the world cursor captures it");
             return;
         }
         self.forget_resume();
