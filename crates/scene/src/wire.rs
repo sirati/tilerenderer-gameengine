@@ -2,7 +2,7 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Beside, Binding, Button, Extension, ScreenRole, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, UnitOrderAction, Update, View, ViewLooks, WorldShape};
+use crate::{Beside, Binding, Button, Extension, ScreenRole, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, WorldOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
 pub const VERSION: u32 = 65;
@@ -1172,12 +1172,12 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.i32(x);
                 w.i32(y);
             }
-            Input::UnitOrder { action, x, y } => {
+            Input::WorldOrder { action, x, y } => {
                 w.u8(15);
                 w.u8(match action {
-                    UnitOrderAction::Preview => 0,
-                    UnitOrderAction::Confirm => 1,
-                    UnitOrderAction::Cancel => 2,
+                    WorldOrderAction::Preview => 0,
+                    WorldOrderAction::Confirm => 1,
+                    WorldOrderAction::Cancel => 2,
                 });
                 w.i32(x);
                 w.i32(y);
@@ -1303,12 +1303,12 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
             14 => Input::WorldMove { x: r.i32()?, y: r.i32()? },
             15 => {
                 let action = match r.u8()? {
-                    0 => UnitOrderAction::Preview,
-                    1 => UnitOrderAction::Confirm,
-                    2 => UnitOrderAction::Cancel,
+                    0 => WorldOrderAction::Preview,
+                    1 => WorldOrderAction::Confirm,
+                    2 => WorldOrderAction::Cancel,
                     tag => return Err(WireError::Tag(tag)),
                 };
-                Input::UnitOrder { action, x: r.i32()?, y: r.i32()? }
+                Input::WorldOrder { action, x: r.i32()?, y: r.i32()? }
             }
             11 => Input::Edge { x: r.i32()?, y: r.i32()? },
             12 => Input::MainView { x: r.i32()?, y: r.i32()?, w: r.i32()?, h: r.i32()?, downscale: r.u32()? },
@@ -1638,9 +1638,9 @@ mod tests {
             Input::CloseQueued { serial: 0x5_0000_000B },
             Input::SettingsPreviewDecision { session: 0x3_0000_0003, id: 0x4_0000_0004, keep: false },
             Input::WorldMove { x: -64, y: 12345 },
-            Input::UnitOrder { action: UnitOrderAction::Preview, x: -100, y: 9999 },
-            Input::UnitOrder { action: UnitOrderAction::Confirm, x: 1234, y: -555 },
-            Input::UnitOrder { action: UnitOrderAction::Cancel, x: 0, y: 0 },
+            Input::WorldOrder { action: WorldOrderAction::Preview, x: -100, y: 9999 },
+            Input::WorldOrder { action: WorldOrderAction::Confirm, x: 1234, y: -555 },
+            Input::WorldOrder { action: WorldOrderAction::Cancel, x: 0, y: 0 },
             Input::Zooms([(3, 2), (2, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]),
             Input::Views { views: [(10, -20, 300, 200), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)], downscale: 2 },
             Input::MainView { x: 5, y: -6, w: 700, h: 400, downscale: 1 },

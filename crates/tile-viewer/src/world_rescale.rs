@@ -52,7 +52,7 @@ impl Layout {
         self.pan_rescale_world(ratio);
         // Unit-order gestures use game pixels too. Their helper also
         // rebases the captured pointer's projected threshold coordinates.
-        self.unit_orders_rescale_world(ratio);
+        self.world_orders_rescale_world(ratio);
     }
 }
 

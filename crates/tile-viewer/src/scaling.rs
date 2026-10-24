@@ -850,7 +850,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
                 let piece = plan.frame_piece(a);
                 (kept(Affine { zoom: fitting(piece.zoom, Some(r)), ..piece }, r).at((r[0], r[1])), r)
             }).collect();
-            if frame.unit_orders.is_some() && !anchors.is_empty() || anchors.len() > 1 || anchors.first().is_some_and(|a| a.0.zoom != (1, 1) || a.0.from != a.0.to) {
+            if frame.order_buttons.is_some() && !anchors.is_empty() || anchors.len() > 1 || anchors.first().is_some_and(|a| a.0.zoom != (1, 1) || a.0.from != a.0.to) {
                 // The tooltip: a camera of its own, mapped as the sprite
                 // nearest to it (the control it is for) is.
                 let tip = tip_host(&v.overlay, &rect_of, &of_sprite, parts.tooltip).and_then(|host| {
@@ -917,7 +917,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     }
     // Place the orders after every interface piece has its final map,
     // including panels supplied in a separate view.
-    if let (Some(place), Some(orders)) = (frame.unit_orders, parts.reachable) {
+    if let (Some(place), Some(orders)) = (frame.order_buttons, parts.reachable) {
         // Where the frame draws them: at the side or corner of the screen
         // their buttons are at (as `panels` anchors a panel), at its scale.
         let side = anchor_of(orders, plan.screen);
@@ -931,7 +931,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         // those come and go, and the buttons would move (and shrink) with
         // them, and back. (Nor how a frame groups its sprites into panels:
         // a sprite between two joins them for as long as it is there.)
-        let occupied: Vec<[i32; 4]> = if matches!(place, layout::UnitOrdersPlace::In(_)) {
+        let occupied: Vec<[i32; 4]> = if matches!(place, layout::OrderButtonsPlace::In(_)) {
             panelled.iter().flat_map(|(_, i, anchors, of_sprite, _, _, sides)| {
                 scene.views[*i].overlay.iter().zip(of_sprite.iter()).filter(|&(_, &k)| k < sides.len())
                     .filter_map(|(s, &k)| rect_of(s).map(|r| (k, r))).filter(|&(_, r)| !in_tip(r) && !inside(orders, r))
@@ -941,7 +941,7 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             }).filter(|r| r[2] > 0 && r[3] > 0).collect()
         } else { Vec::new() };
         for (_, i, anchors, of_sprite, start, tip, _) in &mut panelled {
-            place_unit_orders(place, orders, at_side, &scene.views[*i].overlay, &rect_of, &occupied, anchors, of_sprite, tip.map(|(t, _)| t));
+            place_world_orders(place, orders, at_side, &scene.views[*i].overlay, &rect_of, &occupied, anchors, of_sprite, tip.map(|(t, _)| t));
             // (The tooltip goes with its control, wherever that went.)
             if let Some((t, host)) = *tip {
                 anchors[t].0 = anchors[of_sprite[host]].0.at((anchors[t].1[0], anchors[t].1[1]));
@@ -1155,7 +1155,7 @@ fn drawn_boxed(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: 
 
 /// The unit's order buttons (the sprites inside `orders`, the rectangle of
 /// the game's own order buttons in the driver's pixels) placed as the
-/// layout says (`layout::UnitOrdersPlace`): panels of their own added to
+/// layout says (`layout::OrderButtonsPlace`): panels of their own added to
 /// the frame's `anchors` (each sprite's in `of_sprite`), `at_side` where
 /// the frame draws them. Split at a side by side split's gap, those left
 /// of its middle are moved left of it and the others right of it, as
@@ -1170,7 +1170,7 @@ fn drawn_boxed(cameras: &[Camera], copies: &[tile_render::ScreenCopy], present: 
 /// The tooltip (the sprites of panel `tip`, or of no panel) is none of
 /// them, wherever the game drew it: it goes with its button.
 #[allow(clippy::too_many_arguments)]
-fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], at_side: Affine, sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, occupied: &[[i32; 4]], anchors: &mut Vec<(Affine, [i32; 4])>, of_sprite: &mut [usize], tip: Option<usize>) {
+fn place_world_orders(place: layout::OrderButtonsPlace, orders: [i32; 4], at_side: Affine, sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i32; 4]>, occupied: &[[i32; 4]], anchors: &mut Vec<(Affine, [i32; 4])>, of_sprite: &mut [usize], tip: Option<usize>) {
     let order = |i: usize| of_sprite[i] != usize::MAX && Some(of_sprite[i]) != tip;
     let members: Vec<(usize, [i32; 4])> = sprites.iter().enumerate().filter(|&(i, _)| order(i)).filter_map(|(i, s)| rect_of(s).filter(|&r| inside(orders, r)).map(|r| (i, r))).collect();
     if members.is_empty() { return; }
@@ -1194,7 +1194,7 @@ fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], at_side: 
         }
     };
     match place {
-        layout::UnitOrdersPlace::Gap((g0, g1)) => {
+        layout::OrderButtonsPlace::Gap((g0, g1)) => {
             let (left, right): (Vec<usize>, Vec<usize>) = (0..members.len()).partition(|&m| 2 * shown[m][0] + shown[m][2] < g0 + g1);
             let dl = left.iter().map(|&m| shown[m][0] + shown[m][2]).max().map_or(0, |end| (g0 - end).min(0));
             let dr = right.iter().map(|&m| shown[m][0]).min().map_or(0, |start| (g1 - start).max(0));
@@ -1204,7 +1204,7 @@ fn place_unit_orders(place: layout::UnitOrdersPlace, orders: [i32; 4], at_side: 
                 }
             }
         }
-        layout::UnitOrdersPlace::In(area) => {
+        layout::OrderButtonsPlace::In(area) => {
             let map = orders_in(orders, at_side, area, occupied);
             add((0..members.len()).collect(), &|_| map, anchors);
         }

@@ -148,8 +148,8 @@ pub(crate) mod dividers;
 mod capture;
 #[path = "world_rescale.rs"]
 mod world_rescale;
-#[path = "unit_orders.rs"]
-mod unit_orders;
+#[path = "world_orders.rs"]
+mod world_orders;
 #[path = "world_pointer.rs"]
 mod world_pointer;
 #[path = "detached_popups.rs"]
@@ -611,7 +611,7 @@ pub struct Frame {
     pub view_ui_region: Option<[i32; 4]>,
     /// Where the unit's order buttons (`scene::Interface::reachable`) go
     /// with two views (`scaling::arrange` moves their sprites).
-    pub unit_orders: Option<UnitOrdersPlace>,
+    pub order_buttons: Option<OrderButtonsPlace>,
     pub copies: Vec<ScreenCopy>,
     /// Plain horizontal separators, in their own unscaled UI camera.
     pub separators: Vec<(u32, [i32; 4])>,
@@ -639,7 +639,7 @@ pub struct Frame {
 /// Where the unit's order buttons go while there are two views
 /// ([`UnitButtons`]), in canvas pixels.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum UnitOrdersPlace {
+pub enum OrderButtonsPlace {
     /// Where the driver put them, those left of the middle of the side by
     /// side split's gap (from, to: canvas x) kept left of it and the others
     /// right of it, so the gap stays clear for the pointer.
@@ -776,7 +776,7 @@ pub struct Layout {
     /// What the views follow (from the settings).
     pub roles: Roles,
     /// Where the unit's order buttons go with two views
-    /// ([`Frame::unit_orders`]).
+    /// ([`Frame::order_buttons`]).
     pub unit_buttons: UnitButtons,
     /// Where every screen and popup goes (from the settings; click-anchored
     /// popups excepted).
@@ -1022,7 +1022,7 @@ pub struct Layout {
     /// When the frame being prepared is to show (the pointer thread's
     /// scrolling is shown as of then); set by the window each frame.
     pub frame_instant: Option<std::time::Instant>,
-    unit_orders: unit_orders::UnitOrders,
+    world_orders: world_orders::WorldOrders,
     /// Exploring the world beside the driver's screen ([`Explore`]); the
     /// world beside it in the last frame; the last left press on it (when,
     /// where: for double-clicks).
@@ -1171,7 +1171,7 @@ impl Default for Layout {
             edge_fitted: None,
             pointer_present: None,
             frame_instant: None,
-            unit_orders: unit_orders::UnitOrders::default(),
+            world_orders: world_orders::WorldOrders::default(),
             explore: None,
             beside_of: None,
             beside_press: None,
@@ -1576,7 +1576,7 @@ impl Layout {
     /// placed); captured again once no menu is open (`settle_capture`).
     fn screen_changes(&mut self, opens: bool) {
         if opens {
-            self.cancel_unit_order();
+            self.cancel_world_order();
         }
         if opens && self.screen.is_none() && self.locked {
             self.suspend_capture();
@@ -1899,7 +1899,7 @@ impl Layout {
 
     /// The mouse was let go (e.g. the window lost focus).
     pub fn released(&mut self) {
-        self.unit_order_presses_lost();
+        self.world_order_presses_lost();
         self.last_world_pointer = None;
         self.menu_pan.cancel_drag();
         // (Back in the window a click captures it: nothing pending does.)
@@ -1966,13 +1966,13 @@ impl Layout {
     /// no edge any more (what goes to the driver), and comes back into
     /// whichever view it enters.
     pub fn pointer_gone(&mut self) -> Vec<Input> {
-        self.unit_order_presses_lost();
+        self.world_order_presses_lost();
         self.last_world_pointer = None;
         self.menu_pan.cancel_drag();
         self.side = None;
         self.against = None;
         self.pan_pointer_gone();
-        let mut out = self.take_unit_order_events();
+        let mut out = self.take_world_order_events();
         out.extend(self.edge_change((0, 0)));
         out
     }
@@ -2056,18 +2056,18 @@ impl Layout {
     /// Where the unit's order buttons go (none: where the driver put them,
     /// as with one view): split at a side by side split's gap, or inside
     /// the active view's area (`UnitButtons`).
-    fn unit_orders_place(&self) -> Option<UnitOrdersPlace> {
+    fn order_buttons_place(&self) -> Option<OrderButtonsPlace> {
         let split = self.split.filter(|_| self.world_shown && self.reachable.is_some())?;
         match self.unit_buttons {
-            UnitButtons::Spanning if split.axis == Axis::Vertical => self.gap().map(|(across, _)| UnitOrdersPlace::Gap(across)),
+            UnitButtons::Spanning if split.axis == Axis::Vertical => self.gap().map(|(across, _)| OrderButtonsPlace::Gap(across)),
             UnitButtons::Spanning => None,
-            UnitButtons::ActiveView => Some(UnitOrdersPlace::In(self.view_area(self.active_side()))),
+            UnitButtons::ActiveView => Some(OrderButtonsPlace::In(self.view_area(self.active_side()))),
         }
     }
 
     /// The unit's order buttons (`scene::Interface::reachable`) where they
     /// are drawn (canvas pixels): their pieces as shown, the scale of the
-    /// game's frame and the place `unit_orders_place` gave them applied
+    /// game's frame and the place `order_buttons_place` gave them applied
     /// (none: the viewer shows the interface, but none of them); where the
     /// driver put them while the viewer shows no interface of its own.
     pub(crate) fn orders_shown(&self) -> Option<[i32; 4]> {
@@ -2583,7 +2583,7 @@ impl Layout {
             self.screen_changes(parts.screen.is_some());
         }
         self.clock += dt;
-        self.unit_orders_frame(scene.interface.targeting);
+        self.world_orders_frame(scene.interface.targeting);
         // A popup over a menu (a screen part or the menus): placed over that
         // menu (`scaling::MODAL_TOP`), never at a click nor in a pane.
         let over_menu = parts.screen.is_some() || screen_part.is_some() || scene.views.iter().any(|v| v.view.interface_only && v.view.menu && !v.overlay.is_empty());
@@ -2602,7 +2602,7 @@ impl Layout {
             self.popup_shown = popup.is_some();
             self.notes.push(format!("viewer: popup {}", if self.popup_shown { "open, a view of its own" } else { "closed" }));
             match popup {
-                Some(i) => { self.cancel_unit_order(); self.popup_opened(rect_of(&base[i]), scene.interface.popup_anchor, over_menu); }
+                Some(i) => { self.cancel_world_order(); self.popup_opened(rect_of(&base[i]), scene.interface.popup_anchor, over_menu); }
                 None => self.popup_closed(),
             }
         }
@@ -2921,7 +2921,7 @@ impl Layout {
             if roaming.is_some() || hint.is_some() {
                 frame.view_ui_region = Some(ui_area);
             }
-            frame.unit_orders = self.unit_orders_place();
+            frame.order_buttons = self.order_buttons_place();
             // (A modal one is placed over its menu: `scaling::MODAL_TOP`.)
             let popup_shift = popup.map(|i| if modal.is_some() || on_screen { (0, 0) } else { self.popup_shift(rect_of(&base[i]), main_rect) });
             let screen_shift = screen_part.map(|i| Some(self.screen_shift(rect_of(&base[i]))));
@@ -3256,7 +3256,7 @@ impl Layout {
     fn frame_without_world(&mut self, scene: &Scene, overhang: (u32, u32, u32, u32), interface: Vec<[i32; 4]>, had_world: bool) -> Frame {
         self.clock += std::mem::take(&mut self.step).min(MAX_STEP);
         if had_world {
-            self.cancel_unit_order();
+            self.cancel_world_order();
             self.clear_world_motion();
             self.menu_pan.cancel_drag();
             self.drag = None;
@@ -3332,7 +3332,7 @@ impl Layout {
     /// the viewer's own views: the arrangement is the driver's.
     fn frame_beside(&mut self, scene: &Scene, overhang: (u32, u32, u32, u32), beside: scene::Beside, bounds: Option<WorldBounds>) -> Frame {
         if self.beside.is_none() {
-            self.cancel_unit_order();
+            self.cancel_world_order();
             self.clear_world_motion();
             self.drag = None;
             self.last_press = None;
@@ -4030,8 +4030,8 @@ impl Layout {
         if let Some(b) = self.bounds {
             self.cursor = b.clamp_point(self.cursor);
         }
-        if let Some(mut out) = self.unit_order_motion(self.pointer) {
-            let mut queued = self.take_unit_order_events();
+        if let Some(mut out) = self.world_order_motion(self.pointer) {
+            let mut queued = self.take_world_order_events();
             queued.append(&mut out);
             self.remember_world_inputs(&queued);
             return queued;
@@ -4437,8 +4437,8 @@ impl Layout {
         if let Some(b) = self.bounds {
             self.cursor = b.clamp_point(self.cursor);
         }
-        if let Some(mut out) = self.unit_order_motion(self.pointer) {
-            let mut queued = self.take_unit_order_events();
+        if let Some(mut out) = self.world_order_motion(self.pointer) {
+            let mut queued = self.take_world_order_events();
             queued.append(&mut out);
             self.remember_world_inputs(&queued);
             return queued;
@@ -4477,16 +4477,16 @@ impl Layout {
         if !matches!(input, Input::Wheel { .. } | Input::Scroll { .. }) {
             self.scroll_panned = false;
         }
-        let mut out = self.take_unit_order_events();
+        let mut out = self.take_world_order_events();
         out.extend(self.detached.take_inputs());
         out.extend(self.queued.take_inputs());
-        if self.unit_order_before(&input) {
-            out.extend(self.take_unit_order_events());
+        if self.world_order_before(&input) {
+            out.extend(self.take_world_order_events());
             self.remember_world_inputs(&out);
             return out;
         }
         let routed = self.route_regular(input);
-        out.extend(self.take_unit_order_events());
+        out.extend(self.take_world_order_events());
         out.extend(routed);
         self.remember_world_inputs(&out);
         out
@@ -4581,7 +4581,7 @@ impl Layout {
                 self.pointer = (x, y);
                 // (A right drag begun on the minimap drags B.)
                 self.minimap_drag((x, y));
-                if let Some(out) = self.unit_order_motion((x, y)) { return out; }
+                if let Some(out) = self.world_order_motion((x, y)) { return out; }
                 if let Some(drag) = self.drag {
                     self.dragged(drag, (x, y));
                     return self.edge_change((0, 0));
@@ -4717,7 +4717,7 @@ impl Layout {
         if down && self.click_popup_open() {
             if let Some(out) = self.dismissing_press(button, p) { return out; }
         }
-        if let Some(out) = self.unit_order_button(button, down, p) { return out; }
+        if let Some(out) = self.world_order_button(button, down, p) { return out; }
         // Grabbing a view, or a press that may become a drag (`pan`).
         if let Some(out) = self.pan_button(button, down, p) {
             return out;
@@ -8079,7 +8079,7 @@ mod tests {
     }
 
     #[test]
-    fn the_unit_orders_are_reachable_from_both_views() {
+    fn the_order_buttons_are_reachable_from_both_views() {
         let mut l = split_1to1();
         let mut s = scene();
         // The orders' buttons across the divider, low in the window.

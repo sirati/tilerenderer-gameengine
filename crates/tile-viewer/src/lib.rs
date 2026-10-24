@@ -3221,7 +3221,7 @@ impl App {
     /// before it shows again (while still captured: on Wayland the place
     /// is a hint the release takes).
     fn apply_layout_requests(&mut self, event_loop: &ActiveEventLoop) {
-        for input in self.layout.take_unit_order_events() {
+        for input in self.layout.take_world_order_events() {
             self.send(input);
         }
         let grab = self.layout.take_grab();

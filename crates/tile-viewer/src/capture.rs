@@ -237,7 +237,7 @@ impl Layout {
     /// the window (but while a right-drag previews a unit's order, which
     /// still scrolls at the window's edge).
     pub(super) fn pointer_free_everywhere(&self) -> bool {
-        !self.locked && self.map_movement() == MapMovement::Drag && !self.unit_order_dragging()
+        !self.locked && self.map_movement() == MapMovement::Drag && !self.world_order_dragging()
     }
 
     /// A menu lets go of the captured mouse: captured again at the world
@@ -258,7 +258,7 @@ impl Layout {
     pub(super) fn player_capture(&mut self, into: Hit, p: (i32, i32)) -> bool {
         if self.click_popup_open() {
             self.capture_after_dismissal(into);
-            self.unit_order_events_push(scene::Input::DismissPopup);
+            self.world_order_events_push(scene::Input::DismissPopup);
             return false;
         }
         if let Some(why) = self.capture_refused(into) {

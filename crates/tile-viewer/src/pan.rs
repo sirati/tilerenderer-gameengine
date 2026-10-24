@@ -50,7 +50,7 @@
 //! it was let go does not slide, and any press on a view stops a slide. No
 //! edge scrolling in this mode except while a held right drag previews a
 //! unit go-to order. That preview scrolls at the edge until release; a
-//! separate left click confirms it. `unit_orders` owns that gesture.
+//! separate left click confirms it. `world_orders` owns that gesture.
 //! Insets, A and B alike; a view following
 //! the world cursor moves the world cursor (it keeps it in its middle).
 //!
@@ -336,7 +336,7 @@ impl Layout {
     /// How the mouse moves the map (from the settings).
     pub fn set_map_movement(&mut self, m: MapMovement) {
         if self.pan.mode != m {
-            self.cancel_unit_order();
+            self.cancel_world_order();
             log::info!("viewer: map movement: {}", if m == MapMovement::Drag { "dragging (left or middle button)" } else { "edge scrolling" });
             self.pan.mode = m;
             self.pan.press = None;
@@ -358,7 +358,7 @@ impl Layout {
     }
 
     /// Forgets a left press that may have become a drag: it was a click
-    /// taken by someone else (`unit_orders`), never replayed to the driver.
+    /// taken by someone else (`world_orders`), never replayed to the driver.
     pub(super) fn pan_forget_press(&mut self) {
         self.pan.press = None;
     }
@@ -945,7 +945,7 @@ impl Layout {
     fn edge_scroll_active(&self) -> bool {
         // A held right-button unit preview can reach beyond this pane in
         // Drag mode. Its pending destination stops scrolling on release.
-        let enabled = self.pan.mode == MapMovement::EdgeScroll || self.unit_order_dragging();
+        let enabled = self.pan.mode == MapMovement::EdgeScroll || self.world_order_dragging();
         // (Not under a popup opened at a world click: the map stays put.)
         enabled && self.pan.inside && !self.locked && !self.snapping && self.drag.is_none() && self.pan.grab.is_none() && !self.click_popup_open()
     }

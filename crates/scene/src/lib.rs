@@ -1229,11 +1229,12 @@ pub enum Button {
     Middle,
 }
 
-/// A unit order gesture keeps the native go-to preview open until a separate
+/// A world order gesture (the selected piece, a unit, sent to a place of
+/// the world) keeps the driver's go-to preview open until a separate
 /// click confirms its destination. A driver must reject a confirmation whose
-/// tile, selected unit, or world differs from the last preview.
+/// tile, selected piece, or world differs from the last preview.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum UnitOrderAction {
+pub enum WorldOrderAction {
     Preview,
     Confirm,
     Cancel,
@@ -1370,10 +1371,11 @@ pub enum Input {
     /// does not show. A driver can update hover and targeting directly
     /// without moving its camera. Coordinates use the main world scale.
     WorldMove { x: i32, y: i32 },
-    /// Preview, confirm, or cancel a unit go-to order at a world pixel.
+    /// Preview, confirm, or cancel a go-to order of the selected piece at a
+    /// world pixel.
     /// Releasing the initiating button never confirms the order. Confirmation
     /// is valid only for the tile of the most recent preview.
-    UnitOrder { action: UnitOrderAction, x: i32, y: i32 },
+    WorldOrder { action: WorldOrderAction, x: i32, y: i32 },
     /// A button went down or up on world pixel (x, y) in a view of the
     /// renderer's own whose pointer input does not reach the driver's
     /// window (it shows what the driver's main view does not, or what the

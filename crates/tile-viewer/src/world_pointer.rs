@@ -2,7 +2,7 @@
 //! beneath a stationary pointer while its independent cameras move.
 
 use super::Layout;
-use scene::{Input, UnitOrderAction};
+use scene::{Input, WorldOrderAction};
 
 impl Layout {
     /// Remember input already emitted by a real pointer event, including a
@@ -13,16 +13,16 @@ impl Layout {
                 Input::WorldMove { x, y }
                 | Input::WorldButton { x, y, .. }
                 | Input::WorldKey { x, y, .. }
-                | Input::UnitOrder {
-                    action: UnitOrderAction::Preview,
+                | Input::WorldOrder {
+                    action: WorldOrderAction::Preview,
                     x,
                     y,
                 } => self.last_world_pointer = Some((x, y)),
                 Input::MouseMove { .. }
                 | Input::MouseButton { .. }
                 | Input::Wheel { .. }
-                | Input::UnitOrder {
-                    action: UnitOrderAction::Cancel,
+                | Input::WorldOrder {
+                    action: WorldOrderAction::Cancel,
                     ..
                 } => self.last_world_pointer = None,
                 _ => {}
@@ -35,7 +35,7 @@ impl Layout {
     /// request even when the window reports no mouse movement. Captured
     /// input instead follows the logical cursor, independent of its camera.
     pub fn refresh_world_pointer(&mut self, active: bool) -> Vec<Input> {
-        let mut out = self.take_unit_order_events();
+        let mut out = self.take_world_order_events();
         if !active
             || self.snapping
             || self.explore.is_some()
@@ -50,10 +50,10 @@ impl Layout {
         if point.is_some() && point == self.last_world_pointer {
             return out;
         }
-        if let Some(mut orders) = self.unit_order_motion(self.pointer) {
+        if let Some(mut orders) = self.world_order_motion(self.pointer) {
             // Held right drags update their preview. After release the
             // same helper suppresses hover, keeping the armed destination.
-            out.extend(self.take_unit_order_events());
+            out.extend(self.take_world_order_events());
             out.append(&mut orders);
         } else if let Some((x, y)) = point {
             out.push(Input::WorldMove { x, y });
@@ -218,8 +218,8 @@ mod tests {
             assert_eq!(button(&mut l, Button::Right, true, from), []);
             assert!(matches!(
                 moved(&mut l, edge)[..],
-                [Input::UnitOrder {
-                    action: UnitOrderAction::Preview,
+                [Input::WorldOrder {
+                    action: WorldOrderAction::Preview,
                     ..
                 }]
             ));
@@ -229,8 +229,8 @@ mod tests {
             assert_ne!(target, old);
             assert_eq!(
                 l.refresh_world_pointer(true),
-                [Input::UnitOrder {
-                    action: UnitOrderAction::Preview,
+                [Input::WorldOrder {
+                    action: WorldOrderAction::Preview,
                     x: target.0,
                     y: target.1
                 }]
