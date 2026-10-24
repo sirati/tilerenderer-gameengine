@@ -817,6 +817,8 @@ pub struct Layout {
     /// now moves for it (`Frame::popup_nudge`).
     press_shift: Option<((i32, i32), f64)>,
     popup_nudge: (i32, i32),
+    /// A popup opened this frame: told in the log once its place is known.
+    popup_opened_now: bool,
     /// The last press on a world pixel (`Input::WorldButton`).
     world_press: Option<WorldPress>,
     /// The tile boxes the driver left to the viewer (`detached_popups`).
@@ -1082,6 +1084,7 @@ impl Default for Layout {
             popup_anchor: None,
             press_shift: None,
             popup_nudge: (0, 0),
+            popup_opened_now: false,
             world_press: None,
             detached: Default::default(),
             queued: Default::default(),
@@ -2833,6 +2836,30 @@ impl Layout {
         // table, e.g. the domestic advisor's production menu.)
         let on_screen = parts.popup_on_screen && parts.screen.is_some();
         let modal = popup.filter(|_| over_menu && self.anchored.is_none() && !on_screen);
+        if std::mem::take(&mut self.popup_opened_now) {
+            // Placed with its screen: where the click was made. The game
+            // may have it in its screen part's own pixels (the domestic
+            // advisor's production menu: its corner the click less the
+            // advisor's place); whichever reading puts its corner nearer the
+            // click the game got is the one, and it stays on the screen.
+            self.popup_nudge = match (on_screen, popup.map(|i| rect_of(&base[i])), self.last_press.filter(|&(_, _, t)| self.clock - t < 2.0)) {
+                (true, Some([x, y, w, h]), Some((_, q, _))) => {
+                    let part = screen_part.map(|i| rect_of(&base[i]));
+                    let offsets = [(0, 0)].into_iter().chain(part.map(|r| (r[0], r[1])));
+                    let o = offsets.min_by_key(|o| (x + o.0 - q.0).abs() + (y + o.1 - q.1).abs()).unwrap_or((0, 0));
+                    let (sw, sh) = self.driver_screen();
+                    let d = (o.0 + self.popup_nudge.0, o.1 + self.popup_nudge.1);
+                    let keep = |v: i32, len: i32, span: i32| if len <= span { v.clamp(0, span - len) } else { 0 };
+                    (keep(x + d.0, w, sw as i32) - x, keep(y + d.1, h, sh as i32) - y)
+                }
+                (true, ..) => self.popup_nudge,
+                _ => (0, 0),
+            };
+            frame.popup_nudge = self.popup_nudge;
+            log::info!("viewer: popup {:?} at driver {:?} over screen {:?} (part {:?} at {:?}); on its screen {on_screen}, modal {}, last press {:?}, moved {:?}",
+                parts.placed_popup(), popup.map(|i| rect_of(&base[i])), parts.screen, parts.screen_view, screen_part.map(|i| rect_of(&base[i])),
+                modal.is_some(), self.last_press, self.popup_nudge);
+        }
         let push = |frame: &mut Frame, camera: Camera| {
             frame.cameras.push(camera);
             frame.cameras.len() as u32 - 1
@@ -3533,6 +3560,7 @@ impl Layout {
         // (A press the list took elsewhere, just made: the popup opened at
         // it goes where the pointer was.)
         self.popup_nudge = self.press_shift.filter(|&(_, t)| self.clock - t < 2.0).map_or((0, 0), |(d, _)| d);
+        self.popup_opened_now = true;
         let fresh = self.world_press.filter(|p| self.clock - p.clock < 2.0);
         // (Opened from an entry of the popup at a click, the one in its
         // place or one just closed: that click's.)
@@ -3577,6 +3605,15 @@ impl Layout {
     /// pixels took it to the row's place in the driver
     /// (`smooth_menus`). A popup the driver opens at that click is placed
     /// as if opened at the pointer.
+    /// A press went to the driver at `q` (its pixels) by a way other than
+    /// [`Layout::route`] (the button snapping's click): a popup it opens
+    /// at that click is placed as one opened at a click.
+    pub fn press_sent(&mut self, q: (i32, i32)) {
+        if self.last_press.is_some_and(|(_, at, t)| at == q && t == self.clock) { return }
+        let at = self.driver_to_window(q);
+        self.last_press = Some((at, q, self.clock));
+    }
+
     pub fn press_delivered(&mut self, from: (i32, i32), to: (i32, i32)) {
         if let Some((_, q, _)) = &mut self.last_press {
             if *q == from { *q = to }

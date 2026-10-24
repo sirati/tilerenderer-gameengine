@@ -2881,6 +2881,7 @@ impl App {
         // input goes to the row shown, `smooth_menus`.)
         let moves = matches!(input, Input::MouseMove { .. });
         let press = match input { Input::MouseButton { down: true, x, y, .. } => Some((x, y)), _ => None };
+        if let Some(q) = press { self.layout.press_sent(q); }
         let routed = self.menu_scroll.route(input, self.snap.snap_mode_active());
         // A press the list took to another row's place in the driver: a
         // popup it opens at that click is placed at the pointer all the same.

@@ -545,7 +545,14 @@ fn a_garrison_units_menu_opens_at_its_click_on_the_city_screen() {
 fn an_advisors_menu_opens_at_the_pointer_on_the_advisor_at_any_list_offset() {
     use viewer_settings::{Place, ScreenPlace};
     let compiled = compiled();
+    for whole_window in [false, true] {
     let mut base = advisor_scene(&compiled, "F1");
+    if whole_window {
+        // (As the bridge may hand it: the advisor's view the whole window,
+        // its board in the middle.)
+        base.views[2].view.origin = (0, 0);
+        base.views[2].view.viewport = (0, 0);
+    }
     base.screen_size = SCREEN;
     let menu = [1200, 480, 160, 300];
     let shown = |layout: &Layout, r: [i32; 4]| layout.interface_shown.as_ref()
@@ -553,8 +560,10 @@ fn an_advisors_menu_opens_at_the_pointer_on_the_advisor_at_any_list_offset() {
     for (window, pixel_scale) in [((1920, 1080), 1), ((1280, 800), 1), ((3840, 2160), 2)] {
         for split in [Split::Standard, Split::Vertical1To1] {
             for place in [Place::Floating, Place::RightOrTop] {
-                for shift in [0, 13, -29] {
-                    let what = format!("{window:?} pixel{pixel_scale} {split:?} {place:?} shift {shift}");
+                // (A menu in the advisor's own pixels with the advisor's view
+                // its own rectangle, as the bridge hands the domestic one.)
+                for (shift, local) in [(0, false), (13, false), (-29, false), (0, true), (13, true)].into_iter().filter(|&(_, local)| !(local && whole_window)) {
+                    let what = format!("whole {whole_window} local {local} {window:?} pixel{pixel_scale} {split:?} {place:?} shift {shift}");
                     let resolution = viewer_settings::Resolution { pixel_scale, ..Default::default() };
                     let mut layout = Layout::default();
                     layout.apply_settings(&Settings { split, screen_place: ScreenPlace { vertical: place, horizontal: place }, ..Default::default() });
@@ -574,11 +583,17 @@ fn an_advisors_menu_opens_at_the_pointer_on_the_advisor_at_any_list_offset() {
                     // The pointer on the row at the menu's corner, shifted
                     // by the list; the game got it at the corner.
                     let [x, y, w, h] = menu;
+                    layout.press_sent((x, y + shift));
                     layout.press_delivered((x, y + shift), (x, y));
+                    // (The game has the domestic advisor's menu in the
+                    // advisor's own pixels: its corner the click less the
+                    // advisor's place.)
+                    let (gx, gy) = if local { (x - CITY_PANEL[0], y - CITY_PANEL[1]) } else { (x, y) };
+                    let menu = [gx, gy, w, h];
                     let mut scene = base.clone();
                     scene.interface.popup = Some(257);
                     scene.interface.popup_on_screen = true;
-                    scene.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (x, y), viewport: (w as u32, h as u32), ..Default::default() }, overlay: panel(&compiled, menu) });
+                    scene.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (gx, gy), viewport: (w as u32, h as u32), ..Default::default() }, overlay: panel(&compiled, menu) });
                     draw(&mut layout, &scene);
                     draw(&mut layout, &scene);
                     assert_eq!(layout.driver_rect_to_window(CITY_PANEL), part, "{what}: the advisor stays");
@@ -590,10 +605,11 @@ fn an_advisors_menu_opens_at_the_pointer_on_the_advisor_at_any_list_offset() {
                     let at = ((r[0] + r[2] / 2.0).floor() as i32, (r[1] + r[3] / 2.0).floor() as i32);
                     let driver = layout.route_window(at).unwrap_or_else(|| panic!("{what}: {at:?} goes nowhere"));
                     let tolerance = (1.0 / s).ceil() as i32 + 2;
-                    assert!((driver.0 - (x + w / 2)).abs() <= tolerance && (driver.1 - (y + h / 2)).abs() <= tolerance, "{what}: {at:?} reaches {driver:?}");
+                    assert!((driver.0 - (gx + w / 2)).abs() <= tolerance && (driver.1 - (gy + h / 2)).abs() <= tolerance, "{what}: {at:?} reaches {driver:?}, the game's menu at {menu:?}");
                 }
             }
         }
+    }
     }
 }
 
