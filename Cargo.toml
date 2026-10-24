@@ -3,6 +3,8 @@ resolver = "3"
 members = [
     "crates/application-icon",
     "crates/application-icon-macos",
+    "crates/function-keys",
+    "crates/function-keys-macos",
     "crates/pointer-x11",
     "crates/pointer-wayland",
     "crates/pointer-windows",

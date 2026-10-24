@@ -193,7 +193,7 @@ pub fn virtual_key(code: KeyCode) -> Option<u32> {
     if let Some(i) = numpad.iter().position(|&k| k == code) {
         return Some(0x60 + i as u32);
     }
-    let fkeys = [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12];
+    let fkeys = [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20, F21, F22, F23, F24];
     if let Some(i) = fkeys.iter().position(|&k| k == code) {
         return Some(0x70 + i as u32);
     }
@@ -241,6 +241,18 @@ pub fn virtual_key(code: KeyCode) -> Option<u32> {
 mod tests {
     use super::*;
     use winit::event::{DeviceId, TouchPhase};
+
+    #[test]
+    fn function_keys_map_to_their_windows_codes() {
+        // VK_F1..VK_F12 (Civ III's advisors, F11 demographics), and on to VK_F24.
+        assert_eq!(virtual_key(KeyCode::F1), Some(0x70));
+        assert_eq!(virtual_key(KeyCode::F8), Some(0x77));
+        assert_eq!(virtual_key(KeyCode::F11), Some(0x7A));
+        assert_eq!(virtual_key(KeyCode::F12), Some(0x7B));
+        assert_eq!(virtual_key(KeyCode::F13), Some(0x7C));
+        assert_eq!(virtual_key(KeyCode::F24), Some(0x87));
+        assert_eq!(virtual_key(KeyCode::Fn), None);
+    }
 
     #[test]
     fn focus_loss_releases_held_keys_in_reverse_order_without_repeats() {

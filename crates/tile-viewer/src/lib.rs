@@ -1311,6 +1311,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         spans: Vec::new(),
         look_scene: Arc::new(looks::LookScene::default()),
         menu_scroll: smooth_menus::SmoothMenus::default(),
+        function_keys: function_keys::Controller::new(function_keys::journal_path(&viewer_settings::Settings::default_path())),
     };
     // The arrangement to start with: the user's settings.
     app.set_settings(load_settings());
@@ -1639,6 +1640,9 @@ struct App {
     look_scene: Arc<looks::LookScene>,
     /// Pixel transitions and matching pointer maps of scrollable menu lists.
     menu_scroll: smooth_menus::SmoothMenus,
+    /// F1-F12 kept from the system's shortcuts while the window is in
+    /// front (`viewer_settings::Input::capture_function_keys`; macOS only).
+    function_keys: function_keys::Controller,
 }
 
 /// Adds the time since `t` to span `name` of the profile, if one is kept,
@@ -2685,6 +2689,14 @@ impl App {
         self.settings = settings;
         self.configure_present();
         self.configure_timing();
+    }
+
+    /// F1-F12 to the game while its window is the key window and shown,
+    /// as the settings say.
+    fn sync_function_keys(&mut self) {
+        let window_active = self.pointer_presentation.active() && self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus());
+        let input = &self.settings.input;
+        self.function_keys.set(function_keys::Want { capture: input.capture_function_keys, media_keys: input.media_keys_as_function_keys, window_active });
     }
 
     fn configure_timing(&mut self) {
@@ -3914,6 +3926,10 @@ impl App {
 }
 
 impl ApplicationHandler for App {
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.function_keys.release();
+    }
+
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
         self.woken_idle = matches!(cause, winit::event::StartCause::WaitCancelled { .. });
     }
@@ -3976,6 +3992,7 @@ impl ApplicationHandler for App {
             _ => {}
         }
         self.pointer_presentation.observe(&event);
+        if matches!(event, WindowEvent::Focused(_) | WindowEvent::Occluded(_)) { self.sync_function_keys(); }
         if matches!(event, WindowEvent::Focused(false) | WindowEvent::Occluded(true)) {
             self.menu_scroll.focus_lost();
             for input in self.snap.focus_lost(&mut self.layout) {
@@ -4107,6 +4124,7 @@ impl ApplicationHandler for App {
         // The Alt mode by itself in menus, only for the window in front.
         let focused = self.pointer_presentation.active() && self.gpu.as_ref().is_some_and(|gpu| gpu.window.has_focus());
         self.snap.set_alt_in_menus(self.settings.input.alt_in_menus && focused);
+        self.sync_function_keys();
         let snapped_inputs = if self.settings_preview.active() { Vec::new() } else {
             self.snap.tick(&mut self.layout, &self.shown_scene, now, rates)
         };
