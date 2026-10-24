@@ -158,8 +158,13 @@ and before the game frees anything:
 ```
 
 The game's thread stays in the hook while it waits, so the world stays
-whole for any round still reading it. No thread of ours is joined, no GPU
-device is torn down, no DLL detach runs. With the compatibility fallback
+whole for any round still reading it. It then runs the two steps of the
+game's teardown that persist something (`civ3_sys::quit`): the scroll
+speed into `conquests.ini` and deleting the scenario loader's temporary
+files. A quit's changes to the game folder and prefix are the same as
+with the game's own exit; the rest of the teardown only frees memory and
+handles. No thread of ours is joined, no GPU device is torn down, no DLL
+detach runs. With the compatibility fallback
 the game's own exit runs on after the wait, with nothing of ours reading
 it. The same `Update::Close` closes the in-process viewer, the native
 library's viewer (Linux, macOS) and a separate viewer process.
