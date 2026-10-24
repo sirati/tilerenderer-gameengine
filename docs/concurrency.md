@@ -114,11 +114,55 @@ The game's thread never enters the runtime: it only sends.
 - **jgl text takeover** (`jgl_hooks.rs`, `inproc::loader::InstallOnce`): two
   simultaneous loads of `jgl.dll` both return only once the slots are written.
 - **Panic logging**: the panic hook waits up to 200 ms for the log writer.
+- **Quitting** (`session_end.rs`, below): the game's thread, once it quits,
+  waits at most 500 ms for the publisher's round to end and for the viewer
+  to say it is gone, then ends the process. Polled atomics, no lock.
 - Inside channel implementations: waking a *parked* receiver of ours takes a
   short internal lock (tokio's parker, crossbeam's waker). Game-thread
   receivers only poll, so nothing ever parks on the game's side.
 - wgpu and its dependencies (in-process viewer) lock internally; that is
   their code, on the viewer's thread.
+
+## The game quitting
+
+`crates/civ3-bridge/src/session_end.rs`. Before, the game freed its world
+while the publisher went on reading it and the viewer went on drawing it:
+city labels went, units turned barbarian, then the map went, all over
+several seconds, and only then did the window close. The publisher also
+read the freed memory (safely, through `ReadProcessMemory`), and its rounds
+took seconds there.
+
+The game's quit, its order (PCGames build, `civ3_sys::quit`):
+
+1. The main loop (`run_game`, 0x4F6270) leaves a running game when its
+   "leave" flag is set (the confirmed Quit, `REALLYQUIT`; the end of a game;
+   load; new game), at 0x4F6857, and ends that game. If its "restart" byte
+   is 0 it then returns (0x4F68AD), as it does after the title menu's Quit.
+2. `BIC::run` (0x4C9190) tears the program's objects down; `WinMain`
+   returns; the C runtime's `exit` runs the `atexit` handlers and calls
+   `ExitProcess`, which kills every other thread and runs the DLLs' detach.
+
+The bridge hooks the call sites 0x4F6857 (with the restart byte 0) and
+0x4F68AD, the game's `ExitProcess` import and its own DLL detach (for an
+`ExitProcess` from elsewhere). The first that comes, on the game's thread
+and before the game frees anything:
+
+```
+ game thread                      civ3r-publish                  viewer
+ quit(): SESSION.begin()  ------> round() refuses / no publish
+   WAKE.ring()                    end_session(): Update::Close ---> Display::closing:
+   wait <= 500 ms for:                                              no later batch shown,
+     no round reading,                                              window hidden,
+     the viewer gone <----------- Input::Quit <------------------- F1-F12 given back,
+   end_process (TerminateProcess)                                   Input::Quit
+```
+
+The game's thread stays in the hook while it waits, so the world stays
+whole for any round still reading it. No thread of ours is joined, no GPU
+device is torn down, no DLL detach runs. With the compatibility fallback
+the game's own exit runs on after the wait, with nothing of ours reading
+it. The same `Update::Close` closes the in-process viewer, the native
+library's viewer (Linux, macOS) and a separate viewer process.
 
 ## Viewer side (native viewer process, in-process viewer, transport)
 
