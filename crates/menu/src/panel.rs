@@ -74,6 +74,9 @@
 //! normal = "button"
 //! icon = "two_panes"              # art centred on it (or at `icon_at`)
 //! enable_if = "mode!=simple"      # greyed out (`disabled` art) otherwise
+//! tooltip = "Two views"           # hover text (`tooltip_art`, `tooltip_style`)
+//! disabled_tooltip = "Not in simple mode"  # hover text while greyed out
+//! disabled_over = "veil"          # art over a greyed-out item's icon and text
 //!
 //! [[panels.settings.items]]
 //! checkbox = "smooth"
@@ -258,8 +261,14 @@ pub struct ItemDesc {
     pub text: Option<String>,
     /// Hover text, drawn above the panel and in immediate hover looks.
     pub tooltip: Option<String>,
+    /// Hover text while the item is disabled (`enable_if` false): why. It
+    /// shows like `tooltip`, though the item takes no clicks.
+    pub disabled_tooltip: Option<String>,
     pub tooltip_art: Option<String>,
     pub tooltip_style: Option<String>,
+    /// Art drawn over the whole item while it is disabled, over its icon
+    /// and text (e.g. a translucent veil greying a picture out).
+    pub disabled_over: Option<String>,
     #[serde(default)]
     pub at: [i32; 2],
     pub size: Option<[u32; 2]>,
@@ -536,8 +545,10 @@ struct Item {
     size: Option<(u32, u32)>,
     text: Option<String>,
     tooltip: Option<String>,
+    disabled_tooltip: Option<String>,
     tooltip_art: Option<String>,
     tooltip_style: Option<String>,
+    disabled_over: Option<String>,
     style: Option<String>,
     align: Option<Align>,
     valign: Option<VAlign>,
@@ -655,6 +666,8 @@ fn repeated(desc: &ItemDesc, entry: &str) -> ItemDesc {
         slider: s(&desc.slider),
         text: s(&desc.text),
         tooltip: s(&desc.tooltip),
+        disabled_tooltip: s(&desc.disabled_tooltip),
+        disabled_over: s(&desc.disabled_over),
         tooltip_art: s(&desc.tooltip_art),
         tooltip_style: s(&desc.tooltip_style),
         style: s(&desc.style),
@@ -814,6 +827,8 @@ impl Panels {
                     size: d.size.map(|[w, h]| (w, h)),
                     text: d.text.clone(),
                     tooltip: d.tooltip.clone(),
+                    disabled_tooltip: d.disabled_tooltip.clone(),
+                    disabled_over: art_ref(&d.disabled_over)?,
                     tooltip_art: art_ref(&d.tooltip_art)?,
                     tooltip_style: d.tooltip_style.clone(),
                     style: d.style.clone(),
@@ -944,6 +959,23 @@ impl Panels {
         })
     }
 
+    /// The disabled item with a `disabled_tooltip` at (x, y): hovered for
+    /// its tooltip only (it takes no clicks).
+    fn hit_disabled_tooltip(&self, panel: &Panel, state: &PanelState, area: [i32; 4], x: i32, y: i32) -> Option<usize> {
+        let origin = self.origin(panel, area);
+        panel.items.iter().enumerate().rev().find_map(|(n, i)| {
+            let explained = i.disabled_tooltip.is_some() && Self::visible(i, state) && !Self::enabled(i, state);
+            (explained && self.rect(i, state, origin).is_some_and(|r| inside(r, x, y))).then_some(n)
+        })
+    }
+
+    /// The hover text item `item` shows as it is now: its tooltip, or
+    /// while disabled why it is.
+    fn tooltip_text<'a>(item: &'a Item, state: &PanelState) -> Option<&'a String> {
+        if !Self::visible(item, state) { return None; }
+        if Self::enabled(item, state) { item.tooltip.as_ref() } else { item.disabled_tooltip.as_ref() }
+    }
+
     /// The value slider `item` would take at window x, if it changes.
     fn slide(&self, panel: &Panel, state: &PanelState, area: [i32; 4], index: usize, x: i32) -> Option<(String, f32)> {
         let item = &panel.items[index];
@@ -1031,7 +1063,7 @@ impl Panels {
                     }
                     true
                 } else {
-                    state.hover = if state.theirs == 0 { self.hit(panel, state, area, x, y) } else { None };
+                    state.hover = if state.theirs == 0 { self.hit(panel, state, area, x, y).or_else(|| self.hit_disabled_tooltip(panel, state, area, x, y)) } else { None };
                     state.theirs == 0 && (state.ours != 0 || self.covers(panel, state, area, x, y))
                 }
             }
@@ -1039,8 +1071,8 @@ impl Panels {
                 if state.theirs & bit(button) == 0 && (state.ours != 0 || self.covers(panel, state, area, x, y)) {
                     state.ours |= bit(button);
                     if button == Button::Left {
-                        state.hover = self.hit(panel, state, area, x, y);
-                        state.pressed = state.hover;
+                        state.pressed = self.hit(panel, state, area, x, y);
+                        state.hover = state.pressed.or_else(|| self.hit_disabled_tooltip(panel, state, area, x, y));
                         if let Some(i) = state.pressed.filter(|&i| matches!(panel.items[i].kind, Kind::Slider { .. })) {
                             state.dragging = Some(i);
                             if let Some((control, value)) = self.slide(panel, state, area, i, x) {
@@ -1064,7 +1096,7 @@ impl Panels {
                         if state.dragging.take().is_none() && pressed.is_some() && pressed == over {
                             events.extend(self.activate(panel, state, pressed.unwrap_or_default()));
                         }
-                        state.hover = over;
+                        state.hover = over.or_else(|| self.hit_disabled_tooltip(panel, state, area, x, y));
                     }
                     true
                 } else {
@@ -1112,7 +1144,7 @@ impl Panels {
     /// `measure` (see [`estimate`]).
     pub fn draw(&self, panel: &Panel, state: &PanelState, area: [i32; 4], measure: &dyn Fn(&TextStyle, &str) -> TextMetrics) -> Vec<Draw> {
         let mut out = Vec::new();
-        let tooltip = state.hover.filter(|&n| panel.items.get(n).is_some_and(|i| i.tooltip.is_some() && Self::visible(i, state) && Self::enabled(i, state)));
+        let tooltip = state.hover.filter(|&n| panel.items.get(n).is_some_and(|i| Self::tooltip_text(i, state).is_some()));
         for (n, item) in panel.items.iter().enumerate().filter(|(_, i)| Self::visible(i, state)) {
             if tooltip == Some(n) { continue; }
             out.extend(self.draw_item(panel, state, area, measure, n, item));
@@ -1128,7 +1160,7 @@ impl Panels {
     }
 
     fn tooltip(&self, panel: &Panel, state: &PanelState, area: [i32; 4], measure: &dyn Fn(&TextStyle, &str) -> TextMetrics, item: &Item) -> Vec<Draw> {
-        let Some(text) = &item.tooltip else { return Vec::new() };
+        let Some(text) = Self::tooltip_text(item, state) else { return Vec::new() };
         let style = item.tooltip_style.as_deref().or(item.style.as_deref());
         let Some(desc) = self.style(style) else { return Vec::new() };
         let (ox, oy) = self.origin(panel, area);
@@ -1300,6 +1332,9 @@ impl Panels {
                             Some((tx, ty)) => d.text(&t, item.style.as_deref(), look, (x + tx, y + ty), Align::Left, VAlign::Top),
                             None => d.text(&t, item.style.as_deref(), look, (x + w as i32 / 2, y + h as i32 / 2), Align::Center, VAlign::Middle),
                         }
+                    }
+                    if let Some(over) = item.disabled_over.as_ref().filter(|_| !enabled) {
+                        d.art(over, (x, y), Some((w, h)));
                     }
                 }
                 Kind::Checkbox { control } => {
@@ -1848,6 +1883,63 @@ mod tests {
         assert_eq!(r[1].events, [PanelEvent::Toggled { control: "smooth".into(), on: false }]);
     }
 
+    /// A disabled picture button greys out under its veil, takes no clicks
+    /// and no Alt target, and tells why it is disabled while hovered; once
+    /// enabled it shows its own tooltip.
+    #[test]
+    fn disabled_items_explain_themselves_under_a_veil() {
+        let panels = Panels::parse(r#"
+            [styles.caption]
+            face = "Arial"
+            height = 10
+            [art.button]
+            fill = [200, 200, 200]
+            [art.veil]
+            fill = [255, 255, 255]
+            alpha = 150
+            [art.pic]
+            generated = "rects:20x10;1,1,1,255:0,0,20,10"
+            size = [20, 10]
+            [panels.p]
+            size = [400, 300]
+            anchor = "top-left"
+            [[panels.p.items]]
+            choice = "zoom"
+            value = "Menus"
+            at = [10, 10]
+            size = [40, 30]
+            icon = "pic"
+            normal = "button"
+            style = "caption"
+            tooltip = "World with menus"
+            disabled_tooltip = "The zoom is off"
+            disabled_over = "veil"
+            enable_if = "on"
+        "#).unwrap();
+        let p = panels.panel("p").unwrap();
+        let area = [0, 0, 400, 300];
+        let mut s = PanelState::default();
+        s.values.insert("zoom".into(), Value::Text("World".into()));
+        let texts = |s: &PanelState| panels.draw(p, s, area, &estimate).iter().filter_map(|d| match d { Draw::Text(t) => Some(t.text.clone()), _ => None }).collect::<Vec<_>>();
+        let veiled = |s: &PanelState| panels.draw(p, s, area, &estimate).iter().any(|d| matches!(d, Draw::Element(Element::Fill { rect: [10, 10, 40, 30], alpha: 150, .. })));
+        assert!(veiled(&s) && texts(&s).is_empty());
+        panels.input(p, &mut s, area, &Input::MouseMove { x: 20, y: 20 });
+        assert_eq!(texts(&s), ["The zoom is off"]);
+        assert!(panels.looks(p, &s, area, &estimate).is_empty(), "no Alt target while disabled");
+        for down in [true, false] {
+            let r = panels.input(p, &mut s, area, &Input::MouseButton { button: Button::Left, down, x: 20, y: 20 });
+            assert!(r.events.is_empty());
+        }
+        assert_eq!(s.values["zoom"], Value::Text("World".into()));
+        s.values.insert("on".into(), Value::On(true));
+        panels.input(p, &mut s, area, &Input::MouseMove { x: 21, y: 20 });
+        assert!(!veiled(&s));
+        assert_eq!(texts(&s), ["World with menus"]);
+        assert_eq!(panels.looks(p, &s, area, &estimate).len(), 1);
+        panels.input(p, &mut s, area, &Input::MouseMove { x: 300, y: 200 });
+        assert!(texts(&s).is_empty());
+    }
+
     #[test]
     fn a_checkbox_points_at_its_box_and_spans_its_label() {
         let panels = Panels::parse(PANELS).unwrap();
@@ -1999,41 +2091,63 @@ mod tests {
     fn zoom_preferences_are_separate_and_controls_fit_without_overlap() {
         let panels = Panels::parse(include_str!("../../../assets/civ3/preferences.toml")).unwrap();
         let panel = panels.panel("preferences").unwrap();
-        for menu_zoom in [false, true] {
-            for tab in ["layout", "zoom"] {
-                for mode in ["Off", "Floating131", "Floating171", "Mouse111", "Mouse131", "TopStrip"] {
-                    let mut state = PanelState::default();
-                    state.values.insert("tab".into(), Value::Text(tab.into()));
-                    state.values.insert("layout.zoom".into(), Value::Text(mode.into()));
-                    state.values.insert("layout.split".into(), Value::Text("Vertical1To1".into()));
-                    state.values.insert("layout.menu_zoom".into(), Value::On(menu_zoom));
-                    state.values.insert("layout.zoom_controls".into(), Value::On(menu_zoom || mode != "Off"));
-                    state.values.insert("layout.zoom_lens_controls".into(), Value::On(menu_zoom || !matches!(mode, "Off" | "TopStrip")));
-                    let looks = panels.looks(panel, &state, [0, 0, 1024, 768], &estimate);
-                    for (i, look) in looks.iter().enumerate() {
-                        let [x, y, w, h] = look.rect;
-                        assert!(x >= 49 && x+w <= 973 && y >= 40 && y+h <= 690, "{tab} {mode}: {:?}", look.rect);
-                        for other in &looks[..i] {
-                            let [a, b, c, d] = other.rect;
-                            assert!(x+w <= a || a+c <= x || y+h <= b || b+d <= y, "{tab} {mode}: {:?} overlaps {:?}", look.rect, other.rect);
+        let modes = ["Off", "Floating131", "Floating171", "Mouse111", "Mouse131", "Beside", "TopStrip"];
+        for content in ["World", "WorldAndMenus"] {
+            for split in ["Standard", "Vertical1To1"] {
+                for tab in ["layout", "zoom"] {
+                    for mode in modes {
+                        let mut state = PanelState::default();
+                        state.values.insert("tab".into(), Value::Text(tab.into()));
+                        state.values.insert("layout.zoom".into(), Value::Text(mode.into()));
+                        state.values.insert("layout.zoom_content".into(), Value::Text(content.into()));
+                        state.values.insert("layout.split".into(), Value::Text(split.into()));
+                        state.values.insert("layout.zoom_controls".into(), Value::On(mode != "Off"));
+                        state.values.insert("layout.zoom_lens_controls".into(), Value::On(!matches!(mode, "Off" | "TopStrip")));
+                        let looks = panels.looks(panel, &state, [0, 0, 1024, 768], &estimate);
+                        for (i, look) in looks.iter().enumerate() {
+                            let [x, y, w, h] = look.rect;
+                            assert!(x >= 49 && x+w <= 973 && y >= 40 && y+h <= 690, "{tab} {mode}: {:?}", look.rect);
+                            for other in &looks[..i] {
+                                let [a, b, c, d] = other.rect;
+                                assert!(x+w <= a || a+c <= x || y+h <= b || b+d <= y, "{tab} {mode}: {:?} overlaps {:?}", look.rect, other.rect);
+                            }
                         }
-                    }
-                    for item in &panel.items {
-                        if item.control().is_some_and(|k| k.starts_with("layout.zoom") || k == "layout.menu_zoom") {
-                            let cond = item.show_if.as_ref().unwrap();
-                            let mut layout = state.clone();
-                            layout.values.insert("tab".into(), Value::Text("layout".into()));
-                            assert!(!cond.holds(&layout.values), "zoom control on Layout");
+                        // The pictures: every placement always a target (Alt
+                        // reaches them); what it shows unless the zoom is
+                        // off; the place in a split only where it counts.
+                        let targets = |control: &str| looks.iter().filter(|l| {
+                            panel.items.iter().enumerate().any(|(n, i)| i.control() == Some(control) && id_hash(&panel.name, &n.to_string()) == l.id)
+                        }).count();
+                        if tab == "zoom" {
+                            assert_eq!(targets("layout.zoom"), modes.len());
+                            assert_eq!(targets("layout.zoom_content"), if mode == "Off" { 0 } else { 2 }, "{mode}");
+                            let placed = split != "Standard" && !matches!(mode, "Off" | "Beside");
+                            assert_eq!(targets("layout.zoom_place"), if placed { 3 } else { 0 }, "{split} {mode}");
+                            assert!(looks.iter().all(|l| l.kind == scene::InteractableKind::Button || matches!(l.kind, scene::InteractableKind::Slider { .. })));
+                        }
+                        for item in &panel.items {
+                            if item.control().is_some_and(|k| k.starts_with("layout.zoom")) {
+                                let cond = item.show_if.as_ref().unwrap();
+                                let mut layout = state.clone();
+                                layout.values.insert("tab".into(), Value::Text("layout".into()));
+                                assert!(!cond.holds(&layout.values), "zoom control on Layout");
+                            }
                         }
                     }
                 }
             }
         }
-        let menu_zoom = panel.items.iter().find(|i| i.control() == Some("layout.menu_zoom")).unwrap();
-        assert!(matches!(menu_zoom.kind, Kind::Checkbox { .. }));
-        let mut state = PanelState::default();
-        state.values.insert("tab".into(), Value::Text("zoom".into()));
-        assert!(menu_zoom.show_if.as_ref().unwrap().holds(&state.values));
+        // Every placement, region and content picture is generated art of
+        // one size, with a tooltip naming it.
+        for item in panel.items.iter().filter(|i| matches!(i.control(), Some("layout.zoom" | "layout.zoom_place" | "layout.zoom_content"))) {
+            let icon = item.icon.as_ref().unwrap();
+            assert_eq!(panels.art.get(icon).and_then(|a| a.size), Some((84, 52)), "{icon}");
+            assert!(panels.generated.iter().any(|(name, source, _)| name == icon && source.starts_with("rects:84x52;")), "{icon}");
+            assert!(item.tooltip.as_ref().is_some_and(|t| !t.is_empty()), "{icon}");
+            assert_eq!(item.size, Some((104, 64)), "{icon}");
+        }
+        let note = "Rendering menus doesn't render in a higher resolution. It just shows the pixels.";
+        assert!(panel.items.iter().any(|i| i.text.as_deref() == Some(note) && i.show_if.as_ref().is_some_and(|c| c.holds(&[("tab".to_string(), Value::Text("zoom".into()))].into()))));
         let item = panel.items.iter().find(|i| i.control() == Some("layout.zoom_magnification_step")).unwrap();
         let Kind::Slider { tick_labels, .. } = &item.kind else { panic!("magnification slider") };
         assert_eq!(tick_labels.as_ref().unwrap(), &["1.5×", "2×", "3×", "4×"]);

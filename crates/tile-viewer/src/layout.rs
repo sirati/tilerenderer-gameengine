@@ -80,7 +80,17 @@
 //!   `zoom_magnification` (1.5×, 2×, 3×, 4×; default 2×) on top of how
 //!   large the view under it shows the world (world scale, the view's own
 //!   zoom); Ctrl+wheel over it changes that within those steps until the
-//!   setting changes.
+//!   setting changes. A box beside the pointer (`Zoom::Beside`) goes
+//!   right of the part of the window it enlarges (else left of it),
+//!   `zoom_strip` of the window high and half as wide again.
+//! - **Zoom content** (`zoom_content`), for every one of those places: the
+//!   world drawn again at the zoom's magnification ([`MagnifierMode::World`]),
+//!   or the finished picture around the pointer, menus and interface
+//!   included, its pixels enlarged ([`MagnifierMode::Screen`], a
+//!   `ScreenCopy` drawn over everything). A box showing menus covers the
+//!   interface under it, so it always moves out of the pointer's way
+//!   (never holds the pointer out, even over the interface), and the
+//!   pointer works on what is under it, not on what it shows.
 //! - **Screens**: a screen the driver names (`Scene::interface`) goes over
 //!   the window, or its panel is fitted over A or B. Both world panes keep
 //!   their own cameras. Generic menus instead keep their requested size
@@ -722,8 +732,9 @@ pub struct Layout {
     /// The zoom box's or strip's zoom the settings last asked for: it stays
     /// as the wheel changed it until they ask for another.
     zoom_box_zoom: Option<usize>,
-    /// Menu lens height in thousandths of the window, sharing zoom_strip.
-    menu_zoom_height: Option<u32>,
+    /// The height of the box beside the pointer (`Zoom::Beside`) in
+    /// thousandths of the window, `zoom_strip`; none: `Magnifier::size`.
+    beside_height: Option<u32>,
     /// Map detail independently for A, B and the world magnifier.
     pub clean_map: viewer_settings::clean_map::CleanMap,
     /// Whether to draw the arrow at the driver's point of interest.
@@ -1006,7 +1017,7 @@ impl Default for Layout {
             separator_width: 4,
             window_pixel_scale: 1.0,
             zoom_box_zoom: None,
-            menu_zoom_height: None,
+            beside_height: None,
             clean_map: Default::default(),
             focus_arrow: false,
             window: (1, 1),
@@ -1429,7 +1440,7 @@ impl Layout {
     /// box, where named screens go, what the views follow and whether they
     /// move smoothly. Views already placed stay where they look.
     pub fn apply_settings(&mut self, s: &viewer_settings::Layout) {
-        use viewer_settings::{Split as S, Zoom};
+        use viewer_settings::{Split as S, Zoom, ZoomContent};
         let (main_follow, pane_follow) = match s.roles {
             Roles::Free => (Follow::Driver, Follow::Free),
             Roles::UnitMouse => (Follow::Focus, Follow::Pointer),
@@ -1457,7 +1468,11 @@ impl Layout {
         // The magnification asked for; kept as the wheel changed it while
         // the setting stays the same.
         let wanted = Self::ZOOM_BOX_ZOOMS.start() + s.zoom_magnification_step();
-        let zoom = match self.magnifier.filter(|m| (m.mode == MagnifierMode::Screen) == s.menu_zoom) {
+        let mode = match s.zoom_content {
+            ZoomContent::World => MagnifierMode::World,
+            ZoomContent::WorldAndMenus => MagnifierMode::Screen,
+        };
+        let zoom = match self.magnifier.filter(|m| m.mode == mode) {
             Some(m) if self.zoom_box_zoom == Some(wanted) => m.zoom,
             _ => wanted,
         };
@@ -1473,13 +1488,14 @@ impl Layout {
             Zoom::Mouse111 => Some(ZoomPlace::AboutPointer(1, strip)),
             Zoom::Mouse131 => Some(ZoomPlace::AboutPointer(3, strip)),
             Zoom::TopStrip => Some(ZoomPlace::Strip(strip)),
+            Zoom::Beside => Some(ZoomPlace::Beside),
         };
-        // Menu zoom temporarily replaces world zoom. Its selection is kept
-        // in settings, so switching menu zoom off restores the world lens.
-        self.menu_zoom_height = s.menu_zoom.then_some(strip);
-        self.magnifier = if s.menu_zoom { Some(Magnifier { zoom, ..Self::MAGNIFIER }) }
-            else { place.map(|place| Magnifier { mode: MagnifierMode::World, zoom, place, region: s.zoom_place, ..Self::MAGNIFIER }) };
-        self.zoom_box_block_pointer = s.zoom_box_block_pointer;
+        // (Beside the pointer: as high as the other zooms.)
+        self.beside_height = (s.zoom == Zoom::Beside).then_some(strip);
+        self.magnifier = place.map(|place| Magnifier { mode, zoom, place, region: s.zoom_place, ..Self::MAGNIFIER });
+        // A box showing menus covers the interface under it: it always
+        // moves out of the pointer's way instead.
+        self.zoom_box_block_pointer = s.zoom_box_block_pointer && mode == MagnifierMode::World;
         self.zoom_mouse_above = thousandths(s.zoom_mouse_above, viewer_settings::controls::ZOOM_MOUSE_ABOVE_RANGE.max);
         self.zoom_mouse_below = thousandths(s.zoom_mouse_below, viewer_settings::controls::ZOOM_MOUSE_BELOW_RANGE.max);
         self.zoom_rounded = s.zoom_rounded;
@@ -2248,11 +2264,38 @@ impl Layout {
         }
     }
 
-    /// The magnifier's rectangle, and (screen magnifier beside the
-    /// pointer) the rectangle of the window it magnifies: around the
-    /// pointer, inside the window, the magnifier beside it (so it never
-    /// shows itself or its frame). A zoom box or strip shows the world.
+    /// The magnifier's rectangle, and (a screen magnifier) the rectangle
+    /// of the window it magnifies: around the pointer, inside the window
+    /// (below a strip). Beside the pointer the magnifier goes beside that
+    /// (so it never shows itself or its frame); a box or strip showing the
+    /// screen goes where a world one would, and shows the picture as it is
+    /// without it (copies read the finished picture).
     fn magnifier_geometry(&self, m: &Magnifier) -> ([i32; 4], Option<[i32; 4]>) {
+        let rect = self.world_magnifier_rect(m);
+        if m.place == ZoomPlace::Beside { return rect; }
+        let rect = rect.0;
+        (rect, (m.mode == MagnifierMode::Screen).then(|| self.screen_source(m, rect)))
+    }
+
+    /// The part of the window a screen magnifier at `rect` shows: around
+    /// the pointer (the world cursor while the mouse is captured), inside
+    /// the window, below a strip (whose own place holds nothing to show).
+    fn screen_source(&self, m: &Magnifier, rect: [i32; 4]) -> [i32; 4] {
+        let (n, d) = ZOOMS[m.zoom];
+        let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
+        let top = match m.place {
+            ZoomPlace::Strip(_) => (rect[1] + rect[3] + self.separator_gap()).min(wh),
+            _ => 0,
+        };
+        let (sw, sh) = ((rect[2].max(0) as u32 * d).div_ceil(n) as i32, (rect[3].max(0) as u32 * d).div_ceil(n) as i32);
+        let (sw, sh) = (sw.min(ww), sh.min(wh - top));
+        let (px, py) = self.zoom_mouse_pointer();
+        [(px - sw / 2).clamp(0, (ww - sw).max(0)), (py - sh / 2).clamp(top, (wh - sh).max(top)), sw, sh]
+    }
+
+    /// [`Layout::magnifier_geometry`] but a box or strip's source: where
+    /// the magnifier goes.
+    fn world_magnifier_rect(&self, m: &Magnifier) -> ([i32; 4], Option<[i32; 4]>) {
         // A box's width: `1 : n : 1` of its region's width (margin : box :
         // margin).
         let width = |region: [i32; 4], n: u32| (region[2] as i64 * n.max(1) as i64 / (n.max(1) as i64 + 2)) as i32;
@@ -2289,16 +2332,15 @@ impl Layout {
             }
             ZoomPlace::Strip(_) => return (self.strip().map_or([0, 0, 0, 0], |(s, _)| s), None),
         }
-        let (w, h) = if m.mode == MagnifierMode::Screen {
-            self.menu_zoom_height.map(|height| {
-                let h = (self.window.1 as u64 * height as u64 / 1000).max(1) as i32;
-                ((h * 3 / 2).min(self.window.0 as i32), h)
-            }).unwrap_or((m.size.0 as i32, m.size.1 as i32))
-        } else { (m.size.0 as i32, m.size.1 as i32) };
+        let (w, h) = self.beside_height.map(|height| {
+            let h = (self.window.1 as u64 * height as u64 / 1000).max(1) as i32;
+            ((h * 3 / 2).min(self.window.0 as i32), h)
+        }).unwrap_or((m.size.0 as i32, m.size.1 as i32));
         let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
         let (px, py) = self.pointer;
         let y = (py - h / 2).clamp(0, (wh - h).max(0));
-        if m.mode == MagnifierMode::World {
+        // (The world magnifier of the testing keys: beside the pointer.)
+        if m.mode == MagnifierMode::World && self.beside_height.is_none() {
             // Beside the pointer, kept inside the window.
             let x = if px + 24 + w <= ww { px + 24 } else { px - 24 - w };
             return ([x.clamp(0, (ww - w).max(0)), y, w, h], None);
@@ -2314,7 +2356,9 @@ impl Layout {
         } else {
             (ww - w).max(0)
         };
-        ([x, y, w, h], Some([sx, sy, sw, sh]))
+        // (The world one set to go there too: it shows the world under
+        // the pointer instead.)
+        ([x, y, w, h], (m.mode == MagnifierMode::Screen).then_some([sx, sy, sw, sh]))
     }
 
     /// A floating zoom box ([`ZoomPlace::Box`]): where it rests, whether the
@@ -2344,7 +2388,10 @@ impl Layout {
         let (reach, under) = (part(ZOOM_BOX_REACH), part(ZOOM_BOX_REACH.min(zb.gap)));
         let there = inside([x - reach, y - reach, w + 2 * reach, h + reach + under], p);
         let below = y + h + part(zb.gap);
-        if (self.zoom_box_block_pointer && !self.locked) || self.interface_at(p).is_some() || !there || below >= r[1] + r[3] {
+        // (Over the interface a box showing the world stays: the interface
+        // is drawn over it. One showing menus would cover it: it goes.)
+        let under_interface = m.mode == MagnifierMode::World && self.interface_at(p).is_some();
+        if (self.zoom_box_block_pointer && !self.locked) || under_interface || !there || below >= r[1] + r[3] {
             return (rest, false, rest);
         }
         (rest, true, [x, below, w, h.min(r[1] + r[3] - below)])
@@ -2920,7 +2967,7 @@ impl Layout {
         };
         let pane_shown = fit.is_none_or(|f| f.hit != Hit::Pane);
         let pane = pane_rect.filter(|_| self.split.is_some() && pane_shown && take(1));
-        let magnifier = self.magnifier.filter(|m| take(if m.mode == MagnifierMode::Screen && m.place == ZoomPlace::Beside { 1 } else { 2 }));
+        let magnifier = self.magnifier.filter(|m| take(if m.mode == MagnifierMode::Screen { 1 } else { 2 }));
         let insets = (0..self.insets.len()).take_while(|_| take(2)).count();
         let left_out = usize::from(pane.is_none() && pane_rect.is_some() && self.split.is_some() && pane_shown)
             + usize::from(magnifier.is_none() && self.magnifier.is_some())
@@ -2977,7 +3024,7 @@ impl Layout {
         self.move_zoom_mouse(dt);
         let magnifier = magnifier.filter(|m| m.place == ZoomPlace::Beside || (self.world_shown && !fit_rect.is_some_and(|f| overlap(f, self.magnifier_geometry(m).0))));
         self.magnifier_shown = magnifier.is_some();
-        let zoom_box = magnifier.filter(|m| m.place != ZoomPlace::Beside);
+        let zoom_box = magnifier.filter(|m| m.place != ZoomPlace::Beside && m.mode == MagnifierMode::World);
         if let Some(m) = zoom_box {
             let (rect, _) = self.magnifier_geometry(&m);
             let lens = self.zoom_lens(&m, rect);
@@ -3046,7 +3093,13 @@ impl Layout {
             let (rect, source) = self.magnifier_geometry(&m);
             let zoom = ZOOMS[m.zoom];
             let lens = self.zoom_lens(&m, rect);
-            if lens.is_none() { push(&mut frame, frame_of(rect)); }
+            if matches!(m.place, ZoomPlace::Strip(_)) {
+                // (A strip: the line below it, as a world one has.)
+                let border = Camera { origin: (rect[0], rect[1] + rect[3]), cells: false,
+                    ..Camera::new((rect[2].max(1) as u32, self.separator_gap() as u32)) };
+                let at = push(&mut frame, border);
+                frame.separators.push((at, rect_of(&border)));
+            } else if lens.is_none() { push(&mut frame, frame_of(rect)); }
             match source {
                 // The window around the pointer, at the magnifier's zoom.
                 Some(source) => frame.copies.push(ScreenCopy { source, at: (rect[0], rect[1]), zoom, lens }),
@@ -3676,6 +3729,12 @@ impl Layout {
                 if m.place != ZoomPlace::Beside {
                     if let Some(hit) = self.interface_at(p) {
                         return hit;
+                    }
+                    // One showing the screen shows what is around the
+                    // pointer, not what is under it: the pointer works on
+                    // what is under it.
+                    if m.mode == MagnifierMode::Screen {
+                        return self.hit_below_magnifier(p);
                     }
                 }
                 return Hit::Magnifier;
@@ -4757,7 +4816,7 @@ impl Layout {
             Some(Hit::Magnifier) => {
                 if let Some(m) = &mut self.magnifier {
                     // (A zoom box or strip: within the settings' choices.)
-                    let (lo, hi) = if m.place == ZoomPlace::Beside && self.menu_zoom_height.is_none() { (ONE, ZOOMS.len() - 1) } else { Self::ZOOM_BOX_ZOOMS.into_inner() };
+                    let (lo, hi) = if m.place == ZoomPlace::Beside && self.beside_height.is_none() { (ONE, ZOOMS.len() - 1) } else { Self::ZOOM_BOX_ZOOMS.into_inner() };
                     m.zoom = next(m.zoom).clamp(lo, hi);
                 }
             }
@@ -4953,18 +5012,21 @@ mod tests {
     }
 
     #[test]
-    fn menu_zoom_settings_share_size_and_magnification_and_restore_world_zoom() {
-        use viewer_settings::Zoom;
+    fn a_box_beside_the_mouse_showing_menus_shares_size_and_magnification() {
+        use viewer_settings::{Zoom, ZoomContent};
         for scale in [1, 2] { for rounded in [false, true] { for glass in [false, true] {
             let mut l = Layout::default();
             l.window_pixel_scale = scale as f64;
-            let mut settings = viewer_settings::Layout { menu_zoom: true, zoom: Zoom::TopStrip,
-                zoom_magnification: 1.5, zoom_strip: 0.3, zoom_rounded: rounded, zoom_glass: glass, ..Default::default() };
+            // (What an older file's `menu_zoom` loads as.)
+            let mut settings = viewer_settings::Layout { zoom: Zoom::TopStrip, zoom_magnification: 1.5, zoom_strip: 0.3,
+                zoom_rounded: rounded, zoom_glass: glass, ..Default::default() };
+            settings.migrate_menu_zoom(true);
+            assert_eq!((settings.zoom, settings.zoom_content), (Zoom::Beside, ZoomContent::WorldAndMenus));
             l.apply_settings(&settings);
             l.pointer = (300, 300);
             let f = frame(&mut l, vec![]);
             assert_eq!(l.magnifier.unwrap().mode, MagnifierMode::Screen);
-            assert!(l.strip().is_none(), "menu zoom replaces the world strip");
+            assert!(l.strip().is_none());
             let [copy] = f.copies[..] else { panic!("one screen copy") };
             assert_eq!(copy.zoom, (3, 2));
             let rect = l.magnifier_geometry(&l.magnifier.unwrap()).0;
@@ -4984,13 +5046,68 @@ mod tests {
             settings.zoom_magnification = 4.0;
             l.apply_settings(&settings);
             assert_eq!(ZOOMS[l.magnifier.unwrap().zoom], (4, 1));
-            settings.menu_zoom = false;
+            // The world only, beside the mouse: as large, no copy.
+            settings.zoom_content = ZoomContent::World;
             l.apply_settings(&settings);
             assert_eq!(l.magnifier.unwrap().mode, MagnifierMode::World);
             let f = frame(&mut l, vec![]);
             assert!(f.copies.is_empty());
+            assert_eq!(l.magnifier_geometry(&l.magnifier.unwrap()).0[3], 600 * 3 / 10);
+            assert!(l.shown.iter().any(|(h, _)| *h == Hit::Magnifier));
+            // The strip again: the world.
+            settings.zoom = Zoom::TopStrip;
+            l.apply_settings(&settings);
+            let f = frame(&mut l, vec![]);
+            assert!(f.copies.is_empty());
             assert!(l.strip().is_some());
         } } }
+    }
+
+    /// Showing menus works wherever the zoom goes: the box or strip is where
+    /// it would be showing the world, and shows the picture around the
+    /// pointer (one copy, no world view of its own). The pointer works on
+    /// what is under it; a floating box never holds it out, it moves away.
+    #[test]
+    fn every_zoom_place_shows_menus_as_the_pictures_pixels() {
+        use viewer_settings::{Split as S, Zoom, ZoomContent};
+        for split in [S::Standard, S::Vertical1To1] {
+            for zoom in [Zoom::Floating131, Zoom::Floating171, Zoom::Mouse111, Zoom::Mouse131, Zoom::TopStrip, Zoom::Beside] {
+                let world = settings(|s| (s.split, s.zoom, s.zoom_place, s.zoom_box_block_pointer) = (split, zoom, Place::RightOrTop, true));
+                let menus = Settings { zoom_content: ZoomContent::WorldAndMenus, ..world.clone() };
+                let at = |s: &Settings| {
+                    let mut l = arranged(s);
+                    mv(&mut l, (620, 420));
+                    frame(&mut l, vec![]);
+                    l
+                };
+                let (w, mut m) = (at(&world), at(&menus));
+                let f = frame(&mut m, vec![]);
+                let what = format!("{split:?} {zoom:?}");
+                assert_eq!(m.magnifier.unwrap().mode, MagnifierMode::Screen, "{what}");
+                let [copy] = f.copies[..] else { panic!("{what}: one screen copy") };
+                assert!(!m.shown.iter().any(|(h, _)| *h == Hit::Magnifier), "{what}: no world view");
+                let (rect, source) = m.magnifier_geometry(&m.magnifier.unwrap());
+                assert_eq!(rect, w.magnifier_geometry(&w.magnifier.unwrap()).0, "{what}: where the world one is");
+                assert_eq!(source, Some(copy.source), "{what}");
+                assert_eq!(copy.at, (rect[0], rect[1]), "{what}");
+                assert_eq!(copy.zoom, (2, 1), "{what}");
+                assert_eq!((copy.source[2], copy.source[3]), ((rect[2] + 1) / 2, (rect[3] + 1) / 2), "{what}");
+                let p = m.zoom_mouse_pointer();
+                assert!(inside(copy.source, p), "{what}: {:?} around the pointer {p:?}", copy.source);
+                if zoom == Zoom::TopStrip {
+                    assert!(copy.source[1] >= rect[1] + rect[3], "{what}: below the strip");
+                    assert!(m.strip().is_some(), "{what}: the views make room");
+                }
+                if zoom != Zoom::Beside {
+                    // Inside it: what is under it, not the magnifier.
+                    let middle = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2);
+                    assert_ne!(m.hit(middle), Hit::Magnifier, "{what}");
+                }
+                if matches!(zoom, Zoom::Floating131 | Zoom::Floating171) {
+                    assert!(w.zoom_box_block_pointer && !m.zoom_box_block_pointer, "{what}: moves away instead");
+                }
+            }
+        }
     }
 
     #[test]

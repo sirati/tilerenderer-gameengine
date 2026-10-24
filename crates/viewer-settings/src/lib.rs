@@ -308,6 +308,25 @@ pub enum Zoom {
     /// A strip across the top (a horizontal split), its height
     /// [`Layout::zoom_strip`] of the window.
     TopStrip,
+    /// A box beside the mouse: right of the part of the window it
+    /// enlarges (else left of it), centred on the mouse's height,
+    /// [`Layout::zoom_strip`] of the window high and half as wide again.
+    /// Shows over every screen, not only over the map. Older settings'
+    /// `menu_zoom` (the "Menu zoom beside pointer" switch) load as this,
+    /// showing [`ZoomContent::WorldAndMenus`].
+    Beside,
+}
+
+/// What the zoom shows ([`Layout::zoom_content`]), wherever it goes.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZoomContent {
+    /// The map alone, drawn again at the zoom's magnification (art at its
+    /// full resolution).
+    #[default]
+    World,
+    /// The finished picture under the mouse, menus and the game's
+    /// interface included, its pixels enlarged (no finer detail).
+    WorldAndMenus,
 }
 
 /// What views A and B follow.
@@ -369,9 +388,8 @@ pub struct Layout {
     /// Where the zoom box goes in a vertical split (else unused).
     pub zoom_place: Place,
     pub zoom: Zoom,
-    /// Screen magnifier beside the pointer, including menus. Takes priority
-    /// over world zoom; shares its magnification, height and lens appearance.
-    pub menu_zoom: bool,
+    /// What the zoom shows: the map, or the map with menus.
+    pub zoom_content: ZoomContent,
     /// Height of every zoom ([`Zoom::TopStrip`], the floating boxes and the
     /// boxes at the mouse) as a fraction of the window (or of the view it
     /// is in), 0.05..=0.5, default 0.2.
@@ -433,7 +451,7 @@ impl Default for Layout {
             zoom_glass: true,
             zoom_place: Place::Floating,
             zoom: Zoom::Off,
-            menu_zoom: false,
+            zoom_content: ZoomContent::World,
             zoom_strip: 0.2,
             zoom_box_top: 0.025,
             zoom_box_drop: 0.05,
@@ -495,16 +513,35 @@ impl Layout {
 
     /// Reads the layout table, migrating an older file's per-screen
     /// `screens` table to [`Layout::screen_place`] (an explicit
-    /// `screen_place` wins). Unknown keys are ignored.
+    /// `screen_place` wins) and its `menu_zoom` switch
+    /// ([`Layout::migrate_menu_zoom`]; an explicit `zoom_content` wins).
+    /// Unknown keys are ignored.
     fn migrating<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Layout, D::Error> {
         let mut table = toml::Table::deserialize(d)?;
         let old = table.remove("screens");
+        let menu_zoom = table.remove("menu_zoom");
         let explicit = table.contains_key("screen_place");
+        let explicit_content = table.contains_key("zoom_content");
         let mut layout: Layout = toml::Value::Table(table).try_into().map_err(serde::de::Error::custom)?;
         if let (false, Some(toml::Value::Table(old))) = (explicit, old) {
             layout.screen_place = Layout::migrated_place(&old);
         }
+        if let (false, Some(toml::Value::Boolean(on))) = (explicit_content, menu_zoom) {
+            layout.migrate_menu_zoom(on);
+        }
         Ok(layout)
+    }
+
+    /// An older file's `menu_zoom` switch. On, it showed the whole picture
+    /// (menus too) in a box beside the mouse in place of the world zoom
+    /// chosen: now [`Zoom::Beside`] showing [`ZoomContent::WorldAndMenus`].
+    /// Off, the world zoom chosen showed the map: [`ZoomContent::World`].
+    pub fn migrate_menu_zoom(&mut self, menu_zoom: bool) {
+        if menu_zoom {
+            (self.zoom, self.zoom_content) = (Zoom::Beside, ZoomContent::WorldAndMenus);
+        } else {
+            self.zoom_content = ZoomContent::World;
+        }
     }
 }
 
@@ -985,11 +1022,13 @@ mod zoom_glass_tests {
     fn old_layouts_default_to_glass_and_new_controls_round_trip() {
         let mut settings: Settings = toml::from_str("[layout]\nzoom = 'Floating131'\nzoom_strip = 0.35").unwrap();
         assert!(settings.layout.zoom_rounded && settings.layout.zoom_glass);
-        assert!(!settings.layout.menu_zoom);
-        assert_eq!(settings.control("layout.menu_zoom"), Some(ControlValue::On(false)));
-        assert!(!settings.set_control("layout.menu_zoom", &ControlValue::Number(1.0)));
-        assert!(settings.set_control("layout.menu_zoom", &ControlValue::On(true)));
-        assert_eq!(settings.control("layout.menu_zoom"), Some(ControlValue::On(true)));
+        assert_eq!(settings.layout.zoom_content, ZoomContent::World);
+        assert_eq!(settings.control("layout.zoom_content"), Some(ControlValue::Choice("World".into())));
+        assert!(!settings.set_control("layout.zoom_content", &ControlValue::On(true)));
+        assert!(settings.set_control("layout.zoom_content", &ControlValue::Choice("WorldAndMenus".into())));
+        assert_eq!(settings.control("layout.zoom_content"), Some(ControlValue::Choice("WorldAndMenus".into())));
+        assert!(settings.set_control("layout.zoom", &ControlValue::Choice("Beside".into())));
+        assert_eq!(settings.control("layout.menu_zoom"), None);
         assert_eq!(settings.layout.separator_width, 4);
         assert_eq!(settings.layout.zoom_strip, 0.35);
         for key in ["layout.zoom_rounded", "layout.zoom_glass"] {
@@ -998,5 +1037,43 @@ mod zoom_glass_tests {
         assert!(settings.set_control("layout.separator_width", &ControlValue::Number(99.0)));
         assert_eq!(settings.layout.separator_width, 16);
         assert_eq!(toml::from_str::<Settings>(&toml::to_string(&settings).unwrap()).unwrap(), settings);
+    }
+}
+
+#[cfg(test)]
+mod zoom_content_migration_tests {
+    use super::*;
+
+    fn load(text: &str) -> Layout {
+        toml::from_str::<Settings>(text).unwrap().layout
+    }
+
+    /// The old "Menu zoom beside pointer" switch: on, whatever world zoom
+    /// was chosen, the menus were shown beside the mouse; that is the box
+    /// beside the mouse showing menus now. Off, the world zoom chosen shows
+    /// the map as before. An explicit `zoom_content` wins, and the switch
+    /// is never written again.
+    #[test]
+    fn menu_zoom_loads_as_a_box_beside_the_mouse_showing_menus() {
+        for (zoom, name) in [(Zoom::Off, "Off"), (Zoom::Floating131, "Floating131"), (Zoom::Floating171, "Floating171"),
+            (Zoom::Mouse111, "Mouse111"), (Zoom::Mouse131, "Mouse131"), (Zoom::TopStrip, "TopStrip")] {
+            let on = load(&format!("[layout]\nzoom = '{name}'\nmenu_zoom = true\nzoom_strip = 0.3\nzoom_magnification = 3.0\n"));
+            assert_eq!((on.zoom, on.zoom_content), (Zoom::Beside, ZoomContent::WorldAndMenus), "{name}");
+            assert_eq!((on.zoom_strip, on.zoom_magnification), (0.3, 3.0), "{name}: size and magnification kept");
+            let off = load(&format!("[layout]\nzoom = '{name}'\nmenu_zoom = false\n"));
+            assert_eq!((off.zoom, off.zoom_content), (zoom, ZoomContent::World), "{name}");
+        }
+        // No switch at all: the defaults.
+        assert_eq!(load("[layout]\nzoom = 'Mouse131'\n").zoom_content, ZoomContent::World);
+        // A newer file's own choice wins over a stray old switch.
+        let both = load("[layout]\nzoom = 'TopStrip'\nmenu_zoom = true\nzoom_content = 'World'\n");
+        assert_eq!((both.zoom, both.zoom_content), (Zoom::TopStrip, ZoomContent::World));
+        // Saved again: the new keys only, and they load back the same.
+        let mut s = Settings::default();
+        s.layout = load("[layout]\nzoom = 'Floating171'\nmenu_zoom = true\n");
+        let saved = toml::to_string(&s).unwrap();
+        assert!(!saved.contains("menu_zoom"), "{saved}");
+        assert!(saved.contains("zoom = \"Beside\"") && saved.contains("zoom_content = \"WorldAndMenus\""), "{saved}");
+        assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), s);
     }
 }
