@@ -13,6 +13,7 @@ mod atlas_reservation;
 mod thread_start;
 mod constraints;
 mod pointer_thread;
+mod edge_clock;
 pub mod cursor;
 mod system_cursor;
 pub mod fps;
@@ -3049,8 +3050,11 @@ impl App {
         let init = self.config.native_thread_init;
         let fed = feed.is_some();
         let feed = feed.map(|feed| -> pointer_thread::Feed { feed });
-        match pointer_thread::PointerThread::spawn_with(tick, feed, Vec::new(), init) {
+        // (Edge scrolling runs on its clock: `edge_clock`.)
+        let edges = edge_clock::EdgeClock::new();
+        match pointer_thread::PointerThread::spawn_with(tick, feed, vec![edges.clone() as Arc<dyn pointer_thread::OnTick>], init) {
             Ok(thread) => {
+                self.layout.attach_edge_clock(edges);
                 log::info!("viewer: pointer thread every {:.2} ms{}", tick.as_secs_f64() * 1000.0, if fed { ", reading the pointer off the main thread" } else { "" });
                 self.pointer_thread = Some(thread);
             }
@@ -3603,6 +3607,8 @@ impl App {
             self.layout.menu_scale = plan.menu.zoom;
             self.layout.hud_scale = plan.frame;
             self.layout.window_pixel_scale = plan.factor();
+            self.layout.pointer_present = Some(plan.present);
+            self.layout.frame_instant = Some(now);
             // (What the interface covers changes with the scene only.)
             let key = (scene.seq, self.assets_version);
             if self.interface.as_ref().is_none_or(|(k, _)| *k != key) {

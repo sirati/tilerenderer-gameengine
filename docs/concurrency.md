@@ -189,6 +189,23 @@ the system still refuses the tap, or `WINIT_POINTER_TAP=0`, the main thread
 places the pointer as before. Both threads run the host's thread policy
 first (`ViewerConfig::native_thread_init`: Wine's signals blocked).
 
+Edge scrolling runs on `viewer-pointer`'s clock (`tile-viewer/src/edge_clock.rs`).
+The layout publishes, through `Latest`, the view the pointer is in and how
+that view meets the window's edges (`EdgeTarget`: its rectangle, the edges it
+reaches, the zoom strip's row, the divider it is pushed against, the
+interface's rectangles for the thin zone, the speed). It republishes each
+frame and after each pointer event it handles; it clears the target when edge
+scrolling is not active. Every tick, the thread finds the newest pointer's
+edge and adds that tick's scrolling to the view's running total (`Totals`,
+`Latest`, one writer). Each frame moves every view by how much its total grew
+since the previous frame. The frame reads the total as of one tick before its
+own time, interpolated between the last two ticks. Frames at any phase to the
+ticks then move by exactly their own time and never back. What the thread
+scrolled while scrolling was no longer active (the pointer left, a grab, a
+popup at a click) is dropped. The amount taken is part of `Pan` and is
+carried with the frame's other motion (`prepared_motion`). Without the
+thread (tests, headless rendering) each frame scrolls by its own time.
+
 Latency: a held pointer moves within the tap callback of its own event
 (microseconds after the window server sees it); the main thread's
 `CursorMoved` carries that position when it handles the event, which is when

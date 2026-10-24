@@ -26,6 +26,17 @@
 //! fractional steps carried over between frames. The driver's tile-based
 //! edge scrolling stays disabled.
 //!
+//! The pointer pushed past a window edge (a drag, a warp landing a pixel
+//! out, a clamp) is on that edge's outermost pixel, up to
+//! `edge_clock::PUSH_MARGIN` out: pushing further into an edge never slows
+//! or stops the scrolling. In the window the scrolling runs on the pointer
+//! thread's clock (`edge_clock`, `pointer_thread`): it samples the pointer
+//! at twice the display's rate and adds up how far each view scrolls; a
+//! frame moves the view by what that grew since the last frame (as of one
+//! tick before the frame, interpolated, so frames at any phase to the ticks
+//! move by exactly their own time). Without that thread (tests, headless
+//! rendering) each frame scrolls by its own time here.
+//!
 //! # Dragging
 //!
 //! With `MapMovement::Drag` the left button pressed on a world view is
@@ -67,10 +78,9 @@ use viewer_settings::MapMovement;
 
 use super::{Axis, EDGE_PAN_SPEED, Follow, Hit, Layout, Side, inside};
 
-/// How near (in window pixels) a window edge the pointer scrolls the view
-/// it is in: three times the game's own zone
-/// (`civ3_sys::hooks::EDGE_SCROLL_ZONE`, `scene::EDGE_ZONE`).
-pub const EDGE_ZONE: i32 = 3 * scene::EDGE_ZONE;
+use crate::edge_clock::edge_share;
+#[cfg(test)]
+use crate::edge_clock::{EDGE_ZONE, edge_axis};
 /// The game's edge scrolling timer (`Main_Screen_Form::scroll_at_edge`,
 /// 0x4DE4F0 in PcGames): at its view's outermost pixel it moves the map by
 /// its wheel step (`Scene::map_wheel_step`) every this many seconds.
@@ -81,36 +91,6 @@ pub const DRAG_THRESHOLD: i32 = 4;
 /// How long the pointer may rest before it is let go and the map still
 /// slides on (seconds).
 pub const STILL_BEFORE_RELEASE: f64 = 0.06;
-
-/// Per axis, where pointer coordinate `v` of a window `size` long is at its
-/// edge: 0 if not within [`EDGE_ZONE`] of an edge the view reaches (`low`:
-/// the left or top one; `high`: the right or bottom one), else how far in
-/// it is plus one, negative at the low edge.
-pub fn edge_axis(v: i32, size: i32, low: bool, high: bool) -> i32 {
-    let far = size - 1 - v;
-    if v < 0 || far < 0 {
-        0
-    } else if low && v < EDGE_ZONE {
-        -(v + 1)
-    } else if high && far < EDGE_ZONE {
-        far + 1
-    } else {
-        0
-    }
-}
-
-/// The share of the full edge scrolling speed for the pointer at edge `e`
-/// of a view (as [`edge_axis`] counts), signed: 1 at the outermost pixel,
-/// easing smoothly (a smoothstep, flat at both ends) to nearly nothing at
-/// the zone's inner end, so the map neither jumps on entering the zone nor
-/// slows abruptly near the edge.
-pub fn edge_share(e: i32) -> f64 {
-    if e == 0 {
-        return 0.0;
-    }
-    let t = (e.abs() - 1).min(EDGE_ZONE - 1) as f64 / EDGE_ZONE as f64;
-    (1.0 - t * t * (3.0 - 2.0 * t)) * e.signum() as f64
-}
 
 /// How fast a view scrolls along an axis for the pointer at edge `e` of
 /// it, in window pixels a second, signed, for a driver that does not tell
@@ -278,6 +258,9 @@ pub struct Pan {
     /// The right button went down on the minimap (B there): it drags B
     /// while held, and its release is ours too.
     minimap_right: bool,
+    /// How far the pointer thread had scrolled each view (`edge_clock`
+    /// `Totals`) when a frame last moved it by that.
+    edge_taken: Vec<(u32, (f64, f64))>,
 }
 
 /// A view flying to `to` ([`Layout::minimap_button`]).
@@ -296,7 +279,7 @@ impl Pan {
     /// got it, a drag the pointer moves keeps the frame's velocity samples.
     pub(super) fn carry(&mut self, base: &Pan, frame: Pan) {
         use super::prepared_motion::{carry, carry_fields, carry_keyed, carry_some};
-        let Pan { mode, inside, press, grab, coast, manual_driver, edge_view, exact, replaying, flight, minimap_right } = frame;
+        let Pan { mode, inside, press, grab, coast, manual_driver, edge_view, exact, replaying, flight, minimap_right, edge_taken } = frame;
         carry(&mut self.mode, &base.mode, mode);
         carry(&mut self.inside, &base.inside, inside);
         carry(&mut self.press, &base.press, press);
@@ -308,6 +291,26 @@ impl Pan {
         carry(&mut self.replaying, &base.replaying, replaying);
         carry_some(&mut self.flight, &base.flight, flight, |l, b, f| carry_fields!(Flight { hit, glide, to }, l, b, f));
         carry(&mut self.minimap_right, &base.minimap_right, minimap_right);
+        carry(&mut self.edge_taken, &base.edge_taken, edge_taken);
+    }
+}
+
+/// The key of view `hit` for the pointer thread (`edge_clock::EdgeTarget::view`).
+fn view_key(hit: Hit) -> Option<u32> {
+    match hit {
+        Hit::Main => Some(0),
+        Hit::Pane => Some(1),
+        Hit::Inset(k) => u32::try_from(k).ok()?.checked_add(2),
+        _ => None,
+    }
+}
+
+/// The view of key `view` ([`view_key`]).
+fn hit_of_view(view: u32) -> Option<Hit> {
+    match view {
+        0 => Some(Hit::Main),
+        1 => Some(Hit::Pane),
+        k => Some(Hit::Inset(usize::try_from(k - 2).ok()?)),
     }
 }
 
@@ -323,7 +326,11 @@ fn view_name(hit: Hit) -> String {
 impl Layout {
     /// End map gestures and momentum when the driver leaves its world.
     pub(super) fn clear_world_motion(&mut self) {
-        self.pan = Pan { mode: self.pan.mode, ..Default::default() };
+        // (What the pointer thread scrolled was taken: not again.)
+        self.pan = Pan { mode: self.pan.mode, edge_taken: std::mem::take(&mut self.pan.edge_taken), ..Default::default() };
+        if let Some(clock) = &self.edge_clock {
+            clock.aim(None);
+        }
     }
 
     /// How the mouse moves the map (from the settings).
@@ -568,32 +575,64 @@ impl Layout {
         self.shown.iter().any(|(h, _)| *h == hit).then_some(hit)
     }
 
+    /// The pointer at `p`, pushed back onto the window if it is past an
+    /// edge by no more than `edge_clock::PUSH_MARGIN`: pushed into an edge
+    /// it is on that edge.
+    fn pushed_in(&self, p: (i32, i32)) -> Option<(i32, i32)> {
+        let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
+        Some((crate::edge_clock::pushed_onto(p.0, ww)?, crate::edge_clock::pushed_onto(p.1, wh)?))
+    }
+
     /// The view the pointer at `p` is in and where it is at that view's
     /// edges (as `Input::Edge`): the window's edges the view reaches, and
-    /// the divider's wall it pushes against (at its outermost pixel).
+    /// the divider's wall it pushes against (at its outermost pixel); only
+    /// the game's thin zone over the interface. Pushed past the window's
+    /// edge, it is on that edge.
     fn view_edge(&self, p: (i32, i32)) -> Option<(Hit, (i32, i32))> {
+        let p = self.pushed_in(p)?;
         let hit = self.pan_view_at(p)?;
+        Some((hit, self.edge_target(hit)?.edge_of(p)))
+    }
+
+    /// How view `hit` meets the window's edges, for finding where a pointer
+    /// in it is at them ([`crate::edge_clock::EdgeTarget`]).
+    fn edge_target(&self, hit: Hit) -> Option<crate::edge_clock::EdgeTarget> {
         let (_, cam) = self.shown.iter().find(|(h, _)| *h == hit)?;
-        let [x, y, w, h] = super::rect_of(cam);
-        let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
-        let mut e = (edge_axis(p.0, ww, x <= 0, x + w >= ww), edge_axis(p.1, wh, y <= 0, y + h >= wh));
+        let rect = super::rect_of(cam);
+        let [x, y, _, _] = rect;
         // A top strip reserves the window's top. The first map row below
         // it becomes the upward scroll boundary for the affected pane.
-        if let Some((strip, _)) = self.strip() {
-            if y == strip[1] + strip[3] + super::GAP && p.0 >= strip[0] && p.0 < strip[0] + strip[2] {
-                e.1 = edge_axis(p.1 - y, h, true, false);
-            }
-        }
-        if let (Some(side), Some(split)) = (self.against, self.split) {
-            if side.hit() == hit {
+        let top_row = self.strip().filter(|(strip, _)| y == strip[1] + strip[3] + super::GAP).map(|(strip, _)| (strip[0], strip[0] + strip[2]));
+        let against = match (self.against, self.split) {
+            (Some(side), Some(split)) if side.hit() == hit => {
                 let toward = if side == Side::A { 1 } else { -1 };
-                match split.axis {
-                    Axis::Vertical => e.0 = toward,
-                    Axis::Horizontal => e.1 = toward,
-                }
+                Some((if split.axis == Axis::Vertical { 0 } else { 1 }, toward))
             }
+            _ => None,
+        };
+        let (a, b) = self.panes();
+        let area = match hit {
+            Hit::Inset(k) => self.insets.get(k).map(|i| i.rect),
+            Hit::Main => Some(a),
+            Hit::Pane => b,
+            _ => None,
         }
-        Some((hit, e))
+        .unwrap_or(rect);
+        let scale = self.shown_scale(hit)?;
+        // The game's speed in world pixels (as many tiles a second however
+        // large the view shows them), else window pixels through the zoom.
+        let full = game_edge_speed(self.map_wheel_step).unwrap_or((EDGE_PAN_SPEED * scale, EDGE_PAN_SPEED * scale));
+        Some(crate::edge_clock::EdgeTarget {
+            view: view_key(hit)?,
+            window: (self.window.0 as i32, self.window.1 as i32),
+            area,
+            rect: [x, y, rect[2], rect[3]],
+            top_row,
+            against,
+            interface: self.interface_cover(),
+            full,
+            present: None,
+        })
     }
 
     /// A native map wheel notch moves tiles, rather than scrolling the
@@ -673,6 +712,7 @@ impl Layout {
     /// The pointer left the window (or it lost the focus).
     pub(super) fn pan_pointer_gone(&mut self) {
         self.pan.inside = false;
+        self.aim_edge_clock();
     }
 
     /// A button at `p` (the mouse free): `Some` with what goes to the
@@ -889,20 +929,50 @@ impl Layout {
         self.pan.manual_driver.is_some() && self.main_view.follow == Follow::Driver
     }
 
-    fn edge_scroll(&mut self, dt: f64, fitted: Option<Hit>) {
+    /// Whether the pointer scrolls a view at its edges now (not where it is).
+    fn edge_scroll_active(&self) -> bool {
         // A held right-button unit preview can reach beyond this pane in
         // Drag mode. Its pending destination stops scrolling on release.
         let enabled = self.pan.mode == MapMovement::EdgeScroll || self.unit_order_dragging();
         // (Not under a popup opened at a world click: the map stays put.)
-        let active = enabled && self.pan.inside && !self.locked && !self.snapping && self.drag.is_none() && self.pan.grab.is_none() && !self.click_popup_open();
-        // Over the interface (the minimap, the HUD) only the game's own thin
-        // edge scrolls: the wider zone would move the map under its controls.
-        let over_interface = self.interface_at(self.pointer).is_some();
-        let thin = |d: i32| if over_interface && d.abs() > scene::EDGE_ZONE { 0 } else { d };
+        enabled && self.pan.inside && !self.locked && !self.snapping && self.drag.is_none() && self.pan.grab.is_none() && !self.click_popup_open()
+    }
+
+    /// The view the pointer thread is to scroll from now on (`edge_clock`),
+    /// for the pointer where the layout has it: its view (not one fitted to
+    /// the driver's screen, `fitted`), while edge scrolling is active.
+    fn edge_aim(&self, fitted: Option<Hit>) -> Option<crate::edge_clock::EdgeTarget> {
+        if !self.edge_scroll_active() {
+            return None;
+        }
+        let hit = self.pan_view_at(self.pushed_in(self.pointer)?)?;
+        if fitted == Some(hit) {
+            return None;
+        }
+        let mut target = self.edge_target(hit)?;
+        target.present = self.pointer_present;
+        Some(target)
+    }
+
+    /// Scrolls with the pointer thread's clock (`edge_clock`) from now on.
+    pub fn attach_edge_clock(&mut self, clock: std::sync::Arc<crate::edge_clock::EdgeClock>) {
+        self.pan.edge_taken = clock.totals().moved.iter().map(|&(v, total, _)| (v, total)).collect();
+        self.edge_clock = Some(clock);
+    }
+
+    /// Tells the pointer thread which view the pointer is in now (after it
+    /// moved): it scrolls that one until the next frame looks again.
+    pub(super) fn aim_edge_clock(&self) {
+        if let Some(clock) = &self.edge_clock {
+            clock.aim(self.edge_aim(self.edge_fitted));
+        }
+    }
+
+    fn edge_scroll(&mut self, dt: f64, fitted: Option<Hit>) {
+        self.edge_fitted = fitted;
         let target = self
             .view_edge(self.pointer)
-            .map(|(hit, e)| (hit, (thin(e.0), thin(e.1))))
-            .filter(|&(hit, e)| active && e != (0, 0) && fitted != Some(hit));
+            .filter(|&(hit, e)| self.edge_scroll_active() && e != (0, 0) && fitted != Some(hit));
         let sign = |(h, e): (Hit, (i32, i32))| (h, (e.0.signum(), e.1.signum()));
         if target.map(sign) != self.pan.edge_view {
             match target {
@@ -912,16 +982,46 @@ impl Layout {
             }
             self.pan.edge_view = target.map(sign);
         }
+        if let Some(clock) = self.edge_clock.clone() {
+            // What the pointer thread scrolled since the last frame, on its
+            // own clock (none of it while scrolling is not active now).
+            let totals = clock.totals();
+            for &(view, _, _) in &totals.moved {
+                let total = totals.shown(view, self.frame_instant);
+                let taken = match self.pan.edge_taken.iter_mut().find(|(v, _)| *v == view) {
+                    Some((_, taken)) => std::mem::replace(taken, total),
+                    None => {
+                        self.pan.edge_taken.push((view, total));
+                        (0.0, 0.0)
+                    }
+                };
+                let by = (total.0 - taken.0, total.1 - taken.1);
+                let Some(hit) = hit_of_view(view).filter(|&h| fitted != Some(h) && self.edge_scroll_active()) else { continue };
+                let Some(t) = self.edge_target(hit) else { continue };
+                // (After the window stood still for long, as far as one long
+                // frame scrolls, as without the thread: no jump.)
+                let most = (t.full.0.abs() * crate::edge_clock::MAX_STEP, t.full.1.abs() * crate::edge_clock::MAX_STEP);
+                self.edge_move(hit, (by.0.clamp(-most.0, most.0), by.1.clamp(-most.1, most.1)));
+            }
+            clock.aim(self.edge_aim(fitted));
+            return;
+        }
         let Some((hit, e)) = target else { return };
         if dt <= 0.0 {
             return;
         }
-        let (Some(scale), Some(center)) = (self.shown_scale(hit), self.exact_center(hit)) else { return };
+        let Some(t) = self.edge_target(hit) else { return };
+        self.edge_move(hit, t.step(e, dt));
+    }
+
+    /// Scrolls view `hit` by `by` world pixels from its continuous centre,
+    /// held at the world's edge.
+    fn edge_move(&mut self, hit: Hit, by: (f64, f64)) {
+        if by == (0.0, 0.0) {
+            return;
+        }
+        let Some(center) = self.exact_center(hit) else { return };
         let (center, _) = self.clamp_view_center(hit, center);
-        // The game's speed in world pixels (as many tiles a second however
-        // large the view shows them), else window pixels through the zoom.
-        let full = game_edge_speed(self.map_wheel_step).unwrap_or((EDGE_PAN_SPEED * scale, EDGE_PAN_SPEED * scale));
-        let by = (edge_share(e.0) * full.0 * dt, edge_share(e.1) * full.1 * dt);
         let (to, _) = self.clamp_view_center(hit, (center.0 + by.0, center.1 + by.1));
         self.place_exact(hit, to);
     }
@@ -930,25 +1030,6 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_edge_zone_counts_from_the_edges_the_view_reaches() {
-        // Both edges reached: 1 at the outermost pixel, 48 at the zone's end
-        // (three times the game's 16).
-        assert_eq!(EDGE_ZONE, 48);
-        assert_eq!(edge_axis(0, 800, true, true), -1);
-        assert_eq!(edge_axis(47, 800, true, true), -48);
-        assert_eq!(edge_axis(48, 800, true, true), 0);
-        assert_eq!(edge_axis(799, 800, true, true), 1);
-        assert_eq!(edge_axis(752, 800, true, true), 48);
-        assert_eq!(edge_axis(751, 800, true, true), 0);
-        // An edge the view does not reach (the divider's side of a pane).
-        assert_eq!(edge_axis(799, 800, true, false), 0);
-        assert_eq!(edge_axis(0, 800, false, true), 0);
-        // Outside the window.
-        assert_eq!(edge_axis(-1, 800, true, true), 0);
-        assert_eq!(edge_axis(800, 800, true, true), 0);
-    }
 
     /// The pointer resting on each edge as macOS reports it (the flipped
     /// view's y is `height − cocoa_y`: 0 at the top, but the bottom
@@ -1182,6 +1263,228 @@ mod tests {
         let at = b(&l);
         tick(&mut l, 100);
         assert_eq!(b(&l), at);
+    }
+
+    /// The pointer resting on an edge, then pushed further into it: the
+    /// system reports it on the edge, warped back onto it, or past it (a
+    /// drag, a warp landing a pixel out, a clamp), event after event. The
+    /// map scrolls at that edge's full speed on every frame, never stopping
+    /// between events: all four edges, the corners, and B at its edges and
+    /// against the divider.
+    #[test]
+    fn pushing_into_an_edge_scrolls_at_full_speed_on_every_frame() {
+        let cases: [((i32, i32), (i32, i32)); 8] = [
+            ((0, 300), (-1, 0)),
+            ((799, 300), (1, 0)),
+            ((400, 0), (0, -1)),
+            ((400, 599), (0, 1)),
+            ((0, 0), (-1, -1)),
+            ((799, 0), (1, -1)),
+            ((0, 599), (-1, 1)),
+            ((799, 599), (1, 1)),
+        ];
+        for (at, dir) in cases {
+            let mut l = Layout::default();
+            l.set_map_movement(MapMovement::EdgeScroll);
+            frame(&mut l);
+            frame(&mut l);
+            mv(&mut l, at);
+            tick(&mut l, 16);
+            for (i, out) in [0, 1, 3, 0, 2, 0, 48, 0, 5, 1].into_iter().enumerate() {
+                let p = (at.0 + dir.0 * out, at.1 + dir.1 * out);
+                mv(&mut l, p);
+                let before = l.main_view.center;
+                tick(&mut l, 16);
+                let moved = (l.main_view.center.0 - before.0, l.main_view.center.1 - before.1);
+                // 600 px/s for 16 ms: 9 or 10 whole pixels a frame.
+                for (m, d) in [(moved.0, dir.0), (moved.1, dir.1)] {
+                    assert!(if d == 0 { m == 0 } else { m * d >= 9 }, "edge {dir:?}, push {i} to {p:?}: moved {moved:?}");
+                }
+            }
+        }
+        // B: its right edge, and pushed against the divider from B's side
+        // low down, where the divider is closed (every position past it
+        // pushes: the divider holds the pointer at 404).
+        let mut l = split(MapMovement::EdgeScroll, Roles::Free);
+        for (at, dir, pushes) in [((799, 300), 1, [0, 2, 1, 0, 30, 0]), ((404, 590), -1, [10, 50, 20, 100, 30, 60])] {
+            mv(&mut l, (600, at.1));
+            mv(&mut l, (at.0 + dir * 10, at.1));
+            tick(&mut l, 16);
+            for out in pushes {
+                mv(&mut l, (at.0 + dir * out, at.1));
+                let before = b(&l);
+                tick(&mut l, 16);
+                let moved = b(&l).0 - before.0;
+                assert!(moved * dir >= 9, "B towards {dir}, pushed {out}: moved {moved}");
+            }
+        }
+    }
+
+    /// One frame at `at_ms` on a virtual clock: the pointer thread ticked
+    /// every `tick_ms` up to it, with the pointer at `pointer`.
+    fn clocked_frame(l: &mut Layout, clock: &crate::edge_clock::EdgeClock, ticked: &mut f64, at_ms: f64, tick_ms: f64, pointer: (f64, f64)) -> Frame {
+        while *ticked + tick_ms <= at_ms {
+            *ticked += tick_ms;
+            clock.step(Some(pointer), tick_ms / 1000.0, virtual_ms(*ticked));
+        }
+        l.frame_instant = Some(virtual_ms(at_ms));
+        frame(l)
+    }
+
+    /// `ms` milliseconds into a virtual clock.
+    fn virtual_ms(ms: f64) -> std::time::Instant {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(std::time::Instant::now) + Duration::from_secs_f64(ms / 1000.0)
+    }
+
+    /// Edge scrolling on the pointer thread's clock: pushing into the edge
+    /// with motion events coming irregularly (bunched after stalls) and
+    /// frames 8 to 60 ms apart, every frame moves the view by the full
+    /// speed times the time since the last frame, never less (so never a
+    /// stop between events), give or take the pixel it is drawn at.
+    #[test]
+    fn on_the_pointer_threads_clock_pushing_into_an_edge_scrolls_steadily_through_stalled_frames() {
+        let mut l = Layout::default();
+        l.set_map_movement(MapMovement::EdgeScroll);
+        frame(&mut l);
+        frame(&mut l);
+        let clock = crate::edge_clock::EdgeClock::new();
+        l.attach_edge_clock(clock.clone());
+        let tick = 1000.0 / 240.0;
+        let (mut now, mut ticked) = (50.0, 0.0);
+        mv(&mut l, (0, 300));
+        // (Scrolling for 50 ms already: the first frame sees a tick before it.)
+        clocked_frame(&mut l, &clock, &mut ticked, now, tick, (0.0, 300.0));
+        let mut shown = l.main_view.center;
+        let mut from_ms = now;
+        let frames = [16.0, 50.0, 8.0, 60.0, 16.0, 16.0, 45.0, 8.0, 33.0, 50.0];
+        for (k, ms) in frames.into_iter().cycle().take(60).enumerate() {
+            now += ms;
+            // Motion events only between frames, past the edge by up to 48.
+            let x = -[0, 1, 3, 0, 48, 2, 0][k % 7];
+            for _ in 0..(k % 3) {
+                mv(&mut l, (x, 300));
+            }
+            clocked_frame(&mut l, &clock, &mut ticked, now, tick, (x as f64, 300.0));
+            let moved = shown.0 - l.main_view.center.0;
+            let want = 600.0 * (now - from_ms) / 1000.0;
+            assert!((moved as f64 - want).abs() <= 1.0, "frame {k} ({ms} ms): moved {moved}, {want:.1} wanted");
+            assert_eq!(l.main_view.center.1, shown.1);
+            from_ms = now;
+            shown = l.main_view.center;
+        }
+        // Left: what it had scrolled stays scrolled, nothing more.
+        mv(&mut l, (400, 300));
+        clocked_frame(&mut l, &clock, &mut ticked, now + 100.0, tick, (400.0, 300.0));
+        assert_eq!(l.main_view.center, shown);
+    }
+
+    /// The same with the real pointer thread and wall time: frames spin
+    /// the CPU for 8 to 50 ms, motion events come only between frames. Each
+    /// frame moves the view by the full speed times its own time.
+    #[test]
+    fn with_the_real_pointer_thread_frames_stalled_50_ms_still_scroll_by_their_time() {
+        use crate::pointer_thread::{OnTick, PointerThread, tick_for};
+        let mut l = Layout::default();
+        l.set_map_movement(MapMovement::EdgeScroll);
+        frame(&mut l);
+        frame(&mut l);
+        let clock = crate::edge_clock::EdgeClock::new();
+        l.attach_edge_clock(clock.clone());
+        let thread = PointerThread::spawn(tick_for(Some(120_000)), None, vec![clock.clone() as std::sync::Arc<dyn OnTick>]).unwrap();
+        thread.report(Some((0.0, 300.0)));
+        mv(&mut l, (0, 300));
+        let stall = |ms: u64| {
+            let until = std::time::Instant::now() + Duration::from_millis(ms);
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        };
+        stall(30);
+        l.frame_instant = Some(std::time::Instant::now());
+        frame(&mut l);
+        let (mut shown, mut at) = (l.exact_center(Hit::Main).unwrap().0, l.frame_instant.unwrap());
+        let (mut worst, mut total, mut want_total) = (0.0f64, 0.0, 0.0);
+        for (k, ms) in [16, 50, 8, 50, 16, 33, 50, 8, 45, 16].into_iter().cycle().take(30).enumerate() {
+            stall(ms);
+            let x = -[0, 1, 3, 0, 48, 2][k % 6];
+            for _ in 0..(k % 3) {
+                thread.report(Some((x as f64, 300.0)));
+                mv(&mut l, (x, 300));
+            }
+            let now = std::time::Instant::now();
+            l.frame_instant = Some(now);
+            frame(&mut l);
+            let moved = shown - l.exact_center(Hit::Main).unwrap().0;
+            let want = 600.0 * (now - at).as_secs_f64();
+            worst = worst.max((moved - want).abs() / want);
+            assert!(moved > 0.0, "frame {k} ({ms} ms) did not scroll");
+            (total, want_total) = (total + moved, want_total + want);
+            (shown, at) = (l.exact_center(Hit::Main).unwrap().0, now);
+        }
+        drop(thread);
+        // (A tick or two of scheduling noise on a loaded machine per frame;
+        // in all, the full speed.)
+        assert!(worst < 0.6, "a frame off by {:.0} %", worst * 100.0);
+        assert!((total / want_total - 1.0).abs() < 0.05, "{total:.0} px scrolled, {want_total:.0} wanted");
+    }
+
+    /// With the pointer thread, a pointer that leaves the window (or a
+    /// view grabbed, a popup at a click) stops what it scrolls at once,
+    /// also what it ticked before the frame saw that.
+    #[test]
+    fn on_the_pointer_threads_clock_nothing_scrolls_once_the_pointer_is_gone() {
+        let mut l = split(MapMovement::EdgeScroll, Roles::Free);
+        let clock = crate::edge_clock::EdgeClock::new();
+        l.attach_edge_clock(clock.clone());
+        mv(&mut l, (799, 300));
+        let start = b(&l);
+        let mut ticked = 0.0;
+        clocked_frame(&mut l, &clock, &mut ticked, 100.0, 4.0, (799.0, 300.0));
+        // (Shown one tick late: 96 of the 100 ms.)
+        assert_eq!(b(&l).0 - start.0, 58);
+        // The thread ticked on before the layout heard the pointer left.
+        clock.step(Some((799.0, 300.0)), 0.05, virtual_ms(150.0));
+        l.pointer_gone();
+        let at = b(&l);
+        clocked_frame(&mut l, &clock, &mut ticked, 200.0, 4.0, (799.0, 300.0));
+        assert_eq!(b(&l), at);
+    }
+
+    /// Printed with `--ignored --nocapture`: the view's speed frame by
+    /// frame while the pointer is pushed into the left edge (positions on
+    /// it and past it), frames 8 to 60 ms apart; scrolled by each frame's
+    /// time (`inline`) and on the pointer thread's clock (`thread`).
+    #[test]
+    #[ignore]
+    fn edge_push_velocity_trace() {
+        let frames = [16.0, 50.0, 8.0, 60.0, 16.0, 16.0, 45.0, 8.0, 33.0, 50.0];
+        let pushes = [0, -1, -3, 0, -48, -2, 0];
+        for threaded in [false, true] {
+            let mut l = Layout::default();
+            l.set_map_movement(MapMovement::EdgeScroll);
+            frame(&mut l);
+            frame(&mut l);
+            let clock = crate::edge_clock::EdgeClock::new();
+            if threaded {
+                l.attach_edge_clock(clock.clone());
+            }
+            mv(&mut l, (0, 300));
+            let (mut now, mut ticked) = (0.0, 0.0);
+            l.advance(Duration::from_millis(16));
+            clocked_frame(&mut l, &clock, &mut ticked, now, 1000.0 / 240.0, (0.0, 300.0));
+            let mut row = Vec::new();
+            for (k, ms) in frames.into_iter().enumerate() {
+                now += ms;
+                let x = pushes[k % pushes.len()];
+                mv(&mut l, (x, 300));
+                let before = l.exact_center(Hit::Main).unwrap().0;
+                l.advance(Duration::from_secs_f64(ms / 1000.0));
+                clocked_frame(&mut l, &clock, &mut ticked, now, 1000.0 / 240.0, (x as f64, 300.0));
+                row.push(format!("{ms:>2} ms frame, x={x:>3}: {:>5.1} px/s", (before - l.exact_center(Hit::Main).unwrap().0) / (ms / 1000.0)));
+            }
+            println!("{}:\n  {}", if threaded { "thread" } else { "inline" }, row.join("\n  "));
+        }
     }
 
     #[test]
