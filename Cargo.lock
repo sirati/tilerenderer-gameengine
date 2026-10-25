@@ -1342,10 +1342,12 @@ dependencies = [
 name = "jgl-ffi"
 version = "0.1.0"
 dependencies = [
+ "handoff",
  "inproc",
  "jgl",
  "log",
  "thiserror 2.0.21",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
