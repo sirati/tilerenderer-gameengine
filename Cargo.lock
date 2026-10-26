@@ -1342,6 +1342,7 @@ dependencies = [
 name = "jgl-ffi"
 version = "0.1.0"
 dependencies = [
+ "civ3-ui",
  "handoff",
  "inproc",
  "jgl",

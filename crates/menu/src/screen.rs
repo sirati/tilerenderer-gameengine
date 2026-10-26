@@ -53,6 +53,9 @@ pub struct Region {
 /// other indices are not drawn.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Indices {
+    /// Ordered replacements on the immutable indexed source, before
+    /// palette selection, crop, resize, alpha and transparency rules.
+    pub index_changes: Vec<IndexChange>,
     /// A selected frame of an animated indexed source.
     pub frame: Option<u32>,
     /// Native fixed-point resize, applied before any destination clip.
@@ -61,6 +64,14 @@ pub struct Indices {
     pub palette_alpha: Option<PaletteAlpha>,
     pub transparent: Vec<u8>,
     pub shade: Vec<(u8, u8)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IndexChange {
+    /// Source rectangle, left/top inclusive and right/bottom exclusive.
+    pub rect: [i32; 4],
+    pub from: u8,
+    pub to: u8,
 }
 
 /// A palette-driven blend ramp. Entries matching `skip` are filler. The
@@ -91,6 +102,10 @@ impl Indices {
             if let Some(p) = &self.palette_alpha {
                 out.push_str(&format!("\npalette_alpha = {{ source = {}, first = {}, count = {}, skip = {:?} }}", toml_str(&p.source), p.first, p.count, p.skip));
             }
+            if !self.index_changes.is_empty() {
+                let changes=self.index_changes.iter().map(|c|format!("{{ rect = {:?}, from = {}, to = {} }}",c.rect,c.from,c.to)).collect::<Vec<_>>().join(", ");
+                out.push_str(&format!("\nindex_changes = [{changes}]"));
+            }
             return out;
         }
         let shaded = |i: u8| self.shade.iter().any(|&(s, _)| s == i);
@@ -106,6 +121,7 @@ impl Indices {
         if let Some(frame) = self.frame { key.push_str(&format!("!frame{frame}")); }
         if let Some(p) = &self.palette_alpha { key.push_str(&format!("!alpha{}:{},{},{:?}", p.source, p.first, p.count, p.skip)); }
         if let Some(r) = self.resize { key.push_str(&format!("!resize{}x{}:{},{}", r.size.0, r.size.1, r.sample_step[0], r.sample_step[1])); }
+        if !self.index_changes.is_empty() {key.push_str(&format!("!changes{:?}",self.index_changes));}
         key
     }
 }
