@@ -694,6 +694,9 @@ pub struct SheetDesc {
     /// Used only with `resize`; each output pixel samples floor(i*step/65536)
     /// from the original cell rather than inferring scale from its final size.
     pub resize_step: Option<[u32; 2]>,
+    /// Initial source position for `resize_step`, in 16.16 units.
+    #[serde(default)]
+    pub resize_offset: [u32; 2],
     /// See [`Description::parse`].
     pub variants: Option<Vec<i64>>,
     /// Cut every frame of the image (`frame` aside), one after the other:
@@ -1177,10 +1180,10 @@ fn resize_nearest(image: &RgbaImage, (w, h): (u32, u32)) -> RgbaImage {
 /// The native UI scaler advances exact16.16 source coordinates. Keeping
 /// those increments avoids changing its phase after fractional dimension
 /// truncation or clipping.
-fn resize_fixed(image: &RgbaImage, (w, h): (u32, u32), [sx, sy]: [u32; 2]) -> RgbaImage {
+fn resize_fixed(image: &RgbaImage, (w, h): (u32, u32), [sx, sy]: [u32; 2], [ox, oy]: [u32; 2]) -> RgbaImage {
     RgbaImage::from_fn(w, h, |x, y| image.get(
-        ((u64::from(x) * u64::from(sx)) >> 16) as u32,
-        ((u64::from(y) * u64::from(sy)) >> 16) as u32))
+        ((u64::from(x) * u64::from(sx) + u64::from(ox)) >> 16) as u32,
+        ((u64::from(y) * u64::from(sy) + u64::from(oy)) >> 16) as u32))
 }
 
 /// The band `width` pixels wide outside `sprite`'s art (its opaque pixels
@@ -1661,10 +1664,11 @@ impl Description {
             return Err(err("resized to nothing".into()));
         }
         let grow = sheet.outline.as_ref().map_or(0, |o| o.width);
+        if sheet.resize_offset != [0; 2] && sheet.resize_step.is_none() { return Err(err("resize_offset requires resize_step".into())); }
         if let Some([sx, sy]) = sheet.resize_step {
             let Some([w, h]) = sheet.resize else { return Err(err("resize_step requires resize".into())) };
-            if sx == 0 || sy == 0 || ((u64::from(w - 1) * u64::from(sx)) >> 16) >= u64::from(cw + 2 * grow)
-                || ((u64::from(h - 1) * u64::from(sy)) >> 16) >= u64::from(ch + 2 * grow) {
+            if sx == 0 || sy == 0 || ((u64::from(w - 1) * u64::from(sx) + u64::from(sheet.resize_offset[0])) >> 16) >= u64::from(cw + 2 * grow)
+                || ((u64::from(h - 1) * u64::from(sy) + u64::from(sheet.resize_offset[1])) >> 16) >= u64::from(ch + 2 * grow) {
                 return Err(err("resize_step samples outside its source cell".into()));
             }
         }
@@ -1684,7 +1688,7 @@ impl Description {
             };
             match sheet.resize {
                 Some([w, h]) => match sheet.resize_step {
-                    Some(step) => resize_fixed(&cell, (w, h), step),
+                    Some(step) => resize_fixed(&cell, (w, h), step, sheet.resize_offset),
                     None => resize_nearest(&cell, (w, h)),
                 },
                 None => cell,
@@ -4127,10 +4131,21 @@ mod tests {
     #[test]
     fn fixed_resize_keeps_native_phase_instead_of_centered_nearest() {
         let image = RgbaImage::from_fn(4, 1, |x, _| [x as u8, 0, 0, 255]);
-        let fixed = resize_fixed(&image, (3, 1), [87381, 65536]);
+        let fixed = resize_fixed(&image, (3, 1), [87381, 65536], [0; 2]);
         assert_eq!((0..3).map(|x| fixed.get(x, 0)[0]).collect::<Vec<_>>(), [0, 1, 2]);
         let nearest = resize_nearest(&image, (3, 1));
         assert_eq!((0..3).map(|x| nearest.get(x, 0)[0]).collect::<Vec<_>>(), [0, 2, 3]);
+    }
+
+    #[test]
+    fn fixed_resize_matches_external_bitmap_copy_axis_samples() {
+        // Captured from a 32-bit bitmap-copy oracle, 33x33 -> 24x24.
+        // Both axes must be checked; their initial phases differ.
+        let xs = [0,2,3,5,6,7,9,10,11,13,14,16,17,18,20,21,22,24,25,27,28,29,31,32];
+        let ys = [0,1,3,4,6,7,8,10,11,12,14,15,17,18,19,21,22,23,25,26,28,29,30,32];
+        let image = RgbaImage::from_fn(33, 33, |x, y| [x as u8, y as u8, 17, 255]);
+        let resized = resize_fixed(&image, (24, 24), [90112; 2], [65535, 32768]);
+        for y in 0..24 { for x in 0..24 { assert_eq!(resized.get(x, y), [xs[x as usize], ys[y as usize], 17, 255]); } }
     }
 
     #[test]
@@ -4139,6 +4154,8 @@ mod tests {
             ("resize_step = [65536,65536]", "resize_step requires resize"),
             ("resize = [4,4]\nresize_step = [262144,262144]", "resize_step samples outside"),
             ("resize = [4,4]\nresize_step = [0,65536]", "resize_step samples outside"),
+            ("resize_offset = [65535,32768]", "resize_offset requires resize_step"),
+            ("resize = [4,4]\nresize_step = [65536,65536]\nresize_offset = [65536,0]", "resize_step samples outside"),
         ] {
             let text=format!("grid = {{ layout = \"orthogonal\", step = [1,1] }}\n[images.a]\nsource = \"a\"\n[sheets.icon]\nimage = \"a\"\ncell = [4,4]\ngrid = [1,1]\n{options}\n[[layers]]\nname = \"l\"\nsets = [\"icon/0\"]");
             let error=Description::parse(&text).unwrap().compile(&Checker,256).err().expect("invalid sampler accepted").to_string();

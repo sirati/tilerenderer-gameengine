@@ -60,6 +60,8 @@ pub struct Indices {
     pub frame: Option<u32>,
     /// Native fixed-point resize, applied before any destination clip.
     pub resize: Option<IndexedResize>,
+    /// Initial source position in 16.16 units, before resize increments.
+    pub sample_offset: [u32; 2],
     /// Palette colours weighted by their original palette indices / 256.
     pub palette_alpha: Option<PaletteAlpha>,
     pub transparent: Vec<u8>,
@@ -122,6 +124,7 @@ impl Indices {
         if let Some(p) = &self.palette_alpha { key.push_str(&format!("!alpha{}:{},{},{:?}", p.source, p.first, p.count, p.skip)); }
         if let Some(r) = self.resize { key.push_str(&format!("!resize{}x{}:{},{}", r.size.0, r.size.1, r.sample_step[0], r.sample_step[1])); }
         if !self.index_changes.is_empty() {key.push_str(&format!("!changes{:?}",self.index_changes));}
+        if self.sample_offset != [0; 2] { key.push_str(&format!("!offset{},{}", self.sample_offset[0], self.sample_offset[1])); }
         key
     }
 }
@@ -347,7 +350,11 @@ impl ScreenArt {
             let shade = indices.shade.iter().map(|(i, k)| format!("{i}:{k}")).collect::<Vec<_>>().join(",");
             let _ = write!(out, "indexed\t{}\t{x},{y},{w},{h}\t{palette}\t{first},{count}\t{transparent}\t{shade}", r.source);
             if indices.resize.is_some() || indices.palette_alpha.is_some() || indices.frame.is_some() {
-                let resize = indices.resize.map_or_else(|| "-".into(), |r| format!("{}, {}, {}, {}", r.size.0, r.size.1, r.sample_step[0], r.sample_step[1]).replace(' ', ""));
+                let resize = indices.resize.map_or_else(|| "-".into(), |r| {
+                    let mut s = format!("{},{},{},{}", r.size.0, r.size.1, r.sample_step[0], r.sample_step[1]);
+                    if indices.sample_offset != [0; 2] { s += &format!(",{},{}", indices.sample_offset[0], indices.sample_offset[1]); }
+                    s
+                });
                 let alpha = indices.palette_alpha.as_ref().map_or_else(|| "-".into(), |p| format!("{},{},{},{},{}", p.first, p.count, p.skip[0], p.skip[1], p.skip[2]));
                 let source = indices.palette_alpha.as_ref().map_or("-", |p| p.source.as_str());
                 let _ = write!(out, "\t{resize}\t{alpha}\t{source}");
@@ -421,9 +428,13 @@ impl ScreenArt {
                             }
                             if *resize != "-" {
                                 let Some(v) = nums::<u32>(resize, ',') else { continue };
-                                let [w, h, sx, sy] = v.as_slice() else { continue };
-                                if *w == 0 || *h == 0 || *w > i32::MAX as u32 || *h > i32::MAX as u32 { continue; }
-                                indices.resize = Some(IndexedResize { size: (*w, *h), sample_step: [*sx, *sy] });
+                                let (w, h, sx, sy) = match v.as_slice() {
+                                    [w, h, sx, sy] => (*w, *h, *sx, *sy),
+                                    [w, h, sx, sy, ox, oy] => { indices.sample_offset = [*ox, *oy]; (*w, *h, *sx, *sy) },
+                                    _ => continue,
+                                };
+                                if w == 0 || h == 0 || w > i32::MAX as u32 || h > i32::MAX as u32 { continue; }
+                                indices.resize = Some(IndexedResize { size: (w, h), sample_step: [sx, sy] });
                             }
                             if *alpha != "-" {
                                 let Some(v) = nums::<u8>(alpha, ',') else { continue };
@@ -530,6 +541,7 @@ impl ScreenArt {
             if let Some(frame) = indices.frame { let _ = writeln!(out, "frame = {frame}\n"); }
             if let Some(r) = indices.resize {
                 let _ = writeln!(out, "resize = [{}, {}]\nresize_step = [{}, {}]\n", r.size.0, r.size.1, r.sample_step[0], r.sample_step[1]);
+                if indices.sample_offset != [0; 2] { let _ = writeln!(out, "resize_offset = {:?}\n", indices.sample_offset); }
             }
         }
         for (n, (source, palette, indices)) in indexed_images.iter().enumerate() {
