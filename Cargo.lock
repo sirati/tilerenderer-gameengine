@@ -3872,6 +3872,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wine-unixlib-window"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "wgpu",
+ "wine-unixlib",
+ "winit",
+]
+
+[[package]]
 name = "winit"
 version = "0.30.13"
 dependencies = [
