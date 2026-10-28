@@ -27,6 +27,7 @@ members = [
     "crates/gdi-text",
     "crates/gpu-text",
     "crates/wine-unixlib",
+    "crates/wine-unixlib-echo",
     "crates/wl-pointer",
     "crates/civ3r-native",
     "crates/tile-viewer",

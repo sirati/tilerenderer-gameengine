@@ -3864,6 +3864,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wine-unixlib-echo"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "wine-unixlib",
+]
+
+[[package]]
 name = "winit"
 version = "0.30.13"
 dependencies = [
