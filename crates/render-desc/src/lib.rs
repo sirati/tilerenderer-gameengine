@@ -1911,7 +1911,6 @@ impl Description {
         }
 
         let compiled = Compiled {
-            resource_version: ResourceVersion::new(),
             layout: match self.grid.layout {
                 LayoutDesc::Orthogonal => Layout::Orthogonal,
                 LayoutDesc::Staggered => Layout::Staggered,
@@ -2537,7 +2536,6 @@ impl Compiled {
     /// palette rows and layer values on every copy. A copy with the atlas
     /// pixels gets the new pixels too.
     pub fn apply(&mut self, growth: &Growth) {
-        self.mark_resources_changed();
         let first = self.atlas.sprites.len();
         self.atlas.grow(&growth.atlas);
         self.sprite_names.resize(first, String::new());
@@ -2582,23 +2580,8 @@ impl Compiled {
     }
 }
 
-/// An immutable identity for one version of compiled resources. Comparing
-/// versions is constant time and does not inspect their pixels or tables.
-/// Copies made by [`Compiled::without_pixels`] keep the same version.
-#[derive(Clone, Debug)]
-pub struct ResourceVersion(std::sync::Arc<()>);
-
-impl ResourceVersion {
-    fn new() -> Self { Self(std::sync::Arc::new(())) }
-}
-impl PartialEq for ResourceVersion {
-    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
-}
-impl Eq for ResourceVersion {}
-
 /// A description turned into renderer tables.
 pub struct Compiled {
-    resource_version: ResourceVersion,
     pub layout: Layout,
     pub step: (u32, u32),
     pub color: ColorModel,
@@ -2623,21 +2606,11 @@ pub struct Compiled {
 }
 
 impl Compiled {
-    /// The version of this compiled resource snapshot. Whole compilation
-    /// and each [`Self::apply`] create new identities, even for changes
-    /// that leave table lengths unchanged.
-    pub fn resource_version(&self) -> ResourceVersion { self.resource_version.clone() }
-
-    /// Invalidate resource-dependent caches after directly editing public
-    /// resource fields. Compilation and [`Self::apply`] do this themselves.
-    pub fn mark_resources_changed(&mut self) { self.resource_version = ResourceVersion::new(); }
-
     /// A copy without the atlas pixels (sprite placements, names, sets and
     /// layers kept): what everything but the atlas upload needs, at a
     /// fraction of the memory.
     pub fn without_pixels(&self) -> Compiled {
         Compiled {
-            resource_version: self.resource_version.clone(),
             layout: self.layout,
             step: self.step,
             color: self.color,
@@ -3827,29 +3800,6 @@ mod tests {
         assert_eq!(small.set("mixed"), recovered.set("mixed"));
         assert!(recovered.set_available("large/0") && recovered.set_available("part/0") && recovered.set_available("mixed"), "cache retains source art rather than the unavailable placeholder");
         assert_eq!(sprite_pixels(&recovered, "large/0"), vec![[255, 10, 20, 255]; 16]);
-    }
-
-    #[test]
-    fn resource_versions_preserve_snapshots_and_distinguish_same_size_changes() {
-        let description = Description::parse(&format!("grid = {{ layout = \"orthogonal\", step = [1, 1] }}\n{UNAVAILABLE_ART}")).unwrap();
-        let (mut compiled, mut growing) = description.compile_growing(&Checker, 16, true).unwrap();
-        let snapshot = compiled.without_pixels();
-        let original = compiled.resource_version();
-        assert_eq!(original, snapshot.resource_version());
-        assert_eq!(original, snapshot.without_pixels().resource_version());
-        let rebuilt = description.compile(&Checker, 16).unwrap();
-        assert_eq!(compiled.sprite_names, rebuilt.sprite_names);
-        assert_ne!(original, rebuilt.resource_version(), "same-sized replacement is a new resource version");
-        let size = compiled.atlas.sprites.len();
-        let growth = growing.grow(&compiled, "[sets.mixed]\nframes = [\"clear/0\"]\n", &Checker).unwrap();
-        compiled.apply(&growth);
-        assert_eq!(compiled.atlas.sprites.len(), size, "set replacement appends no sprites");
-        assert_ne!(original, compiled.resource_version());
-        assert_eq!(original, snapshot.resource_version(), "existing snapshots retain their identity");
-        let grown = compiled.resource_version();
-        compiled.color = ColorModel::Quantized { bits: 5 };
-        compiled.mark_resources_changed();
-        assert_ne!(grown, compiled.resource_version(), "direct public edits have an explicit invalidation path");
     }
 
     #[test]
