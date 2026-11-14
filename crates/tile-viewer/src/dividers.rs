@@ -88,7 +88,7 @@ impl Band {
     }
 }
 
-/// How a segment is drawn as a glass bar (a `glass_lens::Lens`): the
+/// How a segment is drawn as a glass bar (a the application frame effect): the
 /// lens's rectangle (the segment's, run on past the window's edge and
 /// into a divider it meets, so that only its free ends show their round
 /// caps), its corner radius and rim (half the thickness: a rounded rod),
@@ -140,7 +140,7 @@ impl Segment {
             End::Free => 0,
         };
         let along = (self.along.0 - run(self.ends[0]), self.along.1 + run(self.ends[1]));
-        // (The halo: `glass_lens::Lens`, 0.28 of the rim.)
+        // (The halo: the application frame effect, 0.28 of the rim.)
         let halo = (t as f32 / 2.0 * 0.28).ceil() as i32 + 1;
         let shown = |at: i32, end: End, out: i32| if end == End::Junction { at } else { at + out };
         let (a0, a1) = (shown(self.along.0, self.ends[0], -halo - run(self.ends[0])), shown(self.along.1, self.ends[1], halo + run(self.ends[1])));
@@ -267,7 +267,7 @@ impl Layout {
     /// least one pixel.
     pub(crate) fn divider_thickness(&self) -> i32 {
         let width = self.separator_width.clamp(1, 16);
-        let width = if self.glass_dividers { width.max(GLASS_WIDTH) } else { width };
+        let width = if self.effects_enabled && self.glass_dividers { width.max(GLASS_WIDTH) } else { width };
         (f64::from(width) / self.window_pixel_scale.max(1.0)).round().max(1.0) as i32
     }
 
@@ -331,7 +331,7 @@ impl Layout {
             let ends = [end(b, b.along.0, out.split, w), end(b, b.along.1, out.split, w)];
             out.segments.extend(carve(b, &open, true, ends));
         }
-        if self.glass_dividers {
+        if self.effects_enabled && self.glass_dividers {
             out.under = self.under_glass(&out, strip.and_then(|(_, side)| side));
         }
         out

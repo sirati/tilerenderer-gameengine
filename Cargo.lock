@@ -493,12 +493,18 @@ dependencies = [
 name = "civ3-ui"
 version = "0.1.0"
 dependencies = [
+ "civ3-spirv",
+ "glass",
  "jgl",
  "log",
+ "marker",
  "menu",
+ "render-desc",
  "scene",
  "tile-game",
+ "tile-render",
  "tile-viewer",
+ "toml 0.9.12+spec-1.1.0",
  "viewer-settings",
 ]
 
@@ -516,6 +522,7 @@ dependencies = [
 name = "civ3r-launcher"
 version = "0.1.0"
 dependencies = [
+ "civ3-spirv",
  "civ3r-process",
  "font8x8",
  "function-keys",
@@ -525,7 +532,6 @@ dependencies = [
  "sha2",
  "signal-hook",
  "tile-render",
- "viewer-spirv",
  "wgpu",
  "winit",
 ]
@@ -3021,7 +3027,6 @@ dependencies = [
  "application-icon",
  "dispatch2",
  "function-keys",
- "glass",
  "handoff",
  "log",
  "marker",

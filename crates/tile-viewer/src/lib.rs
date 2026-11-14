@@ -45,19 +45,18 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Fullscreen, Window, WindowId};
 
-/// The shader module the viewer draws with: `viewer-shaders` (the tile
-/// renderer's, the glass lens's and the selection marker's shaders, one
-/// SPIR-V module), with what the renderer draws from it.
+/// Default tile and marker shaders. Applications can supply a module with
+/// additional effects through [`ViewerConfig::shaders`].
 pub const SHADERS: tile_render::Shaders = tile_render::Shaders::new(viewer_spirv::SPIRV, viewer_spirv::SPIRV_FALLBACK)
-    .with_effect(glass_lens::effect)
     .with_painter(viewer_spirv::PAINTER);
 
-/// The CPU oracle of a renderer drawing with [`SHADERS`] (the glass lens's
-/// and the selection marker's).
-pub const ORACLE: tile_render::reference::Oracle<'static> = tile_render::reference::Oracle { effect: Some(&glass_lens::ORACLE), painter: Some(&marker::PAINTER) };
+/// CPU oracle for the default tile and marker module.
+pub const ORACLE: tile_render::reference::Oracle<'static> = tile_render::reference::Oracle { effect: None, painter: Some(&marker::PAINTER) };
 
 #[derive(Clone, Debug)]
 pub struct ViewerConfig {
+    /// Application shader module and optional view-effect factory.
+    pub shaders: tile_render::Shaders,
     pub title: String,
     /// Window/application icon, including the process-wide Dock icon on macOS.
     pub application_icon: Option<application_icon::ApplicationIcon>,
@@ -94,7 +93,7 @@ pub struct ViewerConfig {
 
 impl Default for ViewerConfig {
     fn default() -> Self {
-        Self { title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None, startup_ready_file: None, launcher_scale: None, settings_path: viewer_settings::Settings::default_path_for("tile-viewer", "TILE_VIEWER_SETTINGS"), extensions: extension::Extensions::default() }
+        Self { shaders: SHADERS, title: "tile-viewer".into(), application_icon: None, size: (1280, 960), fullscreen: false, clear: [0, 0, 0, 255], overhang: (0, 0, 0, 0), process_dpi_aware: true, native_thread_init: None, recording_dir: None, startup_ready_file: None, launcher_scale: None, settings_path: viewer_settings::Settings::default_path_for("tile-viewer", "TILE_VIEWER_SETTINGS"), extensions: extension::Extensions::default() }
     }
 }
 
@@ -1222,7 +1221,7 @@ pub fn render_offscreen(
     size: (u32, u32),
     config: &ViewerConfig,
 ) -> RgbaImage {
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, config.shaders);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world(compiled, scene));
     apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
@@ -1240,7 +1239,7 @@ pub fn render_arranged(
     config: &ViewerConfig,
 ) -> RgbaImage {
     let frame = arranged_frame(compiled, scene, size, config);
-    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, crate::SHADERS);
+    let mut renderer = TileRenderer::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm, config.shaders);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     renderer.set_world(&gpu.device, &scene_world_for(compiled, scene, &frame.view_cameras));
     apply_patches(&mut renderer, &gpu.queue, compiled, &scene.patches);
@@ -1311,6 +1310,7 @@ fn render_planned_inner(
     let rect_of = |s: &scene::FreeSprite| sprite_rect(compiled, s);
     let plan = scaling::plan(window, scene.screen_size, resolution).for_scene(scene, rect_of);
     let mut layout = layout::Layout::default();
+    layout.effects_enabled = config.shaders.effect.is_some();
     layout.apply_settings(settings);
     layout.grid_step = compiled.step;
     layout.driver_screen = Some(plan.screen);
@@ -1332,7 +1332,7 @@ fn render_planned_inner(
     arranged = scaling::arrange_panned(&plan, scene, &mut frame, &mut layout.menu_pan, rect_of);
     // (In the format windows mostly have.)
     let format = wgpu::TextureFormat::Bgra8Unorm;
-    let mut renderer = TileRenderer::new(&gpu.device, format, crate::SHADERS);
+    let mut renderer = TileRenderer::new(&gpu.device, format, config.shaders);
     renderer.set_atlas(&gpu.device, &gpu.queue, &compiled.atlas);
     let mut world = scene_world_arranged(compiled, scene, &frame.view_cameras, &arranged.overlay_cameras);
     let mut cameras = frame.cameras.clone();
@@ -1397,6 +1397,7 @@ async fn show_with(
 /// user's settings left at their defaults).
 pub fn arranged_frame(compiled: &Compiled, scene: &Scene, size: (u32, u32), config: &ViewerConfig) -> layout::Frame {
     let mut layout = layout::Layout::default();
+    layout.effects_enabled = config.shaders.effect.is_some();
     layout.grid_step = compiled.step;
     layout.frame(scene, size, config.overhang, interface_rects(compiled, scene), Some(world_bounds(compiled, scene)))
 }
@@ -2912,6 +2913,7 @@ impl App {
     fn set_settings(&mut self, settings: viewer_settings::Settings) {
         self.input_revision = self.input_revision.wrapping_add(1);
         self.layout.apply_settings(&settings.layout);
+        self.layout.effects_enabled = self.config.shaders.effect.is_some();
         self.layout.clean_map = settings.clean_map.clone();
         self.layout.focus_arrow = settings.accessibility.active_unit_arrow;
         self.layout.set_map_movement(settings.input.map_movement);
@@ -3473,6 +3475,7 @@ impl App {
         let wake_window = window.clone();
         let worker = render_worker::Worker::spawn(render_worker::Init {
             window: window.clone(),
+            shaders: self.config.shaders,
             native_thread_init: self.config.native_thread_init, initial, base: self.whole_version, through: self.assets_version,
             size: (size.width.max(1), size.height.max(1)), profile: self.profile.is_some(), bitmap,
             wake_main: worker_wake(self.cursor_builds.wake.as_ref(), move || wake_window.request_redraw()),

@@ -259,10 +259,10 @@ fn glass_bars_are_as_thick_as_their_walls_and_round_only_at_free_ends() {
             assert_eq!(f.glass_dividers.len(), dividers.segments.len(), "{c:?}");
             for &(at, s) in &f.glass_dividers {
                 let camera = f.cameras[at as usize];
-                let lens = camera.effect.map(glass_lens::Lens::of).unwrap_or_else(|| panic!("{c:?}: no lens"));
+                let lens = camera.effect.map(RoundedFrame::of).unwrap_or_else(|| panic!("{c:?}: no lens"));
                 let t = s.band.thickness();
                 assert_eq!(t, l.divider_thickness(), "{c:?}");
-                assert!(lens.glass && lens.radius == t as f32 / 2.0 && lens.rim == t as f32 / 2.0, "{c:?}: {lens:?}");
+                assert!(lens.raised && lens.radius == t as f32 / 2.0 && lens.rim == t as f32 / 2.0, "{c:?}: {lens:?}");
                 // Across: exactly the wall.
                 let (across, along) = if s.band.vertical { ((camera.origin.0, camera.viewport.0), (camera.origin.1, camera.viewport.1)) } else { ((camera.origin.1, camera.viewport.1), (camera.origin.0, camera.viewport.0)) };
                 assert_eq!((across.0, across.0 + across.1 as i32), s.band.across, "{c:?}");

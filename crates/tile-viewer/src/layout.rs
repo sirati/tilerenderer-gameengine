@@ -165,6 +165,9 @@ mod cursor_screen_tests;
 pub use pan::{DRAG_THRESHOLD, Momentum, Tracker};
 pub use capture::{Attractor, RESUME_AFTER};
 pub use glass::Shade;
+#[path = "layout/frame_geometry.rs"]
+mod frame_geometry;
+pub use frame_geometry::RoundedFrame;
 pub use dividers::{Band, Dividers, End as DividerEnd, Kind as DividerKind, Segment as DividerSegment};
 use tile_render::{Camera, ScreenCopy};
 use viewer_settings::{Place, Roles, ScreenPlace, UnitButtons};
@@ -743,6 +746,8 @@ pub struct Layout {
     /// height (`zoom_mouse_above`, `zoom_mouse_below`).
     pub zoom_mouse_above: u32,
     pub zoom_mouse_below: u32,
+    /// Whether the application supplied a view-effect renderer.
+    pub effects_enabled: bool,
     pub zoom_rounded: bool,
     pub zoom_glass: bool,
     /// The dividers drawn as glass bars (`dividers`).
@@ -1049,6 +1054,7 @@ impl Default for Layout {
             zoom_box_block_pointer: false,
             zoom_mouse_above: 100,
             zoom_mouse_below: 200,
+            effects_enabled: true,
             zoom_rounded: true,
             zoom_glass: true,
             glass_dividers: false,
@@ -2432,12 +2438,12 @@ impl Layout {
     /// the world or the menus), with the rounded corners and glass rim the
     /// settings ask for; a strip has none (no corners, a line or a glass
     /// divider below it, `Layout::dividers`).
-    fn zoom_lens(&self, m: &Magnifier, rect: [i32; 4]) -> Option<glass_lens::Lens> {
-        if matches!(m.place, ZoomPlace::Strip(..)) { return None; }
-        Some(glass_lens::Lens {
+    fn zoom_lens(&self, m: &Magnifier, rect: [i32; 4]) -> Option<RoundedFrame> {
+        if !self.effects_enabled || matches!(m.place, ZoomPlace::Strip(..)) { return None; }
+        Some(RoundedFrame {
             radius: if self.zoom_rounded { (rect[2].min(rect[3]) as f32 * 0.32).min(56.0 / self.window_pixel_scale.max(1.0) as f32) } else { 0.0 },
             rim: (if self.zoom_glass { 24.0 } else { self.separator_width as f32 }) / self.window_pixel_scale.max(1.0) as f32,
-            glass: self.zoom_glass,
+            raised: self.zoom_glass,
         })
     }
 
@@ -2446,7 +2452,7 @@ impl Layout {
     /// where the interface reaches through. None with glass dividers: the
     /// glass bar is drawn with the split's (`Dividers::glass_order`).
     fn strip_line(&self, frame: &mut Frame) {
-        if self.glass_dividers { return; }
+        if self.effects_enabled && self.glass_dividers { return; }
         let dividers = self.dividers();
         let Some(band) = dividers.strip else { return };
         let [x, y, w, h] = band.rect();
@@ -2990,7 +2996,7 @@ impl Layout {
         let pane = pane_rect.filter(|_| self.split.is_some() && pane_shown && take(1));
         // (The magnifier: its world view (a screen copy is no view), and a
         // strip's plain line below it; a box's lens is its frame.)
-        let magnifier_views = |m: &Magnifier| usize::from(m.mode == MagnifierMode::World) + usize::from(matches!(m.place, ZoomPlace::Strip(_)) && !self.glass_dividers);
+        let magnifier_views = |m: &Magnifier| usize::from(m.mode == MagnifierMode::World) + usize::from(matches!(m.place, ZoomPlace::Strip(_)) && !(self.effects_enabled && self.glass_dividers));
         let magnifier = self.magnifier.filter(|m| take(magnifier_views(m)));
         let insets = (0..self.insets.len()).take_while(|_| take(2)).count();
         let left_out = usize::from(pane.is_none() && pane_rect.is_some() && self.split.is_some() && pane_shown)
@@ -3025,7 +3031,7 @@ impl Layout {
         self.move_zoom_mouse(dt);
         let magnifier = magnifier.filter(|m| m.place == ZoomPlace::Beside || (self.world_shown && !fit_rect.is_some_and(|f| overlap(f, self.magnifier_geometry(m).0))));
         self.magnifier_shown = magnifier.is_some();
-        if !self.glass_dividers {
+        if !(self.effects_enabled && self.glass_dividers) {
             // Each pane's picture goes on under its half of the gap; the
             // frosted glass over it where the divider is shown (`glass`).
             let mut halves = Vec::new();
@@ -3056,7 +3062,7 @@ impl Layout {
                     break;
                 }
                 let [x, y, w, h] = bar.rect;
-                let lens = glass_lens::Lens { radius: bar.radius, rim: bar.rim, glass: true };
+                let lens = RoundedFrame { radius: bar.radius, rim: bar.rim, raised: true };
                 let camera = Camera { origin: (x, y), cells: false, effect: Some(lens.into()), target_clip: Some(bar.clip), ..Camera::new((w.max(1) as u32, h.max(1) as u32)) };
                 let at = push(&mut frame, camera);
                 frame.glass_dividers.push((at, segment));
@@ -5098,6 +5104,30 @@ mod tests {
     /// lens (no corners), and below it the line or, with glass dividers,
     /// the glass bar, whatever it shows.
     #[test]
+    fn missing_application_effect_keeps_magnifier_output_and_hit_bounds_rectangular() {
+        let mut l = Layout::default();
+        l.effects_enabled = false;
+        l.apply_settings(&viewer_settings::Layout {
+            zoom: viewer_settings::Zoom::Floating171,
+            zoom_content: viewer_settings::ZoomContent::World,
+            zoom_rounded: true, zoom_glass: true, glass_dividers: true,
+            ..Default::default()
+        });
+        l.pointer = (400, 400);
+        let f = frame(&mut l, vec![]);
+        assert!(f.cameras.iter().all(|c| c.effect.is_none()));
+        assert!(f.copies.iter().all(|c| c.effect.is_none()));
+        assert!(f.glass_dividers.is_empty());
+        let m = l.magnifier.unwrap();
+        let [x, y, _, _] = l.magnifier_geometry(&m).0;
+        assert_eq!(l.hit((x, y)), Hit::Magnifier, "an unrounded rendered corner takes input");
+        l.effects_enabled = true;
+        let f = frame(&mut l, vec![]);
+        assert!(f.cameras.iter().any(|c| c.effect.is_some()));
+        assert_ne!(l.hit((x, y)), Hit::Magnifier, "the application's rounded frame exposes its corner");
+    }
+
+    #[test]
     fn every_zoom_placement_and_content_honours_rounded_corners_and_glass() {
         use viewer_settings::{Zoom, ZoomContent};
         for zoom in [Zoom::Floating131, Zoom::Floating171, Zoom::Mouse111, Zoom::Mouse131, Zoom::Beside, Zoom::TopStrip] {
@@ -5121,12 +5151,12 @@ mod tests {
                             // (Not the glass dividers' bars, clipped to their own place.)
                             let lensed: Vec<_> = f.cameras.iter().filter(|c| c.effect.is_some() && c.target_clip.is_none()).collect();
                             assert!(lensed.len() <= 1, "{what}: one zoom lens");
-                            lensed.first().map(|c| glass_lens::Lens::of(c.effect.unwrap()))
+                            lensed.first().map(|c| RoundedFrame::of(c.effect.unwrap()))
                         }
                         ZoomContent::WorldAndMenus => {
                             let [copy] = f.copies[..] else { panic!("{what}: one screen copy") };
                             assert_eq!(copy.at, (rect[0], rect[1]), "{what}");
-                            copy.effect.map(glass_lens::Lens::of)
+                            copy.effect.map(RoundedFrame::of)
                         }
                     };
                     if zoom == Zoom::TopStrip {
@@ -5139,7 +5169,7 @@ mod tests {
                         continue;
                     }
                     let lens = lens.unwrap_or_else(|| panic!("{what}: a lens"));
-                    assert_eq!(lens.glass, glass, "{what}");
+                    assert_eq!(lens.raised, glass, "{what}");
                     assert_eq!(lens.radius > 0.0, rounded, "{what}");
                     assert_eq!(lens.rim * scale as f32, if glass { 24.0 } else { 4.0 }, "{what}");
                     // Where the pointer works on the zoom (the world, or
@@ -5172,8 +5202,8 @@ mod tests {
             assert_eq!(copy.zoom, (3, 2));
             let rect = l.magnifier_geometry(&l.magnifier.unwrap()).0;
             assert_eq!(rect[3], 600 * 3 / 10);
-            let lens = glass_lens::Lens::of(copy.effect.unwrap());
-            assert_eq!(lens.glass, glass);
+            let lens = RoundedFrame::of(copy.effect.unwrap());
+            assert_eq!(lens.raised, glass);
             assert_eq!(lens.radius > 0.0, rounded);
             assert_eq!(lens.rim * scale as f32, if glass { 24.0 } else { 4.0 });
             assert!((lens.radius * scale as f32 - if rounded { 56.0 } else { 0.0 }).abs() < 0.01);

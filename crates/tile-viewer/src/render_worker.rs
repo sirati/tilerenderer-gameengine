@@ -17,6 +17,7 @@ use tile_render::{Camera, Dirty, PlacedSprite, Present, ScreenCopy, TileRenderer
 use winit::window::Window;
 
 pub(crate) struct Init {
+    pub shaders: tile_render::Shaders,
     pub window: Arc<Window>,
     pub native_thread_init: Option<fn()>,
     pub size: (u32, u32),
@@ -723,7 +724,7 @@ impl State {
             |surface| surface.get_capabilities(&adapter).present_modes,
         );
         let software = init.bitmap || adapter.get_info().device_type == wgpu::DeviceType::Cpu;
-        let mut renderer = TileRenderer::new(&device, config.format, crate::SHADERS);
+        let mut renderer = TileRenderer::new(&device, config.format, init.shaders);
         if init.profile {
             renderer.enable_timing(&device, &queue);
         }
