@@ -1,14 +1,32 @@
+
 [package]
 name = "menu"
 description = "Game-agnostic menus (images, buttons, text) described in TOML, drawn as free sprites over a tile world, with hit testing"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
+
+[package.edition]
+workspace = true
+
+[package.license]
+workspace = true
+
+[package.version]
+workspace = true
 
 [dependencies]
-render-desc = { path = "../render-desc" }
-scene = { path = "../scene" }
-tile-render.workspace = true
-serde = { version = "1", features = ["derive"] }
 toml = "0.9"
-thiserror.workspace = true
+
+[dependencies.render-desc]
+path = "../render-desc"
+
+[dependencies.scene]
+path = "../scene"
+
+[dependencies.tile-render]
+workspace = true
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[dependencies.thiserror]
+workspace = true

@@ -1,13 +1,27 @@
+
 [package]
 name = "scene"
 description = "Game-agnostic world snapshots and input events exchanged between a game driver and a renderer"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
+
+[package.edition]
+workspace = true
+
+[package.license]
+workspace = true
+
+[package.version]
+workspace = true
 
 [dependencies]
-handoff = { path = "../handoff" }
 crossbeam-channel = "0.5"
-thiserror.workspace = true
-viewer-settings = { path = "../viewer-settings" }
 toml = "0.9"
+
+[dependencies.handoff]
+git = "ssh://git@github.com/sirati/tilerenderer.git"
+rev = "6941948fc77ad310c9021df6f01374be9d3a23fc"
+
+[dependencies.thiserror]
+workspace = true
+
+[dependencies.viewer-settings]
+path = "../viewer-settings"

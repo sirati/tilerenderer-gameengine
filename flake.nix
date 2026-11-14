@@ -1,5 +1,5 @@
 {
-  description = "Civ3Renderer: modern tile/menu renderer driven by Civilization III";
+  description = "Generic tile-world viewer and game-engine interfaces, menus, input and scene transport.";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   # Intel macOS remains useful for VM QA. Unstable supports Apple ARM
@@ -8,18 +8,6 @@
 
   outputs = { self, nixpkgs, nixpkgs-darwin }:
     {
-      # Microsoft's DirectPlay files for the game's network play
-      # (tools/install-directplay). Unfree but redistributable; allowed here
-      # by name only. Built on Linux for the macOS deploy too: the files are
-      # x86 Windows DLLs, the same on every host.
-      packages = nixpkgs.lib.genAttrs [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
-      let
-        pkgs = import (if system == "x86_64-darwin" then nixpkgs-darwin else nixpkgs) {
-          inherit system;
-          config.allowUnfreePredicate = p: nixpkgs.lib.getName p == "directplay-redist";
-        };
-      in { directplay = pkgs.callPackage ./nix/directplay.nix { }; });
-
       devShells = nixpkgs.lib.genAttrs [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
       let
         pkgs = import (if system == "x86_64-darwin" then nixpkgs-darwin else nixpkgs) { inherit system; };
@@ -57,7 +45,7 @@
           export CARGO_TARGET_I686_PC_WINDOWS_GNU_RUNNER=$PWD/tools/wine-run
           # The TrueType font the game-agnostic text tests use where there is
           # one (here the game's Lucida Sans, which their references match).
-          export TEST_FONT=''${TEST_FONT:-''${CIV3_INSTALL:-/mnt/datasets/winvm/civ3-src/Civilization III Complete}/LSANS.TTF}
+          export TEST_FONT=''${TEST_FONT:-${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf}
         '';
       } // pkgs.lib.optionalAttrs linux {
         # Windows targets link with mingw-w64 and need its pthreads.

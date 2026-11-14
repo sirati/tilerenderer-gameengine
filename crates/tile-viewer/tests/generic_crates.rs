@@ -11,40 +11,17 @@ const GENERIC: &[&str] = &[
     "application-icon-macos",
     "function-keys",
     "function-keys-macos",
-    "glass",
-    "glass-shaders",
-    "glass-shared",
-    "glass-test-shaders",
-    "glass-test-spirv",
-    "gpu-text",
-    "handoff",
     "marker",
     "marker-shaders",
     "menu",
-    "pointer-api",
-    "pointer-control",
-    "pointer-fallback",
-    "pointer-macos",
-    "pointer-wayland",
-    "pointer-windows",
-    "pointer-windows-ffi",
-    "pointer-x11",
     "render-desc",
-    "render-errors",
     "scene",
-    "shader-build",
     "tile-game",
-    "tile-render",
-    "tile-render-shaders",
-    "tile-render-shared",
-    "tile-render-test-shaders",
-    "tile-render-test-spirv",
     "tile-viewer",
     "viewer-settings",
     "viewer-shaders",
     "viewer-spirv",
     "viewer-transport",
-    "wl-pointer",
 ];
 
 /// Words in code that name a game's crate or the injected-code crates
@@ -78,7 +55,9 @@ fn dependencies(manifest: &str) -> Vec<String> {
         if name.is_empty() || name.contains(' ') {
             continue;
         }
-        out.push(name.to_owned());
+        if name == "package" { out.push(value.trim().trim_matches('"').to_owned()); }
+        else { if name == "package" { out.push(value.trim().trim_matches('"').to_owned()); }
+        else { out.push(name.to_owned()); } }
         if let Some(at) = value.find("package") {
             if let Some(package) = value[at..].split('"').nth(1) {
                 out.push(package.to_owned());

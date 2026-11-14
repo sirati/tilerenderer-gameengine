@@ -1,15 +1,39 @@
+
 [package]
 name = "function-keys-macos"
 description = "macOS system shortcuts and top-row media keys, for giving F1-F12 to a game"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
 
+[package.edition]
+workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[package.license]
+workspace = true
+
+[package.version]
+workspace = true
+
+[target]
+
+[target."cfg(target_os = \"macos\")"]
+
+[target."cfg(target_os = \"macos\")".dependencies]
 block2 = "0.6"
-log.workspace = true
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSEvent", "NSWorkspace", "objc2-core-graphics"] }
-objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGEvent", "CGEventTypes"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSDistributedNotificationCenter", "NSNotification", "NSOperation", "NSString"] }
+
+[target."cfg(target_os = \"macos\")".dependencies.log]
+workspace = true
+
+[target."cfg(target_os = \"macos\")".dependencies.objc2-app-kit]
+version = "0.3.2"
+default-features = false
+features = ["std", "NSEvent", "NSWorkspace", "objc2-core-graphics"]
+
+[target."cfg(target_os = \"macos\")".dependencies.objc2-core-graphics]
+version = "0.3.2"
+default-features = false
+features = ["std", "CGEvent", "CGEventTypes"]
+
+[target."cfg(target_os = \"macos\")".dependencies.objc2-foundation]
+version = "0.3.2"
+default-features = false
+features = ["std", "block2", "NSDistributedNotificationCenter", "NSNotification", "NSOperation", "NSString"]

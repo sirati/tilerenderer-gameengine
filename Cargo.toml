@@ -1,59 +1,8 @@
+
 [workspace]
 resolver = "3"
-members = [
-    "crates/application-icon",
-    "crates/application-icon-macos",
-    "crates/function-keys",
-    "crates/function-keys-macos",
-    "crates/pointer-x11",
-    "crates/pointer-wayland",
-    "crates/pointer-windows",
-    "crates/pointer-windows-ffi",
-    "crates/pointer-macos",
-    "crates/pointer-fallback",
-    "crates/pointer-control",
-    "crates/pointer-api",
-    "crates/tile-render-shared",
-    "crates/tile-render",
-    "crates/glass-shared",
-    "crates/glass",
-    "crates/marker",
-    "crates/viewer-spirv",
-    "crates/shader-build",
-    "crates/tile-render-test-spirv",
-    "crates/glass-test-spirv",
-    "crates/civ3-assets",
-    "crates/civ3-spirv",
-    "crates/render-desc",
-    "crates/render-errors",
-    "crates/scene",
-    "crates/menu",
-    "crates/gdi-text",
-    "crates/gpu-text",
-    "crates/wine-unixlib",
-    "crates/wine-unixlib-echo",
-    "crates/wine-unixlib-window",
-    "crates/wl-pointer",
-    "crates/civ3r-native",
-    "crates/tile-viewer",
-    "crates/viewer-settings",
-    "crates/viewer-transport",
-    "crates/civ3r-viewer",
-    "crates/civ3r-launcher",
-    "crates/civ3r-process",
-    "crates/handoff",
-    "crates/inproc",
-    "crates/civ3-sys",
-    "crates/jgl",
-    "crates/jgl-ffi",
-    "crates/tile-game",
-    "crates/civ3-ui",
-    "crates/civ3-world",
-    "crates/civ3-bridge",
-]
-# Shader crates are compiled by rust-gpu, never by the workspace toolchain.
-# The viewer combines its libraries once; library tests build independent modules.
-exclude = ["crates/tile-render-shaders", "crates/glass-shaders", "crates/marker-shaders", "crates/viewer-shaders", "crates/tile-render-test-shaders", "crates/glass-test-shaders", "crates/civ3-shaders", "vendor"]
+members = ["crates/application-icon", "crates/application-icon-macos", "crates/function-keys", "crates/function-keys-macos", "crates/marker", "crates/viewer-spirv", "crates/render-desc", "crates/scene", "crates/menu", "crates/tile-viewer", "crates/viewer-settings", "crates/viewer-transport", "crates/tile-game"]
+exclude = ["crates/marker-shaders", "crates/viewer-shaders", "vendor"]
 
 [workspace.package]
 edition = "2024"
@@ -61,26 +10,51 @@ license = "MIT OR Apache-2.0"
 version = "0.1.0"
 
 [workspace.dependencies]
-tile-render-shared = { path = "crates/tile-render-shared" }
-tile-render = { path = "crates/tile-render" }
-viewer-spirv = { path = "crates/viewer-spirv" }
-gpu-text = { path = "crates/gpu-text" }
-bytemuck = { version = "1.24", features = ["derive", "min_const_generics"] }
-glam = "0.30"
-wgpu = { version = "30", features = ["spirv", "vulkan-portability"] }
 winit = "0.30"
 pollster = "0.4"
-log = { version = "0.4", features = ["std"] }
-env_logger = "0.11"
 thiserror = "2"
-anyhow = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
+
+[workspace.dependencies.tile-render-shared]
+git = "ssh://git@github.com/sirati/tilerenderer.git"
+rev = "6941948fc77ad310c9021df6f01374be9d3a23fc"
+
+[workspace.dependencies.tile-render]
+git = "ssh://git@github.com/sirati/tilerenderer.git"
+rev = "6941948fc77ad310c9021df6f01374be9d3a23fc"
+
+[workspace.dependencies.viewer-spirv]
+path = "crates/viewer-spirv"
+
+[workspace.dependencies.wgpu]
+version = "30"
+features = ["spirv", "vulkan-portability"]
+
+[workspace.dependencies.log]
+version = "0.4"
+features = ["std"]
+
+[workspace.dependencies.image]
+version = "0.25"
+default-features = false
+features = ["png"]
+
+[profile]
+
+[profile.dev]
+
+[profile.dev.package]
 
 [profile.dev.package."*"]
 opt-level = 2
 
-# wgpu-hal with a fix for DX12 in 32-bit processes (pipeline stream
-# subobject alignment), see vendor/wgpu-hal/src/dx12/pipeline_desc.rs.
+[patch]
+
 [patch.crates-io]
-wgpu-hal = { path = "vendor/wgpu-hal" }
-winit = { path = "vendor/winit" }
+
+[patch.crates-io.wgpu-hal]
+git = "ssh://git@github.com/sirati/tilerenderer.git"
+rev = "6941948fc77ad310c9021df6f01374be9d3a23fc"
+
+[patch.crates-io.winit]
+git = "ssh://git@github.com/sirati/pointer-control-rs.git"
+rev = "10c22945ee0a9c23084cb85035a1ee44432cabd5"

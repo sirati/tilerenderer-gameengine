@@ -1,10 +1,21 @@
+
 [package]
 name = "function-keys"
 description = "F1-F12 for the game while its window is in front: system shortcuts on those keys paused, and restored"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
+
+[package.edition]
+workspace = true
+
+[package.license]
+workspace = true
+
+[package.version]
+workspace = true
 
 [dependencies]
-function-keys-macos = { path = "../function-keys-macos" }
-log.workspace = true
+
+[dependencies.function-keys-macos]
+path = "../function-keys-macos"
+
+[dependencies.log]
+workspace = true

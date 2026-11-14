@@ -1,10 +1,22 @@
+
 [package]
 name = "viewer-transport"
 description = "Authenticated bounded local transport between a game driver and a native viewer"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
+
+[package.edition]
+workspace = true
+
+[package.license]
+workspace = true
+
+[package.version]
+workspace = true
 
 [dependencies]
-handoff = { path = "../handoff" }
-scene = { path = "../scene" }
+
+[dependencies.handoff]
+git = "ssh://git@github.com/sirati/tilerenderer.git"
+rev = "6941948fc77ad310c9021df6f01374be9d3a23fc"
+
+[dependencies.scene]
+path = "../scene"

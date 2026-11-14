@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # Cargo runner for the *-pc-windows-gnu targets: runs the binary under Wine.
 #
-#   CIV3R_WINE        Wine build (default: the one built for ~/winvm, else `wine`)
-#   CIV3R_WINEPREFIX  prefix (default /mnt/datasets/winvm/wine-dev, created on demand)
+#   WINE_TEST_RUNTIME        Wine build (default: the one built for ~/winvm, else `wine`)
+#   WINE_TEST_PREFIX  prefix (default $HOME/.cache/tilerenderer-gameengine/wine-tests, created on demand)
 #
 # Wayland only, like the game: DISPLAY is dropped, the prefix uses
 # winewayland.drv, and WAYLAND_DISPLAY is passed through (a headless one from
 # tools/../~/winvm/bin/wlh works). Vulkan goes to the host's drivers through
 # winevulkan, so TILE_RENDER_ADAPTER=radv still selects the AMD iGPU.
 set -euo pipefail
-wine_dir=${CIV3R_WINE:-$(readlink -f "$HOME/.cache/winvm/wine" 2>/dev/null || true)}
+wine_dir=${WINE_TEST_RUNTIME:-$(readlink -f "$HOME/.cache/winvm/wine" 2>/dev/null || true)}
 if [ -n "$wine_dir" ] && [ -x "$wine_dir/bin/wine" ]; then
   PATH=$wine_dir/bin:$PATH
 fi
-export WINEPREFIX=${CIV3R_WINEPREFIX:-/mnt/datasets/winvm/wine-dev}
+export WINEPREFIX=${WINE_TEST_PREFIX:-$HOME/.cache/tilerenderer-gameengine/wine-tests}
 export WINEDEBUG=${WINEDEBUG:--all}
 export WINEDLLOVERRIDES="mscoree,mshtml=;${WINEDLLOVERRIDES:-}"
 unset DISPLAY

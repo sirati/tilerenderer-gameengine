@@ -1,32 +1,84 @@
+
 [package]
 name = "tile-viewer"
 description = "Game-agnostic window that renders scene snapshots with a render description and reports input"
-edition.workspace = true
-license.workspace = true
-version.workspace = true
+
+[package.edition]
+workspace = true
+
+[package.license]
+workspace = true
+
+[package.version]
+workspace = true
 
 [dependencies]
-render-errors = { path = "../render-errors" }
-application-icon = { path = "../application-icon" }
-handoff = { path = "../handoff" }
-tile-render.workspace = true
-marker = { path = "../marker" }
-viewer-spirv.workspace = true
-render-desc = { path = "../render-desc" }
-scene = { path = "../scene" }
-viewer-settings = { path = "../viewer-settings" }
-wgpu.workspace = true
-winit.workspace = true
-pollster.workspace = true
-log.workspace = true
-thiserror.workspace = true
-pointer-control = { path = "../pointer-control" }
-function-keys = { path = "../function-keys" }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-softbuffer = { version = "0.4.8", default-features = false }
-# Scheduling the window onto the main thread of a host application.
-dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
+[dependencies.render-errors]
+git = "ssh://git@github.com/sirati/tilerenderer.git"
+rev = "6941948fc77ad310c9021df6f01374be9d3a23fc"
+
+[dependencies.application-icon]
+path = "../application-icon"
+
+[dependencies.handoff]
+git = "ssh://git@github.com/sirati/tilerenderer.git"
+rev = "6941948fc77ad310c9021df6f01374be9d3a23fc"
+
+[dependencies.tile-render]
+workspace = true
+
+[dependencies.marker]
+path = "../marker"
+
+[dependencies.viewer-spirv]
+workspace = true
+
+[dependencies.render-desc]
+path = "../render-desc"
+
+[dependencies.scene]
+path = "../scene"
+
+[dependencies.viewer-settings]
+path = "../viewer-settings"
+
+[dependencies.wgpu]
+workspace = true
+
+[dependencies.winit]
+workspace = true
+
+[dependencies.pollster]
+workspace = true
+
+[dependencies.log]
+workspace = true
+
+[dependencies.thiserror]
+workspace = true
+
+[dependencies.pointer-control]
+git = "ssh://git@github.com/sirati/pointer-control-rs.git"
+rev = "10c22945ee0a9c23084cb85035a1ee44432cabd5"
+
+[dependencies.function-keys]
+path = "../function-keys"
+
+[target]
+
+[target."cfg(target_os = \"macos\")"]
+
+[target."cfg(target_os = \"macos\")".dependencies]
+
+[target."cfg(target_os = \"macos\")".dependencies.softbuffer]
+version = "0.4.8"
+default-features = false
+
+[target."cfg(target_os = \"macos\")".dependencies.dispatch2]
+version = "0.3"
+default-features = false
+features = ["std"]
 
 [dev-dependencies]
 toml = "0.9"

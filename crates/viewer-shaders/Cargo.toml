@@ -1,3 +1,4 @@
+
 [package]
 name = "viewer-shaders"
 description = "Generic viewer shader module combining tile and selection marker entry points"
@@ -10,10 +11,22 @@ crate-type = ["dylib", "lib"]
 
 [dependencies]
 spirv-std = "0.11"
-tile-render-shaders = { path = "../tile-render-shaders" }
-marker-shaders = { path = "../marker-shaders" }
-# The tile renderer's types its painter entry point reads.
-tile-render-shared = { path = "../tile-render-shared" }
+
+[dependencies.tile-render-shaders]
+git = "ssh://git@github.com/sirati/tilerenderer.git"
+rev = "6941948fc77ad310c9021df6f01374be9d3a23fc"
+
+[dependencies.marker-shaders]
+path = "../marker-shaders"
+
+[dependencies.tile-render-shared]
+git = "ssh://git@github.com/sirati/tilerenderer.git"
+rev = "6941948fc77ad310c9021df6f01374be9d3a23fc"
+
+[lints]
 
 [lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spirv"))'] }
+
+[lints.rust.unexpected_cfgs]
+level = "allow"
+check-cfg = ["cfg(target_arch, values(\"spirv\"))"]
