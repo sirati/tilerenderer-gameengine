@@ -53,6 +53,9 @@ pub const SHADERS: tile_render::Shaders = tile_render::Shaders::new(viewer_spirv
 /// CPU oracle for the default tile and marker module.
 pub const ORACLE: tile_render::reference::Oracle<'static> = tile_render::reference::Oracle { effect: None, painter: Some(&marker::PAINTER) };
 
+/// Generic busy-cursor art for an application's render description.
+pub const LOADING_CURSOR_DESCRIPTION: &str = include_str!("../../../assets/viewer/loading-cursor.toml");
+
 #[derive(Clone, Debug)]
 pub struct ViewerConfig {
     /// Application shader module and optional view-effect factory.
