@@ -19,7 +19,11 @@ members = [
     "crates/glass",
     "crates/marker",
     "crates/viewer-spirv",
+    "crates/shader-build",
+    "crates/tile-render-test-spirv",
+    "crates/glass-test-spirv",
     "crates/civ3-assets",
+    "crates/civ3-spirv",
     "crates/render-desc",
     "crates/render-errors",
     "crates/scene",
@@ -47,9 +51,9 @@ members = [
     "crates/civ3-world",
     "crates/civ3-bridge",
 ]
-# The shader crates are compiled by rust-gpu (pinned nightly), as one module
-# (viewer-shaders), from viewer-spirv's build script, never by the workspace toolchain.
-exclude = ["crates/tile-render-shaders", "crates/glass-shaders", "crates/marker-shaders", "crates/viewer-shaders", "vendor"]
+# Shader crates are compiled by rust-gpu, never by the workspace toolchain.
+# The viewer combines its libraries once; library tests build independent modules.
+exclude = ["crates/tile-render-shaders", "crates/glass-shaders", "crates/marker-shaders", "crates/viewer-shaders", "crates/tile-render-test-shaders", "crates/glass-test-shaders", "crates/civ3-shaders", "vendor"]
 
 [workspace.package]
 edition = "2024"

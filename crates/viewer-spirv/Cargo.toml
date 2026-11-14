@@ -1,9 +1,9 @@
 [package]
 name = "viewer-spirv"
-description = "The viewer's shader module (viewer-shaders) compiled to SPIR-V with rust-gpu, embedded"
+description = "The viewer's shader module (tile and marker entry points) compiled to SPIR-V with rust-gpu, embedded"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [build-dependencies]
-cargo-gpu-install = "0.11"
+shader-build = { path = "../shader-build" }

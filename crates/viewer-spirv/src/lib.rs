@@ -1,5 +1,5 @@
 //! The viewer's shader module: `viewer-shaders`, which links the tile
-//! renderer's, the glass lens's and the selection marker's shader
+//! renderer's and the selection marker's shader
 //! libraries, compiled to one SPIR-V module by this crate's build script.
 //!
 //! It holds bytes only (no renderer types), so that every crate drawing

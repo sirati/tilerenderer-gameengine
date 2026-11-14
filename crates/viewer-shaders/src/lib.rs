@@ -1,12 +1,11 @@
 //! The viewer's shader module: every entry point of the shader libraries
-//! it links (the tile renderer's, the glass lens's), compiled together by
+//! it links (the tile renderer's and the selection marker's), compiled together by
 //! rust-gpu into one SPIR-V module (one compile per build, see
 //! `viewer-spirv`), and the one entry point wiring two of them together:
 //! [`painted_fs`], the tile renderer's painted shapes painted by the
 //! selection marker.
 #![cfg_attr(target_arch = "spirv", no_std)]
 
-pub use glass_shaders;
 pub use marker_shaders;
 pub use tile_render_shaders;
 

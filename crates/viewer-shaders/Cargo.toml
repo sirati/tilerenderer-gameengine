@@ -1,6 +1,6 @@
 [package]
 name = "viewer-shaders"
-description = "The viewer's one rust-gpu shader module: links the tile renderer's, the glass lens's and the selection marker's shaders (built by viewer-spirv's build script)"
+description = "Generic viewer shader module combining tile and selection marker entry points"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
@@ -11,7 +11,6 @@ crate-type = ["dylib", "lib"]
 [dependencies]
 spirv-std = "0.11"
 tile-render-shaders = { path = "../tile-render-shaders" }
-glass-shaders = { path = "../glass-shaders" }
 marker-shaders = { path = "../marker-shaders" }
 # The tile renderer's types its painter entry point reads.
 tile-render-shared = { path = "../tile-render-shared" }

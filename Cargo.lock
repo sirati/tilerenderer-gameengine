@@ -470,6 +470,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "civ3-spirv"
+version = "0.1.0"
+dependencies = [
+ "shader-build",
+]
+
+[[package]]
 name = "civ3-sys"
 version = "0.1.0"
 dependencies = [
@@ -1069,10 +1076,10 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glass-shared",
+ "glass-test-spirv",
  "image",
  "pollster",
  "tile-render",
- "viewer-spirv",
  "wgpu",
 ]
 
@@ -1081,6 +1088,13 @@ name = "glass-shared"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "glass-test-spirv"
+version = "0.1.0"
+dependencies = [
+ "shader-build",
 ]
 
 [[package]]
@@ -2703,6 +2717,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "shader-build"
+version = "0.1.0"
+dependencies = [
+ "cargo-gpu-install",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2975,7 +2996,7 @@ dependencies = [
  "render-errors",
  "thiserror 2.0.21",
  "tile-render-shared",
- "viewer-spirv",
+ "tile-render-test-spirv",
  "wgpu",
 ]
 
@@ -2984,6 +3005,13 @@ name = "tile-render-shared"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "tile-render-test-spirv"
+version = "0.1.0"
+dependencies = [
+ "shader-build",
 ]
 
 [[package]]
@@ -3258,7 +3286,7 @@ dependencies = [
 name = "viewer-spirv"
 version = "0.1.0"
 dependencies = [
- "cargo-gpu-install",
+ "shader-build",
 ]
 
 [[package]]
