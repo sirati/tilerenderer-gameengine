@@ -593,7 +593,7 @@ mod tests {
         assert!(!draft.restore_number_control("resolution.frame_scale", &accepted));
         assert!(!draft.restore_number_control("resolution.pixel_scale", &accepted));
         // The active unit's arrow size: its own, the HUD's left alone.
-        (draft.accessibility.arrow_size, draft.accessibility.hud_size, accepted.accessibility.arrow_size) = (4, 2, 1);
+        (draft.accessibility.arrow_size, draft.accessibility.hud_size, accepted.accessibility.arrow_size) = (3, 2, 1);
         assert!(draft.restore_number_control("accessibility.arrow_size", &accepted));
         assert_eq!((draft.accessibility.arrow_size, draft.accessibility.hud_size), (1, 2));
         accepted.display.max_fps = 144;

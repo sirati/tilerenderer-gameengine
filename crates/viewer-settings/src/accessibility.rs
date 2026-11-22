@@ -7,7 +7,10 @@ use crate::controls::{ControlValue, Range};
 pub struct Accessibility {
     pub active_unit_arrow: bool,
     pub arrow_bobbing: bool,
-    /// The arrow's size: an index into [`ARROW_SCALES`].
+    /// The arrow's size: an index into [`ARROW_SCALES`] (whole multiples
+    /// of its art, so its edges stay smooth). Saved as `arrow_step`: older
+    /// files' `arrow_size` indexed [`OLD_ARROW_SCALES`] ([`Accessibility::migrating`]).
+    #[serde(rename = "arrow_step")]
     pub arrow_size: usize,
     pub unit_rings: bool,
     pub war: RingColor,
@@ -41,7 +44,10 @@ impl Default for Accessibility {
 }
 
 pub const HUD_SCALES: [f32; 4] = [1.0, 1.5, 2.0, 3.0];
-pub const ARROW_SCALES: [f32; 5] = [1.0, 1.5, 2.0, 2.5, 3.0];
+pub const ARROW_SCALES: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+/// The arrow sizes older files indexed (`arrow_size`), with fractional
+/// sizes that painted its art's pixels unevenly.
+pub const OLD_ARROW_SCALES: [f32; 5] = [1.0, 1.5, 2.0, 2.5, 3.0];
 /// The compact palette shown beside each diplomatic relation.
 pub const PALETTE: [[u8; 3]; 16] = [
     [255, 0, 0], [240, 112, 24], [248, 208, 32], [64, 240, 96],
@@ -59,13 +65,28 @@ pub fn range(key: &str) -> Option<Range> {
     match key {
         "accessibility.ring_width" => Some(Range { min: 1.0, max: 6.0, step: 1.0 }),
         "accessibility.hud_size" => Some(Range { min: 0.0, max: 3.0, step: 1.0 }),
-        "accessibility.arrow_size" => Some(Range { min: 0.0, max: 4.0, step: 1.0 }),
+        "accessibility.arrow_size" => Some(Range { min: 0.0, max: 3.0, step: 1.0 }),
         _ => None,
     }
 }
 impl Accessibility {
+    /// Reads the accessibility table. An older file's `arrow_size` (an
+    /// index into [`OLD_ARROW_SCALES`]) becomes the step of the nearest
+    /// whole size, a half size rounding up (1.5 to 2); an explicit
+    /// `arrow_step` wins.
+    pub(crate) fn migrating<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Accessibility, D::Error> {
+        let mut table = toml::Table::deserialize(d)?;
+        let old = table.remove("arrow_size");
+        let explicit = table.contains_key("arrow_step");
+        let mut accessibility: Accessibility = toml::Value::Table(table).try_into().map_err(serde::de::Error::custom)?;
+        if let (false, Some(toml::Value::Integer(old))) = (explicit, old) {
+            let scale = OLD_ARROW_SCALES[usize::try_from(old).unwrap_or(0).min(OLD_ARROW_SCALES.len() - 1)];
+            accessibility.arrow_size = ARROW_SCALES.iter().position(|&s| s >= scale.round()).unwrap_or(ARROW_SCALES.len() - 1);
+        }
+        Ok(accessibility)
+    }
     pub fn hud_scale(&self) -> f32 { HUD_SCALES[self.hud_size.min(3)] }
-    pub fn arrow_scale(&self) -> f32 { ARROW_SCALES[self.arrow_size.min(4)] }
+    pub fn arrow_scale(&self) -> f32 { ARROW_SCALES[self.arrow_size.min(ARROW_SCALES.len() - 1)] }
     pub fn control(&self, key: &str) -> Option<ControlValue> {
         use ControlValue::*;
         Some(match key.strip_prefix("accessibility.")? {
@@ -73,7 +94,7 @@ impl Accessibility {
             "unit_rings" => On(self.unit_rings), "stack_count" => On(self.stack_count),
             "stack_backdrop" => On(self.stack_backdrop),
             "ring_width" => Number(self.ring_width.clamp(1, 6) as f32), "hud_size" => Number(self.hud_size.min(3) as f32),
-            "arrow_size" => Number(self.arrow_size.min(4) as f32),
+            "arrow_size" => Number(self.arrow_size.min(ARROW_SCALES.len() - 1) as f32),
             relation => {
                 let (name, field) = relation.split_once('.')?;
                 let ring = match name { "war" => &self.war, "allied" => &self.allied, "peace" => &self.peace, _ => return None };
@@ -137,8 +158,26 @@ mod tests {
         assert!(!s.set_control("accessibility.war.color", &ControlValue::Choice("invalid".into())));
         s.set_control("accessibility.hud_size", &ControlValue::Number(f32::NAN));
         assert_eq!(s.accessibility.hud_scale(), 1.0);
-        assert_eq!((s.accessibility.arrow_size, s.accessibility.arrow_scale()), (3, 2.5), "the arrow's size by its slider's steps");
-        assert!(s.set_control("accessibility.arrow_size", &ControlValue::Number(9.0)));
+        assert_eq!((s.accessibility.arrow_size, s.accessibility.arrow_scale()), (3, 4.0), "the arrow's size by its slider's steps");
+        assert!(s.set_control("accessibility.arrow_size", &ControlValue::Number(2.0)));
         assert_eq!(s.accessibility.arrow_scale(), 3.0);
+        assert!(s.set_control("accessibility.arrow_size", &ControlValue::Number(9.0)));
+        assert_eq!(s.accessibility.arrow_scale(), 4.0);
+    }
+
+    #[test]
+    fn an_older_files_fractional_arrow_size_becomes_the_nearest_whole_one() {
+        let scale = |text: &str| toml::from_str::<Settings>(text).unwrap().accessibility.arrow_scale();
+        // Old steps 1.0, 1.5, 2.0, 2.5, 3.0 (and past the end).
+        for (old, whole) in [(0, 1.0), (1, 2.0), (2, 2.0), (3, 3.0), (4, 3.0), (9, 3.0)] {
+            assert_eq!(scale(&format!("[accessibility]\narrow_size = {old}\nunit_rings = true\n")), whole, "old step {old}");
+        }
+        assert_eq!(scale("[accessibility]\narrow_size = 4\narrow_step = 1\n"), 2.0, "the new key wins");
+        // Saved again, only the new key, read back the same.
+        let s: Settings = toml::from_str("[accessibility]\narrow_size = 3\nunit_rings = true\n").unwrap();
+        assert!(s.accessibility.unit_rings, "the rest of the table is read");
+        let text = toml::to_string(&s).unwrap();
+        assert!(text.contains("arrow_step = 2") && !text.contains("arrow_size"), "{text}");
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), s);
     }
 }

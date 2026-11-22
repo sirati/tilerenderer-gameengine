@@ -83,7 +83,10 @@ pub fn sample(px: f32, py: f32, color: [f32; 3], smooth: bool) -> (bool, [f32; 3
         grain_at(px.floor() as i32, py.floor() as i32)
     };
     let mottle = (px*0.77+py*0.32).sin()*(py*0.63-px*0.21).sin();
-    let worn_edge = 0.95+grain*0.30+(py*1.7).sin()*0.12;
+    // The 1:1 art's ink edge is worn unevenly, pixel by pixel; painted
+    // larger, that unevenness bends its straight edges into waves, so
+    // there it keeps its mean width.
+    let worn_edge = if smooth { 0.95 } else { 0.95+grain*0.30+(py*1.7).sin()*0.12 };
     let bevel = ((3.8-edge)/2.8).clamp(0.0, 1.0);
     let ridge = (-((px-16.0)/3.7).powi(2)).exp()*0.17;
     let shade = 0.76+ridge+0.08*(py*0.16).cos()+mottle*0.055+grain*0.045;

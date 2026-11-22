@@ -67,3 +67,33 @@ impl tile_render::reference::Painter for MarkerPainter {
         marker_math::paint(shape, x, y, scale, param, rgba)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::marker_math::{arrow_pixel, ARROW_TIP};
+
+    /// Where the shaft's metal meets its right-hand ink edge on stage row
+    /// `y` (from the tip) of the arrow painted `scale` times as large: the
+    /// first pixel right of the shaft's middle darker than `threshold`.
+    fn ink_from(y: f32, scale: f32) -> i32 {
+        let threshold = 140.0;
+        (0..40 * scale as i32).find(|&x| {
+            let p = arrow_pixel(x as f32, y, scale, [232.0, 183.0, 87.0, 255.0]);
+            p[3] > 0.0 && p[0] + p[1] + p[2] < threshold
+        }).expect("the shaft's edge")
+    }
+
+    #[test]
+    fn painted_larger_the_shafts_straight_edge_stays_straight() {
+        for scale in [2.0f32, 3.0, 4.0] {
+            // The right edge runs from art (23, 5.5) to (22, 23): leaning
+            // left by one art pixel. Its ink must follow it, never wave.
+            let rows: Vec<i32> = ((8.0 * scale) as i32..(20.0 * scale) as i32)
+                .map(|row| ink_from(row as f32 - ARROW_TIP.1 * scale, scale))
+                .collect();
+            assert!(rows.windows(2).all(|w| w[1] <= w[0]), "at {scale}x the ink edge waves: {rows:?}");
+            let lean = rows[0] - rows[rows.len() - 1];
+            assert!(lean <= scale.ceil() as i32 + 1, "at {scale}x it leans {lean} pixels: {rows:?}");
+        }
+    }
+}
