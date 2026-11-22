@@ -6,8 +6,13 @@
 //! (or on the box) closes it and does nothing else, as a click beside the
 //! game's box does; so does Esc with the pointer in that view. Nothing in it
 //! takes input: the game has no box open any more.
+//!
+//! A box that would reach past its view's edge moves the view as little as
+//! it takes to show it whole (it stays on its tile), and closing it moves
+//! the view back by as much: for the view following the world cursor, only
+//! while the box is there.
 
-use super::{button_index, inside, scaled_up, Button, Follow, Hit, Input, Layout, WorldPress};
+use super::{button_index, fit_pan, inside, scaled_up, world_steps, Button, Follow, Hit, Input, Layout, WorldPress};
 
 /// The views' kept popups, and what the driver is to hear of them.
 #[derive(Clone, Debug, Default)]
@@ -22,6 +27,8 @@ pub(super) struct Detached {
     outbox: Vec<Input>,
     /// Buttons whose press closed one: their release does nothing either.
     swallowed: [bool; 3],
+    /// Views moved for boxes now gone, to be moved back by as much.
+    unpan: Vec<(Hit, (i32, i32))>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -31,6 +38,10 @@ struct Kept {
     anchor: scene::PopupAnchor,
     size: (i32, i32),
     press: WorldPress,
+    /// How far its view was moved for it (world pixels).
+    pan: (i32, i32),
+    /// That view follows the world cursor: moved only while it is kept.
+    pointer: bool,
 }
 
 /// How many world presses are remembered for finding a popup's click.
@@ -38,11 +49,19 @@ const PRESSES: usize = 8;
 
 impl Detached {
     fn close(&mut self, serial: u64) {
-        self.kept.retain(|k| k.serial != serial);
+        self.forget(serial);
         if !self.closing.contains(&serial) {
             self.closing.push(serial);
             self.outbox.push(Input::CloseDetached { serial });
         }
+    }
+
+    /// Drops kept box `serial`; its view's move is to be undone.
+    fn forget(&mut self, serial: u64) {
+        for k in self.kept.iter().filter(|k| k.serial == serial && k.pan != (0, 0) && !k.pointer) {
+            self.unpan.push((k.press.hit, k.pan));
+        }
+        self.kept.retain(|k| k.serial != serial);
     }
 
     /// The driver's inputs this asks for (`Layout::route`).
@@ -71,7 +90,11 @@ impl Layout {
         let size = |view: u32| scene.view(view).map_or((0, 0), |v| (v.view.viewport.0 as i32, v.view.viewport.1 as i32));
         let shown: Vec<Hit> = self.shown.iter().map(|(hit, _)| *hit).collect();
         let d = &mut self.detached;
-        d.kept.retain(|k| popups.iter().any(|p| p.serial == k.serial));
+        let gone: Vec<u64> = d.kept.iter().filter(|k| !popups.iter().any(|p| p.serial == k.serial)).map(|k| k.serial).collect();
+        for serial in gone {
+            d.forget(serial);
+        }
+        let mut new = Vec::new();
         d.closing.retain(|s| popups.iter().any(|p| p.serial == *s));
         for p in popups {
             if let Some(k) = d.kept.iter_mut().find(|k| k.serial == p.serial) {
@@ -93,7 +116,8 @@ impl Layout {
                 d.close(serial);
             }
             log::info!("viewer: the tile box {} kept at the world click {:?} ({:?}); the views play on", p.serial, press.world, press.hit);
-            d.kept.push(Kept { serial: p.serial, view: p.view, anchor: p.anchor, size: size(p.view), press });
+            d.kept.push(Kept { serial: p.serial, view: p.view, anchor: p.anchor, size: size(p.view), press, pan: (0, 0), pointer: false });
+            new.push(p.serial);
         }
         if !shown.is_empty() {
             let gone: Vec<u64> = d.kept.iter().filter(|k| !shown.contains(&k.press.hit)).map(|k| k.serial).collect();
@@ -101,6 +125,48 @@ impl Layout {
                 d.close(serial);
             }
         }
+        for serial in new {
+            self.detached_fit(serial);
+        }
+        self.detached_unpan();
+    }
+
+    /// Moves the view of new kept box `serial` as little as it takes for
+    /// the box to show whole in it.
+    fn detached_fit(&mut self, serial: u64) {
+        let Some(k) = self.detached.kept.iter().find(|k| k.serial == serial).copied() else { return };
+        let Some(((x, y), zoom, camera)) = self.anchored_place(k.anchor, k.press, k.size) else { return };
+        let (w, h) = (scaled_up(k.size.0, zoom), scaled_up(k.size.1, zoom));
+        let (vw, vh) = (camera.viewport.0 as i32, camera.viewport.1 as i32);
+        let pan = (fit_pan(x - camera.origin.0, w, vw), fit_pan(y - camera.origin.1, h, vh));
+        if pan == (0, 0) {
+            return;
+        }
+        let by = (world_steps(pan.0, camera.zoom), world_steps(pan.1, camera.zoom));
+        let pointer = self.follow_of(k.press.hit) == Some(Follow::Pointer);
+        if !pointer {
+            let Some(c) = self.free_view(k.press.hit).map(|v| v.center) else { return };
+            self.place_view(k.press.hit, (c.0 + by.0, c.1 + by.1));
+        }
+        if let Some(kept) = self.detached.kept.iter_mut().find(|k| k.serial == serial) {
+            (kept.pan, kept.pointer) = (by, pointer);
+        }
+        log::info!("viewer: the tile box {serial} needs {pan:?} more room in its view: moved by {by:?} until it closes");
+    }
+
+    /// Moves the views moved for boxes now closed back by as much.
+    fn detached_unpan(&mut self) {
+        for (hit, by) in std::mem::take(&mut self.detached.unpan) {
+            if let Some(c) = self.free_view(hit).map(|v| v.center) {
+                self.place_view(hit, (c.0 - by.0, c.1 - by.1));
+            }
+        }
+    }
+
+    /// How far the kept boxes move the view following the world cursor at
+    /// `hit` while they are there (world pixels).
+    pub(super) fn detached_pointer_pan(&self, hit: Hit) -> (i32, i32) {
+        self.detached.kept.iter().filter(|k| k.pointer && k.press.hit == hit).fold((0, 0), |a, k| (a.0 + k.pan.0, a.1 + k.pan.1))
     }
 
     /// Where the kept popups go on the canvas now (view, (top-left, zoom)).
@@ -146,6 +212,7 @@ impl Layout {
         for serial in closing {
             self.detached.close(serial);
         }
+        self.detached_unpan();
         self.detached.swallowed[b] = true;
         log::info!("viewer: a press in its view closes the kept tile box");
         Some(self.detached.take_inputs())
@@ -160,6 +227,7 @@ impl Layout {
         for &serial in &closing {
             self.detached.close(serial);
         }
+        self.detached_unpan();
         !closing.is_empty()
     }
 }

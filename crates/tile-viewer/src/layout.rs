@@ -2713,6 +2713,10 @@ impl Layout {
             Hit::Inset(i) => Some((2 + i, by)),
             _ => None,
         });
+        // (Per view, in `views_mut`'s order: how far the kept tile boxes
+        // move the one following the world cursor.)
+        let detached_pans: Vec<(i32, i32)> = std::iter::once(Hit::Main).chain(self.split.map(|_| Hit::Pane)).chain((0..self.insets.len()).map(Hit::Inset))
+            .map(|hit| self.detached_pointer_pan(hit)).collect();
         let capture_focus = self.locked && self.semantic_focus_active;
         let combat_focus = self.semantic_focus_active && scene.camera_arrival.is_some_and(|a| scene.camera_focus.is_some_and(|f| f.serial == a.serial));
         let arrival_area = scene.camera_arrival.filter(|a| scene.camera_focus.is_some_and(|f| f.serial == a.serial)).map(|a| a.bounds);
@@ -2778,6 +2782,11 @@ impl Layout {
             // (Moved for a popup opened at a click to fit the window.)
             let target = match popup_pan {
                 Some((j, by)) if j == k && v.follow == Follow::Pointer => target.map(|t| (t.0 + by.0, t.1 + by.1)),
+                _ => target,
+            };
+            // (And for the kept tile boxes in it, while they are.)
+            let target = match detached_pans.get(k) {
+                Some(&by) if by != (0, 0) && v.follow == Follow::Pointer => target.map(|t| (t.0 + by.0, t.1 + by.1)),
                 _ => target,
             };
             match target {
@@ -3689,10 +3698,15 @@ impl Layout {
         let p = (near(a.world.0, camera.x, camera.origin.0, press.at.0, self.world_period.0), near(a.world.1, camera.y, camera.origin.1, press.at.1, self.world_period.1));
         let zoom = self.popup_zoom((w, h), a.world_scaled.then_some(camera.zoom));
         let offset = |v: i32| (v as i64 * zoom.0 as i64).div_euclid(zoom.1.max(1) as i64) as i32;
-        // Kept in the window: past an edge it opens on the other side of
-        // the click (above it, left of it), as a menu does near the edge.
+        // Kept in the window: past an edge a menu opens on the other side
+        // of the click (above it, left of it). One showing a piece of the
+        // world stays on it: its view moves to show it whole instead
+        // (`detached_popups`, `popup_opened`).
         let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
         let at = (p.0 + offset(a.offset.0), p.1 + offset(a.offset.1));
+        if a.world_scaled {
+            return Some((at, zoom, camera));
+        }
         let at = (other_side_if_out(at.0, scaled_up(w, zoom), press.at.0, ww), other_side_if_out(at.1, scaled_up(h, zoom), press.at.1, wh));
         Some((at, zoom, camera))
     }
@@ -9359,6 +9373,45 @@ mod tests {
         // With none kept, Esc is the game's again.
         l.frame(&parked(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert!(matches!(l.route(Input::Key { vk: VK_ESCAPE, down: true, text: None }).as_slice(), [Input::Key { vk: VK_ESCAPE, .. } | Input::WorldKey { vk: VK_ESCAPE, .. }]));
+    }
+
+    #[test]
+    fn a_tile_box_past_its_views_edge_moves_the_view_until_it_closes() {
+        let mut l = Layout::default();
+        l.apply_settings(&settings(|s| s.split = S::Vertical1To1));
+        let s = parked();
+        for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        let (a, _) = l.panes();
+        let at = |f: &Frame| { let c = camera_at(f, (a[0], a[1])); (c.x, c.y) };
+        let rest = at(&l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS));
+        // A click near A's bottom right: its box (256 by 173, its corner
+        // half a tile left of the click) reaches past A's right and bottom.
+        let p = (a[0] + a[2] - 60, a[1] + a[3] - 60);
+        let w = world_press(&mut l, Button::Right, p);
+        let mut kept = with_detached(&[(0x1000, 1, w)]);
+        kept.interface.detached[0].anchor.world_scaled = true;
+        l.frame(&kept, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let f = l.frame(&kept, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let &(_, ((x, y), zoom)) = f.popup_places.iter().find(|(id, _)| *id == 0x1000).expect("placed");
+        assert_eq!(zoom, (1, 1));
+        // Whole in A, its far corner at A's (moved no more than that), on
+        // its tile: the view moved under it by as much.
+        assert_eq!((x + 256, y + 173), (a[0] + a[2], a[1] + a[3]), "at {:?} in {a:?}", (x, y));
+        let moved = at(&f);
+        assert_eq!((moved.0 - rest.0, moved.1 - rest.1), ((p.0 - 64 + 256) - (a[0] + a[2]), (p.1 - 20 + 173) - (a[1] + a[3])));
+        // Closed: the view moves back.
+        let q = (a[0] + 50, a[1] + 50);
+        assert_eq!(l.route(Input::MouseButton { button: Button::Left, down: true, x: q.0, y: q.1 }), vec![Input::CloseDetached { serial: 1 }]);
+        l.route(Input::MouseButton { button: Button::Left, down: false, x: q.0, y: q.1 });
+        l.frame(&parked(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(at(&l.frame(&parked(), (800, 600), (0, 0, 0, 0), vec![], BOUNDS)), rest);
+        // A menu there still opens on the other side of its click, where it
+        // would reach past the window (only below: it fits right of it).
+        let w = world_press(&mut l, Button::Right, p);
+        let menu = with_anchored_popup(scene::PopupAnchor { world: w, offset: (0, 0), world_scaled: false }, (200, 150));
+        let f = l.frame(&menu, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert_eq!(f.popup_at, Some(((p.0, p.1 - 150), (1, 1))));
+        assert_eq!(at(&f), rest, "a menu moves no view");
     }
 
     #[test]
