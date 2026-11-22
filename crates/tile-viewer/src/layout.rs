@@ -1393,6 +1393,21 @@ fn fit_pan(at: i32, len: i32, room: i32) -> i32 {
     if at < 0 || len > room { at } else { (at + len - room).max(0) }
 }
 
+/// Where something `len` long goes along an axis of `0..room`, placed at
+/// `at` for a click at `click`: there if it lies within; else on the other
+/// side of the click (its far end at the click, or its start), if it lies
+/// within there; else as far in as it goes (from 0 when it is longer).
+fn other_side_if_out(at: i32, len: i32, click: i32, room: i32) -> i32 {
+    if room <= 0 || (at >= 0 && at + len <= room) {
+        return at;
+    }
+    let other = if at + len > room { click - len } else { click };
+    if other >= 0 && other + len <= room {
+        return other;
+    }
+    at.clamp(0, (room - len).max(0))
+}
+
 /// Canvas pixels `v` as world pixels at camera `zoom` (canvas pixels per
 /// world pixel), rounded away from zero (moving at least that far).
 fn world_steps(v: i32, zoom: (u32, u32)) -> i32 {
@@ -3674,7 +3689,12 @@ impl Layout {
         let p = (near(a.world.0, camera.x, camera.origin.0, press.at.0, self.world_period.0), near(a.world.1, camera.y, camera.origin.1, press.at.1, self.world_period.1));
         let zoom = self.popup_zoom((w, h), a.world_scaled.then_some(camera.zoom));
         let offset = |v: i32| (v as i64 * zoom.0 as i64).div_euclid(zoom.1.max(1) as i64) as i32;
-        Some(((p.0 + offset(a.offset.0), p.1 + offset(a.offset.1)), zoom, camera))
+        // Kept in the window: past an edge it opens on the other side of
+        // the click (above it, left of it), as a menu does near the edge.
+        let (ww, wh) = (self.window.0 as i32, self.window.1 as i32);
+        let at = (p.0 + offset(a.offset.0), p.1 + offset(a.offset.1));
+        let at = (other_side_if_out(at.0, scaled_up(w, zoom), press.at.0, ww), other_side_if_out(at.1, scaled_up(h, zoom), press.at.1, wh));
+        Some((at, zoom, camera))
     }
 
     /// The anchored popup's zoom: the menus', smaller only where the popup
@@ -9218,20 +9238,18 @@ mod tests {
                             // menu one menu pixel past it.
                             let now = camera_at(&f, (pane[0], pane[1]));
                             let q = shown_at(&now, w, at, (8000, 0));
-                            assert_eq!(corner, (q.0 + step(1), q.1 + step(1)), "{what}");
+                            // There, or past the window's edge on the other side
+                            // of the click (`other_side_if_out`).
+                            let (mw, mh) = (scaled_up(menu.0 as i32, z), scaled_up(menu.1 as i32, z));
+                            assert_eq!(corner, (other_side_if_out(q.0 + step(1), mw, at.0, 800), other_side_if_out(q.1 + step(1), mh, at.1, 600)), "{what}");
                             // Not kept out of the other view, nor anywhere else.
                             assert_eq!(f.popup_region, None, "{what}");
-                            let fits = at.0 + step(1) + scaled_up(menu.0 as i32, z) <= 800 && at.1 + step(1) + scaled_up(menu.1 as i32, z) <= 600;
-                            if fits {
-                                // There: where the click was (to the art pixel).
-                                assert!((q.0 - at.0).abs() < slack && (q.1 - at.1).abs() < slack, "{what}: {corner:?} for a click at {at:?}");
-                            }
-                            // Fitting, no view moved for it; else only the clicked one.
+                            // There: where the click was (to the art pixel).
+                            assert!((q.0 - at.0).abs() < slack && (q.1 - at.1).abs() < slack, "{what}: {corner:?} for a click at {at:?}");
+                            // No view moved for it.
                             for origin in [(a[0], a[1]), (b.unwrap()[0], b.unwrap()[1])] {
                                 let (x, y) = (camera_at(&before, origin), camera_at(&f, origin));
-                                if fits || origin != (pane[0], pane[1]) {
-                                    assert_eq!((x.x, x.y), (y.x, y.y), "{what}: the view at {origin:?} moved");
-                                }
+                                assert_eq!((x.x, x.y), (y.x, y.y), "{what}: the view at {origin:?} moved");
                             }
                             assert!(corner.0 + scaled_up(menu.0 as i32, z) <= 800 && corner.1 + scaled_up(menu.1 as i32, z) <= 600, "{what}: {corner:?}");
                             if captures {
@@ -9258,6 +9276,30 @@ mod tests {
         let anchor = (w.0 - 8000 - 64, w.1 - 20);
         let f = l.frame(&with_anchored_popup(scene::PopupAnchor { world: anchor, offset: (0, 0), world_scaled: false }, (256, 173)), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         assert_eq!(f.popup_at, Some(((p.0 - 64, p.1 - 20), (1, 1))));
+    }
+
+    #[test]
+    fn a_menu_at_a_click_near_an_edge_opens_on_the_other_side_of_the_click() {
+        // Near the bottom right the menu (its corner at the click) would
+        // reach past both edges: it opens above and left of the click. With
+        // room below and right it stays at the click.
+        for (p, corner) in [((700, 550), (500, 400)), ((100, 100), (100, 100)), ((700, 100), (500, 100))] {
+            let mut l = Layout::default();
+            let s = parked();
+            for _ in 0..3 { l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+            let w = world_press(&mut l, Button::Right, p);
+            let f = l.frame(&with_anchored_popup(scene::PopupAnchor { world: w, offset: (0, 0), world_scaled: false }, (200, 150)), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+            assert_eq!(f.popup_at, Some((corner, (1, 1))), "a click at {p:?}");
+        }
+    }
+
+    #[test]
+    fn a_popup_goes_to_the_other_side_of_its_click_only_where_it_fits_there() {
+        assert_eq!(other_side_if_out(100, 50, 100, 800), 100, "within");
+        assert_eq!(other_side_if_out(780, 50, 780, 800), 730, "past the end: before the click");
+        assert_eq!(other_side_if_out(-30, 50, 20, 800), 20, "past the start: after the click");
+        assert_eq!(other_side_if_out(780, 300, 790, 800), 490, "fits nowhere whole: as far in as it goes");
+        assert_eq!(other_side_if_out(10, 900, 10, 800), 0, "longer than the room: from its start");
     }
 
     /// The parked scene with kept tile boxes (`Interface::detached`): view,
@@ -9344,7 +9386,7 @@ mod tests {
     }
 
     #[test]
-    fn a_menu_past_the_windows_edge_moves_its_view_just_enough() {
+    fn a_menu_past_the_windows_edge_opens_on_the_other_side_of_its_click() {
         let menu = (200, 150);
         for roles in [Roles::Free, Roles::UnitMouse] {
             for side in [Side::A, Side::B] {
@@ -9375,29 +9417,24 @@ mod tests {
                     let open = with_anchored_popup(scene::PopupAnchor { world: w, offset: (1, 1), world_scaled: false }, menu);
                     let f = l.frame(&open, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
                     let ((x, y), _) = f.popup_at.unwrap();
-                    // Whole in the window, its corner still at the clicked pixel.
-                    let need = ((at.0 + 1 + menu.0 as i32 - 800).max(0), (at.1 + 1 + menu.1 as i32 - 600).max(0));
-                    let (n, d) = ZOOMS[zoom];
-                    let world = (world_steps(need.0, (n, d)), world_steps(need.1, (n, d)));
-                    let (c0, c1) = (camera_at(&before, mine), camera_at(&f, mine));
-                    if captures {
-                        // (The pointer's view keeps the world cursor in its middle:
-                        // the move is the popup's, gone once it closes.)
-                        assert_eq!((c1.x - c0.x, c1.y - c0.y), world, "{what}");
-                    } else {
-                        assert_eq!((c1.x - c0.x, c1.y - c0.y), world, "{what}: moved by the least that fits");
+                    // No view moves for it: the menu opens above and left of
+                    // the click (its far corner there), whole in the window.
+                    for origin in [mine, other] {
+                        let (c0, c1) = (camera_at(&before, origin), camera_at(&f, origin));
+                        assert_eq!((c0.x, c0.y), (c1.x, c1.y), "{what}: the view at {origin:?} moved");
                     }
                     assert!(x + menu.0 as i32 <= 800 && y + menu.1 as i32 <= 600 && x >= 0 && y >= 0, "{what}: {:?}", (x, y));
-                    assert_eq!((x, y), { let q = shown_at(&c1, w, at, (8000, 0)); (q.0 + 1, q.1 + 1) }, "{what}");
-                    assert!(x + menu.0 as i32 > 800 - 2 * (n / d) as i32 || y + menu.1 as i32 > 600 - 2 * (n / d) as i32, "{what}: no further than needed");
+                    // (Past the window's right edge: its far side at the click;
+                    // past the bottom too where the pane is the window's bottom.)
+                    let q = shown_at(&camera_at(&f, mine), w, at, (8000, 0));
+                    assert_eq!((x, y), (other_side_if_out(q.0 + 1, menu.0 as i32, at.0, 800), other_side_if_out(q.1 + 1, menu.1 as i32, at.1, 600)), "{what}");
                     // The other view stays.
                     let (o0, o1) = (camera_at(&before, other), camera_at(&f, other));
                     assert_eq!((o0.x, o0.y), (o1.x, o1.y), "{what}");
-                    // Closed: a view following the pointer is back on the cursor,
-                    // a free or focus view stays where it was moved.
+                    // Closed: every view is where it was.
                     let after = l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-                    let c2 = camera_at(&after, mine);
-                    if captures { assert_eq!((c2.x, c2.y), (c0.x, c0.y), "{what}"); } else { assert_eq!((c2.x, c2.y), (c1.x, c1.y), "{what}: a view moved for the menu stays moved"); }
+                    let (c0, c2) = (camera_at(&before, mine), camera_at(&after, mine));
+                    assert_eq!((c2.x, c2.y), (c0.x, c0.y), "{what}");
                 }
             }
         }
@@ -9677,8 +9714,11 @@ mod tests {
                     let site = (w.0 - 50, w.1 - 20);
                     let tile_box = with_anchored_popup(scene::PopupAnchor { world: site, offset: (0, 0), world_scaled: true }, (256, 173));
                     let f = l.frame(&tile_box, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
-                    let (corner, _) = f.popup_at.unwrap_or_else(|| panic!("{what}: not at the menu's tile"));
-                    assert_eq!(corner, shown_at(&camera_at(&f, (pane[0], pane[1])), site, p, (8000, 0)), "{what}");
+                    let (corner, z) = f.popup_at.unwrap_or_else(|| panic!("{what}: not at the menu's tile"));
+                    let shown = shown_at(&camera_at(&f, (pane[0], pane[1])), site, p, (8000, 0));
+                    // (Past the window's edge: on the other side of the click.)
+                    let expected = (other_side_if_out(shown.0, scaled_up(256, z), p.0, 800), other_side_if_out(shown.1, scaled_up(173, z), p.1, 600));
+                    assert_eq!(corner, expected, "{what}");
                 }
             }
         }
