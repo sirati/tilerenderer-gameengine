@@ -497,10 +497,15 @@ pub fn pick_tuned(tuning: &Tuning, targets: &[Target], from: Point, current: Opt
         .filter(|(_, t)| t.snappable() && Some(t.id) != current)
         .filter_map(|(k, t)| {
             let spot = t.center();
-            // (A control is all of its area: the way to it is the way to
-            // its part nearest the pointer, so one beside the pointer, a
-            // list's next row, lies across a sideways move, not ahead.)
-            let c = if t.spread() { t.closest(from) } else { spot };
+            // (A control is all of its area. A move ending in it reached it;
+            // otherwise the way to it is the way to its part nearest the
+            // pointer, so one beside the pointer, a list's next row, lies
+            // across a sideways move, not ahead.)
+            let c = match t.spread() {
+                true if inside(t.area, aim) => aim,
+                true => t.closest(from),
+                false => spot,
+            };
             let d = (c.0 - from.0, c.1 - from.1);
             let dist = d.0.hypot(d.1);
             if dist < 1.0 {

@@ -229,8 +229,10 @@ fn the_attractor_draws_the_pointer_past_elements_off_the_way() {
     let mut t = targets(&[Interactable { region: None, alt_right_click: false, anchor: None, rect: [270, 470, 20, 20], kind: InteractableKind::Button, id: 3 }], ((0, 0), (1, 1)), (800, 600));
     t.push(Target::capture([0, 0, 800, 600], (400, 300)));
     assert_eq!(pick(&t, (330.0, 535.0), Some(2), (0.0, -60.0)).map(|k| t[k].id), Some(CAPTURE_ID));
-    // As a button there it would lose to C.
-    t[1].kind = TargetKind::Button;
+    // A mere button at its spot (all of it a 20 px square there) would
+    // lose to C.
+    let middle = targets(&[Interactable { region: None, alt_right_click: false, anchor: None, rect: [390, 290, 20, 20], kind: InteractableKind::Button, id: 4 }], ((0, 0), (1, 1)), (800, 600));
+    t[1] = middle[0];
     assert_eq!(pick(&t, (330.0, 535.0), Some(2), (0.0, -60.0)).map(|k| t[k].id), Some(3));
 }
 
