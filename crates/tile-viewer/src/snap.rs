@@ -288,12 +288,15 @@ impl Target {
         (q.0 - p.0).hypot(q.1 - p.1)
     }
 
-    /// Seen by [`pick`] as all of its [`Target::area`], not a point: a
-    /// control larger than where it takes the pointer (a check box with
-    /// its label), and a slider or scroll bar (the pointer goes on its
-    /// knob, the whole bar is the control).
+    /// Seen by [`pick`] as all of its [`Target::area`], never a point:
+    /// every control attracts the pointer from all of itself (its hit
+    /// rectangle, and its region where it has one: a check box with its
+    /// label, an entry's icon and text, a slider's whole bar), wherever
+    /// its pointer spot ([`Target::center`]) lies, even outside its picture
+    /// (an icon's corner). Only the capture view draws the pointer to its
+    /// spot, from a disc around it.
     fn spread(&self) -> bool {
-        !self.is_capture() && (self.spread || self.area != self.rect || matches!(self.kind, TargetKind::Slider { .. }))
+        !self.is_capture()
     }
 
     /// The point of the whole control ([`Target::area`]) nearest `p`.
@@ -494,7 +497,10 @@ pub fn pick_tuned(tuning: &Tuning, targets: &[Target], from: Point, current: Opt
         .filter(|(_, t)| t.snappable() && Some(t.id) != current)
         .filter_map(|(k, t)| {
             let spot = t.center();
-            let c = if t.spread() { t.closest(aim) } else { spot };
+            // (A control is all of its area: the way to it is the way to
+            // its part nearest the pointer, so one beside the pointer, a
+            // list's next row, lies across a sideways move, not ahead.)
+            let c = if t.spread() { t.closest(from) } else { spot };
             let d = (c.0 - from.0, c.1 - from.1);
             let dist = d.0.hypot(d.1);
             if dist < 1.0 {

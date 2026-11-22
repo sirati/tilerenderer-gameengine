@@ -154,9 +154,10 @@ fn only_elements_within_45_degrees_of_the_motion_are_picked() {
 
 #[test]
 fn the_direction_counts_far_more_than_the_distance() {
-    // Right of (500, 400): one straight ahead 110 px away, one 18° off at
-    // 63 px, one 30° off at 58 px.
-    let t = targets(&[at(1, 610, 400), at(2, 560, 420), at(3, 550, 371)], IDENTITY, WINDOW);
+    // Right of (500, 400), each 20 px square and taken as all of itself:
+    // one straight ahead, its near edge 100 px away; one whose nearest
+    // corner is 22° off at 54 px; one 25° off at 44 px.
+    let t = targets(&[at(1, 610, 400), at(2, 560, 430), at(3, 550, 371)], IDENTITY, WINDOW);
     assert_eq!(t[pick(&t, (500.0, 400.0), None, (15.0, 0.0)).unwrap()].id, 1);
     // Along a row: the one about as far as the mouse went.
     let r = targets(&[at(1, 200, 100), at(2, 300, 100), at(3, 400, 100)], IDENTITY, WINDOW);

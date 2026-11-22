@@ -39,9 +39,12 @@ fn a_menu_check_box_taking_clicks_on_its_label_draws_the_pointer_from_it_too() {
     let k = pick(&with, from, Some(1), (0.0, -190.0)).unwrap();
     assert_eq!(with[k].id, 7);
     assert_eq!(with[k].center(), (308.0, 108.0));
-    // Without a region it is the spot on its box alone.
+    // Without a region it is still all of its rectangle, label and all
+    // (a control is always its whole area), pointing at its box.
     let without = targets(&[button(1, 480, 300), menu_check(None), button(3, 560, 110)], IDENTITY, WINDOW);
-    assert_eq!(without[pick(&without, from, Some(1), (0.0, -190.0)).unwrap()].id, 3);
+    let k = pick(&without, from, Some(1), (0.0, -190.0)).unwrap();
+    assert_eq!(without[k].id, 7);
+    assert_eq!(without[k].center(), (308.0, 108.0));
 }
 
 #[test]
@@ -96,4 +99,17 @@ fn the_pointer_follows_the_knob_as_the_bar_scrolls() {
     let middle = targets(&[bar(500_000)], IDENTITY, WINDOW);
     s.tick(0.1, &middle, Rates::default());
     assert_eq!(s.target(), Some((708.0, 300.0)));
+}
+
+#[test]
+fn a_portrait_draws_the_pointer_from_all_of_itself_not_its_corner() {
+    // A leader's portrait (200 square) whose pointer spot is its lower
+    // right corner, and D further right, 11° off the way. Moving right
+    // straight into the portrait's middle: the portrait, though its spot
+    // is 31° off; as a point it lost to D.
+    let portrait = Interactable { region: None, alt_right_click: false, anchor: Some([599, 299]), rect: [400, 100, 200, 200], kind: InteractableKind::Button, id: 5 };
+    let t = targets(&[button(1, 300, 120), portrait, button(4, 700, 200)], IDENTITY, WINDOW);
+    let k = pick(&t, (300.0, 120.0), Some(1), (40.0, 0.0)).unwrap();
+    assert_eq!(t[k].id, 5);
+    assert_eq!(t[k].center(), (599.0, 299.0), "it still points at its spot");
 }
