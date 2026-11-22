@@ -102,6 +102,26 @@ fn esc_closes_the_menu_and_alt_turns_the_mode_off_until_the_menus_are_gone() {
 }
 
 #[test]
+fn turned_off_it_stays_off_when_the_driver_goes_from_one_menu_back_to_another() {
+    let (mut snap, mut l) = setup();
+    let menu = scene(Some("Report"));
+    run(&mut snap, &mut l, &menu, 0.0, 0.2);
+    key(&mut snap, &mut l, &menu, ALT, true, 0.3);
+    key(&mut snap, &mut l, &menu, ALT, false, 0.35);
+    run(&mut snap, &mut l, &menu, 0.4, 0.2);
+    assert!(!snap.active());
+    // A talk closing and its advisor's screen coming back: the world
+    // without either for a few frames.
+    run(&mut snap, &mut l, &scene(None), 0.6, 4.0 * TICK);
+    run(&mut snap, &mut l, &scene(Some("Overview")), 0.6 + 4.0 * TICK, 1.0);
+    assert!(!snap.active(), "no one saw the menus close: still declined");
+    // Closed long enough to be seen, then a menu: on by itself again.
+    run(&mut snap, &mut l, &scene(None), 2.0, 2.0 * MENUS_CLOSED_FOR);
+    run(&mut snap, &mut l, &scene(Some("Summary")), 2.0 + 2.0 * MENUS_CLOSED_FOR, 0.2);
+    assert!(snap.snapper.snapping());
+}
+
+#[test]
 fn the_players_own_mode_stays_after_the_menus_and_the_setting_off_or_the_window_behind_does_nothing() {
     // Turned on in the world with Alt: a menu coming and going leaves it.
     let (mut snap, mut l) = setup();

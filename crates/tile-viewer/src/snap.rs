@@ -186,6 +186,13 @@ pub const DEFAULT_SCROLL_STEP: f64 = 16.0;
 /// One notch, as `Input::Wheel` counts them.
 const NOTCH: i32 = 120;
 
+/// How long the menus are all closed (seconds) before a mode the player
+/// turned off in them may come on by itself again: a driver going from
+/// one menu back to another (a talk closing, its advisor's screen coming
+/// back) can show the world without either for a frame or two, which no
+/// one sees as the menus closed.
+pub const MENUS_CLOSED_FOR: f64 = 0.3;
+
 /// The sprite sets of the snapping pointer and its half-transparent ghost
 /// (the pointer's tip at the anchor): the driver's arrow and its ghost if
 /// the description has them, else the viewer's own.
@@ -1196,8 +1203,10 @@ pub struct SnapInput {
     /// The mode is on because a menu is open (it goes off with the last).
     by_menu: bool,
     /// The player turned the mode off while menus were open: not on again
-    /// by itself until they are all closed.
+    /// by itself until they are all closed ([`MENUS_CLOSED_FOR`]).
     menu_declined: bool,
+    /// Since when no menu is open (the clock's seconds).
+    menus_closed_at: Option<f64>,
     /// The attractors drawn (window pixels; whether a click captures), as
     /// of the last update: while the mode is on and the mouse is free.
     attractors: Vec<(Point, bool)>,
@@ -1849,7 +1858,7 @@ impl SnapInput {
     /// it off again, a mode the player had turned on stays as it is. The
     /// player turning it off (Alt, Ctrl, an attractor, focus, capturing the
     /// mouse beside the menu) keeps it off
-    /// until the menus are all closed.
+    /// until the menus are all closed (for [`MENUS_CLOSED_FOR`]).
     fn menu_mode(&mut self, layout: &mut Layout, scene: &scene::Scene, now: f64, rates: Rates) -> Vec<Input> {
         // (The game menu and the quit dialogue let go of the pointer, but
         // not the mode: it works there as in any menu, its grab the one
@@ -1860,8 +1869,14 @@ impl SnapInput {
             self.menu_declined = menu;
             log::debug!("snap: the mode a menu turned on was turned off");
         }
-        if !menu {
-            self.menu_declined = false;
+        if menu {
+            self.menus_closed_at = None;
+        } else {
+            let closed_at = *self.menus_closed_at.get_or_insert(now);
+            if self.menu_declined && now - closed_at >= MENUS_CLOSED_FOR {
+                self.menu_declined = false;
+                log::debug!("snap: the menus closed: button snapping by itself in the next");
+            }
             if std::mem::take(&mut self.by_menu) {
                 return self.leave(layout, "the menus closed");
             }
