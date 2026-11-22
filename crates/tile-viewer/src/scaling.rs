@@ -726,8 +726,10 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let region = if popup { popup_region.or(menu_region) } else { menu_region };
         let zoom = if fits { fit_at_most(plan.menu.zoom, Some([o.0, o.1, w, h]), region_size(region)) } else { plan.menu.zoom };
         // A popup with a main panel: that panel in the middle of its region.
+        // (The layout may have moved the popup's camera and what it draws
+        // by `d` already, e.g. into the pointer's view: the panel with it.)
         if let Some(core) = parts.popup_core.filter(|_| popup && placed_popup == Some(id)) {
-            return core_place(core, [o.0, o.1, w, h], zoom, region.unwrap_or(canvas_rect));
+            return core_place([core[0] + d.0, core[1] + d.1, core[2], core[3]], [o.0, o.1, w, h], zoom, region.unwrap_or(canvas_rect));
         }
         let from = (o.0 - d.0 + w / 2, o.1 - d.1 + h / 2);
         // A screen part goes in the middle of the canvas, where the game
@@ -1390,6 +1392,62 @@ mod tests {
         assert_eq!(a.rect(popup)[0], -8, "{:?}", a.rect(popup));
         // At half size, the same middle.
         assert_eq!(centre(core_place(core, popup, (1, 2), pane)), (1360, 540));
+    }
+
+    /// A talk opened with the pointer in one of two views side by side:
+    /// whole in that view, its dialog as near the view's middle as that
+    /// allows (the run-18 report: in the right view it reached past the
+    /// window's edge).
+    #[test]
+    fn a_popup_with_a_main_panel_opens_whole_in_the_pointers_view() {
+        use scene::{Input, View, ViewState};
+        use viewer_settings::{Settings, Split};
+        let (screen, popup, core) = ((1920u32, 1080u32), [297, 2, 716, 565], [297, 50, 438, 517]);
+        let rect_of = |s: &FreeSprite| Some([s.x, s.y, 716, 565]);
+        // The game's world view and its interface, as on the map.
+        let bounds = Some(layout::WorldBounds { size: (8000, 4000), wrap: (true, false) });
+        let world = Scene {
+            screen_size: screen,
+            views: vec![ViewState { id: 0, view: View { camera_x: 1000, camera_y: 500, zoom: (1, 1), ..Default::default() }, overlay: vec![] },
+                ViewState { id: 255, view: View { interface_only: true, ..Default::default() }, overlay: vec![] }],
+            focus: Some((3000, 2000)),
+            shape: scene::WorldShape { cols: 62, rows: 125, wrap_x: true, wrap_y: false },
+            ..Default::default()
+        };
+        let mut scene = world.clone();
+        scene.interface = scene::Interface { popup: Some(257), popup_core: Some(core), ..Default::default() };
+        scene.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (popup[0], popup[1]), viewport: (popup[2] as u32, popup[3] as u32), ..Default::default() },
+            overlay: vec![FreeSprite { set: 1, x: popup[0], y: popup[1], screen: true, ..Default::default() }] });
+        let empty = world;
+        for pointer in [(400, 500), (1500, 500)] {
+            let p = plan(screen, screen, &Resolution::default()).for_scene(&scene, rect_of);
+            let mut layout = layout::Layout::default();
+            let mut settings = Settings::default();
+            settings.layout.split = Split::Vertical1To1;
+            settings.layout.menu_follows_pointer = true;
+            layout.apply_settings(&settings.layout);
+            layout.driver_screen = Some(p.screen);
+            layout.menu_scale = p.menu.zoom;
+            for _ in 0..3 { layout.frame(&empty, p.canvas(), (0, 0, 0, 0), vec![], bounds); }
+            layout.route(Input::MouseMove { x: pointer.0, y: pointer.1 });
+            let (a, b) = layout.panes();
+            let view = if pointer.0 < 960 { a } else { b.unwrap() };
+            let mut f = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], bounds);
+            let shown = arrange_panned(&p, &scene, &mut f, &mut layout.menu_pan, rect_of).shown.unwrap();
+            let talk = *shown.iter().find(|s| s.driver == popup).expect("shown");
+            // (Where it shows on the canvas, whole: not cut off at an edge.)
+            let r = talk.rect;
+            assert_eq!((r[2], r[3]), (popup[2], popup[3]), "pointer {pointer:?}: cut off: {r:?}");
+            assert!(r[0] >= view[0] && r[0] + r[2] <= view[0] + view[2] && r[1] >= view[1] && r[1] + r[3] <= view[1] + view[3],
+                "pointer {pointer:?}: the popup {r:?} whole in its view {view:?}");
+            let dialog = [r[0] + core[0] - popup[0], r[1] + core[1] - popup[1], core[2], core[3]];
+            let middle = view[0] + view[2] / 2;
+            let off = (dialog[0] + dialog[2] / 2 - middle).abs();
+            // (The advisor's box at the dialog's right keeps it left of the
+            // middle where the view is too narrow for both centred.)
+            let room = (view[0] + view[2]) - (middle + (popup[0] + popup[2] - (core[0] + core[2] / 2)));
+            assert!(off <= (-room).max(0) + 1, "pointer {pointer:?}: dialog {dialog:?}, {off} from the view's middle {middle}");
+        }
     }
 
     #[test]
