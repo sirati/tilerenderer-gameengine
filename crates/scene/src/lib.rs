@@ -530,6 +530,14 @@ pub struct Interface {
     /// not have it). A renderer may draw it elsewhere (and map pointer input
     /// there back to where the driver put it).
     pub popup: Option<u32>,
+    /// The open popup's main panel (x, y, w, h, the driver's pixels), if
+    /// it has more around it (e.g. a talk's dialog, with a portrait beside
+    /// it whose picture and text change as the talk goes on). A renderer
+    /// that places the popup itself (not at a click, not over a menu) puts
+    /// this panel in the middle of the region it shows it in, as far as
+    /// the whole popup stays inside it there, so that what changes around
+    /// it moves nothing. None: the popup's own rectangle is placed.
+    pub popup_core: Option<[i32; 4]>,
     /// Independently placed modal views, bottom to top. `popup` is the top.
     pub modal_stack: ModalStack,
     /// Per entry of `modal_stack`: the view is part of the one under it,

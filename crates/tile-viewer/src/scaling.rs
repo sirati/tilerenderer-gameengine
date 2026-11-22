@@ -580,6 +580,21 @@ fn modal_place((w, h): (i32, i32), [x, y, rw, rh]: [i32; 4]) -> (i32, i32) {
     (x + (rw - w) / 2, y + if h <= rh { top.min(rh - h) } else { (rh - h) / 2 })
 }
 
+/// The map of a popup (`rect`, the driver's pixels) with a main panel
+/// `core` (`scene::Interface::popup_core`) into `region` at `zoom`: the
+/// panel's centre in the region's middle, moved as little as it takes to
+/// keep the whole popup inside; where the popup is larger than the region
+/// that way, the popup in its middle.
+fn core_place(core: [i32; 4], rect: [i32; 4], zoom: Ratio, [rx, ry, rw, rh]: [i32; 4]) -> Affine {
+    let centre = (core[0] + core[2] / 2, core[1] + core[3] / 2);
+    let axis = |c: i32, start: i32, len: i32, lo: i32, span: i32| {
+        let before = scaled((c - start).max(0) as i64, zoom) as i32;
+        let after = scaled((start + len - c).max(0) as i64, zoom) as i32;
+        if before + after > span { lo + (span - before - after) / 2 + before } else { (lo + span / 2).clamp(lo + before, lo + span - after) }
+    };
+    Affine { from: centre, to: (axis(centre.0, rect[0], rect[2], rx, rw), axis(centre.1, rect[1], rect[3], ry, rh)), zoom }
+}
+
 /// The driver's interface and other views (cameras of the layout's
 /// `frame` in the driver's pixels) shown on the canvas as `plan` says: the
 /// menus and the driver's views within them about the middle (a popup
@@ -710,6 +725,10 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let (w, h) = (size.0 as i32, size.1 as i32);
         let region = if popup { popup_region.or(menu_region) } else { menu_region };
         let zoom = if fits { fit_at_most(plan.menu.zoom, Some([o.0, o.1, w, h]), region_size(region)) } else { plan.menu.zoom };
+        // A popup with a main panel: that panel in the middle of its region.
+        if let Some(core) = parts.popup_core.filter(|_| popup && placed_popup == Some(id)) {
+            return core_place(core, [o.0, o.1, w, h], zoom, region.unwrap_or(canvas_rect));
+        }
         let from = (o.0 - d.0 + w / 2, o.1 - d.1 + h / 2);
         // A screen part goes in the middle of the canvas, where the game
         // drew it or not (the hall of fame: at its window's top left, as a
@@ -1341,6 +1360,37 @@ fn tip_host(sprites: &[FreeSprite], rect_of: &impl Fn(&FreeSprite) -> Option<[i3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_popups_main_panel_goes_in_the_middle_of_its_region_and_stays_there() {
+        // A talk: its dialog (438 by 517), the advisor's box at its right
+        // reaching further out (the popup 716 wide from the dialog's left).
+        let core = [297, 50, 438, 517];
+        let popup = [297, 0, 716, 567];
+        let centre = |a: Affine| a.apply((297 + 219, 50 + 258));
+        // The window: the dialog's middle in the window's middle, not the
+        // popup's (which would push the dialog left of it).
+        let window = [0, 0, 1920, 1080];
+        assert_eq!(centre(core_place(core, popup, (1, 1), window)), (960, 540));
+        // A pane, wide enough: in the pane's middle.
+        let pane = [800, 0, 1120, 1080];
+        assert_eq!(centre(core_place(core, popup, (1, 1), pane)), (1360, 540));
+        // The advisor's box growing or shrinking moves nothing there.
+        for advisor in [600, 716, 760] {
+            assert_eq!(centre(core_place(core, [297, 0, advisor, 567], (1, 1), pane)), (1360, 540), "{advisor}");
+        }
+        // Too narrow for it centred: moved as little as it takes for the
+        // whole popup to be inside; narrower than the popup: the popup in
+        // the middle.
+        let narrow = [0, 0, 900, 1080];
+        let a = core_place(core, popup, (1, 1), narrow);
+        assert_eq!(a.rect(popup)[0] + a.rect(popup)[2], 900, "its right edge at the pane's");
+        let tiny = [0, 0, 700, 1080];
+        let a = core_place(core, popup, (1, 1), tiny);
+        assert_eq!(a.rect(popup)[0], -8, "{:?}", a.rect(popup));
+        // At half size, the same middle.
+        assert_eq!(centre(core_place(core, popup, (1, 2), pane)), (1360, 540));
+    }
 
     #[test]
     fn base_ui_size_is_independent_of_render_resolution() {

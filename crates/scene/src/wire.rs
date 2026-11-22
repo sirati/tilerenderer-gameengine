@@ -5,7 +5,7 @@
 use crate::{Beside, Binding, Button, Extension, ScreenRole, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, WorldOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 65;
+pub const VERSION: u32 = 66;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -587,7 +587,7 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 for attached in i.modal_attached {
                     w.bool(attached);
                 }
-                for rect in [i.reachable, i.focus_control, i.tooltip] {
+                for rect in [i.reachable, i.focus_control, i.tooltip, i.popup_core] {
                     w.bool(rect.is_some());
                     for v in rect.unwrap_or_default() {
                         w.i32(v);
@@ -911,7 +911,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     let rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
                     Ok(some.then_some(rect))
                 };
-                let (reachable, focus_control, tooltip) = (rect()?, rect()?, rect()?);
+                let (reachable, focus_control, tooltip, popup_core) = (rect()?, rect()?, rect()?, rect()?);
                 let beside = r.bool()?;
                 let screen_rect = [r.i32()?, r.i32()?, r.i32()?, r.i32()?];
                 let edge = match r.u8()? {
@@ -964,6 +964,7 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     roaming,
                     capture_hint,
                     popup,
+                    popup_core,
                     modal_stack,
                     modal_attached,
                     screen_view,
@@ -1534,6 +1535,7 @@ mod tests {
             roaming: Some(256),
             capture_hint: Some(259),
             popup: Some(261),
+            popup_core: Some([310, 60, 438, 517]),
             modal_stack: crate::ModalStack([Some(257), Some(259), Some(260), Some(261)]),
             modal_attached: [false, false, true, false],
             screen_view: Some(258),
