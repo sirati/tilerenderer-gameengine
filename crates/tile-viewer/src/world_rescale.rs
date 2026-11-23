@@ -42,11 +42,12 @@ impl Layout {
         // Input still consults the last shown cameras before this frame's
         // replacements exist. Rebase their centres, keeping physical span
         // and zoom, so edge pans and hover use the new world coordinates.
+        // (One moved between whole world pixels as its whole camera.)
         for (_, camera) in &mut self.shown {
-            let (w, h) = camera.world_size();
-            let center = point((camera.x + w as i32 / 2, camera.y + h as i32 / 2));
-            camera.x = center.0 - w as i32 / 2;
-            camera.y = center.1 - h as i32 / 2;
+            let middle = super::camera_middle(camera);
+            let center = point(middle);
+            camera.x += center.0 - middle.0;
+            camera.y += center.1 - middle.1;
             camera.downscale = downscale;
         }
         self.pan_rescale_world(ratio);
@@ -148,9 +149,9 @@ mod tests {
                 assert_eq!(l.main_view.center, requested, "Z must not reset the requested centre");
                 assert_eq!(l.split.unwrap().view.center, (3100 / scale as i32, 1080 / scale as i32));
                 for (hit, camera) in l.shown.iter().filter(|(hit, _)| matches!(hit, Hit::Main | Hit::Pane)) {
-                    let (w, h) = camera.world_size();
+                    let (w, h) = crate::layout::whole_camera(camera).world_size();
                     let wanted = if *hit == Hit::Main { requested } else { (3100 / scale as i32, 1080 / scale as i32) };
-                    let actual = (camera.x + w as i32 / 2, camera.y + h as i32 / 2);
+                    let actual = crate::layout::camera_middle(camera);
                     assert_eq!(actual, (bounds.clamp_center(0, wanted.0, w as i32), bounds.clamp_center(1, wanted.1, h as i32)));
                     assert_eq!(h, 864);
                     if *hit == Hit::Main && focus_y == 672 && scale == 2 {

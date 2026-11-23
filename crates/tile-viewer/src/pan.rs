@@ -379,7 +379,7 @@ impl Layout {
     /// wrap (as its camera shows it), and per axis whether it was held.
     fn clamp_view_center(&self, hit: Hit, c: (f64, f64)) -> ((f64, f64), (bool, bool)) {
         let (Some(b), Some((_, cam))) = (self.bounds, self.shown.iter().find(|(h, _)| *h == hit)) else { return (c, (false, false)) };
-        let (w, h) = cam.world_size();
+        let (w, h) = super::whole_camera(cam).world_size();
         let axis = |v: f64, size: i32, wrap: bool, span: u32| -> f64 {
             let (size, span) = (size as f64, span as f64);
             match wrap {
@@ -439,7 +439,7 @@ impl Layout {
     /// following the driver), it is taken over once from there: from a
     /// glide's own continuous position if it is that glide's pixel, else
     /// from the whole pixel. Nothing flows back from here to the game.
-    fn exact_center(&self, hit: Hit) -> Option<(f64, f64)> {
+    pub(super) fn exact_center(&self, hit: Hit) -> Option<(f64, f64)> {
         let now = self.view_point(hit)?;
         if let Some(e) = self.pan.exact.iter().find(|e| e.hit == hit && e.drawn == now) {
             return Some(e.exact);
@@ -2215,6 +2215,55 @@ mod tests {
                     assert!((l.exact_center(hit).unwrap().1 - want).abs() < 1e-6, "{scale:?} {hit:?} burst {n}");
                     assert_eq!(center_of(&l, hit), (at.0, want.round() as i32), "{scale:?} {hit:?} burst {n}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_zoomed_in_view_pans_by_screen_pixels() {
+        // At 2:1 and 3:1 a window pixel is a fraction of a world pixel: a
+        // drag by one window pixel moves the picture by one, not by a whole
+        // world pixel every second or third; what is drawn under the
+        // pointer is what a click there picks.
+        for scale in [(2, 1), (3, 1)] {
+            for hit in [Hit::Main, Hit::Pane] {
+                let mut l = split(MapMovement::EdgeScroll, Roles::Free);
+                l.world_scale = scale;
+                frame(&mut l);
+                let v = &mut l.split.as_mut().unwrap().view;
+                (v.center, v.settling) = ((4000, 2000), false);
+                frame(&mut l);
+                let camera = |l: &Layout| l.shown.iter().find(|(h, _)| *h == hit).unwrap().1;
+                let m = scale.0 as i32;
+                // (Where world pixel `w` starts on the screen.)
+                let screen_of = |c: &tile_render::Camera, w: i32| c.origin.0 + (w - c.x) * m;
+                let c0 = camera(&l);
+                let rect = [c0.origin.0, c0.origin.1, c0.viewport.0 as i32, c0.viewport.1 as i32];
+                let (x0, w) = (rect[0] + rect[2] / 2, c0.x + rect[2] / 2 / m);
+                let start = screen_of(&c0, w);
+                button(&mut l, Button::Middle, true, (x0, 300));
+                for n in 1..=2 * m {
+                    mv(&mut l, (x0 - n, 300));
+                    frame(&mut l);
+                    let c = camera(&l);
+                    assert_eq!(screen_of(&c, w), start - n, "{scale:?} {hit:?} pixel {n}");
+                    assert_eq!(super::super::world_at(&c, (start - n, 300)).0, w, "{scale:?} {hit:?} pixel {n}");
+                    // (Drawn over the whole pane, not past it.)
+                    let shifted = c.origin.0 != rect[0];
+                    assert!(c.origin.0 <= rect[0] && c.origin.0 + c.viewport.0 as i32 >= rect[0] + rect[2], "{c:?}");
+                    assert_eq!(c.target_clip, shifted.then_some([rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]]), "{scale:?} {hit:?} pixel {n}");
+                    // The driver's labels on A with the world; B's own
+                    // screen sprites by the rest.
+                    let label = |c: &tile_render::Camera| c.origin.0 + (x0 - c.origin.0 + c.screen_shift.0) * m;
+                    match hit {
+                        Hit::Main => assert_eq!(label(&c) - label(&c0), -n, "{scale:?} pixel {n}"),
+                        _ => assert_eq!(c.screen_shift.0, c.origin.0 - rect[0], "{scale:?} pixel {n}"),
+                    }
+                }
+                button(&mut l, Button::Middle, false, (x0 - 2 * m, 300));
+                // Two whole world pixels on: as an unshifted camera.
+                let c = camera(&l);
+                assert_eq!((c.origin, c.viewport, c.target_clip, c.x), (c0.origin, c0.viewport, None, c0.x + 2), "{scale:?} {hit:?}");
             }
         }
     }

@@ -342,11 +342,16 @@ pub struct FreeView {
     hand_focus: Option<(i32, i32)>,
     /// Fractional world pixels retained across changes of game art scale.
     scale_rest: (f64, f64),
+    /// Its continuous centre (a pan's or a glide's) as of the last frame:
+    /// while it rounds to `center`, the camera is moved by the screen
+    /// pixels of the rest, so a view zoomed in moves by screen pixels, not
+    /// by whole world pixels.
+    fine: Option<(f64, f64)>,
 }
 
 impl FreeView {
     pub fn new(center: (i32, i32), zoom: usize, follow: Follow) -> Self {
-        Self { center, zoom, follow, settling: false, glide: Glide::default(), hand_focus: None, scale_rest: (0.0, 0.0) }
+        Self { center, zoom, follow, settling: false, glide: Glide::default(), hand_focus: None, scale_rest: (0.0, 0.0), fine: None }
     }
 
     /// Moved by hand to `center`.
@@ -380,7 +385,7 @@ impl FreeView {
     /// source size, so a fractional last source pixel cannot hide an edge.
     fn expose_tile(&self, tile: (i32, i32), half: (i32, i32), rect: [i32; 4], bounds: Option<WorldBounds>, scale: (u32, u32)) -> (i32, i32) {
         if self.center == UNPLACED { return tile; }
-        let camera = self.camera(rect, (0, 0, 0, 0), bounds, scale);
+        let camera = whole_camera(&self.camera(rect, (0, 0, 0, 0), bounds, scale));
         let source = self.source(rect, scale);
         let axis = |center: i32, start: i32, source: i32, tile: i32, half: i32, pixels: u32, axis: usize| {
             let span = (pixels as i64 * camera.zoom.1 as i64 / camera.zoom.0 as i64) as i32;
@@ -408,13 +413,39 @@ impl FreeView {
             Some(b) => (b.clamp_center(0, center.0, sw), b.clamp_center(1, center.1, sh)),
             None => center,
         };
+        let zoom = self.zoom_by(scale);
+        // Between whole world pixels (where a pan or a glide has it, not
+        // held at an edge of the world), by `rest` screen pixels (rounded
+        // towards zero: none at 1:1 and below): from the world pixel before
+        // its whole one, the picture moved back by the rest and drawn that
+        // much wider, clipped to `rect` (`whole_camera` undoes it).
+        let fine = self.fine.filter(|f| self.center != UNPLACED && (f.0.round() as i32, f.1.round() as i32) == self.center);
+        let (n, d) = (zoom.0.max(1) as f64, zoom.1.max(1) as f64);
+        // (Where the world pixel after a camera's first starts.)
+        let second = zoom.0.max(1).div_ceil(zoom.1.max(1)) as i32;
+        let axis = |placed: i32, shown: i32, fine: Option<f64>, span: i32| {
+            let whole = shown - span / 2;
+            let rest = match fine {
+                Some(f) if placed == shown => {
+                    let r = (f - placed as f64) * n / d;
+                    (if r >= 0.0 { (r - 0.5).ceil() } else { (r + 0.5).floor() }) as i32
+                }
+                _ => 0,
+            };
+            if rest == 0 { (whole, 0) } else { (whole - 1, second + rest) }
+        };
+        let (x, kx) = axis(center.0, cx, fine.map(|f| f.0), sw);
+        let (y, ky) = axis(center.1, cy, fine.map(|f| f.1), sh);
+        let (w, h) = (rect[2].max(1), rect[3].max(1));
         Camera {
-            x: cx - sw / 2,
-            y: cy - sh / 2,
-            zoom: self.zoom_by(scale),
-            origin: (rect[0], rect[1]),
+            x,
+            y,
+            zoom,
+            origin: (rect[0] - kx, rect[1] - ky),
+            screen_shift: (-kx, -ky),
+            target_clip: ((kx, ky) != (0, 0)).then_some([rect[0], rect[1], rect[0] + w, rect[1] + h]),
             overhang,
-            ..Camera::new((rect[2].max(1) as u32, rect[3].max(1) as u32))
+            ..Camera::new(((w + kx) as u32, (h + ky) as u32))
         }
     }
 }
@@ -1305,6 +1336,36 @@ fn world_at(camera: &Camera, (px, py): (i32, i32)) -> (i32, i32) {
     (camera.x + (px - camera.origin.0) * d / n, camera.y + (py - camera.origin.1) * d / n)
 }
 
+/// `camera` as it is without the move between whole world pixels
+/// [`FreeView::camera`] gives it (from the world pixel before its whole
+/// one, its origin back before its clip rectangle by less than two world
+/// pixels): at its whole world pixel over that rectangle. What a view shows
+/// (its middle, its span) is read from this one; what it shows at a pixel
+/// from `camera` as drawn. Any other camera as it is.
+pub(crate) fn whole_camera(camera: &Camera) -> Camera {
+    let Some(clip) = camera.target_clip.filter(|_| camera.cells) else { return *camera };
+    let rest = (clip[0] - camera.origin.0, clip[1] - camera.origin.1);
+    if rest.0 < 0 || rest.1 < 0 || rest == (0, 0) {
+        return *camera;
+    }
+    Camera {
+        x: camera.x + i32::from(rest.0 > 0),
+        y: camera.y + i32::from(rest.1 > 0),
+        origin: (clip[0], clip[1]),
+        viewport: (camera.viewport.0.saturating_sub(rest.0 as u32).max(1), camera.viewport.1.saturating_sub(rest.1 as u32).max(1)),
+        target_clip: None,
+        ..*camera
+    }
+}
+
+/// The world pixel in the middle of what `camera` shows (its
+/// [`whole_camera`]'s middle).
+pub(crate) fn camera_middle(camera: &Camera) -> (i32, i32) {
+    let c = whole_camera(camera);
+    let (w, h) = c.world_size();
+    (c.x + w as i32 / 2, c.y + h as i32 / 2)
+}
+
 /// Where the driver's screen and its world go when it asks for them side
 /// by side in a window of `window`: how far its screen moves, and the
 /// world's rectangle (the rest of the window, a gap from the screen).
@@ -1795,6 +1856,7 @@ impl Layout {
     /// w 0: all of it), when it changed since last asked.
     pub fn take_main_view_change(&mut self) -> Option<(i32, i32, i32, i32)> {
         let world_rect = |c: &Camera| {
+            let c = whole_camera(c);
             let (w, h) = c.world_size();
             (c.x, c.y, w as i32, h as i32)
         };
@@ -1834,6 +1896,7 @@ impl Layout {
             Some(*h) != fitted && (matches!(h, Hit::Pane | Hit::Inset(_)) || (*h == Hit::Main && fitted == Some(Hit::Pane)))
         });
         for (slot, (_, c)) in views.iter_mut().zip(own) {
+            let c = whole_camera(c);
             let (w, h) = c.world_size();
             *slot = (c.x, c.y, w as i32, h as i32);
         }
@@ -1937,8 +2000,7 @@ impl Layout {
         // is (where it was when the mouse was let go), the view staying
         // put; nothing goes to the driver.
         if let Some((_, camera)) = self.shown.iter().find(|(h, _)| *h == hit) {
-            let (w, h) = camera.world_size();
-            self.cursor = (camera.x + w as i32 / 2, camera.y + h as i32 / 2);
+            self.cursor = camera_middle(camera);
         }
         self.locked = true;
         self.grab = Some(true);
@@ -2803,6 +2865,14 @@ impl Layout {
                     v.center = t;
                 }
                 None => v.glide.snap(v.center),
+            }
+        }
+        // (Each view's continuous centre, its camera moved by the rest.)
+        let hits: Vec<Hit> = std::iter::once(Hit::Main).chain(self.split.map(|_| Hit::Pane)).chain((0..self.insets.len()).map(Hit::Inset)).collect();
+        for hit in hits {
+            let fine = self.exact_center(hit);
+            if let Some(v) = self.free_view(hit) {
+                v.fine = fine;
             }
         }
         self.interface = interface;
@@ -3797,24 +3867,29 @@ impl Layout {
         let crop = (camera.x + rect[0] - camera.origin.0, camera.y + rect[1] - camera.origin.1);
         let zoom = v.zoom_by(self.world_scale);
         let unmoved = driver && zoom == (1, 1) && v.center == (crop.0 + rect[2] / 2, crop.1 + rect[3] / 2);
-        let (x, y, cull) = if unmoved {
-            (crop.0, crop.1, camera.cull)
+        let (x, y, cull, placed) = if unmoved {
+            (crop.0, crop.1, camera.cull, None)
         } else {
             let placed = if driver { v } else { FreeView { follow: Follow::Free, ..v } };
             let c = placed.camera(rect, overhang, if driver { None } else { self.bounds }, self.world_scale);
             // Zoomed in on what the driver shows, its cell range still holds.
             let centred = v.center == (camera.x + camera.viewport.0 as i32 / 2, camera.y + camera.viewport.1 as i32 / 2);
             let cull = if driver && zoom.0 > zoom.1 && centred { camera.cull } else { None };
-            (c.x, c.y, cull)
+            (c.x, c.y, cull, Some(c))
         };
-        let shift = (camera.x - x + camera.origin.0 - rect[0], camera.y - y + camera.origin.1 - rect[1]);
+        // (Between whole world pixels: moved by the screen pixels of the
+        // rest, the driver's labels with the world.)
+        let rest = placed.map_or((0, 0), |c| c.screen_shift);
+        let shift = (camera.x - x + camera.origin.0 - rect[0] + rest.0, camera.y - y + camera.origin.1 - rect[1] + rest.1);
+        let intersect = |a: [i32; 4], b: [i32; 4]| [a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])];
         Camera {
             x,
             y,
             zoom,
-            viewport: (rect[2].max(1) as u32, rect[3].max(1) as u32),
-            origin: (rect[0], rect[1]),
+            viewport: placed.map_or((rect[2].max(1) as u32, rect[3].max(1) as u32), |c| c.viewport),
+            origin: placed.map_or((rect[0], rect[1]), |c| c.origin),
             screen_shift: shift,
+            target_clip: [camera.target_clip, placed.and_then(|c| c.target_clip)].into_iter().flatten().reduce(intersect),
             cull,
             zoomed_art: self.zoomed_art(zoom),
             ..*camera
@@ -5054,8 +5129,8 @@ impl Layout {
             // Arrows: pan what is under the pointer by an eighth of it.
             0x25..=0x28 => {
                 let hit = if hit == Hit::Interface { Hit::Main } else { hit };
-                let size = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| c.world_size());
-                let center = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| (c.x + c.world_size().0 as i32 / 2, c.y + c.world_size().1 as i32 / 2));
+                let size = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| whole_camera(c).world_size());
+                let center = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| camera_middle(c));
                 let focus = self.focus;
                 if let (Some(v), Some((w, h)), Some(center)) = (self.free_view(hit), size, center) {
                     let (dx, dy) = match vk {
@@ -9053,6 +9128,48 @@ mod tests {
         let f = l.frame(&at(1064), (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
         // (A shows the driver's middle in its own: 200 pixels further on.)
         assert_eq!((f.cameras[0].x, f.cameras[0].screen_shift, f.cameras[0].cull), (1264, (-200, 0), None));
+    }
+
+    #[test]
+    fn a_camera_between_whole_world_pixels_is_its_whole_one_moved_by_screen_pixels() {
+        // Between whole world pixels a view's camera draws its picture
+        // nearest to where it continuously is (to half a screen pixel,
+        // where world pixels start at whole screen pixels), and its whole
+        // camera, middle and span are as at the pixel it rounds to.
+        for zoom in 0..ZOOMS.len() {
+            for scale in [(1, 1), (3, 2), (2, 1)] {
+                for rect in [[0, 0, 400, 300], [404, 7, 397, 301]] {
+                    let mut v = FreeView::new((4000, 2000), zoom, Follow::Free);
+                    let whole = v.camera(rect, (0, 0, 0, 0), None, scale);
+                    let (n, d) = (whole.zoom.0 as f64, whole.zoom.1 as f64);
+                    for k in -50..50 {
+                        let fine = (4000.0 + k as f64 / 100.0, 2000.0 - k as f64 / 101.0);
+                        v.fine = Some(fine);
+                        let c = v.camera(rect, (0, 0, 0, 0), None, scale);
+                        let w = whole_camera(&c);
+                        let at = format!("zoom {:?} scale {scale:?} rect {rect:?} at {fine:?}: {c:?}", ZOOMS[zoom]);
+                        assert_eq!((w.x, w.y, w.origin, w.viewport, w.target_clip), (whole.x, whole.y, whole.origin, whole.viewport, None), "{at}");
+                        assert_eq!(camera_middle(&c), (4000, 2000), "{at}");
+                        assert!(c.origin.0 <= rect[0] && c.origin.1 <= rect[1] && c.origin.0 + c.viewport.0 as i32 == rect[0] + rect[2] && c.origin.1 + c.viewport.1 as i32 == rect[1] + rect[3], "{at}");
+                        if (c.origin.0, c.origin.1) != (rect[0], rect[1]) {
+                            assert_eq!(c.target_clip, Some([rect[0], rect[1], rect[0] + rect[2], rect[1] + rect[3]]), "{at}");
+                        }
+                        if whole.zoom.1 == 1 {
+                            // (Where world pixel 4000 starts, and where it
+                            // is continuously.)
+                            let m = whole.zoom.0 as i32;
+                            let drawn = (c.origin.0 + (4000 - c.x) * m, c.origin.1 + (2000 - c.y) * m);
+                            let ideal = (rect[0] as f64 + (4000.0 - fine.0 + (4000 - whole.x) as f64) * n / d, rect[1] as f64 + (2000.0 - fine.1 + (2000 - whole.y) as f64) * n / d);
+                            assert!((drawn.0 as f64 - ideal.0).abs() <= 0.5 + 1e-9 && (drawn.1 as f64 - ideal.1).abs() <= 0.5 + 1e-9, "{at}: {drawn:?} {ideal:?}");
+                        }
+                        // (At 1:1 and below: as without.)
+                        if n <= d {
+                            assert_eq!((c.x, c.y, c.origin, c.viewport, c.target_clip), (whole.x, whole.y, whole.origin, whole.viewport, None), "{at}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn captured_edge_fixture(at: (i32, i32), wrap: (bool, bool)) -> Layout {

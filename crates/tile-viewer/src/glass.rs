@@ -89,7 +89,16 @@ impl Layout {
         match hit.and_then(|hit| self.shown.iter().find(|(h, c)| *h == hit && !c.stacked)) {
             Some((_, c)) => {
                 let (x, y) = world_at_floor(c, at);
-                Camera { x, y, origin: at, viewport: size, ..*c }
+                // (From where that world pixel starts in the view's picture,
+                // which goes on there to the pixel: also a view moved
+                // between whole world pixels, `FreeView::camera`; only over
+                // `rect`.)
+                let (n, d) = (c.zoom.0.max(1) as i64, c.zoom.1.max(1) as i64);
+                let start = |origin: i32, from: i32, to: i32| origin + ((to - from) as i64 * n + d - 1).div_euclid(d) as i32;
+                let origin = (start(c.origin.0, c.x, x).min(at.0), start(c.origin.1, c.y, y).min(at.1));
+                let clip = (origin != at).then_some([rect[0], rect[1], rect[0] + size.0 as i32, rect[1] + size.1 as i32]);
+                let viewport = (size.0 + (at.0 - origin.0) as u32, size.1 + (at.1 - origin.1) as u32);
+                Camera { x, y, origin, viewport, target_clip: clip, ..*c }
             }
             // (A zoomed view of nothing: the background colour.)
             None => Camera { zoom: (2, 1), origin: at, cells: false, ..Camera::new(size) },

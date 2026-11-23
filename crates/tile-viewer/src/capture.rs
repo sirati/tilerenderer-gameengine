@@ -286,8 +286,7 @@ impl Layout {
     /// capture puts the world cursor).
     pub(super) fn view_middle(&self, hit: Hit) -> Option<(i32, i32)> {
         let (_, camera) = self.shown.iter().find(|(h, _)| *h == hit)?;
-        let (w, h) = camera.world_size();
-        Some((camera.x + w as i32 / 2, camera.y + h as i32 / 2))
+        Some(super::camera_middle(camera))
     }
 
     /// The Alt mode's attractors as of the last frame: one in each view of

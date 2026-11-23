@@ -92,7 +92,7 @@ pub(super) struct Motion {
 
 impl FreeView {
     fn carry(&mut self, base: &Self, frame: Self) {
-        carry_fields!(FreeView { center, zoom, follow, settling, glide, hand_focus, scale_rest }, self, base, frame);
+        carry_fields!(FreeView { center, zoom, follow, settling, glide, hand_focus, scale_rest, fine }, self, base, frame);
     }
 }
 
