@@ -789,8 +789,15 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     }).collect();
     // The loading bar's camera and rectangle (the driver's pixels).
     let mut bar: Option<(usize, [i32; 4])> = None;
-    for (i, v) in scene.views.iter().enumerate() {
-        let Some(c) = frame.view_cameras.get(i).copied().flatten().map(|c| c as usize) else { continue };
+    // The views in the order they are painted, their cameras' (popups by
+    // their place in the modal stack, not by id): what shows on top takes
+    // the pointer, the last of `shown` that holds it.
+    let mut painted: Vec<(usize, usize)> = (0..scene.views.len())
+        .filter_map(|i| frame.view_cameras.get(i).copied().flatten().map(|c| (c as usize, i)))
+        .collect();
+    painted.sort_unstable();
+    for (c, i) in painted {
+        let v = &scene.views[i];
         let camera = frame.cameras[c];
         if frame.placed.contains(&(c as u32)) { continue; }
         if !v.view.interface_only {

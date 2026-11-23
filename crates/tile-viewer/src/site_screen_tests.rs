@@ -802,3 +802,67 @@ fn a_combo_box_list_opened_in_a_popup_goes_with_it_over_it_and_takes_its_clicks(
         }
     }
 }
+
+/// Of two popups, each placed on its own, the one on top (the later in the
+/// modal stack) takes the clicks where it is drawn over the other, whatever
+/// their ids (views are kept by id: here the one on top has the lower).
+#[test]
+fn of_two_popups_the_one_drawn_on_top_takes_the_pointer_whatever_their_ids() {
+    use viewer_settings::{Place, ScreenPlace};
+    // A dialog, and a prompt it opened that reaches past its top (so it is
+    // not part of it, `modal_attached`).
+    const DIALOG: u32 = 0x91_C5FC;
+    const PROMPT: u32 = 0x24_7244;
+    let dialog = [700, 300, 520, 400];
+    let prompt = [740, 260, 440, 120];
+    let inside = |r: [i32; 4], (x, y): (i32, i32)| x >= r[0] && y >= r[1] && x < r[0] + r[2] && y < r[1] + r[3];
+    let compiled = compiled();
+    for kind in ["map", "Chart", "Menu"] {
+        let mut s = if kind == "map" { map_scene(&compiled) } else { report_scene(&compiled, kind) };
+        s.screen_size = SCREEN;
+        let art = panel(&compiled, dialog).into_iter().map(|p| FreeSprite { set: compiled.set("Shade/0").unwrap().0.raw(), ..p }).collect();
+        s.views.push(ViewState { id: DIALOG, view: View { interface_only: true, origin: (dialog[0], dialog[1]), viewport: (dialog[2] as u32, dialog[3] as u32), ..Default::default() }, overlay: art });
+        let mut marks = Vec::new();
+        for y in (prompt[1]..prompt[1] + prompt[3] - 15).step_by(16) {
+            for x in (prompt[0]..prompt[0] + prompt[2] - 15).step_by(16) {
+                marks.push(screen_sprite(&compiled, "Mark/0", x, y));
+            }
+        }
+        s.views.push(ViewState { id: PROMPT, view: View { interface_only: true, origin: (prompt[0], prompt[1]), viewport: (prompt[2] as u32, prompt[3] as u32), ..Default::default() }, overlay: marks });
+        s.views.sort_by_key(|view| view.id);
+        s.interface.popup = Some(PROMPT);
+        s.interface.modal_stack = scene::ModalStack([Some(DIALOG), Some(PROMPT), None, None]);
+        for place in [Place::Floating, Place::RightOrTop] {
+            let context = format!("{kind} {place:?}");
+            let plan = scaling::plan((1280, 800), SCREEN, &viewer_settings::Resolution { menu_scale_percent: 75.0, ..Default::default() })
+                .for_scene(&s, |sp| sprite_rect(&compiled, sp));
+            let mut layout = Layout::default();
+            layout.apply_settings(&Settings { split: Split::Vertical1To1, screen_place: ScreenPlace { vertical: place, horizontal: place }, ..Default::default() });
+            layout.driver_screen = Some(SCREEN);
+            let mut image = None;
+            for _ in 0..2 {
+                layout.screen_content = named_screen_content(&compiled, &s);
+                let mut frame = layout.frame(&s, plan.canvas(), (0, 0, 0, 0), interface_rects(&compiled, &s), Some(world_bounds(&compiled, &s)));
+                let arranged = scaling::arrange_panned(&plan, &s, &mut frame, &mut layout.menu_pan, |sp| sprite_rect(&compiled, sp));
+                layout.set_interface_shown(arranged.shown);
+                let world = scene_world_arranged(&compiled, &s, &frame.view_cameras, &arranged.overlay_cameras);
+                image = Some(tile_render::reference::render_views(&world, &compiled.atlas, &frame.cameras, plan.canvas(), 0, BACKGROUND));
+            }
+            let image = image.unwrap();
+            let shown = layout.interface_shown.clone().unwrap_or_default();
+            let piece = |r: [i32; 4]| shown.iter().find(|p| p.driver == r).unwrap_or_else(|| panic!("{context}: {r:?} is shown"));
+            // Marks of the prompt where it lies over the dialog: drawn there,
+            // and a click on one reaches that mark in the game.
+            for mark in [(756, 324), (948, 308), (1140, 340)] {
+                assert!(inside(dialog, mark) && inside(prompt, mark));
+                let [x, y, w, h] = piece(prompt).to_canvas([mark.0, mark.1, 16, 16]);
+                let at = ((x + w / 2.0) as i32, (y + h / 2.0) as i32);
+                assert!(at.0 >= 0 && at.1 >= 0 && (at.0 as u32) < image.width && (at.1 as u32) < image.height,
+                    "{context}: the prompt's {mark:?} is shown at {at:?}, on the canvas (prompt {:?}, dialog {:?})", piece(prompt), piece(dialog));
+                assert_eq!(image.get(at.0 as u32, at.1 as u32), MARK, "{context}: the prompt is drawn over the dialog at {mark:?}");
+                let driver = layout.route_window(at).unwrap_or_else(|| panic!("{context}: the prompt takes the pointer at {mark:?}"));
+                assert!(inside([mark.0, mark.1, 16, 16], driver), "{context}: a click on the prompt's {mark:?} reaches the game at {driver:?}");
+            }
+        }
+    }
+}
