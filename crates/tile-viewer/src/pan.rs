@@ -2507,7 +2507,7 @@ mod tests {
 
     /// A minimap at the driver's screen's bottom left, 200 × 100 of an 8000
     /// × 4000 world: 40 world pixels a minimap pixel.
-    const MINIMAP: scene::Minimap = scene::Minimap { at: (0, 500), size: (200, 100), shown: [0, 500, 200, 100], world: (8000, 4000) };
+    const MINIMAP: scene::Minimap = scene::Minimap { at: (0, 500), size: (200, 100), shown: [0, 500, 200, 100], world: (8000, 4000), marks: None };
 
     fn minimap_scene() -> Scene {
         let mut s = scene_at(0);

@@ -142,7 +142,7 @@ mod tests {
 
     const BOUNDS: Option<WorldBounds> = Some(WorldBounds { size: (8000, 4000), wrap: (true, false) });
     /// 200 × 100 of the 8000 × 4000 world: 40 world pixels a minimap pixel.
-    const MINIMAP: scene::Minimap = scene::Minimap { at: (0, 500), size: (200, 100), shown: [0, 500, 200, 100], world: (8000, 4000) };
+    const MINIMAP: scene::Minimap = scene::Minimap { at: (0, 500), size: (200, 100), shown: [0, 500, 200, 100], world: (8000, 4000), marks: None };
     /// Frames of uneven length, as a real window has them.
     const FRAME_MS: [u64; 4] = [16, 7, 25, 11];
 

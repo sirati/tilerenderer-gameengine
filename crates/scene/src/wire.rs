@@ -547,6 +547,10 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
                 }
                 w.i32(m.world.0);
                 w.i32(m.world.1);
+                w.bool(m.marks.is_some());
+                let (main, others) = m.marks.unwrap_or_default();
+                w.0.extend_from_slice(&main);
+                w.0.extend_from_slice(&others);
             }
             Update::Assets(n) => {
                 w.u8(8);
@@ -886,6 +890,12 @@ pub fn decode_updates(bytes: &[u8]) -> Result<Vec<Update>, WireError> {
                     size: (r.u32()?, r.u32()?),
                     shown: [r.i32()?, r.i32()?, r.i32()?, r.i32()?],
                     world: (r.i32()?, r.i32()?),
+                    marks: {
+                        let marked = r.bool()?;
+                        let main = [r.u8()?, r.u8()?, r.u8()?];
+                        let others = [r.u8()?, r.u8()?, r.u8()?];
+                        marked.then_some((main, others))
+                    },
                 };
                 Update::Minimap(some.then_some(m))
             }
@@ -1438,7 +1448,7 @@ mod tests {
     fn the_minimap_travels_and_maps_its_pixels_to_the_world() {
         let mut before = Scene::default();
         let mut after = before.clone();
-        let m = crate::Minimap { at: (10, 400), size: (200, 100), shown: [10, 400, 200, 100], world: (8000, 4000) };
+        let m = crate::Minimap { at: (10, 400), size: (200, 100), shown: [10, 400, 200, 100], world: (8000, 4000), marks: Some(([255, 255, 255], [255, 255, 0])) };
         after.minimap = Some(m);
         let updates = after.updates_since(&before);
         assert_eq!(updates, vec![Update::Minimap(Some(m))]);

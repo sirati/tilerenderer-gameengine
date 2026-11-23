@@ -423,6 +423,11 @@ pub struct Minimap {
     pub shown: [i32; 4],
     /// The world pixels (at the current game zoom) the whole picture spans.
     pub world: (i32, i32),
+    /// The colours a renderer marks its views with on it (the one showing
+    /// the driver's own view, the others), outlining what each shows every
+    /// frame where it is: the driver then marks no view itself. `None`: the
+    /// driver's own marks.
+    pub marks: Option<([u8; 3], [u8; 3])>,
 }
 
 impl Minimap {

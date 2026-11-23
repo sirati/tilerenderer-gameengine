@@ -4153,6 +4153,15 @@ impl App {
         let mut markers = marker_sprites_sized(&self.compiled, &arranged.markers, world_downscale(scene), self.started.elapsed(), bobbing, arrow_size);
         markers.extend(glass_sprites(&self.compiled, &arranged.divider));
         markers.extend(separator_sprites(&arranged.separators));
+        // The views marked on the minimap, where they are this frame
+        // (`Layout::minimap_marks`), over it in the canvas's own camera.
+        if let Some(camera) = self.overlay_camera {
+            markers.extend(self.layout.minimap_marks().into_iter().map(|([x, y, w, h], [r, g, b])| tile_render::PlacedSprite {
+                screen: true, view: Some(camera),
+                solid: Some(tile_render::SolidRect { width: w as u32, height: h as u32, rgba: [r, g, b, 255] }),
+                ..tile_render::PlacedSprite::new(tile_render::SpriteSetId::EMPTY, x, y)
+            }));
+        }
         // The cursor where the viewer draws it, in a camera of its own on
         // top (only when there is one: the frame is as before otherwise).
         let captured = self.layout.captured();

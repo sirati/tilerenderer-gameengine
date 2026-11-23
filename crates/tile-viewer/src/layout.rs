@@ -4484,6 +4484,52 @@ impl Layout {
     /// in the window: in the driver's screen fitted into a pane, else where
     /// the interface piece holding it is shown (`interface_shown`), else
     /// where the driver put it.
+    /// The views marked on the driver's minimap (`scene::Minimap::marks`) as
+    /// they show this frame: each edge of each view's outline on the canvas
+    /// (x, y, w, h) and its colour, the main pane's (the driver's own view)
+    /// in the first, the others' in the second; a view across the seam of
+    /// a world that wraps in two parts; cut to the minimap. Drawn every
+    /// frame where the views are, not in the driver's picture.
+    pub fn minimap_marks(&self) -> Vec<([i32; 4], [u8; 3])> {
+        let Some(m) = self.minimap else { return Vec::new() };
+        let Some((main_color, other_color)) = m.marks else { return Vec::new() };
+        if m.size.0 == 0 || m.size.1 == 0 || m.world.0 <= 0 || m.world.1 <= 0 || m.shown[2] <= 0 || m.shown[3] <= 0 {
+            return Vec::new();
+        }
+        let [cx, cy, cw, ch] = self.driver_rect_to_window(m.shown);
+        let s = (cw / m.shown[2] as f64, ch / m.shown[3] as f64);
+        // (A world pixel on the canvas: through the picture onto the screen.)
+        let to = |wx: f64, wy: f64| (
+            cx + (m.at.0 as f64 + wx * m.size.0 as f64 / m.world.0 as f64 - m.shown[0] as f64) * s.0,
+            cy + (m.at.1 as f64 + wy * m.size.1 as f64 / m.world.1 as f64 - m.shown[1] as f64) * s.1,
+        );
+        let clip = [cx.round() as i32, cy.round() as i32, (cx + cw).round() as i32, (cy + ch).round() as i32];
+        // (One picture pixel thick, as the driver draws its own.)
+        let thick = s.0.max(s.1).round().max(1.0) as i32;
+        let wraps = self.bounds.is_some_and(|b| b.wrap.0);
+        let mut out = Vec::new();
+        for (hit, camera) in self.shown.iter().filter(|(h, _)| matches!(h, Hit::Main | Hit::Pane | Hit::Inset(_))) {
+            let c = whole_camera(camera);
+            let (w, h) = c.world_size();
+            let color = if *hit == Hit::Main { main_color } else { other_color };
+            let x = if wraps { c.x.rem_euclid(m.world.0) } else { c.x };
+            let parts = if wraps && x + w as i32 > m.world.0 { vec![(x, m.world.0 - x), (0, x + w as i32 - m.world.0)] } else { vec![(x, w as i32)] };
+            for (px, pw) in parts {
+                let (x0, y0) = to(px as f64, c.y as f64);
+                let (x1, y1) = to((px + pw) as f64, (c.y + h as i32) as f64);
+                let [l, t, r, b] = [x0.round() as i32, y0.round() as i32, x1.round() as i32, y1.round() as i32];
+                for e in [[l, t, r - l, thick], [l, b - thick, r - l, thick], [l, t, thick, b - t], [r - thick, t, thick, b - t]] {
+                    let (ex0, ey0) = (e[0].max(clip[0]), e[1].max(clip[1]));
+                    let (ex1, ey1) = ((e[0] + e[2]).min(clip[2]), (e[1] + e[3]).min(clip[3]));
+                    if ex1 > ex0 && ey1 > ey0 {
+                        out.push(([ex0, ey0, ex1 - ex0, ey1 - ey0], color));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn driver_rect_to_window(&self, r: [i32; 4]) -> [f64; 4] {
         if let Some(mapping) = self.beside_mapping.filter(|_| self.interface_shown.is_none()) {
             let [x, y, w, h] = mapping.rect(r);
@@ -9195,6 +9241,32 @@ mod tests {
     }
 
     #[test]
+    fn the_views_are_marked_on_the_minimap_where_they_show_this_frame() {
+        // A 200×100 minimap of an 8000×4000 world at (10, 400): 40 world
+        // pixels a minimap pixel. With marks asked for, every view's outline
+        // where its camera is now; A's in the first colour, B's the second.
+        let mut l = arranged(&settings(|s| s.split = S::Vertical1To1));
+        let mut s = scene();
+        s.minimap = Some(scene::Minimap { at: (10, 400), size: (200, 100), shown: [10, 400, 200, 100], world: (8000, 4000), marks: Some(([255, 255, 255], [255, 255, 0])) });
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        let marks = l.minimap_marks();
+        let camera = |hit| whole_camera(&l.shown.iter().find(|(h, _)| *h == hit).unwrap().1);
+        for (hit, color) in [(Hit::Main, [255, 255, 255]), (Hit::Pane, [255, 255, 0])] {
+            let c = camera(hit);
+            let (w, h) = c.world_size();
+            let (x0, y0) = (10 + c.x.rem_euclid(8000) / 40, 400 + c.y / 40);
+            let top = marks.iter().find(|(r, k)| *k == color && r[3] == 1 && (r[1] - y0).abs() <= 1).unwrap_or_else(|| panic!("{hit:?} {marks:?}"));
+            assert!((top.0[0] - x0).abs() <= 1 && (top.0[2] - w as i32 / 40).abs() <= 1, "{hit:?}: {top:?} {c:?}");
+            assert!(marks.iter().any(|(r, k)| *k == color && r[2] == 1 && (r[3] - h as i32 / 40).abs() <= 1), "{hit:?}: {marks:?}");
+        }
+        assert!(marks.iter().all(|(r, _)| r[0] >= 10 && r[1] >= 400 && r[0] + r[2] <= 210 && r[1] + r[3] <= 500), "{marks:?}");
+        // Without marks asked for: none (the driver marks its own).
+        s.minimap = s.minimap.map(|m| scene::Minimap { marks: None, ..m });
+        l.frame(&s, (800, 600), (0, 0, 0, 0), vec![], BOUNDS);
+        assert!(l.minimap_marks().is_empty());
+    }
+
+    #[test]
     fn a_camera_between_whole_world_pixels_is_its_whole_one_moved_by_screen_pixels() {
         // Between whole world pixels a view's camera draws its picture
         // nearest to where it continuously is (to half a screen pixel,
@@ -10343,7 +10415,7 @@ mod presented_mapping_tests {
     fn presenting_a_minimap_installs_and_removes_its_click_area() {
         let mut active = Layout::default();
         let mut submitted = active.clone();
-        submitted.minimap = Some(scene::Minimap { at: (30, 960), size: (200, 100), shown: [30, 960, 200, 100], world: (8000, 4000) });
+        submitted.minimap = Some(scene::Minimap { at: (30, 960), size: (200, 100), shown: [30, 960, 200, 100], world: (8000, 4000), marks: None });
         let expected = submitted.minimap;
         active.adopt_presented_mapping(submitted);
         assert_eq!(active.minimap, expected);
