@@ -571,6 +571,26 @@ const PANEL_GAP: i32 = 6;
 /// top third, across in the middle.
 pub const MODAL_TOP: Ratio = (1, 6);
 
+/// Logs where a modal part over a menu goes (its driver rectangle, the
+/// menu's content box and pictures, the piece), when that changes: why a
+/// screen of the game's over its title shows as a dialog or in the title's
+/// place.
+fn log_modal_place(modal: [i32; 4], menu_box: Option<[i32; 4]>, menu_rects: &[[i32; 4]], piece: Affine) {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (modal, menu_box, menu_rects, piece.from, piece.to, piece.zoom).hash(&mut hasher);
+    let key = hasher.finish();
+    if LAST.swap(key, Ordering::Relaxed) != key {
+        let mut sizes: Vec<(i32, i32)> = menu_rects.iter().map(|r| (r[2], r[3])).collect();
+        sizes.sort_unstable_by(|a, b| (b.0 * b.1).cmp(&(a.0 * a.1)));
+        sizes.dedup();
+        sizes.truncate(6);
+        log::info!("viewer: modal part {modal:?} over a menu (content {menu_box:?}, largest pictures {sizes:?}): from {:?} to {:?} at {:?}", piece.from, piece.to, piece.zoom);
+    }
+}
+
 /// Where a modal popup of `size` (canvas pixels) over a menu goes in
 /// `region`: across in its middle, its top [`MODAL_TOP`] of the way down,
 /// moved up as far as needed to be whole there (in the middle where it is
@@ -711,11 +731,14 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         // A screen of its own over a menu, as large as that menu (a game's
         // 1024 by 768 screens over its title, wherever it draws them): in
         // the menu's place, as the menu is shown, not as a dialog.
-        if let Some(b) = menu_box.filter(|b| (b[2], b[3]) == (w, h)) {
-            return Affine { from: o, to: menu.apply((b[0], b[1])), zoom: menu.zoom };
-        }
-        let zoom = fit_at_most(modal_zoom, Some([o.0, o.1, w, h]), region_size(Some(modal_region)));
-        Affine { from: o, to: modal_place((scaled(w as i64, zoom) as i32, scaled(h as i64, zoom) as i32), modal_region), zoom }
+        let piece = if let Some(b) = menu_box.filter(|b| (b[2], b[3]) == (w, h)) {
+            Affine { from: o, to: menu.apply((b[0], b[1])), zoom: menu.zoom }
+        } else {
+            let zoom = fit_at_most(modal_zoom, Some([o.0, o.1, w, h]), region_size(Some(modal_region)));
+            Affine { from: o, to: modal_place((scaled(w as i64, zoom) as i32, scaled(h as i64, zoom) as i32), modal_region), zoom }
+        };
+        log_modal_place([o.0, o.1, w, h], menu_box, &menu_rects, piece);
+        piece
     };
     let anchored = |id| frame.popup_places.iter().find(|(view, _)| *view == id).map(|(_, place)| *place)
         .or_else(|| popup_at.filter(|_| placed_popup == Some(id)));
@@ -1078,7 +1101,23 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         ShownPiece { rect: clip.map_or(rect, |clip| intersection(rect, clip)), clip: clip.unwrap_or(canvas_rect), driver: [r[0] - shift.0, r[1] - shift.1, r[2], r[3]], piece, shift, under_modal, modal }
     });
     out.shown = Some(shown.filter(|s| s.rect[2] > 0 && s.rect[3] > 0).collect());
+    log_pieces(scene, menu_box, out.shown.as_deref().unwrap_or_default());
     out
+}
+
+/// Logs where the driver's interface goes on the canvas (each piece: its
+/// driver rectangle, where it shows, whether modal), when that changes.
+fn log_pieces(scene: &Scene, menu_box: Option<[i32; 4]>, shown: &[ShownPiece]) {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let pieces: Vec<([i32; 4], [i32; 4], bool)> = shown.iter().map(|s| (s.driver, s.rect, s.modal)).collect();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (&pieces, menu_box, &scene.interface.screen, scene.interface.popup).hash(&mut hasher);
+    let key = hasher.finish();
+    if LAST.swap(key, Ordering::Relaxed) != key {
+        log::info!("viewer: interface pieces (screen {:?}, popup {:?}, menu content {menu_box:?}): {pieces:?}", scene.interface.screen, scene.interface.popup);
+    }
 }
 
 /// A preview menu has already been placed at its requested edge by the
