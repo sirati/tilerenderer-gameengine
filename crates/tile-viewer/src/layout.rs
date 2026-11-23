@@ -633,6 +633,9 @@ pub struct Frame {
     /// driver elsewhere than the pointer showed it (a list shown scrolled by
     /// pixels, `smooth_menus`), and the popup goes where the pointer was.
     pub popup_nudge: (i32, i32),
+    /// Where the viewer shows each list (`scene::ListView`): its id and
+    /// offset (content pixels, continuous; `crate::list_scroll`).
+    pub list_offsets: Vec<(u64, f64)>,
     /// World-anchored lower modal views retain their own place under a child.
     pub popup_places: Vec<(u32, ((i32, i32), (u32, u32)))>,
     /// Generic menus retain their requested scale in their opening view.

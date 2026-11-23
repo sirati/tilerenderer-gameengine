@@ -30,6 +30,7 @@ mod presentation;
 pub mod snap;
 pub mod altrec;
 pub mod smooth_menus;
+pub mod list_scroll;
 pub mod extension;
 
 use std::sync::Arc;
@@ -1541,6 +1542,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         spans: Vec::new(),
         look_scene: Arc::new(looks::LookScene::default()),
         menu_scroll: smooth_menus::SmoothMenus::default(),
+        list_scroll: list_scroll::ListScrolls::default(),
         function_keys: function_keys::Controller::new(function_keys::journal_path(&settings_path)),
         extensions: running_extensions,
         host_closed: false,
@@ -1884,6 +1886,9 @@ struct App {
     look_scene: Arc<looks::LookScene>,
     /// Pixel transitions and matching pointer maps of scrollable menu lists.
     menu_scroll: smooth_menus::SmoothMenus,
+    /// The lists shown as views of their own, scrolled by the viewer
+    /// (`list_scroll`).
+    list_scroll: list_scroll::ListScrolls,
     /// F1-F12 kept from the system's shortcuts while the window is in
     /// front (`viewer_settings::Input::capture_function_keys`; macOS only).
     function_keys: function_keys::Controller,
@@ -3050,6 +3055,12 @@ impl App {
         let moves = matches!(input, Input::MouseMove { .. });
         let press = match input { Input::MouseButton { down: true, x, y, .. } => Some((x, y)), _ => None };
         if let Some(q) = press { self.layout.press_sent(q); }
+        // A list the viewer scrolls itself takes its scroll input, and the
+        // pointer on it goes where the driver's list has it (`list_scroll`).
+        let Some(input) = self.list_scroll.route(input) else {
+            if let Some(gpu) = &self.gpu { gpu.window.request_redraw(); }
+            return;
+        };
         let routed = self.menu_scroll.route(input, self.snap.snap_mode_active());
         // A press the list took to another row's place in the driver: a
         // popup it opens at that click is placed at the pointer all the same.
@@ -3946,8 +3957,17 @@ impl App {
         let layout_compiled = future_layout.as_deref().unwrap_or(&self.compiled);
         let mut arranged = {
             let now = std::time::Instant::now();
-            if let Some(at) = self.drawn_at.replace(now) {
-                self.layout.advance(now - at);
+            // (The lists' glides, by the same time.)
+            self.list_scroll.follow(scene);
+            let lists_moving = match self.drawn_at.replace(now) {
+                Some(at) => {
+                    self.layout.advance(now - at);
+                    self.list_scroll.advance((now - at).as_secs_f64())
+                }
+                None => false,
+            };
+            if lists_moving {
+                if let Some(gpu) = &self.gpu { gpu.window.request_redraw(); }
             }
             let bounds = world_bounds(layout_compiled, scene);
             self.layout.grid_step = self.compiled.step;
@@ -3965,8 +3985,14 @@ impl App {
             let rects = self.interface.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
             self.layout.screen_content = named_screen_content(layout_compiled, scene);
             let mut arranged = self.layout.frame(scene, window, self.config.overhang, rects, Some(bounds));
+            arranged.list_offsets = self.list_scroll.offsets();
             let compiled = layout_compiled;
             let shown = scaling::arrange_panned(&plan, scene, &mut arranged, &mut self.layout.menu_pan, |s| sprite_rect(compiled, s));
+            // Where the lists show; the driver told where they are.
+            self.list_scroll.shown(&shown.lists);
+            for input in self.list_scroll.take_inputs() {
+                frame_input(&mut self.preparing_inputs, &self.display, input);
+            }
             self.layout.set_interface_shown(shown.shown);
             self.layout.set_queued_shown(shown.queued);
             // A middle drag suppresses hover while the menu moves. Restore

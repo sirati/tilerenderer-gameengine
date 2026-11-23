@@ -503,6 +503,35 @@ pub struct Arranged {
     /// The queued reports as shown (`scene::Interface::queued`), the one to
     /// read first.
     pub queued: Vec<QueuedShown>,
+    /// The lists shown as views of their own (`scene::ListView`).
+    pub lists: Vec<ListShown>,
+}
+
+/// A list shown as a view of its own (`scene::ListView`): where (its
+/// rectangle on the canvas, as cut) and how large (canvas pixels per
+/// driver pixel).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ListShown {
+    pub id: u64,
+    pub rect: [i32; 4],
+    pub zoom: Ratio,
+}
+
+/// A list's entries' canvas `camera` at offset `pos` (content pixels,
+/// continuous): from its whole pixel, moved up by the screen pixels of the
+/// rest and that much taller, its clip keeping it to the list's rectangle
+/// (an entry the offset puts partly in it shows cut at its edge).
+pub fn scrolled(camera: &mut Camera, pos: f64) {
+    let whole = pos.floor();
+    let rest = crate::layout::screen_rest(pos - whole, camera.zoom).max(0);
+    camera.y = whole as i32;
+    camera.origin.1 -= rest;
+    camera.screen_shift.1 -= rest;
+    camera.viewport.1 += rest as u32;
+    if camera.target_clip.is_none() {
+        let [x, y] = [camera.origin.0, camera.origin.1 + rest];
+        camera.target_clip = Some([x, y, x + camera.viewport.0 as i32, y + camera.viewport.1 as i32 - rest]);
+    }
 }
 
 /// A queued report as shown on the canvas (`scene::QueuedPopup`).
@@ -836,6 +865,8 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         let v = &scene.views[i];
         let camera = frame.cameras[c];
         if frame.placed.contains(&(c as u32)) { continue; }
+        // (A list's entries: as their screen, below.)
+        if v.view.list.is_some() { continue; }
         if !v.view.interface_only {
             // (The main one is the layout's own arrangement.)
             if v.view.viewport.0 > 0 && v.view.viewport.1 > 0 {
@@ -955,6 +986,27 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
         }
         shown.extend(v.overlay.iter().filter_map(&rect_of).map(|r| (piece, [r[0] + d.0, r[1] + d.1, r[2], r[3]], d, clips[c])));
     }
+    // A list's entries (`scene::ListView`): mapped as the screen they are
+    // in, cut to their rectangle there (within that screen's clip); the
+    // pointer on them is the screen's (the driver's list takes it there).
+    for (i, v) in scene.views.iter().enumerate() {
+        let Some(list) = v.view.list else { continue };
+        let (Some(c), Some(over)) = (frame.view_cameras.get(i).copied().flatten().map(|c| c as usize), scene.views.iter().position(|o| o.id == list.over)) else { continue };
+        let Some(o) = frame.view_cameras.get(over).copied().flatten().map(|o| o as usize) else { continue };
+        let Some(piece) = pieces[o] else { continue };
+        let camera = frame.cameras[c];
+        let r = [camera.origin.0, camera.origin.1, camera.viewport.0 as i32, camera.viewport.1 as i32];
+        let piece = piece.at(camera.origin);
+        let on = piece.rect(r);
+        let clip = clips[o].map_or(on, |k| {
+            let (x, y) = (on[0].max(k[0]), on[1].max(k[1]));
+            [x, y, ((on[0] + on[2]).min(k[0] + k[2]) - x).max(0), ((on[1] + on[3]).min(k[1] + k[3]) - y).max(0)]
+        });
+        pieces[c] = Some(piece);
+        clips[c] = Some(clip);
+        shown.push((piece, r, (0, 0), Some(clip)));
+        out.lists.push(ListShown { id: list.id, rect: clip, zoom: piece.zoom });
+    }
     let intersection = |a: [i32; 4], b: [i32; 4]| {
         let (x, y) = (a[0].max(b[0]), a[1].max(b[1]));
         [x, y, (a[0] + a[2]).min(b[0] + b[2]) - x, (a[1] + a[3]).min(b[1] + b[3]) - y]
@@ -1049,6 +1101,12 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     // (Not the divider's narrow fillers: a mirror there is a sliver.)
     let below = layer.map_or(0, |l| frame.cameras[..l].iter().filter(|c| c.cells && !c.stacked && c.viewport.0 >= 16 && c.viewport.1 >= 16).count()).min(4);
     let slots = below.min(tile_render::MAX_VIEWS.saturating_sub(required.min(tile_render::MAX_VIEWS) + 3));
+    let mut list_of: Vec<Option<u64>> = vec![None; frame.cameras.len()];
+    for (i, v) in scene.views.iter().enumerate() {
+        if let (Some(list), Some(c)) = (v.view.list, frame.view_cameras.get(i).copied().flatten()) {
+            list_of[c as usize] = Some(list.id);
+        }
+    }
     let mut cameras = Vec::with_capacity(frame.cameras.len() + extra + 1 + slots);
     let mut index = vec![0u32; frame.cameras.len()];
     frame.cursor_slots.clear();
@@ -1073,6 +1131,10 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
             (None, Some(piece)) if !camera.cells => {
                 let mut camera = overlaid(piece.camera(camera));
                 if let Some([x, y, w, h]) = clips[k] { camera.target_clip = Some([x, y, x + w, y + h]); }
+                // A list's entries at the viewer's offset, by screen pixels.
+                if let Some(pos) = list_of[k].and_then(|id| frame.list_offsets.iter().find(|(l, _)| *l == id).map(|&(_, p)| p)) {
+                    scrolled(&mut camera, pos);
+                }
                 cameras.push(camera);
             },
             (None, Some(piece)) => cameras.push(piece.camera(camera)),
@@ -3455,6 +3517,53 @@ mod tests {
                     assert!((modal.rect[2] - m.rect[2]).abs() <= 1 && (modal.rect[3] - m.rect[3]).abs() <= 1, "{what}: {:?} {:?}", modal.rect, m.rect);
                 }
             }
+        }
+    }
+
+    /// A list shown as a view of its own (`scene::ListView`) over a menu:
+    /// mapped as that menu, its entries' camera at the viewer's offset by
+    /// screen pixels (from the whole content pixel, moved up by the rest),
+    /// cut to the list's rectangle where the menu shows it.
+    #[test]
+    fn a_list_view_shows_over_its_screen_at_the_viewers_offset() {
+        use scene::{ListView, View, ViewState};
+        let background = 1;
+        for (screen, window, scale_menus) in [((1920u32, 1080u32), (1920u32, 1080u32), false), ((1920, 1080), (1920, 1080), true), ((1024, 768), (3072, 2304), true)] {
+            let menu = [(screen.0 as i32 - 1024) / 2, (screen.1 as i32 - 768) / 2, 1024, 768];
+            let rect_of = |s: &FreeSprite| Some([s.x, s.y, 1024, 768]);
+            let list = [menu[0] + 100, menu[1] + 200, 300, 120];
+            let mut scene = Scene {
+                screen_size: screen,
+                views: vec![
+                    ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() }, overlay: vec![FreeSprite { set: background, x: menu[0], y: menu[1], screen: true, ..Default::default() }] },
+                    ViewState { id: 300, view: View { interface_only: true, origin: (list[0], list[1]), viewport: (300, 120), camera_y: 48,
+                        list: Some(ListView { id: 42, over: 255, count: 30, step: 24, published: (0, 30) }), ..Default::default() }, overlay: vec![] },
+                ],
+                ..Default::default()
+            };
+            scene.interface.screen = Some("Lists".into());
+            let settings = Resolution { scale_menus, ..Default::default() };
+            let p = plan(window, screen, &settings).for_scene(&scene, rect_of);
+            let mut layout = layout::Layout::default();
+            layout.driver_screen = Some(p.screen);
+            layout.menu_scale = p.menu.zoom;
+            let mut f = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+            f.list_offsets = vec![(42, 50.5)];
+            let out = arrange_panned(&p, &scene, &mut f, &mut layout.menu_pan, rect_of);
+            let shown = out.shown.unwrap();
+            let m = *shown.iter().find(|s| s.driver == menu).expect("the menu shown");
+            let what = format!("{screen:?} in {window:?}, scale menus {scale_menus}");
+            // (Measured from its own origin, as the renderer rounds it.)
+            let on = m.piece.at((list[0], list[1])).rect(list);
+            assert_eq!(out.lists, [ListShown { id: 42, rect: on, zoom: m.piece.zoom }], "{what}");
+            assert!((on[1] - m.piece.rect(list)[1]).abs() <= 1, "{what}");
+            let c = f.cameras[f.view_cameras[1].unwrap() as usize];
+            let rest = crate::layout::screen_rest(0.5, c.zoom);
+            assert_eq!((c.y, c.zoom), (50, m.piece.zoom), "{what}");
+            assert_eq!(c.target_clip, Some([on[0], on[1], on[0] + on[2], on[1] + on[3]]), "{what}");
+            assert_eq!(c.origin.1, on[1] - rest, "{what}: {c:?}");
+            assert!(c.origin.1 + c.viewport.1 as i32 >= on[1] + on[3], "{what}: reaches the list's foot: {c:?}");
+            scene.interface.screen = None;
         }
     }
 
