@@ -1059,6 +1059,9 @@ pub struct Layout {
     /// When the frame being prepared is to show (the pointer thread's
     /// scrolling is shown as of then); set by the window each frame.
     pub frame_instant: Option<std::time::Instant>,
+    /// With vsync, the display's refresh period: frames show on it, and
+    /// `frame_instant` is when this one will (`ShowClock`).
+    pub show_period: Option<std::time::Duration>,
     world_orders: world_orders::WorldOrders,
     /// Exploring the world beside the driver's screen ([`Explore`]); the
     /// world beside it in the last frame; the last left press on it (when,
@@ -1209,6 +1212,7 @@ impl Default for Layout {
             edge_fitted: None,
             pointer_present: None,
             frame_instant: None,
+            show_period: None,
             world_orders: world_orders::WorldOrders::default(),
             explore: None,
             beside_of: None,

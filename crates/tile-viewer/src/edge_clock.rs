@@ -168,12 +168,42 @@ pub struct Totals {
     pub at: Option<(Instant, Instant)>,
     pub edge: Option<(u32, (i32, i32))>,
     pub ticks: u64,
+    /// The last ticks' totals, oldest first (at most [`TRAIL`]): when, and
+    /// per view how far in all ([`Totals::shown_at`]).
+    pub trail: Vec<(Instant, Vec<(u32, (f64, f64))>)>,
 }
+
+/// Ticks kept in [`Totals::trail`]: more than a refresh and a tick at twice
+/// the refresh rate.
+pub const TRAIL: usize = 8;
 
 impl Totals {
     /// How far view `view` scrolled in all, as of the last tick.
     pub fn of(&self, view: u32) -> (f64, f64) {
         self.moved.iter().find(|(v, _, _)| *v == view).map_or((0.0, 0.0), |&(_, m, _)| m)
+    }
+
+    /// How far view `view` had scrolled at instant `at`: between the totals
+    /// of the ticks round it (the first or the last outside them). A frame
+    /// takes it at a fixed time before it shows (`Layout::show_period`),
+    /// so each shown frame moves the view by exactly its own time, whenever
+    /// its preparation began, and never back.
+    pub fn shown_at(&self, view: u32, at: Instant) -> (f64, f64) {
+        let of = |totals: &Vec<(u32, (f64, f64))>| totals.iter().find(|(v, _)| *v == view).map_or((0.0, 0.0), |&(_, m)| m);
+        let Some(first) = self.trail.first() else { return self.of(view) };
+        if at <= first.0 {
+            return of(&first.1);
+        }
+        for pair in self.trail.windows(2) {
+            let ((ta, a), (tb, b)) = (&pair[0], &pair[1]);
+            if at <= *tb {
+                let span = tb.saturating_duration_since(*ta).as_secs_f64();
+                let f = if span > 0.0 { at.saturating_duration_since(*ta).as_secs_f64() / span } else { 1.0 };
+                let (a, b) = (of(a), of(b));
+                return (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
+            }
+        }
+        self.trail.last().map_or(self.of(view), |(_, t)| of(t))
     }
 
     /// How far view `view` scrolled as of one tick before `now`: between
@@ -242,6 +272,10 @@ impl EdgeClock {
                 None => totals.moved.push((t.view, by, (0.0, 0.0))),
             }
         }
+        totals.trail.push((now, totals.moved.iter().map(|&(v, m, _)| (v, m)).collect()));
+        if totals.trail.len() > TRAIL {
+            totals.trail.remove(0);
+        }
         self.totals.publish(totals);
     }
 }
@@ -255,6 +289,24 @@ impl OnTick for EdgeClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_takes_the_scroll_between_the_ticks_round_its_instant() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let ms = |n: u64| Duration::from_millis(n);
+        let totals = Totals {
+            trail: (0..4).map(|k| (t0 + ms(8 * k), vec![(3, (10.0 * k as f64, -5.0 * k as f64))])).collect(),
+            ..Default::default()
+        };
+        assert_eq!(totals.shown_at(3, t0 + ms(4)), (5.0, -2.5));
+        assert_eq!(totals.shown_at(3, t0 + ms(20)), (25.0, -12.5));
+        // Before the first, after the last: those, never past them.
+        assert_eq!(totals.shown_at(3, t0), (0.0, 0.0));
+        assert_eq!(totals.shown_at(3, t0 + ms(100)), (30.0, -15.0));
+        // Another view: none.
+        assert_eq!(totals.shown_at(4, t0 + ms(12)), (0.0, 0.0));
+    }
 
     #[test]
     fn the_edge_zone_counts_from_the_edges_the_view_reaches() {

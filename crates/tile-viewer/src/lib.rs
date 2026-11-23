@@ -1530,6 +1530,7 @@ fn new_app(config: ViewerConfig, assets: Assets, display: Display, stop: Arc<std
         woken_idle: false,
         cursor_cameras: None,
         frame_clock: FrameClock::default(),
+        show_clock: ShowClock::default(),
         map_drawn: false,
         interface: None,
         profile: profile::env_on("TILE_VIEWER_PROFILE").then(|| profile::Profile::new("viewer", Duration::from_secs(5))),
@@ -1859,6 +1860,8 @@ struct App {
     cursor_cameras: Option<Vec<Camera>>,
     /// Animation/retry timing and the optional maximum presentation rate.
     frame_clock: FrameClock,
+    /// When the frames will show (`ShowClock`).
+    show_clock: ShowClock,
     /// Whether a scene with the world in a view was drawn yet.
     map_drawn: bool,
     /// What the scene's interface covers (`interface_rects`), for the scene
@@ -1928,6 +1931,48 @@ const DEFAULT_FRAME: Duration = Duration::from_millis(16);
 /// The animation clock permits immediate input frames unless the user set
 /// a maximum rate. Only a presented frame starts the cap's next interval;
 /// unsuccessful draw attempts merely postpone the next animation retry.
+/// When the frames shown will show: with vsync, on the display's refresh,
+/// one refresh after the last (or whole refreshes after it, frames
+/// skipped). A frame's motion (edge scrolling, glides, lists) is taken at
+/// that instant, not at the moment its preparation began: each shown frame
+/// then moves exactly one refresh's time on, and steady motion steps evenly
+/// rather than by however long each frame happened to wait.
+#[derive(Clone, Copy, Debug, Default)]
+struct ShowClock {
+    /// The refresh period (none: frames show as soon as they are drawn).
+    period: Option<Duration>,
+    last: Option<Instant>,
+}
+
+impl ShowClock {
+    fn configure(&mut self, period: Option<Duration>) {
+        if self.period != period {
+            *self = ShowClock { period, last: None };
+        }
+    }
+
+    /// The instant a frame whose preparation begins `now` shows at.
+    fn next(&mut self, now: Instant) -> Instant {
+        let Some(p) = self.period.filter(|p| !p.is_zero()) else { return now };
+        // (About a refresh after its preparation begins, on the grid of the
+        // frames shown before.)
+        let target = now + p;
+        let at = match self.last {
+            Some(last) if target > last => {
+                // (The next refresh, unless its preparation began a whole
+                // refresh or more late: then that many on.)
+                let k = (target.duration_since(last).as_secs_f64() / p.as_secs_f64()).floor().max(1.0);
+                last + p.mul_f64(k)
+            }
+            // (Ahead of the display already: the next refresh after it.)
+            Some(last) => last + p,
+            None => target,
+        };
+        self.last = Some(at);
+        at
+    }
+}
+
 struct FrameClock {
     interval: Duration,
     capped: bool,
@@ -1993,7 +2038,33 @@ impl FrameClock {
 
 #[cfg(test)]
 mod frame_clock_tests {
-    use super::{Duration, FrameClock, Instant};
+    use super::{Duration, FrameClock, Instant, ShowClock};
+
+    #[test]
+    fn frames_prepared_unevenly_show_a_refresh_apart() {
+        let start = Instant::now();
+        let p = Duration::from_micros(16_667);
+        let mut clock = ShowClock::default();
+        clock.configure(Some(p));
+        // Preparations at uneven moments within each refresh: their frames
+        // show one refresh apart all the same.
+        let jitter = [0u64, 9, 2, 13, 5, 0, 11, 3];
+        let mut shown = Vec::new();
+        for (k, j) in jitter.iter().enumerate() {
+            shown.push(clock.next(start + p * k as u32 + Duration::from_millis(*j)));
+        }
+        for pair in shown.windows(2) {
+            assert_eq!(pair[1] - pair[0], p, "{shown:?}");
+        }
+        // A refresh missed: two refreshes on, not a refresh and a bit.
+        let last = *shown.last().unwrap();
+        let later = clock.next(start + p * (jitter.len() as u32 + 1) + Duration::from_millis(1));
+        assert_eq!(later - last, p * 2);
+        // Without vsync: as soon as drawn.
+        clock.configure(None);
+        let now = Instant::now();
+        assert_eq!(clock.next(now), now);
+    }
 
     #[test]
     fn update_and_redraw_storms_obey_the_same_cap() {
@@ -2977,6 +3048,9 @@ impl App {
         let refresh = gpu.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).filter(|&r| r > 0);
         let interval = presentation_interval(max_fps, mode, refresh);
         self.frame_clock.configure(interval, max_fps > 0);
+        // (With vsync, frames show on the display's refresh.)
+        let vsync = matches!(mode, wgpu::PresentMode::AutoVsync | wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed);
+        self.show_clock.configure(refresh.filter(|_| vsync && max_fps == 0).map(|r| Duration::from_secs_f64(1000.0 / r as f64)));
         if (gpu.config.present_mode, gpu.config.desired_maximum_frame_latency) != (mode, latency) {
             gpu.config.present_mode = mode;
             gpu.config.desired_maximum_frame_latency = latency;
@@ -3957,7 +4031,9 @@ impl App {
         let scene = self.shown_scene.as_ref();
         let layout_compiled = future_layout.as_deref().unwrap_or(&self.compiled);
         let mut arranged = {
-            let now = std::time::Instant::now();
+            // (Its motion as of when it will show: `ShowClock`.)
+            let now = self.show_clock.next(std::time::Instant::now());
+            self.layout.show_period = self.show_clock.period;
             // (The lists' glides, by the same time.)
             self.list_scroll.follow(scene);
             let lists_moving = match self.drawn_at.replace(now) {

@@ -1013,7 +1013,15 @@ impl Layout {
             // own clock (none of it while scrolling is not active now).
             let totals = clock.totals();
             for &(view, _, _) in &totals.moved {
-                let total = totals.shown(view, self.frame_instant);
+                // (At a fixed time before the frame shows: a refresh and a
+                // tick, as one tick late when it is prepared.)
+                let total = match (self.frame_instant, totals.at) {
+                    (Some(show), Some((t0, t1))) => match show.checked_sub(self.show_period.unwrap_or_default() + t1.saturating_duration_since(t0)) {
+                        Some(at) => totals.shown_at(view, at),
+                        None => totals.shown(view, self.frame_instant),
+                    },
+                    _ => totals.shown(view, self.frame_instant),
+                };
                 let taken = match self.pan.edge_taken.iter_mut().find(|(v, _)| *v == view) {
                     Some((_, taken)) => std::mem::replace(taken, total),
                     None => {
