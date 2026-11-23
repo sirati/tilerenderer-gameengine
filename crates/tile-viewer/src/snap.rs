@@ -1063,8 +1063,9 @@ impl Snapper {
 
     /// Where a release of a press at `at` (on element `on`: its id, its
     /// area and the motion since) goes: there, unless the pointer went to
-    /// another element (to it) or the mouse moved past the dead zone (just
-    /// outside the pressed element, the way it moved).
+    /// another element (to it) or the mouse moved out of the pressed
+    /// element's area, past the dead zone (just outside it, the way it
+    /// moved).
     fn released_at(&self, at: Point, on: Option<(u64, [f64; 4], Point)>) -> Point {
         let Some((id, area, held)) = on else { return at };
         if self.snapped.is_some_and(|s| s.id != id && !s.capture) {
@@ -1081,9 +1082,15 @@ impl Snapper {
             .iter()
             .filter(|(_, _, _, d)| d.abs() > 1e-12)
             .map(|&(lo, hi, o, d)| if d > 0.0 { (hi - o) / d } else { (lo - o) / d })
-            .fold(f64::INFINITY, f64::min);
-        let t = if exit.is_finite() { exit.max(0.0) + 1.0 } else { 1.0 };
-        (at.0 + dir.0 * t, at.1 + dir.1 * t)
+            .fold(f64::INFINITY, f64::min)
+            .max(0.0);
+        // Off it only once the mouse moved that far: as far as from the
+        // press out of its area (a wide button takes a longer move than
+        // the dead zone; a jolt while clicking stays a click on it).
+        if !exit.is_finite() || reach < exit {
+            return at;
+        }
+        (at.0 + dir.0 * (exit + 1.0), at.1 + dir.1 * (exit + 1.0))
     }
 
     /// A wheel turn goes to the element snapped to, or where the pointer

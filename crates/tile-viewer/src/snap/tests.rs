@@ -1385,4 +1385,19 @@ fn a_press_the_mouse_moves_off_is_not_released_on_its_element() {
     s.click(Button::Left, true).unwrap();
     s.motion((5.0, 0.0));
     assert_eq!(release(&mut s), (120.0, 110.0));
+    // Past the dead zone but not as far as out of it, nothing that way
+    // (run 29: a jolt while clicking a wide button let go just outside it,
+    // no click): still a click on it; moved out of it: off it.
+    let wide = targets(&[button(1, [100, 60, 200, 100])], IDENTITY, WINDOW);
+    for (motion, clicked) in [(30.0, true), (60.0, false)] {
+        let mut s = Snapper::default();
+        s.enter(0.0, (200.0, 110.0), &wide, Rates::default());
+        s.click(Button::Left, true).unwrap();
+        s.motion((0.0, -motion / Tuning::default().motion_gain));
+        let at = release(&mut s);
+        assert_eq!(at == (200.0, 110.0), clicked, "{motion}: {at:?}");
+        if !clicked {
+            assert!(at.1 < 60.0 && (at.0 - 200.0).abs() < 1.0, "{at:?}");
+        }
+    }
 }

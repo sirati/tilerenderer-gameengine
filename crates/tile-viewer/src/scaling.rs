@@ -320,6 +320,13 @@ fn content_bounds(rects: &[[i32; 4]], screen: (u32, u32)) -> Option<[i32; 4]> {
     let (ml, mt) = ((w - 1024) / 2, (h - 768) / 2);
     let in_menu = |r: &[i32; 4]| !larger || (r[0] + r[2] > ml && r[0] < ml + 1024 && r[1] + r[3] > mt && r[1] < mt + 768);
     let content: Vec<[i32; 4]> = rects.iter().copied().filter(|r| !backdrop(r) && in_menu(r)).collect();
+    // Only a backdrop (and what lies round the menu's place, as corner
+    // labels): the menu's place itself, where the game's 1024 by 768 menus
+    // show (a screen of its own over a title cleared to black, the Hall of
+    // Fame, then goes where the title did), not the whole window.
+    if content.is_empty() && larger && rects.iter().any(backdrop) {
+        return Some([ml.max(0), mt.max(0), 1024.min(w), 768.min(h)]);
+    }
     let b = bounding(if content.is_empty() { rects } else { &content })?;
     // Only what is on the driver's screen is drawn (a 768-row title on a
     // 720-row screen is cut there): fit and centre that.
@@ -3447,6 +3454,51 @@ mod tests {
                     assert_eq!((modal.rect[0], modal.rect[1], modal.piece.zoom), (m.rect[0], m.rect[1], m.piece.zoom), "{what}");
                     assert!((modal.rect[2] - m.rect[2]).abs() <= 1 && (modal.rect[3] - m.rect[3]).abs() <= 1, "{what}: {:?} {:?}", modal.rect, m.rect);
                 }
+            }
+        }
+    }
+
+    /// The real Hall of Fame (TS Neo, run 29): opened from the campaign
+    /// screen it is a 1024 by 768 modal part at the window's top left over
+    /// a title cleared to black (a backdrop of the whole window, no board).
+    /// It shows exactly where the title's board shows, not a sixth of the
+    /// way down as a dialog over a window-sized menu.
+    #[test]
+    fn a_menu_sized_modal_over_a_cleared_title_shows_where_the_title_does() {
+        use scene::{View, ViewState};
+        let (background, board, backdrop) = (1, 2, 3);
+        for (screen, window, pixel_scale) in [((3274u32, 2048u32), (3274u32, 2048u32), 1u32), ((1920, 1080), (1920, 1080), 1), ((3274, 2048), (3258, 1904), 2)] {
+            let menu = [(screen.0 as i32 - 1024) / 2, (screen.1 as i32 - 768) / 2, 1024, 768];
+            let rect_of = |s: &FreeSprite| Some(if s.set == backdrop { [0, 0, screen.0 as i32, screen.1 as i32] } else { [s.x, s.y, 1024, 768] });
+            let sprite = |set: u32, (x, y): (i32, i32)| FreeSprite { set, x, y, screen: true, ..Default::default() };
+            let title = |overlay: Vec<FreeSprite>| Scene {
+                screen_size: screen,
+                views: vec![ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() }, overlay }],
+                ..Default::default()
+            };
+            for scale_menus in [false, true] {
+                let settings = Resolution { pixel_scale, scale_menus, ..Default::default() };
+                let what = format!("{screen:?} in {window:?}, {settings:?}");
+                let shown = |scene: &Scene| {
+                    let p = plan(window, screen, &settings).for_scene(scene, rect_of);
+                    let mut layout = layout::Layout::default();
+                    layout.driver_screen = Some(p.screen);
+                    layout.menu_scale = p.menu.zoom;
+                    let mut f = layout.frame(scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+                    arrange_panned(&p, scene, &mut f, &mut layout.menu_pan, rect_of).shown.unwrap()
+                };
+                // The title as it shows, its board's place.
+                let lit = shown(&title(vec![sprite(backdrop, (0, 0)), sprite(background, (menu[0], menu[1]))]));
+                let t = lit.iter().find(|s| s.driver == menu).expect("the title's board shown");
+                // The Hall of Fame over it cleared.
+                let mut hall = title(vec![sprite(backdrop, (0, 0))]);
+                hall.interface.popup = Some(257);
+                hall.views.push(ViewState { id: 257, view: View { interface_only: true, origin: (0, 0), viewport: (1024, 768), ..Default::default() }, overlay: vec![sprite(board, (0, 0))] });
+                let over = shown(&hall);
+                let h = over.iter().find(|s| s.driver == [0, 0, 1024, 768] && s.is_modal()).expect("the Hall of Fame shown");
+                // (Its own origin's rounding at a fractional zoom: a pixel.)
+                assert!((h.rect[0] - t.rect[0]).abs() <= 1 && (h.rect[1] - t.rect[1]).abs() <= 1 && h.piece.zoom == t.piece.zoom, "{what}: {:?} {:?}", h.rect, t.rect);
+                assert!((h.rect[2] - t.rect[2]).abs() <= 1 && (h.rect[3] - t.rect[3]).abs() <= 1, "{what}: {:?} {:?}", h.rect, t.rect);
             }
         }
     }
