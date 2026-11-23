@@ -832,9 +832,10 @@ pub fn marker_sprites(compiled: &Compiled, markers: &[layout::Marker], downscale
 const ARROW_RGBA: [u8; 4] = [232, 183, 87, 255];
 const ARROW_SHADOW_RGBA: [u8; 4] = [32, 23, 14, 255];
 /// The arrow's tip above the point it marks, and its shadow's centre from
-/// it, in full-size world pixels (as the game description places the 1:1 art).
+/// it, in full-size world pixels (as the game description places the 1:1
+/// art): the shadow centred on the marked point, under the arrow.
 const ARROW_TIP: (i32, i32) = (0, -68);
-const ARROW_SHADOW_CENTRE: (i32, i32) = (8, 4);
+const ARROW_SHADOW_CENTRE: (i32, i32) = (0, 0);
 
 /// [`marker_sprites`] with the arrow `size` times as large as its 1:1 art.
 /// Larger, it is painted at the resolution of each view showing it
