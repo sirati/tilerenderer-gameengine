@@ -122,10 +122,16 @@ pub const DEAD_ZONE: f64 = 12.0;
 pub const IDLE_RESET: f64 = 0.25;
 
 /// How much an element off the motion's direction is held back: its
-/// distance term times `1 + ANGLE_WEIGHT · (angle / CONE)²` (9 at the
-/// cone's edge, 2.6 at 20°, 1.4 at 10°): one straight ahead wins over one
-/// 20° off unless that is more than twice as near.
-pub const ANGLE_WEIGHT: f64 = 8.0;
+/// distance term times `1 + ANGLE_WEIGHT · (angle / CONE)²` (21 at the
+/// cone's edge, 9.9 at 30°, 5 at 20°, 2 at 10°): one straight ahead wins
+/// over one 20° off unless that is about five times as near, so a move
+/// up goes up between elements left and right of it.
+pub const ANGLE_WEIGHT: f64 = 20.0;
+
+/// After this long without mouse motion (seconds) the next move is
+/// measured from the pointer's spot on its element again, not from where
+/// the last move met the element ([`Snapper::choose`]).
+pub const ORIGIN_RESET: f64 = 0.3;
 
 /// The distance term: how far an element is from the distance the mouse
 /// moved, plus this much of its distance (nearer ones first when equally
@@ -534,6 +540,48 @@ pub fn pick_tuned(tuning: &Tuning, targets: &[Target], from: Point, current: Opt
         .map(|(k, _, _)| k)
 }
 
+/// Where a move `moved` from `from` met target `t`: the point where its
+/// way enters the target's area, or, passing beside it, the area's point
+/// least off its direction (the move turned the least to reach it). The
+/// next move goes on from there ([`Snapper::choose`]).
+fn entry_point(t: &Target, from: Point, moved: Point) -> Point {
+    let [x, y, w, h] = t.area;
+    let reach = moved.0.hypot(moved.1);
+    if reach == 0.0 || inside(t.area, from) {
+        return t.closest(from);
+    }
+    let dir = (moved.0 / reach, moved.1 / reach);
+    // (The ray from `from` against the rectangle: the slab method.)
+    let mut enter = 0.0_f64;
+    let mut leave = f64::INFINITY;
+    for (o, d, lo, hi) in [(from.0, dir.0, x, x + w), (from.1, dir.1, y, y + h)] {
+        if d.abs() < 1e-12 {
+            if o < lo || o > hi {
+                leave = -1.0;
+            }
+        } else {
+            let (a, b) = ((lo - o) / d, (hi - o) / d);
+            enter = enter.max(a.min(b));
+            leave = leave.min(a.max(b));
+        }
+    }
+    if enter <= leave {
+        return (from.0 + dir.0 * enter, from.1 + dir.1 * enter);
+    }
+    // (Beside it: of its corners and its point nearest the way, the one
+    // least off the direction.)
+    let along = |p: Point| {
+        let d = (p.0 - from.0, p.1 - from.1);
+        let n = d.0.hypot(d.1);
+        if n == 0.0 { 1.0 } else { (d.0 * dir.0 + d.1 * dir.1) / n }
+    };
+    let aim = (from.0 + moved.0, from.1 + moved.1);
+    [(x, y), (x + w, y), (x, y + h), (x + w, y + h), t.closest(aim)]
+        .into_iter()
+        .max_by(|a, b| along(*a).total_cmp(&along(*b)))
+        .unwrap_or(t.center())
+}
+
 /// The angle (degrees) between `moved` and the way from `from` to `to`.
 fn degrees(from: Point, to: Point, moved: Point) -> f64 {
     let d = (to.0 - from.0, to.1 - from.1);
@@ -708,6 +756,10 @@ pub struct Snapper {
     parked: Option<Point>,
     /// When the element now snapped to was picked (for the log).
     picked: f64,
+    /// Where the move that picked the element snapped to met it (its
+    /// area's point along the motion, [`entry_point`]): the next move is
+    /// measured from there until the mouse rests [`ORIGIN_RESET`].
+    origin: Option<Point>,
     /// What it picks and times its flights by (the constants, but in a
     /// replay).
     tuning: Tuning,
@@ -1021,6 +1073,9 @@ impl Snapper {
             self.idle = 0.0;
         } else {
             self.idle += dt;
+            if self.idle >= ORIGIN_RESET {
+                self.origin = None;
+            }
             // (A move on, beyond a nudge, waits for the next update.)
             if self.idle > self.tuning.idle_reset && self.moved.0.hypot(self.moved.1) < 2.0 * self.tuning.dead_zone {
                 self.moved = (0.0, 0.0);
@@ -1075,6 +1130,8 @@ impl Snapper {
         self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }), capture: t.is_capture(), alt_right_click: t.alt_right_click });
         let c = t.center();
         self.picked = now;
+        // (Measured from its spot, unless a move set where it met it.)
+        self.origin = None;
         if c != self.flight.to || !self.flight.done(now) || self.pos != c {
             let duration = self.flight_time();
             self.flight.retarget(c, now, duration);
@@ -1088,7 +1145,7 @@ impl Snapper {
 
     /// What an update would do now.
     fn choose(&self, targets: &[Target]) -> Choice {
-        let from = self.flight.to;
+        let from = self.origin.unwrap_or(self.flight.to);
         let m = self.moved;
         // (In a list too: motion goes to the entries shown, or out of the
         // list past its edges; only the wheel and a scroll scroll it.)
@@ -1099,8 +1156,10 @@ impl Snapper {
     fn update(&mut self, targets: &[Target], now: f64) {
         match self.choose(targets) {
             Choice::Snap(k) => {
-                log::debug!("snap: motion {:?} picks {} at {:.0}° off it", self.moved, targets[k].id, degrees(self.flight.to, targets[k].center(), self.moved));
+                let from = self.origin.unwrap_or(self.flight.to);
+                log::debug!("snap: motion {:?} picks {} at {:.0}° off it", self.moved, targets[k].id, degrees(from, targets[k].center(), self.moved));
                 self.snap_to(targets, k, now);
+                self.origin = Some(entry_point(&targets[k], from, self.moved));
             }
             Choice::Nothing => log::debug!("snap: motion {:?}: nothing within {:.0}°, stays", self.moved, CONE.to_degrees()),
         }
@@ -1135,6 +1194,8 @@ impl Snapper {
                 if c != t {
                     self.flight.retarget(c, now, self.flight_time());
                     self.arrived = false;
+                    // (Where a move met it is gone with it.)
+                    self.origin = None;
                 }
             }
             None => self.gone(targets, s.id, now),

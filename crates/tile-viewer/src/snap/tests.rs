@@ -1314,3 +1314,39 @@ fn lists_shown_scrolled_are_targets_where_their_rows_show() {
     assert!(shown.iter().all(|e| entries.contains(&e)));
     assert!(got.iter().any(|i| i.id == 10) && got.iter().any(|i| i.id == 1), "the list and the other buttons stay");
 }
+
+#[test]
+fn a_move_up_between_elements_left_and_right_of_it_goes_up() {
+    // A technology tree's column: the next one straight up; one up and a
+    // little to the left (about 23° off), nearer.
+    let t = targets(&[at(1, 300, 300), at(2, 272, 248), at(3, 300, 200)], IDENTITY, WINDOW);
+    let from = t[0].center();
+    assert_eq!(pick(&t, from, Some(1), (0.0, -40.0)), Some(2), "straight up");
+    // (The weight before: the nearer one off to the side.)
+    let old = Tuning { angle_weight: 8.0, ..Tuning::default() };
+    assert_eq!(pick_tuned(&old, &t, from, Some(1), (0.0, -40.0)), Some(1));
+}
+
+#[test]
+fn the_next_move_goes_on_from_where_the_last_one_met_the_element_until_the_mouse_rests() {
+    // A at (120, 110); B, wide, right of it at x 300..360; under B, D below
+    // its left end and E below its middle.
+    let t = targets(&[at(1, 120, 110), button(2, [300, 100, 60, 20]), at(4, 305, 200), at(5, 340, 200)], IDENTITY, WINDOW);
+    let (d, e) = (t[2].center(), t[3].center());
+    // Right into B (met at its left edge), then down at once: D, below
+    // where the move came in, not E below B's spot.
+    let mut s = Snapper::default();
+    s.enter(0.0, (120.0, 110.0), &t, Rates::default());
+    run(&mut s, &t, 0.0, 0.1, (4.0, 0.0), |t| t < 0.05);
+    assert_eq!(s.target(), Some(t[1].center()));
+    run(&mut s, &t, 0.1, 0.45, (0.0, 4.0), |_| true);
+    assert_eq!(s.target(), Some(d), "from where the move met B");
+    // The same with a rest of more than ORIGIN_RESET between: from B's
+    // spot, E.
+    let mut s = Snapper::default();
+    s.enter(0.0, (120.0, 110.0), &t, Rates::default());
+    run(&mut s, &t, 0.0, 0.5, (4.0, 0.0), |t| t < 0.05);
+    assert_eq!(s.target(), Some(t[1].center()));
+    run(&mut s, &t, 0.5, 0.9, (0.0, 4.0), |_| true);
+    assert_eq!(s.target(), Some(e), "from B's spot after the rest");
+}
