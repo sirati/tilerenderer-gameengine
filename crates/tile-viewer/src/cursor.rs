@@ -622,10 +622,10 @@ pub fn snap_to_tiles(marks: Marks, f: &Facts, centre: impl Fn((i32, i32)) -> (i3
     }
     if f.captured {
         let input = f.cursor_view.map(|(_, at, _)| at);
-        return Marks { world: f.world_cursor.iter().copied().map(&centre).collect(), system: None, input, ..marks };
+        return Marks { world: f.world_cursor.iter().copied().map(&centre).collect(), world_rest: (0.0, 0.0), system: None, input, ..marks };
     }
     match f.pointer_world.filter(|_| f.pointer_inside && !f.unlocking) {
-        Some(w) => Marks { world: vec![centre(w)], system: None, input: Some(f.pointer), ..marks },
+        Some(w) => Marks { world: vec![centre(w)], world_rest: (0.0, 0.0), system: None, input: Some(f.pointer), ..marks },
         None => marks,
     }
 }
@@ -728,8 +728,10 @@ pub struct Facts {
     /// The system pointer waits for a frame to be let go of (or to be
     /// shown at the world cursor): it is still hidden.
     pub unlocking: bool,
-    /// The layout's world cursor markers (world pixels as its markers).
+    /// The layout's world cursor markers (world pixels as its markers), and
+    /// how far past them the world cursor is (`Layout::cursor_rest`).
     pub world_cursor: Vec<(i32, i32)>,
+    pub world_cursor_rest: (f64, f64),
     /// The view following the world cursor: its rectangle, where the world
     /// cursor is in it, whether it is held at the world's edge
     /// (`Layout::world_cursor_view`).
@@ -862,11 +864,11 @@ impl Machine {
         } else if f.captured {
             let at = f.cursor_view.map(|(_, at, _)| at);
             let system = if self.edge && !f.unlocking && !entering { at } else { None };
-            Marks { world: f.world_cursor.clone(), window: vec![], system, input: if system.is_none() { at } else { None }, mirror_only_in: None }
+            Marks { world: f.world_cursor.clone(), world_rest: f.world_cursor_rest, window: vec![], system, input: if system.is_none() { at } else { None }, mirror_only_in: None }
         } else {
             // (Mirrored in the other views only over the plain map.)
             let world = f.pointer_world.filter(|_| f.pointer_inside && !f.interface_open).into_iter().collect();
-            Marks { world, window: vec![], system: (!f.unlocking).then_some(f.pointer), input: None, mirror_only_in: None }
+            Marks { world, world_rest: (0.0, 0.0), window: vec![], system: (!f.unlocking).then_some(f.pointer), input: None, mirror_only_in: None }
         };
         plan
     }
@@ -878,6 +880,10 @@ pub struct Marks {
     /// World pixels (in the pixels of views showing the world downscaled,
     /// as the layout's markers) to mark in every view showing them.
     pub world: Vec<(i32, i32)>,
+    /// How far past those whole pixels the marks are (world pixels, the
+    /// world cursor's motion not yet a whole one): drawn there, to the
+    /// screen pixel.
+    pub world_rest: (f64, f64),
     /// Window pixels to draw it at as they are (the snapping pointer).
     pub window: Vec<(i32, i32)>,
     /// Where the system draws its pointer (none while it is hidden): a
@@ -919,7 +925,14 @@ pub fn sprites(set: SpriteSetId, marks: &Marks, cameras: &[Camera], overlay: u32
 /// Where the cursor shows for `marks` (see [`sprites`]).
 pub fn placements(marks: &Marks, cameras: &[Camera], period: (i32, i32)) -> Vec<Placed> {
     let mut out = Vec::new();
-    let inside = |c: &Camera, q: (i32, i32)| c.cells && !c.stacked && q.0 >= c.origin.0 && q.1 >= c.origin.1 && q.0 < c.origin.0 + c.viewport.0 as i32 && q.1 < c.origin.1 + c.viewport.1 as i32;
+    // (Where a camera shows its world: its rectangle, within its clip, as
+    // one moved between whole world pixels is, `FreeView::camera`.)
+    let shows = |c: &Camera| {
+        let r = [c.origin.0, c.origin.1, c.origin.0 + c.viewport.0 as i32, c.origin.1 + c.viewport.1 as i32];
+        c.target_clip.map_or(r, |k| [r[0].max(k[0]), r[1].max(k[1]), r[2].min(k[2]), r[3].min(k[3])])
+    };
+    let within = |r: [i32; 4], q: (i32, i32)| q.0 >= r[0] && q.1 >= r[1] && q.0 < r[2] && q.1 < r[3];
+    let inside = |c: &Camera, q: (i32, i32)| c.cells && !c.stacked && within(shows(c), q);
     // The view the input goes to: the topmost showing the world there.
     let input_view = marks.input.and_then(|p| cameras.iter().rposition(|c| inside(c, p)));
     let shifts = |p: i32| if p > 0 { vec![-p, 0, p] } else { vec![0] };
@@ -927,7 +940,7 @@ pub fn placements(marks: &Marks, cameras: &[Camera], period: (i32, i32)) -> Vec<
         if !c.cells || c.stacked {
             continue;
         }
-        let rect = [c.origin.0, c.origin.1, c.origin.0 + c.viewport.0 as i32, c.origin.1 + c.viewport.1 as i32];
+        let rect = shows(c);
         // (Whether a mark only mirroring the pointer may show in this view.)
         let mirrors_here = marks.mirror_only_in.as_ref().is_none_or(|only| {
             only.iter().any(|r| rect[0] >= r[0] && rect[1] >= r[1] && rect[2] <= r[0] + r[2] && rect[3] <= r[1] + r[3])
@@ -940,14 +953,15 @@ pub fn placements(marks: &Marks, cameras: &[Camera], period: (i32, i32)) -> Vec<
             for sx in shifts(period.0) {
                 for sy in shifts(period.1) {
                     let (px, py) = (wx + sx - c.x, wy + sy - c.y);
-                    let q = (c.origin.0 + (px * n).div_euclid(d), c.origin.1 + (py * n).div_euclid(d));
+                    // (Past the whole pixel by the rest, as a view between
+                    // whole world pixels is moved: `screen_rest`.)
+                    let rest = (crate::layout::screen_rest(marks.world_rest.0, c.zoom), crate::layout::screen_rest(marks.world_rest.1, c.zoom));
+                    let q = (c.origin.0 + (px * n).div_euclid(d) + rest.0, c.origin.1 + (py * n).div_euclid(d) + rest.1);
                     if q.0 < rect[0] || q.1 < rect[1] || q.0 >= rect[2] || q.1 >= rect[3] {
                         continue;
                     }
                     // Covered by a later view showing the world there.
-                    let covered = cameras[k + 1..].iter().any(|o| {
-                        o.cells && !o.stacked && q.0 >= o.origin.0 && q.1 >= o.origin.1 && q.0 < o.origin.0 + o.viewport.0 as i32 && q.1 < o.origin.1 + o.viewport.1 as i32
-                    });
+                    let covered = cameras[k + 1..].iter().any(|o| inside(o, q));
                     let system = marks.system.is_some_and(|s| (s.0 - q.0).abs() <= span && (s.1 - q.1).abs() <= span);
                     let own = Some(k) == input_view;
                     if !covered && !system && (own || mirrors_here) {
@@ -1130,7 +1144,7 @@ mod tests {
         let interface = Camera { cells: false, ..Camera::new((800, 300)) };
         let cameras = [a, b, interface];
         // The pointer over A at world (150, 120): drawn in B only, clipped.
-        let marks = Marks { world: vec![(150, 120)], window: vec![], system: Some((150, 120)), input: None, mirror_only_in: None };
+        let marks = Marks { world: vec![(150, 120)], world_rest: (0.0, 0.0), window: vec![], system: Some((150, 120)), input: None, mirror_only_in: None };
         let s = sprites(set, &marks, &cameras, 3, (0, 0));
         assert_eq!(s.len(), 1);
         assert_eq!((s[0].x, s[0].y, s[0].view, s[0].screen), (400 + 100, 40, Some(3), true));
@@ -1139,7 +1153,7 @@ mod tests {
         let s = sprites(set, &Marks { system: None, ..marks.clone() }, &cameras, 3, (0, 0));
         assert_eq!(s.len(), 2);
         // A world that wraps every 1000 pixels: (1150, 120) is the same.
-        let s = sprites(set, &Marks { world: vec![(1150, 120)], window: vec![(5, 6)], system: None, input: None, mirror_only_in: None }, &cameras, 3, (1000, 0));
+        let s = sprites(set, &Marks { world: vec![(1150, 120)], world_rest: (0.0, 0.0), window: vec![(5, 6)], system: None, input: None, mirror_only_in: None }, &cameras, 3, (1000, 0));
         assert_eq!(s.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>(), [(150, 120), (500, 40), (5, 6)]);
         assert_eq!(s[2].clip, None);
     }
@@ -1153,7 +1167,7 @@ mod tests {
         let cameras = [a, b, zoom];
         let only = Some(vec![[500, 200, 100, 60]]);
         // Free over A at world (150, 120): not in B, still in the zoom box.
-        let free = Marks { world: vec![(150, 120)], window: vec![], system: Some((150, 120)), input: None, mirror_only_in: only.clone() };
+        let free = Marks { world: vec![(150, 120)], world_rest: (0.0, 0.0), window: vec![], system: Some((150, 120)), input: None, mirror_only_in: only.clone() };
         let s = sprites(set, &free, &cameras, 3, (0, 0));
         assert_eq!(s.iter().map(|s| s.clip).collect::<Vec<_>>(), [Some([500, 200, 600, 260])]);
         // Captured in A: drawn there (the pointer itself) and in the zoom box.
@@ -1534,7 +1548,7 @@ mod tests {
         let cameras = [a, b, empty_camera(), interface];
         // The mouse captured, the world cursor drawn in A (where the input
         // goes) and mirrored in B.
-        let marks = Marks { world: vec![(100, 50)], window: vec![], system: None, input: Some((100, 50)), mirror_only_in: None };
+        let marks = Marks { world: vec![(100, 50)], world_rest: (0.0, 0.0), window: vec![], system: None, input: Some((100, 50)), mirror_only_in: None };
         for scale in [Scale::default(), Scale::new(48, 1)] {
             let c = compose(art, &marks, &cameras, &[2], scale, (800, 300), 4, (0, 0));
             assert_eq!(c.sprites.len(), 2, "{scale:?}");
@@ -1550,7 +1564,7 @@ mod tests {
             assert_eq!(c.top.len(), if scale.unscaled() { 0 } else { 1 });
         }
         // The pointer free (the system's): every drawn mark is a mirror.
-        let free = Marks { world: vec![(100, 50)], window: vec![], system: Some((100, 50)), input: None, mirror_only_in: None };
+        let free = Marks { world: vec![(100, 50)], world_rest: (0.0, 0.0), window: vec![], system: Some((100, 50)), input: None, mirror_only_in: None };
         let c = compose(art, &free, &cameras, &[2], Scale::default(), (800, 300), 4, (0, 0));
         assert_eq!(c.sprites.iter().map(|s| s.view).collect::<Vec<_>>(), [Some(2)]);
         // No slot (e.g. the world beside a screen): on top as before.

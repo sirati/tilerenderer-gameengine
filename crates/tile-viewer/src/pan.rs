@@ -445,7 +445,8 @@ impl Layout {
             return Some(e.exact);
         }
         let glide = match (self.follow_of(hit)?, hit) {
-            (Follow::Pointer, _) => None,
+            // (Where the world cursor continuously is.)
+            (Follow::Pointer, _) => return Some(self.cursor_exact()),
             (_, Hit::Main) => Some(self.main_view.glide),
             (_, Hit::Pane) => self.split.map(|s| s.view.glide),
             (_, Hit::Inset(k)) => self.insets.get(k).map(|i| i.view.glide),
@@ -461,7 +462,20 @@ impl Layout {
     /// hand): drawn at its nearest whole pixel, `c` itself kept for the
     /// next pan ([`Layout::exact_center`]).
     fn place_exact(&mut self, hit: Hit, c: (f64, f64)) {
-        self.place_view(hit, (c.0.round() as i32, c.1.round() as i32));
+        let whole = (c.0.round() as i32, c.1.round() as i32);
+        self.place_view(hit, whole);
+        // (The world cursor moved so: there continuously, but where it is
+        // held at an edge of a world that does not wrap.)
+        if self.follow_of(hit) == Some(Follow::Pointer) {
+            let held = |v: i32, axis: usize| self.bounds.is_some_and(|b| {
+                let (size, wrap) = b.axis(axis);
+                !wrap && (v < 0 || v >= size)
+            });
+            self.motion_rest = (
+                if held(whole.0, 0) { 0.0 } else { c.0 - whole.0 as f64 },
+                if held(whole.1, 1) { 0.0 } else { c.1 - whole.1 as f64 },
+            );
+        }
         self.pan.exact.retain(|e| e.hit != hit);
         if let Some(drawn) = self.view_point(hit) {
             self.pan.exact.push(Exact { hit, exact: c, drawn });
@@ -609,7 +623,7 @@ impl Layout {
     /// in it is at them ([`crate::edge_clock::EdgeTarget`]).
     fn edge_target(&self, hit: Hit) -> Option<crate::edge_clock::EdgeTarget> {
         let (_, cam) = self.shown.iter().find(|(h, _)| *h == hit)?;
-        let rect = super::rect_of(cam);
+        let rect = super::rect_of(&super::whole_camera(cam));
         let [x, y, _, _] = rect;
         // A top strip reserves the window's top. The first map row below
         // it (right below the strip's divider, `Layout::dividers`) becomes

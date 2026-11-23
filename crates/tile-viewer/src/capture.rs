@@ -153,7 +153,7 @@ impl Layout {
         if popup && self.click_popup_open() {
             return Some("a popup is open");
         }
-        let view = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| [c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32]);
+        let view = self.shown.iter().find(|(h, _)| *h == hit).map(|(_, c)| super::rect_of(&super::whole_camera(c)));
         let covers = |rects: &[[i32; 4]]| view.is_none_or(|v| rects.iter().any(|&r| super::overlap(r, v)));
         if popup && self.popup_shown && covers(&self.menu_cover.popup) {
             return Some("a popup is open over it");
@@ -201,7 +201,7 @@ impl Layout {
     /// is captured in, it lets the mouse go (the click goes to the menu).
     pub fn menu_clicked(&mut self, p: (i32, i32)) {
         let Some(hit) = self.captured_view().filter(|_| self.menu_open()) else { return };
-        let inside = self.shown.iter().find(|(h, _)| *h == hit).is_some_and(|(_, c)| super::inside([c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32], p));
+        let inside = self.shown.iter().find(|(h, _)| *h == hit).is_some_and(|(_, c)| super::inside(super::rect_of(&super::whole_camera(c)), p));
         if !inside {
             self.release("a click on the menu outside the captured view");
         }
@@ -303,7 +303,7 @@ impl Layout {
             if self.split.is_none() && !follows {
                 continue;
             }
-            let rect = [c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32];
+            let rect = super::rect_of(&super::whole_camera(c));
             let middle = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2);
             let cursor = self.cursor_on_window().filter(|&p| follows && super::inside(rect, p));
             let reaches = |at: (i32, i32)| if follows { self.capture_hit(at) == Some(hit) } else { self.hit(at) == hit };

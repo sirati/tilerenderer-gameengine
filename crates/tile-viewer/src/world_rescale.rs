@@ -285,7 +285,8 @@ mod tests {
             frame(&mut l, scale);
             let exact = (l.cursor.0 as f64 + l.motion_rest.0, l.cursor.1 as f64 + l.motion_rest.1);
             assert_eq!(exact, (3507.25 / scale as f64, 2002.75 / scale as f64));
-            assert_eq!(l.split.unwrap().view.center, l.cursor);
+            // (B centred where the cursor continuously is, to the pixel.)
+            assert_eq!(l.split.unwrap().view.center, (exact.0.round() as i32, exact.1.round() as i32));
             assert_eq!(l.main_view.center, (3007 / scale as i32, 2003 / scale as i32));
             assert!(l.captured());
         }

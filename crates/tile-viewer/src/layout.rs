@@ -416,9 +416,10 @@ impl FreeView {
         let zoom = self.zoom_by(scale);
         // Between whole world pixels (where a pan or a glide has it, not
         // held at an edge of the world), by `rest` screen pixels (rounded
-        // towards zero: none at 1:1 and below): from the world pixel before
-        // its whole one, the picture moved back by the rest and drawn that
-        // much wider, clipped to `rect` (`whole_camera` undoes it).
+        // half up, [`screen_rest`]; none at 1:1 and below): from the world
+        // pixel before its whole one, the picture moved back by the rest and
+        // drawn that much wider, clipped to `rect` (`whole_camera` undoes
+        // it).
         let fine = self.fine.filter(|f| self.center != UNPLACED && (f.0.round() as i32, f.1.round() as i32) == self.center);
         let (n, d) = (zoom.0.max(1) as f64, zoom.1.max(1) as f64);
         // (Where the world pixel after a camera's first starts.)
@@ -426,10 +427,7 @@ impl FreeView {
         let axis = |placed: i32, shown: i32, fine: Option<f64>, span: i32| {
             let whole = shown - span / 2;
             let rest = match fine {
-                Some(f) if placed == shown => {
-                    let r = (f - placed as f64) * n / d;
-                    (if r >= 0.0 { (r - 0.5).ceil() } else { (r + 0.5).floor() }) as i32
-                }
+                Some(f) if placed == shown && n > d => screen_rest(f - placed as f64, zoom),
                 _ => 0,
             };
             if rest == 0 { (whole, 0) } else { (whole - 1, second + rest) }
@@ -1366,6 +1364,23 @@ pub(crate) fn camera_middle(camera: &Camera) -> (i32, i32) {
     (c.x + w as i32 / 2, c.y + h as i32 / 2)
 }
 
+/// World pixels `rest` on a camera at `zoom` in screen pixels, rounded half
+/// up: what a camera between whole world pixels is moved by, and a mark
+/// that far past its whole pixel (`cursor::placements`), alike, so a mark
+/// at the middle of a view following it stays on its screen pixel. (A
+/// half taken as reached however the rest was summed: the two agree.)
+pub(crate) fn screen_rest(rest: f64, zoom: (u32, u32)) -> i32 {
+    (rest * zoom.0.max(1) as f64 / zoom.1.max(1) as f64 + 0.5 + 1e-9).floor() as i32
+}
+
+/// The window pixel `camera` shows world pixel `p` on, `rest` world pixels
+/// past it ([`screen_rest`]).
+fn on_screen(camera: &Camera, p: (i32, i32), rest: (f64, f64)) -> (i32, i32) {
+    let (n, d) = (camera.zoom.0.max(1) as i32, camera.zoom.1.max(1) as i32);
+    (camera.origin.0 + ((p.0 - camera.x) * n).div_euclid(d) + screen_rest(rest.0, camera.zoom),
+     camera.origin.1 + ((p.1 - camera.y) * n).div_euclid(d) + screen_rest(rest.1, camera.zoom))
+}
+
 /// Where the driver's screen and its world go when it asks for them side
 /// by side in a window of `window`: how far its screen moves, and the
 /// world's rectangle (the rest of the window, a gap from the screen).
@@ -2041,8 +2056,7 @@ impl Layout {
     /// Where the world cursor is in the window: in the view following it.
     fn cursor_on_window(&self) -> Option<(i32, i32)> {
         let (_, c) = self.shown.iter().find(|(h, _)| self.follow_of(*h) == Some(Follow::Pointer))?;
-        let (n, d) = (c.zoom.0.max(1) as i32, c.zoom.1.max(1) as i32);
-        Some((c.origin.0 + (self.cursor.0 - c.x) * n / d, c.origin.1 + (self.cursor.1 - c.y) * n / d))
+        Some(on_screen(c, self.cursor, self.motion_rest))
     }
 
     /// The pointer left the window, or the window lost the focus: it is at
@@ -2760,7 +2774,10 @@ impl Layout {
         // round its middle): what the driver centres on (the selected piece,
         // a popup's subject, a place looked at) is in the middle of A.
         let main_driver = semantic_main.or(driver);
-        let (cursor, focus) = (self.cursor, scene.focus);
+        // (A view following the world cursor: centred where it continuously
+        // is, `cursor_rest`.)
+        let exact = self.cursor_exact();
+        let (cursor, focus) = ((exact.0.round() as i32, exact.1.round() as i32), scene.focus);
         let main_focus = if self.semantic_focus_active { semantic_main.or(focus).or(driver) } else { focus.or(semantic_main).or(driver) };
         let has_world = scene.shape.cols > 0 && scene.shape.rows > 0;
         self.world_frames = if has_world { self.world_frames.saturating_add(1) } else { 0 };
@@ -3313,8 +3330,11 @@ impl Layout {
                 Some(Hit::Pane) => self.clean_map.b,
                 Some(Hit::Magnifier) => self.clean_map.zoom,
                 _ => {
-                    // Narrow divider fillers belong to their adjacent pane.
-                    let center = (camera.origin.0 + camera.viewport.0 as i32 / 2, camera.origin.1 + camera.viewport.1 as i32 / 2);
+                    // Narrow divider fillers belong to their adjacent pane
+                    // (one continuing a pane moved between whole world
+                    // pixels: by its clip rectangle).
+                    let [x0, y0, x1, y1] = camera.target_clip.unwrap_or([camera.origin.0, camera.origin.1, camera.origin.0 + camera.viewport.0 as i32, camera.origin.1 + camera.viewport.1 as i32]);
+                    let center = ((x0 + x1) / 2, (y0 + y1) / 2);
                     let in_b = self.split.zip(self.gap()).is_some_and(|(split, ((g0, g1), _))| {
                         let along = if split.axis == Axis::Vertical { center.0 } else { center.1 };
                         along >= g0 + (g1 - g0) / 2
@@ -4093,16 +4113,29 @@ impl Layout {
         if self.locked { None } else { self.world_under(self.pointer) }
     }
 
+    /// How far past its whole pixel the world cursor continuously is (world
+    /// pixels: the motion not yet a whole one). Its view is centred and its
+    /// mark drawn there, to the screen pixel; the driver gets the pixel.
+    pub fn cursor_rest(&self) -> (f64, f64) {
+        self.motion_rest
+    }
+
+    /// The world cursor where it continuously is ([`Layout::cursor_rest`]).
+    pub(crate) fn cursor_exact(&self) -> (f64, f64) {
+        (self.cursor.0 as f64 + self.motion_rest.0, self.cursor.1 as f64 + self.motion_rest.1)
+    }
+
     /// The view following the world cursor in the last frame: its window
     /// rectangle (x, y, w, h), where the world cursor is in it, and whether
     /// the view is held at the edge of a world that does not wrap, so the
     /// cursor is off its middle (for the cursor's drawing, `crate::cursor`).
     pub fn world_cursor_view(&self) -> Option<([i32; 4], (i32, i32), bool)> {
         let (_, c) = self.shown.iter().find(|(h, _)| self.follow_of(*h) == Some(Follow::Pointer))?;
+        let c = whole_camera(c);
         let (n, d) = (c.zoom.0.max(1), c.zoom.1.max(1));
         let span = ((c.viewport.0 * d).div_ceil(n) as i32, (c.viewport.1 * d).div_ceil(n) as i32);
         let held = self.bounds.is_some_and(|b| b.clamp_center(0, self.cursor.0, span.0) != self.cursor.0 || b.clamp_center(1, self.cursor.1, span.1) != self.cursor.1);
-        let rect = [c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32];
+        let rect = rect_of(&c);
         Some((rect, self.cursor_on_window()?, held))
     }
 
@@ -4110,6 +4143,7 @@ impl Layout {
     /// nonwrapping world edge rather than centring that cursor.
     pub fn world_cursor_axes(&self) -> Option<(bool, bool)> {
         let (_, c) = self.shown.iter().find(|(h, _)| self.follow_of(*h) == Some(Follow::Pointer))?;
+        let c = whole_camera(c);
         let (n, d) = (c.zoom.0.max(1), c.zoom.1.max(1));
         let span = ((c.viewport.0 * d).div_ceil(n) as i32, (c.viewport.1 * d).div_ceil(n) as i32);
         Some(self.bounds.map_or((false, false), |b| (
@@ -4126,7 +4160,7 @@ impl Layout {
         if !self.locked {
             return vec![];
         }
-        let bounds = self.pointer_bounds().unwrap_or([c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32]);
+        let bounds = self.pointer_bounds().unwrap_or_else(|| rect_of(&whole_camera(&c)));
         let x = p.0.clamp(bounds[0], bounds[0] + bounds[2] - 1);
         let y = p.1.clamp(bounds[1], bounds[1] + bounds[3] - 1);
         let from = self.pointer;
@@ -4197,10 +4231,7 @@ impl Layout {
         }
         let following = self.shown.iter().find(|(h, _)| self.follow_of(*h) == Some(Follow::Pointer));
         let camera = following.or_else(|| self.shown.iter().find(|(h, _)| *h == Hit::Main)).map(|(_, c)| c);
-        camera.map_or(self.pointer, |c| {
-            let (n, d) = (c.zoom.0.max(1) as i32, c.zoom.1.max(1) as i32);
-            (c.origin.0 + (self.cursor.0 - c.x) * n / d, c.origin.1 + (self.cursor.1 - c.y) * n / d)
-        })
+        camera.map_or(self.pointer, |c| on_screen(c, self.cursor, self.motion_rest))
     }
 
     /// Button snapping (`crate::snap`) holds the pointer (`on`) or gives it
@@ -4228,7 +4259,7 @@ impl Layout {
             if self.follow_of(*h) != Some(Follow::Pointer) {
                 return None;
             }
-            let rect = [c.origin.0, c.origin.1, c.viewport.0 as i32, c.viewport.1 as i32];
+            let rect = rect_of(&whole_camera(c));
             let middle = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2);
             let cursor = self.cursor_on_window().filter(|&p| inside(rect, p));
             [Some(middle), cursor].into_iter().flatten().find(|&at| self.capture_hit(at) == Some(*h)).map(|at| (rect, at))
@@ -4247,7 +4278,8 @@ impl Layout {
     pub fn capture_for_target(&mut self) -> Option<Vec<Input>> {
         let (hit, camera) = self.shown.iter().find(|(h, _)| matches!(h, Hit::Main | Hit::Pane | Hit::Inset(_)) && self.follow_of(*h) == Some(Follow::Pointer)).copied()?;
         if !self.locked {
-            let middle = (camera.origin.0 + camera.viewport.0 as i32 / 2, camera.origin.1 + camera.viewport.1 as i32 / 2);
+            let view = rect_of(&whole_camera(&camera));
+            let middle = (view[0] + view[2] / 2, view[1] + view[3] / 2);
             self.pointer = middle;
             self.raw_pointer = middle;
             self.warp = Some(middle);
@@ -8849,6 +8881,35 @@ mod tests {
                         assert!((l.motion_rest.1 - expected.1.fract()).abs() < 1e-9);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_captured_world_cursor_moves_its_view_by_screen_pixels() {
+        // At 2:1 and 3:1 a mouse pixel is a fraction of a world pixel: the
+        // view following the world cursor moves by it, the cursor staying
+        // on its screen pixel, the driver getting its whole pixel.
+        for (scale, step) in [((2, 1), 1.0), ((3, 1), 1.0), ((2, 1), -1.0)] {
+            let mut l = arranged(&settings(|s| (s.split, s.roles) = (S::Vertical1To1, Roles::UnitMouse)));
+            l.world_scale = scale;
+            frame(&mut l, vec![]);
+            assert!(click(&mut l, (600, 300)).is_empty());
+            frame(&mut l, vec![]);
+            let camera = |l: &Layout| l.shown.iter().find(|(h, _)| l.follow_of(*h) == Some(Follow::Pointer)).unwrap().1;
+            let m = scale.0 as i32;
+            let c0 = camera(&l);
+            let w = c0.x + 40;
+            let start = c0.origin.0 + (w - c0.x) * m;
+            let (_, at, _) = l.world_cursor_view().unwrap();
+            let from = l.cursor;
+            for n in 1..=3 * m {
+                l.motion((step, 0.0));
+                frame(&mut l, vec![]);
+                let c = camera(&l);
+                assert_eq!(c.origin.0 + (w - c.x) * m, start - n * step as i32, "{scale:?} {step} pixel {n}");
+                assert_eq!(l.world_cursor_view().unwrap().1, at, "{scale:?} {step} pixel {n}");
+                assert_eq!(l.cursor.0, from.0 + (n as f64 * step / m as f64).trunc() as i32, "{scale:?} {step} pixel {n}");
             }
         }
     }

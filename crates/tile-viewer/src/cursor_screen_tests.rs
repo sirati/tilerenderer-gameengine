@@ -176,6 +176,7 @@ fn shoot(compiled: &Compiled, settings: &Settings, scene: &Scene, p: Option<(i32
         snap_mode,
         unlocking: false,
         world_cursor: frame.markers.iter().filter_map(|m| if let Marker::Cursor(p) = m { Some(*p) } else { None }).collect(),
+        world_cursor_rest: l.cursor_rest(),
         cursor_view: l.world_cursor_view(),
         cursor_axes: l.world_cursor_axes().unwrap_or((false, false)),
         pointer: l.pointer_in_window(),

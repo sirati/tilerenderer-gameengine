@@ -4135,6 +4135,7 @@ impl App {
             snap_mode: self.snap.snap_mode_active(),
             unlocking: self.unlock_pending.is_some(),
             world_cursor: arranged.markers.iter().filter_map(|m| if let layout::Marker::Cursor(p) = m { Some(*p) } else { None }).collect(),
+            world_cursor_rest: self.layout.cursor_rest(),
             cursor_view: self.layout.world_cursor_view(),
             cursor_axes: self.layout.world_cursor_axes().unwrap_or((false, false)),
             pointer: if captured { self.system_pointer } else { self.layout.pointer_in_window() },
