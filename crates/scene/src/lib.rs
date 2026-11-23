@@ -51,6 +51,39 @@ pub struct View {
     /// own cells ([`Scene::layers`]); views of one binding share its slots
     /// (see docs/per-view-layers.md).
     pub binding: u32,
+    /// A list's entries, scrolled in the viewport ([`ListView`]); `None`:
+    /// no list.
+    pub list: Option<ListView>,
+}
+
+/// A view of a list's entries (an interface-only view over its screen's,
+/// `over`): entry `k`'s content is the view's world-space sprites at
+/// content y `k · step` (x from the list's left), and the camera's y is the
+/// list's offset (content pixels) as the driver last showed it. Only the
+/// entries are content: what is behind them (the screen's background)
+/// stays in the screen's own view and never scrolls.
+///
+/// A renderer scrolls it on its own, continuously: at its frame rate, by
+/// screen pixels, from the first input on (no step to reach first), in the
+/// content's bounds, drawing every entry the offset puts partly in the
+/// viewport, clipped to it. It tells the driver where it is
+/// ([`Input::ListScrolled`]); the driver follows (the game's own first
+/// entry shown) and publishes the entries round there.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListView {
+    /// The list (the same while it is shown).
+    pub id: u64,
+    /// The view of the screen it is in: shown where and as large as that
+    /// one, its rectangle a part of it.
+    pub over: u32,
+    /// How many entries it has, and each one's height (content pixels):
+    /// the content is `count · step` high.
+    pub count: u32,
+    pub step: u32,
+    /// The entries the scene holds sprites for (first, how many): at least
+    /// a page round the offset, so a renderer scrolls on while the driver
+    /// publishes more.
+    pub published: (u32, u32),
 }
 
 /// Cells of a layer kept apart from its own ([`Scene::layers`]), which the
@@ -1338,6 +1371,11 @@ pub enum Input {
     /// `pixels` (a trackpad); positive moves the content right and down.
     /// The `Wheel` notches it makes for the driver's interface follow it.
     Scroll { dx: i32, dy: i32, pixels: bool, x: i32, y: i32 },
+    /// Where the renderer shows list `id` ([`ListView`]): its offset in
+    /// content pixels (rounded). The driver shows the entry there first
+    /// (rounded to whole entries as its list can) and publishes the entries
+    /// round it.
+    ListScrolled { id: u64, offset: i32 },
     /// A key, as a Windows virtual-key code (the de-facto lingua franca of
     /// keyboard input), with the character it produced, if any.
     Key { vk: u32, down: bool, text: Option<char> },

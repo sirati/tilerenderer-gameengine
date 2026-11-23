@@ -2,10 +2,10 @@
 //! renderer cannot share Rust objects (another process, or the native side
 //! of a Wine program). Little endian, length-prefixed, versioned.
 
-use crate::{Beside, Binding, Button, Extension, ScreenRole, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, WorldOrderAction, Update, View, ViewLooks, WorldShape};
+use crate::{Beside, Binding, Button, Extension, ScreenRole, DetachedPopup, QueuedPopup, PopupAnchor, CameraFocus, Cursor, Edge, FreeSprite, Glyph, Input, Interactable, InteractableKind, Interface, LayerCells, ListView, LookState, Looks, Patch, PointerState, Select, SliderAction, SystemCursor, WorldOrderAction, Update, View, ViewLooks, WorldShape};
 
 /// Bumped whenever the encoding changes.
-pub const VERSION: u32 = 66;
+pub const VERSION: u32 = 67;
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
@@ -139,6 +139,13 @@ impl Writer {
         self.u32(v.downscale);
         self.u32(v.hidden_categories);
         self.u32(v.binding);
+        self.bool(v.list.is_some());
+        let l = v.list.unwrap_or_default();
+        self.u32(l.id as u32);
+        self.u32((l.id >> 32) as u32);
+        for n in [l.over, l.count, l.step, l.published.0, l.published.1] {
+            self.u32(n);
+        }
     }
 
     fn layer_cells(&mut self, l: &LayerCells) {
@@ -256,7 +263,12 @@ impl Reader<'_> {
         let downscale = self.u32()?;
         let hidden_categories = self.u32()?;
         let binding = self.u32()?;
-        Ok(View { camera_x, camera_y, zoom, viewport, cull: has_cull.then_some(cull), origin, interface_only, menu, downscale, hidden_categories, binding })
+        let has_list = self.bool()?;
+        let id = self.u32()? as u64 | (self.u32()? as u64) << 32;
+        let (over, count, step) = (self.u32()?, self.u32()?, self.u32()?);
+        let published = (self.u32()?, self.u32()?);
+        let list = has_list.then_some(ListView { id, over, count, step, published });
+        Ok(View { camera_x, camera_y, zoom, viewport, cull: has_cull.then_some(cull), origin, interface_only, menu, downscale, hidden_categories, binding, list })
     }
 
     fn layer_cells(&mut self) -> Result<LayerCells, WireError> {
@@ -1152,6 +1164,12 @@ pub fn encode_input(events: &[Input]) -> Vec<u8> {
                 w.bool(keep);
             }
             Input::DismissPopup => w.u8(17),
+            Input::ListScrolled { id, offset } => {
+                w.u8(25);
+                w.u32(id as u32);
+                w.u32((id >> 32) as u32);
+                w.i32(offset);
+            }
             Input::Extension { kind, ref data } => {
                 w.u8(24);
                 w.u32(kind);
@@ -1293,6 +1311,7 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<Input>, WireError> {
                 id: r.u32()? as u64 | (r.u32()? as u64) << 32, keep: r.bool()?,
             },
             17 => Input::DismissPopup,
+            25 => Input::ListScrolled { id: r.u32()? as u64 | (r.u32()? as u64) << 32, offset: r.i32()? },
             24 => {
                 let kind = r.u32()?;
                 let n = r.len(1)?;
@@ -1500,10 +1519,20 @@ mod tests {
     }
 
     #[test]
+    fn a_list_view_round_trips() {
+        let mut s = Scene::empty(WorldShape { cols: 1, rows: 1, wrap_x: false, wrap_y: false }, 1);
+        s.view_mut(4).view = View { interface_only: true, camera_y: 72, viewport: (300, 120), origin: (10, 20),
+            list: Some(ListView { id: 0x9_0000_0002, over: 3, count: 40, step: 24, published: (5, 20) }), ..Default::default() };
+        let view = s.view_mut(4).view;
+        let got = decode_updates(&encode_updates(&[Update::View { id: 4, view: Some(view) }])).unwrap();
+        assert_eq!(got, [Update::View { id: 4, view: Some(view) }]);
+    }
+
+    #[test]
     fn updates_and_input_round_trip() {
         let mut s = Scene::empty(WorldShape { cols: 3, rows: 2, wrap_x: true, wrap_y: false }, 2);
         s.tick = 7;
-        s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false, menu: true, downscale: 2, hidden_categories: 0x123, binding: 9 };
+        s.view_mut(0).view = View { camera_x: -5, camera_y: 12, zoom: (1, 2), viewport: (640, 480), cull: Some((1, 2, 3, 4)), origin: (3, 4), interface_only: false, menu: true, downscale: 2, hidden_categories: 0x123, binding: 9, list: None };
         s.slots.push(crate::LayerSlot { id: 3, layer: 1, cells: LayerCells { values: vec![1, 0, 2, 0, 0, 7], phases: Some(vec![0, 1, 2, 3, 4, 5]), offsets: Some(vec![(-128, 0); 6]) } });
         s.slots.push(crate::LayerSlot { id: 8, layer: 0, cells: LayerCells { values: vec![0; 6], phases: None, offsets: None } });
         s.bindings.push(Binding { id: 9, slots: vec![(0, 8), (1, 3)] });
@@ -1634,6 +1663,7 @@ mod tests {
             Input::Quit,
             Input::Look { x: -5, y: 7000 },
             Input::DismissPopup,
+            Input::ListScrolled { id: 0x7_0000_0011, offset: -12 },
             Input::Extension { kind: 0x1234_5678, data: vec![3, 255, 0, 9] },
             Input::Extension { kind: 0, data: vec![] },
             Input::CloseDetached { serial: 0x2_0000_0009 },
