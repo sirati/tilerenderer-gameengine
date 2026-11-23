@@ -1350,3 +1350,39 @@ fn the_next_move_goes_on_from_where_the_last_one_met_the_element_until_the_mouse
     run(&mut s, &t, 0.5, 0.9, (0.0, 4.0), |_| true);
     assert_eq!(s.target(), Some(e), "from B's spot after the rest");
 }
+
+#[test]
+fn a_press_the_mouse_moves_off_is_not_released_on_its_element() {
+    let t = row();
+    let release = |s: &mut Snapper| match s.click(Button::Left, false).unwrap().as_slice() {
+        [Action::Button { down: false, at, .. }] => *at,
+        other => panic!("{other:?}"),
+    };
+    // Pressed on A and let go: a click on A.
+    let mut s = Snapper::default();
+    s.enter(0.0, (120.0, 110.0), &t, Rates::default());
+    s.click(Button::Left, true).unwrap();
+    assert_eq!(release(&mut s), (120.0, 110.0));
+    // Pressed on A, the mouse moved right on to B: let go on B.
+    let mut s = Snapper::default();
+    s.enter(0.0, (120.0, 110.0), &t, Rates::default());
+    s.click(Button::Left, true).unwrap();
+    run(&mut s, &t, 0.0, 0.5, (4.0, 0.0), |t| t < 0.05);
+    assert_eq!(s.target(), Some((320.0, 110.0)));
+    assert_eq!(release(&mut s), (320.0, 110.0));
+    // Pressed on A, the mouse moved up where nothing is: let go just above
+    // A, off it.
+    let mut s = Snapper::default();
+    s.enter(0.0, (120.0, 110.0), &t, Rates::default());
+    s.click(Button::Left, true).unwrap();
+    run(&mut s, &t, 0.0, 0.5, (0.0, -4.0), |t| t < 0.05);
+    assert_eq!(s.target(), Some((120.0, 110.0)), "nothing that way");
+    let at = release(&mut s);
+    assert!(at.1 < 100.0 && (at.0 - 120.0).abs() < 1.0, "{at:?}");
+    // A nudge within the dead zone: still a click on A.
+    let mut s = Snapper::default();
+    s.enter(0.0, (120.0, 110.0), &t, Rates::default());
+    s.click(Button::Left, true).unwrap();
+    s.motion((5.0, 0.0));
+    assert_eq!(release(&mut s), (120.0, 110.0));
+}

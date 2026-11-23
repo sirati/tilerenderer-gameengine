@@ -687,6 +687,8 @@ struct Snapped {
     capture: bool,
     /// Its left clicks go to the driver as right clicks.
     alt_right_click: bool,
+    /// All of it (window pixels, [`Target::area`]).
+    area: [f64; 4],
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -749,6 +751,10 @@ pub struct Snapper {
     rates: Rates,
     /// Where each button's press went, and as which button.
     pressed: [Option<(Point, Button)>; 3],
+    /// The element each held button was pressed on (its id and area), and
+    /// the motion since (window pixels): moved off, its release goes
+    /// elsewhere ([`Snapper::click`]).
+    pressed_on: [Option<(u64, [f64; 4], Point)>; 3],
     /// The driver's element the pointer last rested on (kept across modes:
     /// the next one goes on from it).
     rested: Option<u64>,
@@ -994,8 +1000,12 @@ impl Snapper {
     pub fn motion(&mut self, d: Point) -> bool {
         match self.phase {
             Phase::Snapping => {
-                self.moved = (self.moved.0 + d.0 * self.tuning.motion_gain, self.moved.1 + d.1 * self.tuning.motion_gain);
+                let d = (d.0 * self.tuning.motion_gain, d.1 * self.tuning.motion_gain);
+                self.moved = (self.moved.0 + d.0, self.moved.1 + d.1);
                 self.moving = true;
+                for (_, _, held) in self.pressed_on.iter_mut().flatten() {
+                    *held = (held.0 + d.0, held.1 + d.1);
+                }
                 true
             }
             Phase::Landing => true,
@@ -1009,12 +1019,16 @@ impl Snapper {
 
     /// A button: while snapping it goes to the element snapped to (the
     /// pointer put there), where the pointer parked to that point; a
-    /// release goes where its press went. Nothing snapped to: nothing (never
-    /// the world). `None`: not the snapping pointer's.
+    /// release goes where its press went, unless the mouse moved off the
+    /// element meanwhile (as a person drags off a button not to press it):
+    /// then to the element the pointer went to, or, none that way, just
+    /// outside the pressed one ([`Snapper::released_at`]). Nothing snapped
+    /// to: nothing (never the world). `None`: not the snapping pointer's.
     pub fn click(&mut self, button: Button, down: bool) -> Option<Vec<Action>> {
         let b = button_index(button);
         if !down {
-            return self.pressed[b].take().map(|(at, sent)| vec![Action::Button { button: sent, down, at }]);
+            let on = self.pressed_on[b].take();
+            return self.pressed[b].take().map(|(at, sent)| vec![Action::Button { button: sent, down, at: self.released_at(at, on) }]);
         }
         let mut sent = button;
         let at = match self.phase {
@@ -1043,7 +1057,33 @@ impl Snapper {
             Phase::Off => return None,
         };
         self.pressed[b] = Some((at, sent));
+        self.pressed_on[b] = self.snapped.filter(|s| !s.capture).map(|s| (s.id, s.area, (0.0, 0.0)));
         Some(vec![Action::Move(at), Action::Button { button: sent, down, at }])
+    }
+
+    /// Where a release of a press at `at` (on element `on`: its id, its
+    /// area and the motion since) goes: there, unless the pointer went to
+    /// another element (to it) or the mouse moved past the dead zone (just
+    /// outside the pressed element, the way it moved).
+    fn released_at(&self, at: Point, on: Option<(u64, [f64; 4], Point)>) -> Point {
+        let Some((id, area, held)) = on else { return at };
+        if self.snapped.is_some_and(|s| s.id != id && !s.capture) {
+            return self.flight.to;
+        }
+        let reach = held.0.hypot(held.1);
+        if reach < self.tuning.dead_zone {
+            return at;
+        }
+        // (The way out of its area from the press, a pixel past its edge.)
+        let dir = (held.0 / reach, held.1 / reach);
+        let [x, y, w, h] = area;
+        let exit = [(x, x + w, at.0, dir.0), (y, y + h, at.1, dir.1)]
+            .iter()
+            .filter(|(_, _, _, d)| d.abs() > 1e-12)
+            .map(|&(lo, hi, o, d)| if d > 0.0 { (hi - o) / d } else { (lo - o) / d })
+            .fold(f64::INFINITY, f64::min);
+        let t = if exit.is_finite() { exit.max(0.0) + 1.0 } else { 1.0 };
+        (at.0 + dir.0 * t, at.1 + dir.1 * t)
     }
 
     /// A wheel turn goes to the element snapped to, or where the pointer
@@ -1127,7 +1167,7 @@ impl Snapper {
     fn snap_to(&mut self, targets: &[Target], k: usize, now: f64) {
         let t = &targets[k];
         let list = t.list(k).map(|l| targets[l].id);
-        self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }), capture: t.is_capture(), alt_right_click: t.alt_right_click });
+        self.snapped = Some(Snapped { id: t.id, list, entry: matches!(t.kind, TargetKind::ListItem { .. }), capture: t.is_capture(), alt_right_click: t.alt_right_click, area: t.area });
         let c = t.center();
         self.picked = now;
         // (Measured from its spot, unless a move set where it met it.)
@@ -1183,13 +1223,14 @@ impl Snapper {
             let list = s.list.and_then(|id| targets.iter().position(|x| x.id == id));
             let under = targets.iter().find(|x| matches!(x.kind, TargetKind::ListItem { list: l } if l == list) && inside(x.rect, t));
             match under {
-                Some(x) => self.snapped = Some(Snapped { id: x.id, alt_right_click: x.alt_right_click, ..s }),
+                Some(x) => self.snapped = Some(Snapped { id: x.id, alt_right_click: x.alt_right_click, area: x.area, ..s }),
                 None => self.gone(targets, s.id, now),
             }
             return;
         }
         match targets.iter().find(|x| x.id == s.id) {
             Some(x) => {
+                self.snapped = Some(Snapped { area: x.area, ..s });
                 let c = x.center();
                 if c != t {
                     self.flight.retarget(c, now, self.flight_time());
