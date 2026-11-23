@@ -708,6 +708,12 @@ pub fn arrange_panned(plan: &Plan, scene: &Scene, frame: &mut layout::Frame, pan
     };
     let modal_piece = |camera: Camera| {
         let (o, (w, h)) = (camera.origin, (camera.viewport.0 as i32, camera.viewport.1 as i32));
+        // A screen of its own over a menu, as large as that menu (a game's
+        // 1024 by 768 screens over its title, wherever it draws them): in
+        // the menu's place, as the menu is shown, not as a dialog.
+        if let Some(b) = menu_box.filter(|b| (b[2], b[3]) == (w, h)) {
+            return Affine { from: o, to: menu.apply((b[0], b[1])), zoom: menu.zoom };
+        }
         let zoom = fit_at_most(modal_zoom, Some([o.0, o.1, w, h]), region_size(Some(modal_region)));
         Affine { from: o, to: modal_place((scaled(w as i64, zoom) as i32, scaled(h as i64, zoom) as i32), modal_region), zoom }
     };
@@ -3365,6 +3371,45 @@ mod tests {
         assert!(!layout.menu_pan.route(&Input::MouseMove { x: 20, y: 20 }));
         assert!(!layout.menu_pan.route(&Input::MouseButton { button: Button::Right, down: true, x: 320, y: 180 }));
         assert!(!layout.menu_pan.route(&Input::Wheel { delta: 120, x: 320, y: 180 }));
+    }
+
+    /// A modal part as large as the menu under it (the game's Hall of Fame,
+    /// its campaign record: 1024 by 768 screens over the title, the Hall of
+    /// Fame drawn at the window's top left) shows where the menu does, at
+    /// its zoom, not a sixth of the way down as a dialog.
+    #[test]
+    fn a_modal_as_large_as_its_menu_shows_in_the_menus_place() {
+        use scene::{View, ViewState};
+        let (background, board) = (1, 2);
+        for (screen, window, pixel_scale) in [((3274u32, 2048u32), (3274u32, 2048u32), 1u32), ((1920, 1080), (1920, 1080), 1), ((3274, 2048), (3258, 1904), 2)] {
+            let menu = [(screen.0 as i32 - 1024) / 2, (screen.1 as i32 - 768) / 2, 1024, 768];
+            let rect_of = |s: &FreeSprite| Some([s.x, s.y, 1024, 768]);
+            let sprite = |set: u32, (x, y): (i32, i32)| FreeSprite { set, x, y, screen: true, ..Default::default() };
+            for at in [(0, 0), (menu[0], menu[1])] {
+                let mut scene = Scene {
+                    screen_size: screen,
+                    views: vec![ViewState { id: 255, view: View { interface_only: true, menu: true, ..Default::default() }, overlay: vec![sprite(background, (menu[0], menu[1]))] }],
+                    ..Default::default()
+                };
+                scene.interface.popup = Some(257);
+                scene.views.push(ViewState { id: 257, view: View { interface_only: true, origin: at, viewport: (1024, 768), ..Default::default() }, overlay: vec![sprite(board, at)] });
+                for scale_menus in [false, true] {
+                    let settings = Resolution { pixel_scale, scale_menus, ..Default::default() };
+                    let what = format!("{screen:?} in {window:?}, board at {at:?}, {settings:?}");
+                    let p = plan(window, screen, &settings).for_scene(&scene, rect_of);
+                    let mut layout = layout::Layout::default();
+                    layout.driver_screen = Some(p.screen);
+                    layout.menu_scale = p.menu.zoom;
+                    let mut f = layout.frame(&scene, p.canvas(), (0, 0, 0, 0), vec![], None);
+                    let shown = arrange_panned(&p, &scene, &mut f, &mut layout.menu_pan, rect_of).shown.unwrap();
+                    let m = *shown.iter().find(|s| s.driver == menu).expect("the menu shown");
+                    let modal = *shown.iter().find(|s| s.driver == [at.0, at.1, 1024, 768] && s.piece != m.piece || at == (menu[0], menu[1]) && s.driver == menu).expect("the board shown");
+                    // (Its own origin's rounding at a fractional zoom: a pixel.)
+                    assert_eq!((modal.rect[0], modal.rect[1], modal.piece.zoom), (m.rect[0], m.rect[1], m.piece.zoom), "{what}");
+                    assert!((modal.rect[2] - m.rect[2]).abs() <= 1 && (modal.rect[3] - m.rect[3]).abs() <= 1, "{what}: {:?} {:?}", modal.rect, m.rect);
+                }
+            }
+        }
     }
 
     /// A modal popup over a menu (C3X's info box over the Preferences
