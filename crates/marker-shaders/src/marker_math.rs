@@ -31,9 +31,12 @@ pub fn paint(shape: u32, x: f32, y: f32, scale: f32, bob: f32, rgba: [f32; 4]) -
 
 /// The arrow's outline in the pixels of its 1:1 art (33×48): slightly
 /// unequal shoulders and a tapered, chamfered shaft, the tip at (16, 44).
-const POINTS: [(f32, f32); 11] = [(13.0, 3.0), (21.0, 3.6), (23.0, 5.5), (22.0, 23.0),
+/// Closed: its first point again at the end, so every edge is two
+/// neighbours (an index wrapped round to the first lost the closing edge
+/// on the GPU, and a bar of metal stood left of the shaft's top: TS Neo).
+const POINTS: [(f32, f32); 12] = [(13.0, 3.0), (21.0, 3.6), (23.0, 5.5), (22.0, 23.0),
     (29.5, 23.8), (29.0, 27.0), (16.0, 44.0), (3.5, 26.0),
-    (4.0, 23.0), (11.5, 23.4), (11.0, 5.0)];
+    (4.0, 23.0), (11.5, 23.4), (11.0, 5.0), (13.0, 3.0)];
 
 /// Whether art point (x, y) is inside the arrow, how far it is from the
 /// outline, and how the nearest edge faces the light.
@@ -41,9 +44,9 @@ fn surface(x: f32, y: f32) -> (bool, f32, f32) {
     let mut inside = false;
     let (mut distance, mut light) = (f32::MAX, 0.0);
     let mut i = 0;
-    while i < POINTS.len() {
+    while i + 1 < POINTS.len() {
         let a = POINTS[i];
-        let b = POINTS[if i + 1 == POINTS.len() { 0 } else { i + 1 }];
+        let b = POINTS[i + 1];
         if (a.1 > y) != (b.1 > y) && x < (b.0-a.0)*(y-a.1)/(b.1-a.1)+a.0 { inside = !inside; }
         let (dx, dy) = (b.0-a.0, b.1-a.1);
         let t = ((x-a.0)*dx+(y-a.1)*dy)/(dx*dx+dy*dy);

@@ -4065,8 +4065,7 @@ impl App {
             arranged.list_offsets = self.list_scroll.offsets();
             let compiled = layout_compiled;
             let shown = scaling::arrange_panned(&plan, scene, &mut arranged, &mut self.layout.menu_pan, |s| sprite_rect(compiled, s));
-            // Where the lists show; the driver told where they are.
-            self.list_scroll.shown(&shown.lists);
+            // The driver told where the lists are.
             for input in self.list_scroll.take_inputs() {
                 frame_input(&mut self.preparing_inputs, &self.display, input);
             }

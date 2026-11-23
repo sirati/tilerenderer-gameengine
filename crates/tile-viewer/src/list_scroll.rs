@@ -2,7 +2,8 @@
 //! scrolled by the viewer.
 //!
 //! A list has one offset (content pixels, continuous). The trackpad moves
-//! it at once by the pixels the fingers move (through the list's zoom),
+//! it at once by the pixels the fingers move (the layout gives them in the
+//! driver's pixels, which are the content's),
 //! from the first input on; a wheel notch moves its target a step, which
 //! the offset glides to. The entries are drawn at that offset every frame
 //! (`scaling::scrolled`: by screen pixels, the entries it puts partly in
@@ -37,8 +38,6 @@ struct List {
     driver: i32,
     /// The offset last told the driver.
     sent: Option<i32>,
-    /// Canvas pixels per driver pixel where it shows.
-    zoom: f64,
 }
 
 impl List {
@@ -81,22 +80,13 @@ impl ListScrolls {
                     }
                     old
                 }
-                None => List { id: l.id, rect, step: 0.0, max, pos: driver as f64, target: driver as f64, driver, sent: Some(driver), zoom: 1.0 },
+                None => List { id: l.id, rect, step: 0.0, max, pos: driver as f64, target: driver as f64, driver, sent: Some(driver) },
             };
             (list.rect, list.step, list.max, list.driver) = (rect, l.step.max(1) as f64, max, driver);
             list.clamp();
             kept.push(list);
         }
         self.lists = kept;
-    }
-
-    /// Where each list shows (`scaling::ListShown`): its zoom there.
-    pub fn shown(&mut self, shown: &[crate::scaling::ListShown]) {
-        for l in &mut self.lists {
-            if let Some(s) = shown.iter().find(|s| s.id == l.id) {
-                l.zoom = s.zoom.0.max(1) as f64 / s.zoom.1.max(1) as f64;
-            }
-        }
     }
 
     /// `dt` seconds on: the glides to the wheel's targets. Whether a list
@@ -131,8 +121,9 @@ impl ListScrolls {
             Input::Scroll { dx: _, dy, pixels, x, y } => {
                 let Some(i) = over(&self.lists, x, y) else { self.scrolled = false; return Some(input) };
                 let l = &mut self.lists[i];
-                // (Positive moves the content down: towards the start.)
-                let by = if pixels { dy as f64 / 1000.0 / l.zoom.max(1e-6) } else { dy as f64 / 1000.0 * l.step };
+                // (Positive moves the content down: towards the start. In
+                // the driver's pixels already, `Layout::route`.)
+                let by = if pixels { dy as f64 / 1000.0 } else { dy as f64 / 1000.0 * l.step };
                 l.pos -= by;
                 l.target = l.pos;
                 l.clamp();
@@ -211,9 +202,8 @@ mod tests {
     fn the_trackpad_moves_a_list_from_its_first_pixel() {
         let mut l = ListScrolls::default();
         l.follow(&scene(0));
-        l.shown(&[crate::scaling::ListShown { id: 42, rect: [0, 0, 1, 1], zoom: (2, 1) }]);
-        // One window pixel up at 2:1: half a content pixel, at once.
-        assert!(l.route(Input::Scroll { dx: 0, dy: -1000, pixels: true, x: 150, y: 250 }).is_none());
+        // Half a driver pixel up (a window pixel at 2:1): at once.
+        assert!(l.route(Input::Scroll { dx: 0, dy: -500, pixels: true, x: 150, y: 250 }).is_none());
         assert_eq!(pos(&l), 0.5);
         // The window's notches of the same motion are not the driver's.
         assert!(l.route(Input::Wheel { delta: -120, x: 150, y: 250 }).is_none());
