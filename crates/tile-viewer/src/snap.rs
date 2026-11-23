@@ -13,9 +13,11 @@
 //! divider, its walls and the window's edges (edge scrolling) do not apply
 //! to it: it reaches the interface anywhere in the window, in any view,
 //! the corner's buttons and popups drawn elsewhere included
-//! ([`Layout::moved_parts`]). Turned on again, it goes on from the element
-//! it last rested on (if that is still there), else from the one nearest
-//! the pointer.
+//! ([`Layout::moved_parts`]). Turned on again with the pointer on an
+//! element, it starts from that one (the person points at it); else it
+//! goes on from the element it last rested on (if that is still there:
+//! the pointer may be the world cursor, gone elsewhere since), else from
+//! the one nearest the pointer.
 //!
 //! **Where it goes.** On Alt it snaps at once to the element nearest the
 //! pointer. Then, at most [`Rates::updates_per_second`] times a second, the
@@ -840,10 +842,11 @@ impl Snapper {
         self.tuning.flight / self.rates.updates_per_second
     }
 
-    /// Turns the mode on at time `now`, the pointer at `at`: it goes on
-    /// from the element it last rested on if that is still there (from
-    /// there), else it flies to the one nearest `at` at once (the capture
-    /// view if there is no other).
+    /// Turns the mode on at time `now`, the pointer at `at`: on the
+    /// element `at` is on, if it is on one; else it goes on from the
+    /// element it last rested on if that is still there (from there),
+    /// else it flies to the one nearest `at` at once (the capture view if
+    /// there is no other).
     pub fn enter(&mut self, now: f64, at: Point, targets: &[Target], rates: Rates) {
         *self = Self { pressed: self.pressed, rested: self.rested, tuning: self.tuning, ..Self::default() };
         self.phase = Phase::Snapping;
@@ -851,7 +854,10 @@ impl Snapper {
         self.last = now;
         self.pos = at;
         self.flight = Flight::rest(at);
-        let resume = self.rested.and_then(|id| targets.iter().position(|t| t.id == id && !t.is_capture() && t.snappable()));
+        // (The pointer put on an element: that one, not where the mode
+        // last was.)
+        let pointed = targets.iter().any(|t| !t.is_capture() && t.snappable() && t.distance(at) == 0.0);
+        let resume = self.rested.filter(|_| !pointed).and_then(|id| targets.iter().position(|t| t.id == id && !t.is_capture() && t.snappable()));
         if let Some(k) = resume {
             self.pos = targets[k].center();
             self.flight = Flight::rest(self.pos);

@@ -428,6 +428,16 @@ fn turned_on_again_it_goes_on_from_the_element_it_rested_on() {
     s.stop();
     s.enter(3.0, (100.0, 700.0), &without_b, Rates::default());
     assert_eq!(s.target(), Some((120.0, 110.0)));
+    // Rested on B again, then turned on with the pointer put on C: C, not
+    // back on B.
+    s.leave();
+    s.stop();
+    s.enter(4.0, (320.0, 110.0), &t, Rates::default());
+    assert_eq!(s.rested(), Some(2));
+    s.leave();
+    s.stop();
+    s.enter(5.0, (930.0, 115.0), &t, Rates::default());
+    assert_eq!(s.target(), Some((920.0, 110.0)));
 }
 
 #[test]
