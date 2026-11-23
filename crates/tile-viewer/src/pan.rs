@@ -682,6 +682,10 @@ impl Layout {
     /// (its `Wheel` notches go on as ever).
     pub(super) fn map_scroll(&mut self, d: (f64, f64), pixels: bool, p: (i32, i32)) -> Option<Vec<Input>> {
         let hit = self.wheel_view(p)?;
+        // (The system's momentum: the map's own flick moves it, `flick`.)
+        if pixels && self.scroll_momentum {
+            return Some(vec![]);
+        }
         let d = if self.shift && d.0 == 0.0 { (d.1, 0.0) } else { d };
         let per = if pixels {
             let scale = self.shown_scale(hit)?;
@@ -873,6 +877,19 @@ impl Layout {
         }
     }
 
+    /// The trackpad left moving at `v` (window pixels a second, as its
+    /// scrolls): the map under the pointer slides on, slowing as a drag let
+    /// go does, by each frame's time; with edge scrolling it adds up.
+    pub fn flick(&mut self, v: (f64, f64)) {
+        let Some(hit) = self.wheel_view(self.pointer) else { return };
+        let (Some(scale), Some(pos)) = (self.shown_scale(hit), self.exact_center(hit)) else { return };
+        let momentum = Momentum { vel: v };
+        if momentum.moving() {
+            log::info!("viewer: {} flicked at {:.0?} px/s", view_name(hit), v);
+            self.pan.coast = Some(Coast { hit, pos, momentum, scale });
+        }
+    }
+
     fn slide(&mut self, dt: f64) {
         let Some(mut c) = self.pan.coast else { return };
         if self.locked || self.click_popup_open() || !self.shown.iter().any(|(h, _)| *h == c.hit) {
@@ -880,7 +897,10 @@ impl Layout {
             return;
         }
         let d = c.momentum.step(dt);
-        let (pos, held) = self.clamp_view_center(c.hit, (c.pos.0 - d.0 * c.scale, c.pos.1 - d.1 * c.scale));
+        // (From where the view is now: whatever else moves it, edge
+        // scrolling say, adds to the slide.)
+        let from = self.exact_center(c.hit).unwrap_or(c.pos);
+        let (pos, held) = self.clamp_view_center(c.hit, (from.0 - d.0 * c.scale, from.1 - d.1 * c.scale));
         // (Stopped by the world's edge that way.)
         if held.0 {
             c.momentum.vel.0 = 0.0;
@@ -2405,6 +2425,46 @@ mod tests {
 
     fn shift(l: &mut Layout, down: bool) {
         l.route(Input::Key { vk: 0x10, down, text: None });
+    }
+
+    #[test]
+    fn a_trackpad_flick_slides_the_map_and_adds_to_edge_scrolling() {
+        let mut l = split(MapMovement::EdgeScroll, Roles::Free);
+        let mut stepped = scene_at(1000);
+        stepped.map_wheel_step = (64, 32);
+        for _ in 0..2 { l.frame(&stepped, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        mv(&mut l, (200, 300));
+        let start = l.exact_center(Hit::Main).unwrap();
+        // Flicked down (content down: the view up), it slides and slows.
+        l.flick((0.0, 1200.0));
+        let mut steps = Vec::new();
+        let mut last = start;
+        for _ in 0..30 {
+            tick(&mut l, 16);
+            let now = l.exact_center(Hit::Main).unwrap();
+            steps.push(last.1 - now.1);
+            last = now;
+        }
+        assert!(steps[0] > 0.0 && steps.windows(2).all(|w| w[1] <= w[0] + 1e-9), "{steps:?}");
+        // The system's momentum meanwhile does not move it.
+        l.scroll_momentum = true;
+        let before = l.exact_center(Hit::Main).unwrap();
+        let out = l.route(Input::Scroll { dx: 0, dy: 40_000, pixels: true, x: 200, y: 300 });
+        assert!(out.is_empty());
+        assert_eq!(l.exact_center(Hit::Main).unwrap(), before);
+        l.scroll_momentum = false;
+        // With the pointer at the left edge, the slide still goes on: the two add.
+        let mut l = split(MapMovement::EdgeScroll, Roles::Free);
+        let mut stepped = scene_at(1000);
+        stepped.map_wheel_step = (64, 32);
+        for _ in 0..2 { l.frame(&stepped, (800, 600), (0, 0, 0, 0), vec![], BOUNDS); }
+        mv(&mut l, (200, 300));
+        l.flick((0.0, 1200.0));
+        mv(&mut l, (0, 300));
+        let from = l.exact_center(Hit::Main).unwrap();
+        for _ in 0..10 { tick(&mut l, 16); }
+        let to = l.exact_center(Hit::Main).unwrap();
+        assert!(to.0 < from.0 && to.1 < from.1, "edge left and slide up together: {from:?} -> {to:?}");
     }
 
     #[test]

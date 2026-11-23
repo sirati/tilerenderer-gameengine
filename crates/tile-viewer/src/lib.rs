@@ -4601,7 +4601,14 @@ impl ApplicationHandler for App {
         self.input.set_wheel_scale(self.desktop_scale());
         self.settings_preview.set_desktop_scale(self.desktop_scale());
         self.input.sync_wheel_context(self.display.scene(), self.layout.route_window(self.layout.pointer_in_window()), self.snap.snap_mode_active() || self.layout.captured());
-        for input in self.input.translate(&event) {
+        let translated = self.input.translate(&event);
+        // (The trackpad's own momentum is the map's flick's to replace.)
+        self.layout.scroll_momentum = self.input.scroll_momentum();
+        if let Some(v) = self.input.take_flick() {
+            self.layout.flick(v);
+            if let Some(gpu) = &self.gpu { gpu.window.request_redraw(); }
+        }
+        for input in translated {
             let pointer = self.input.window_pointer();
             let window = self.gpu.as_ref().map_or((1, 1), |g| (g.config.width, g.config.height));
             let (consumed, result) = self.settings_preview.input(&input, (pointer.0 as i32, pointer.1 as i32), window);

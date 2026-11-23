@@ -1062,6 +1062,10 @@ pub struct Layout {
     /// With vsync, the display's refresh period: frames show on it, and
     /// `frame_instant` is when this one will (`ShowClock`).
     pub show_period: Option<std::time::Duration>,
+    /// The trackpad scrolls coming are the system's momentum after the
+    /// fingers left (`input::InputState::scroll_momentum`): not the map's,
+    /// which slides on by its own flick.
+    pub scroll_momentum: bool,
     world_orders: world_orders::WorldOrders,
     /// Exploring the world beside the driver's screen ([`Explore`]); the
     /// world beside it in the last frame; the last left press on it (when,
@@ -1213,6 +1217,7 @@ impl Default for Layout {
             pointer_present: None,
             frame_instant: None,
             show_period: None,
+            scroll_momentum: false,
             world_orders: world_orders::WorldOrders::default(),
             explore: None,
             beside_of: None,

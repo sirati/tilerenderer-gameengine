@@ -16,6 +16,13 @@ pub struct InputState {
     /// Physical sides stay distinct until the final release of a shared
     /// Windows virtual key, such as ShiftLeft and ShiftRight.
     keys_down: Vec<KeyCode>,
+    /// The trackpad: the fingers' recent pixel moves (when, how far), when
+    /// they left it, whether the system's momentum after that is under way,
+    /// and the flick they left with (`InputState::take_flick`).
+    finger: Vec<(std::time::Instant, (f64, f64))>,
+    lifted: Option<std::time::Instant>,
+    momentum: bool,
+    flick: Option<(f64, f64)>,
     wheel_rest: f64,
     wheel_pixels: bool,
     wheel_scale: Option<f64>,
@@ -27,7 +34,67 @@ pub struct InputState {
     logged_native: Vec<u16>,
 }
 
+/// A trackpad gesture beginning this soon after the fingers left is the
+/// system's momentum (macOS: its own gesture, right after theirs).
+const MOMENTUM_GAP: std::time::Duration = std::time::Duration::from_millis(80);
+/// The fingers' moves over this long before they left give their speed.
+const RELEASE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+/// Slower than this (window pixels a second) when they leave: no flick.
+const FLICK_MIN: f64 = 60.0;
+
 impl InputState {
+    /// Whether the trackpad scrolls coming now are the system's momentum
+    /// after the fingers left, not the fingers: the map's own flick moves
+    /// it instead (`Layout::flick`); lists still take them.
+    pub fn scroll_momentum(&self) -> bool {
+        self.momentum
+    }
+
+    /// The fingers' velocity (window pixels a second, as scrolls give
+    /// them) as they left the trackpad moving, once.
+    pub fn take_flick(&mut self) -> Option<(f64, f64)> {
+        self.flick.take()
+    }
+
+    /// The trackpad's gesture `phase` with pixel move `delta` at `now`.
+    fn gesture(&mut self, delta: &MouseScrollDelta, phase: TouchPhase, now: std::time::Instant) {
+        let MouseScrollDelta::PixelDelta(p) = delta else {
+            (self.momentum, self.lifted) = (false, None);
+            self.finger.clear();
+            return;
+        };
+        match phase {
+            TouchPhase::Started => {
+                // (Right after the fingers left: the system's momentum.)
+                self.momentum = self.lifted.is_some_and(|t| now.saturating_duration_since(t) < MOMENTUM_GAP);
+                self.lifted = None;
+                if !self.momentum {
+                    self.finger.clear();
+                    self.flick = None;
+                }
+            }
+            TouchPhase::Moved if !self.momentum => {
+                self.finger.push((now, (p.x, p.y)));
+                self.finger.retain(|(t, _)| now.saturating_duration_since(*t) <= RELEASE_WINDOW * 2);
+            }
+            TouchPhase::Moved => {}
+            TouchPhase::Ended | TouchPhase::Cancelled if self.momentum => self.momentum = false,
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.lifted = Some(now);
+                let recent: Vec<&(std::time::Instant, (f64, f64))> = self.finger.iter().filter(|(t, _)| now.saturating_duration_since(*t) <= RELEASE_WINDOW).collect();
+                if let Some(first) = recent.first() {
+                    let span = now.saturating_duration_since(first.0).as_secs_f64().max(1.0 / 120.0);
+                    let sum = recent.iter().fold((0.0, 0.0), |a, (_, d)| (a.0 + d.0, a.1 + d.1));
+                    let v = (sum.0 / span, sum.1 / span);
+                    if v.0.hypot(v.1) >= FLICK_MIN && v.0.is_finite() && v.1.is_finite() {
+                        self.flick = Some(v);
+                    }
+                }
+                self.finger.clear();
+            }
+        }
+    }
+
     /// PixelDelta uses physical pixels. Keep gesture distance independent
     /// of monitor scale while line-based wheels retain their native units.
     pub fn set_wheel_scale(&mut self, scale: f64) {
@@ -188,6 +255,7 @@ impl InputState {
                 vec![Input::MouseButton { button, down: *state == ElementState::Pressed, x, y }]
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
+                self.gesture(delta, *phase, std::time::Instant::now());
                 if *phase == TouchPhase::Cancelled { self.wheel_rest = 0.0; return vec![]; }
                 if *phase == TouchPhase::Started { self.wheel_rest = 0.0; }
                 let out = self.wheel(delta);
@@ -274,6 +342,34 @@ pub fn virtual_key(code: KeyCode) -> Option<u32> {
 mod tests {
     use super::*;
     use winit::event::{DeviceId, TouchPhase};
+
+    #[test]
+    fn fingers_leaving_the_trackpad_moving_flick_and_its_momentum_is_marked() {
+        use winit::dpi::PhysicalPosition;
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let px = |y: f64| MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, y));
+        let mut s = InputState::default();
+        // Fingers moving 12 pixels every 10 ms (1200 px/s), then off.
+        s.gesture(&px(0.0), TouchPhase::Started, ms(0));
+        for k in 1..=10 { s.gesture(&px(12.0), TouchPhase::Moved, ms(10 * k)); }
+        assert!(!s.scroll_momentum());
+        s.gesture(&px(0.0), TouchPhase::Ended, ms(100));
+        let (vx, vy) = s.take_flick().expect("a flick");
+        assert!(vx == 0.0 && (vy - 1200.0).abs() < 150.0, "{vy}");
+        assert!(s.take_flick().is_none(), "once");
+        // The system's momentum right after: marked, no new flick.
+        s.gesture(&px(0.0), TouchPhase::Started, ms(110));
+        assert!(s.scroll_momentum());
+        s.gesture(&px(9.0), TouchPhase::Moved, ms(120));
+        s.gesture(&px(0.0), TouchPhase::Ended, ms(400));
+        assert!(!s.scroll_momentum() && s.take_flick().is_none());
+        // Fingers that stopped before leaving: no flick.
+        s.gesture(&px(0.0), TouchPhase::Started, ms(1000));
+        s.gesture(&px(12.0), TouchPhase::Moved, ms(1010));
+        s.gesture(&px(0.0), TouchPhase::Ended, ms(1300));
+        assert!(s.take_flick().is_none());
+    }
 
     #[test]
     fn top_row_codes_are_f3_to_f6_only_when_asked() {
